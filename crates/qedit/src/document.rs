@@ -40,12 +40,8 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
-    let text = String::from_utf8(bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not valid UTF-8", path.display()),
-        )
-    })?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not valid UTF-8"))?;
 
     let crlf = text.matches("\r\n").count();
     let cr = text.matches('\r').count();
@@ -102,6 +98,30 @@ pub fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Result<()> 
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// `path` made absolute, with `.`, `..`, and symlinked folders resolved, so
+/// that however a file is named it gets the same path as in the file tree.
+/// The file name is kept even if it is a symlink, as the tree shows it. A
+/// path whose folder doesn't exist is only made absolute.
+pub fn resolve(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(parent) => parent.join(name),
+            Err(_) => absolute,
+        },
+        _ => absolute,
+    }
+}
+
+/// Whether `a` and `b` name the same file, following symlinks.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
 }
 
 fn resolve_symlinks(path: &Path) -> io::Result<PathBuf> {
@@ -169,6 +189,32 @@ mod tests {
         let path = dir.join("bin");
         fs::write(&path, [0xff, 0xfe, b'a']).unwrap();
         assert_eq!(load(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_gives_one_path_per_file() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("resolve").canonicalize().unwrap();
+        fs::create_dir_all(dir.join("real")).unwrap();
+        symlink(dir.join("real"), dir.join("linked-dir")).unwrap();
+        fs::write(dir.join("real/a.txt"), "").unwrap();
+        symlink(dir.join("real/a.txt"), dir.join("real/link.txt")).unwrap();
+
+        let a = dir.join("real/a.txt");
+        assert_eq!(resolve(&dir.join("real/../real/./a.txt")), a);
+        assert_eq!(resolve(&dir.join("linked-dir/a.txt")), a);
+        // A new file in an existing folder, and one in a missing folder.
+        assert_eq!(
+            resolve(&dir.join("linked-dir/new.txt")),
+            dir.join("real/new.txt")
+        );
+        assert_eq!(resolve(&dir.join("gone/x.txt")), dir.join("gone/x.txt"));
+        // Symlinked file names are kept, but still count as the same file.
+        let link = dir.join("real/link.txt");
+        assert_eq!(resolve(&link), link);
+        assert!(same_file(&link, &a));
+        assert!(!same_file(&a, &dir.join("real/new.txt")));
     }
 
     #[cfg(unix)]

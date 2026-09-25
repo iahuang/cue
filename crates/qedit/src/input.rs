@@ -8,6 +8,11 @@
 //! else (replies to the renderer's capability queries) is returned as
 //! [`Event::Reply`] for the renderer.
 
+use std::time::Duration;
+
+/// Clicks on the same spot within this interval count as a double/triple click.
+pub const MULTI_CLICK: Duration = Duration::from_millis(400);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Mods {
     pub shift: bool,

@@ -5,9 +5,9 @@ things i'd like
 tier 0 - required for use at all
 
 - file nav
-  - single or multi-directory workspaces
+  - single or multi-directory workspaces (partial: single folder works via `qedit FOLDER`; the workspace already holds a list of roots, but there's no way to add a second yet)
     - allows a folder to be added to the workspace that already exists as a child or a parent of an existing workspace folder
-  - left-hand file tree navigator; expand and collapse
+  - left-hand file tree navigator; expand and collapse (done)
   - search
     - should ignore .gitignore and .git by default
     - quick "go to file" ctrl+P
@@ -19,7 +19,7 @@ tier 0 - required for use at all
   - find and replace
   - basic language awareness for features like autoclosing brackets, quotes
 - command pallete (come up with a sensible shortcut for this. claude says cmd+space is taken)
-  - actions such as file save, copy, paste ideally prefixed with like `editor:copy`
+  - actions such as file save, copy, paste ideally prefixed with like `editor:copy` (done: every shortcut is a named command like `editor:copy`, listed with its shortcut in `qedit --help`; the palette UI itself isn't built yet)
   - philosophy: any action which has a keyboard shortcut should also be findable in the command pallete. and likewise you should be able to see the shortcut there.
 
 ---

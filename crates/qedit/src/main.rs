@@ -1,21 +1,27 @@
 //! qedit: a terminal text editor on OpenTUI's native core.
 
+mod app;
 mod document;
 mod editor;
 mod history;
 mod input;
+mod keymap;
 mod terminal;
+mod tree;
 mod words;
+mod workspace;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use opentui::{EditBuffer, Output, Renderer, WidthMethod};
+use opentui::{Output, Renderer};
 
-use editor::{Action, Editor, File};
+use app::{App, AppAction};
 use input::{Event, Parser};
+use keymap::{Command, Keymap};
+use workspace::Workspace;
 
 /// How long input must be idle before a lone ESC counts as the Escape key.
 const ESC_TIMEOUT: Duration = Duration::from_millis(30);
@@ -50,9 +56,24 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: qedit [FILE]";
+const USAGE: &str = "usage: qedit [FILE | FOLDER]";
 
-/// The optional file argument, or the exit code for `--help` / bad usage.
+/// Usage and every command with its shortcut.
+fn help() -> String {
+    let keymap = Keymap::default();
+    let mut help = format!(
+        "{USAGE}\n\nOpens FOLDER, or the current folder with FILE (or a new, unnamed buffer) open.\nShift+movement or the mouse selects.\n\n"
+    );
+    for &command in Command::ALL {
+        let key = keymap
+            .shortcut(command)
+            .map_or(String::new(), |key| key.to_string());
+        help += &format!("  {key:<16}{:<30}{}\n", command.id(), command.title());
+    }
+    help
+}
+
+/// The optional file or folder argument, or the exit code for `--help` / bad usage.
 fn parse_args() -> Result<Option<PathBuf>, ExitCode> {
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
@@ -62,7 +83,7 @@ fn parse_args() -> Result<Option<PathBuf>, ExitCode> {
     }
     match first {
         Some(arg) if arg == "-h" || arg == "--help" => {
-            println!("{USAGE}\n\nOpens FILE (or a new, unnamed buffer). ^S save, ^Z/^Y undo/redo, ^A select all, ^C/^X/^V copy/cut/paste,\n^W toggle wrap, ^Q quit. Shift+movement or the mouse selects.");
+            print!("{}", help());
             Err(ExitCode::SUCCESS)
         }
         Some(arg) => Ok(Some(PathBuf::from(arg))),
@@ -72,46 +93,29 @@ fn parse_args() -> Result<Option<PathBuf>, ExitCode> {
 
 fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     // Load before taking over the terminal so errors print normally.
-    let loaded = match &path {
-        Some(path) => Some(document::load(path).map_err(|e| format!("{}: {e}", path.display()))?),
-        None => None,
+    let cwd = std::env::current_dir()?;
+    let (root, file) = match path {
+        Some(path) if path.is_dir() => (path, None),
+        Some(path) => (cwd, Some(path)),
+        None => (cwd, None),
     };
-
+    let workspace = Workspace::new([root])?;
     let (mut width, mut height) = terminal::size();
+    let mut app = App::new(workspace, file, width, height)?;
+
     let mut renderer = Renderer::new(width, height, Output::Stdout)?;
     renderer.setup_terminal(true);
     // Clicks, drags, and the wheel; plain motion isn't needed.
     renderer.enable_mouse(false);
-
-    let buffer = EditBuffer::new(WidthMethod::Unicode)?;
-    buffer.set_tab_width(4);
-    let mut file = File {
-        path,
-        line_ending: Default::default(),
-    };
-    let mut notice = None;
-    if let Some(loaded) = loaded {
-        buffer.set_text(&loaded.text);
-        buffer.set_cursor(0, 0);
-        file.line_ending = loaded.line_ending;
-        if loaded.mixed_endings {
-            notice = Some(format!(
-                "Mixed line endings; saving will use {}.",
-                loaded.line_ending.label()
-            ));
-        }
-    }
-    let mut editor = Editor::new(&buffer, file, width, height)?;
-    if let Some(notice) = notice {
-        editor.show_message(notice, false);
-    }
     let mut parser = Parser::new();
 
     loop {
         {
             let frame = renderer.next_buffer()?;
-            let (x, y) = editor.draw(&frame);
-            renderer.set_cursor_position(x as i32 + 1, y as i32 + 1, true);
+            match app.draw(&frame) {
+                Some((x, y)) => renderer.set_cursor_position(x as i32 + 1, y as i32 + 1, true),
+                None => renderer.set_cursor_position(1, 1, false),
+            }
         }
         renderer.render(false);
 
@@ -135,15 +139,15 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 
         for event in events.drain(..) {
             match event {
-                Event::Key(key) => match editor.handle_key(key) {
-                    Action::Quit => return Ok(()),
-                    Action::Copy(text) => {
+                Event::Key(key) => match app.handle_key(key) {
+                    AppAction::Quit => return Ok(()),
+                    AppAction::Copy(text) => {
                         renderer.copy_to_clipboard(&text);
                     }
-                    Action::Continue => {}
+                    AppAction::Continue => {}
                 },
-                Event::Mouse(mouse) => editor.handle_mouse(mouse, Instant::now()),
-                Event::Paste(text) => editor.paste(&text),
+                Event::Mouse(mouse) => app.handle_mouse(mouse, Instant::now()),
+                Event::Paste(text) => app.paste(&text),
                 Event::Reply(bytes) => renderer.process_capability_response(&bytes),
             }
         }
@@ -152,7 +156,7 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
         if size != (width, height) {
             (width, height) = size;
             renderer.resize(width, height);
-            editor.resize(width, height);
+            app.resize(width, height);
         }
     }
 }

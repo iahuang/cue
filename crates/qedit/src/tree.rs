@@ -1,0 +1,614 @@
+//! The file tree: the workspace roots and whichever folders are expanded,
+//! shown as an indented list.
+//!
+//! Folders are read when they are expanded and re-read on refresh; nothing
+//! watches the file system yet. Which folders are expanded is remembered by
+//! path, so collapsing a folder and expanding it again restores its subfolders.
+
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use opentui::{Attributes, Buffer, Rgba};
+
+use crate::keymap::Command;
+use crate::workspace::{deepest_root, root_name};
+
+const FG: Rgba = Rgba::rgb(186, 194, 222);
+const ROOT_FG: Rgba = Rgba::rgb(205, 214, 244);
+const ACTIVE_FG: Rgba = Rgba::rgb(137, 180, 250);
+const ARROW_FG: Rgba = Rgba::rgb(108, 112, 134);
+const SELECTED_BG: Rgba = Rgba::rgb(69, 71, 110);
+/// The selection while the editor has focus.
+const SELECTED_BG_UNFOCUSED: Rgba = Rgba::rgb(49, 50, 68);
+
+/// Rows the mouse wheel scrolls.
+const WHEEL_ROWS: usize = 3;
+
+/// Entries never shown.
+const HIDDEN: &[&str] = &[".git"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Row {
+    path: PathBuf,
+    name: String,
+    /// 0 for workspace roots.
+    depth: usize,
+    is_dir: bool,
+}
+
+/// What the app should do after the tree handled input.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TreeAction {
+    None,
+    /// Show this file in the editor, and move focus there if `focus`. A
+    /// `preview` replaces the previous preview unless it was edited.
+    Open {
+        path: PathBuf,
+        focus: bool,
+        preview: bool,
+    },
+}
+
+pub struct FileTree {
+    roots: Vec<PathBuf>,
+    expanded: HashSet<PathBuf>,
+    /// Every visible entry, top to bottom.
+    rows: Vec<Row>,
+    selected: usize,
+    /// The first row on screen.
+    scroll: usize,
+    /// Rows on screen.
+    height: usize,
+    /// The file shown in the editor, highlighted.
+    active: Option<PathBuf>,
+    /// The active file is a preview, shown in italics.
+    active_preview: bool,
+}
+
+impl FileTree {
+    /// A tree of `roots`, each expanded.
+    pub fn new(roots: &[PathBuf]) -> FileTree {
+        let mut tree = FileTree {
+            roots: Vec::new(),
+            expanded: HashSet::new(),
+            rows: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            height: 1,
+            active: None,
+            active_preview: false,
+        };
+        tree.set_roots(roots);
+        tree
+    }
+
+    /// Shows `roots`; new ones start expanded.
+    pub fn set_roots(&mut self, roots: &[PathBuf]) {
+        for root in roots {
+            if !self.roots.contains(root) {
+                self.expanded.insert(root.clone());
+            }
+        }
+        self.roots = roots.to_vec();
+        self.refresh();
+    }
+
+    /// Re-reads every expanded folder, keeping the selection on the same
+    /// path when it still exists.
+    pub fn refresh(&mut self) {
+        let selected = self.rows.get(self.selected).map(|row| row.path.clone());
+        let mut rows = Vec::new();
+        for root in &self.roots {
+            rows.push(Row {
+                path: root.clone(),
+                name: root_name(root),
+                depth: 0,
+                is_dir: true,
+            });
+            if self.expanded.contains(root) {
+                self.push_children(&mut rows, root, 1);
+            }
+        }
+        self.rows = rows;
+        if let Some(index) = selected.and_then(|path| self.index_of(&path)) {
+            self.selected = index;
+        }
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        self.scroll_into_view();
+    }
+
+    pub fn set_height(&mut self, height: u32) {
+        self.height = (height as usize).max(1);
+        self.scroll_into_view();
+    }
+
+    /// Highlights `path` as the file in the editor, in italics if it is a
+    /// preview.
+    pub fn set_active(&mut self, path: Option<&Path>, preview: bool) {
+        self.active = path.map(Path::to_path_buf);
+        self.active_preview = preview;
+    }
+
+    #[cfg(test)]
+    pub fn active_is_preview(&self) -> bool {
+        self.active_preview
+    }
+
+    /// Expands the folders down to `path` and selects it, if it is in the
+    /// workspace.
+    pub fn reveal(&mut self, path: &Path) {
+        let Some(root) = deepest_root(&self.roots, path) else {
+            return;
+        };
+        let folders: Vec<PathBuf> = path
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(root))
+            .map(Path::to_path_buf)
+            .collect();
+        self.expanded.extend(folders);
+        self.refresh();
+        if let Some(index) = self.index_of(path) {
+            self.select(index);
+        }
+    }
+
+    pub fn run(&mut self, command: Command) -> TreeAction {
+        let page = self.height.saturating_sub(1).max(1);
+        match command {
+            Command::TreeUp => self.select(self.selected.saturating_sub(1)),
+            Command::TreeDown => self.select(self.selected + 1),
+            Command::TreePageUp => self.select(self.selected.saturating_sub(page)),
+            Command::TreePageDown => self.select(self.selected + page),
+            Command::TreeFirst => self.select(0),
+            Command::TreeLast => self.select(usize::MAX),
+            Command::TreeExpand => self.expand_or_enter(),
+            Command::TreeCollapse => self.collapse_or_leave(),
+            Command::TreeOpen => return self.activate(true, false),
+            Command::TreePreview => return self.activate(false, true),
+            Command::TreeRefresh => self.refresh(),
+            _ => {}
+        }
+        TreeAction::None
+    }
+
+    /// A left click on screen row `y`: selects the entry there, then
+    /// expands/collapses a folder or opens a file. A single click previews
+    /// the file and keeps focus in the tree; a `double` click keeps the file
+    /// open and moves focus to it.
+    pub fn click(&mut self, y: u32, double: bool) -> TreeAction {
+        let index = self.scroll + y as usize;
+        if index >= self.rows.len() {
+            return TreeAction::None;
+        }
+        self.select(index);
+        self.activate(double, !double)
+    }
+
+    /// Scrolls by `rows` without moving the selection.
+    pub fn scroll(&mut self, rows: isize) {
+        let rows = rows * WHEEL_ROWS as isize;
+        let max = self.rows.len().saturating_sub(self.height);
+        self.scroll = self.scroll.saturating_add_signed(rows).min(max);
+    }
+
+    /// Draws the tree in the columns from `x` to `x + width`. Deep or long
+    /// rows are cut off at the right edge.
+    pub fn draw(&self, frame: &Buffer, x: u32, width: u32, focused: bool) {
+        frame.with_clip(x, 0, width, self.height as u32, || {
+            self.draw_rows(frame, x, width, focused)
+        });
+    }
+
+    fn draw_rows(&self, frame: &Buffer, x: u32, width: u32, focused: bool) {
+        let visible = self.rows.iter().enumerate().skip(self.scroll);
+        for ((index, row), y) in visible.zip(0..self.height as u32) {
+            if index == self.selected {
+                let bg = if focused {
+                    SELECTED_BG
+                } else {
+                    SELECTED_BG_UNFOCUSED
+                };
+                frame.fill_rect(x, y, width, 1, bg);
+            }
+            let indent = x + 1 + 2 * row.depth as u32;
+            let name_x = indent + 2;
+            if row.is_dir {
+                let arrow = if self.expanded.contains(&row.path) {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                frame.draw_text(arrow, indent, y, ARROW_FG, None, Attributes::NONE);
+            }
+            let (fg, attributes) = if row.depth == 0 {
+                (ROOT_FG, Attributes::BOLD)
+            } else if self.active.as_ref() == Some(&row.path) && self.active_preview {
+                (ACTIVE_FG, Attributes::BOLD | Attributes::ITALIC)
+            } else if self.active.as_ref() == Some(&row.path) {
+                (ACTIVE_FG, Attributes::BOLD)
+            } else {
+                (FG, Attributes::NONE)
+            };
+            let room = (x + width).saturating_sub(name_x + 1) as usize;
+            frame.draw_text(&truncate(&row.name, room), name_x, y, fg, None, attributes);
+        }
+    }
+
+    // --- navigation -----------------------------------------------------------
+
+    /// Selects row `index` (clamped) and scrolls it into view.
+    fn select(&mut self, index: usize) {
+        self.selected = index.min(self.rows.len().saturating_sub(1));
+        self.scroll_into_view();
+    }
+
+    fn scroll_into_view(&mut self) {
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + self.height {
+            self.scroll = self.selected + 1 - self.height;
+        }
+        self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.height));
+    }
+
+    /// Enter/Space/click: opens the selected file, or expands/collapses a
+    /// folder.
+    fn activate(&mut self, focus: bool, preview: bool) -> TreeAction {
+        let Some(row) = self.rows.get(self.selected) else {
+            return TreeAction::None;
+        };
+        if !row.is_dir {
+            return TreeAction::Open {
+                path: row.path.clone(),
+                focus,
+                preview,
+            };
+        }
+        if self.expanded.contains(&row.path) {
+            self.collapse(self.selected);
+        } else {
+            self.expand(self.selected);
+        }
+        TreeAction::None
+    }
+
+    /// Right: expands a collapsed folder, or steps into an expanded one.
+    fn expand_or_enter(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        if !row.is_dir {
+            return;
+        }
+        if !self.expanded.contains(&row.path) {
+            self.expand(self.selected);
+        } else if self
+            .rows
+            .get(self.selected + 1)
+            .is_some_and(|next| next.depth > row.depth)
+        {
+            self.select(self.selected + 1);
+        }
+    }
+
+    /// Left: collapses an expanded folder, or steps out to the parent.
+    fn collapse_or_leave(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        if row.is_dir && self.expanded.contains(&row.path) {
+            self.collapse(self.selected);
+            return;
+        }
+        let depth = row.depth;
+        if let Some(parent) = self.rows[..self.selected]
+            .iter()
+            .rposition(|row| row.depth < depth)
+        {
+            self.select(parent);
+        }
+    }
+
+    fn expand(&mut self, index: usize) {
+        let row = &self.rows[index];
+        let (path, depth) = (row.path.clone(), row.depth);
+        self.expanded.insert(path.clone());
+        let mut children = Vec::new();
+        self.push_children(&mut children, &path, depth + 1);
+        self.rows.splice(index + 1..index + 1, children);
+    }
+
+    fn collapse(&mut self, index: usize) {
+        let depth = self.rows[index].depth;
+        self.expanded.remove(&self.rows[index].path);
+        let end = self.rows[index + 1..]
+            .iter()
+            .position(|row| row.depth <= depth)
+            .map_or(self.rows.len(), |n| index + 1 + n);
+        self.rows.drain(index + 1..end);
+        if self.selected >= end {
+            self.selected -= end - (index + 1);
+        } else if self.selected > index {
+            self.selected = index;
+        }
+        self.scroll_into_view();
+    }
+
+    fn index_of(&self, path: &Path) -> Option<usize> {
+        self.rows.iter().position(|row| row.path == path)
+    }
+
+    /// Appends the entries of `dir`, and of its expanded subfolders.
+    fn push_children(&self, rows: &mut Vec<Row>, dir: &Path, depth: usize) {
+        for row in read_dir(dir, depth) {
+            let expand = row.is_dir && self.expanded.contains(&row.path);
+            let path = row.path.clone();
+            rows.push(row);
+            if expand {
+                self.push_children(rows, &path, depth + 1);
+            }
+        }
+    }
+}
+
+/// The entries of `dir`, folders first, each group by name ignoring case.
+/// An unreadable folder shows as empty.
+fn read_dir(dir: &Path, depth: usize) -> Vec<Row> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<Row> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| !HIDDEN.iter().any(|&hidden| entry.file_name() == hidden))
+        .map(|entry| {
+            let path = entry.path();
+            // Follow symlinks to folders. They're read only when expanded,
+            // so a link cycle can't recurse on its own.
+            let is_dir = match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => path.is_dir(),
+                Ok(kind) => kind.is_dir(),
+                Err(_) => false,
+            };
+            Row {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                path,
+                depth,
+                is_dir,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        (!a.is_dir, a.name.to_lowercase(), &a.name).cmp(&(
+            !b.is_dir,
+            b.name.to_lowercase(),
+            &b.name,
+        ))
+    });
+    rows
+}
+
+/// `s` cut to `max` characters, ending in an ellipsis if cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh directory with `files` (paths ending in `/` are folders).
+    fn fixture(name: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("qedit-tree-{}", std::process::id()))
+            .join(name);
+        let _ = fs::remove_dir_all(&dir);
+        for file in files {
+            let path = dir.join(file);
+            if file.ends_with('/') {
+                fs::create_dir_all(&path).unwrap();
+            } else {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, "").unwrap();
+            }
+        }
+        dir.canonicalize().unwrap()
+    }
+
+    /// A tree with room for 20 rows.
+    fn tree(roots: &[PathBuf]) -> FileTree {
+        let mut tree = FileTree::new(roots);
+        tree.set_height(20);
+        tree
+    }
+
+    /// The visible rows, indented by depth, folders marked with `/`.
+    fn listing(tree: &FileTree) -> Vec<String> {
+        tree.rows
+            .iter()
+            .map(|row| {
+                let slash = if row.is_dir { "/" } else { "" };
+                format!("{}{}{slash}", "  ".repeat(row.depth), row.name)
+            })
+            .collect()
+    }
+
+    fn selected(tree: &FileTree) -> &str {
+        &tree.rows[tree.selected].name
+    }
+
+    #[test]
+    fn lists_folders_first_and_hides_git() {
+        let root = fixture(
+            "order",
+            &[
+                "b.txt",
+                "A.txt",
+                "src/main.rs",
+                ".git/HEAD",
+                "docs/",
+                ".env",
+            ],
+        );
+        let tree = tree(&[root]);
+        assert_eq!(
+            listing(&tree),
+            ["order/", "  docs/", "  src/", "  .env", "  A.txt", "  b.txt"]
+        );
+    }
+
+    #[test]
+    fn expanding_and_collapsing_with_the_keyboard() {
+        let root = fixture("keys", &["src/tree/mod.rs", "src/main.rs", "z.txt"]);
+        let mut tree = tree(&[root]);
+        tree.run(Command::TreeDown);
+        assert_eq!(selected(&tree), "src");
+        tree.run(Command::TreeExpand);
+        tree.run(Command::TreeExpand);
+        assert_eq!(
+            selected(&tree),
+            "tree",
+            "Right steps into an expanded folder"
+        );
+        tree.run(Command::TreeExpand);
+        assert_eq!(
+            listing(&tree),
+            [
+                "keys/",
+                "  src/",
+                "    tree/",
+                "      mod.rs",
+                "    main.rs",
+                "  z.txt"
+            ]
+        );
+
+        tree.run(Command::TreeDown);
+        tree.run(Command::TreeCollapse);
+        assert_eq!(selected(&tree), "tree", "Left steps out to the parent");
+        tree.run(Command::TreeUp);
+        tree.run(Command::TreeCollapse);
+        assert_eq!(listing(&tree), ["keys/", "  src/", "  z.txt"]);
+
+        tree.run(Command::TreeExpand);
+        assert!(
+            listing(&tree).contains(&"      mod.rs".to_string()),
+            "subfolders stay expanded"
+        );
+    }
+
+    #[test]
+    fn opening_files_and_toggling_folders() {
+        let root = fixture("open", &["dir/inner.txt", "file.txt"]);
+        let mut tree = tree(std::slice::from_ref(&root));
+        tree.run(Command::TreeLast);
+        assert_eq!(
+            tree.run(Command::TreeOpen),
+            TreeAction::Open {
+                path: root.join("file.txt"),
+                focus: true,
+                preview: false,
+            }
+        );
+        assert_eq!(
+            tree.run(Command::TreePreview),
+            TreeAction::Open {
+                path: root.join("file.txt"),
+                focus: false,
+                preview: true,
+            }
+        );
+        // Clicking a folder toggles it.
+        assert_eq!(tree.click(1, false), TreeAction::None);
+        assert_eq!(
+            listing(&tree),
+            ["open/", "  dir/", "    inner.txt", "  file.txt"]
+        );
+        tree.click(1, false);
+        assert_eq!(listing(&tree), ["open/", "  dir/", "  file.txt"]);
+        assert_eq!(
+            tree.click(10, false),
+            TreeAction::None,
+            "below the last row"
+        );
+    }
+
+    #[test]
+    fn collapsing_the_parent_of_the_selection_selects_the_parent() {
+        let root = fixture("collapse", &["dir/a", "dir/b", "last"]);
+        let mut tree = tree(&[root]);
+        tree.click(1, false);
+        tree.select(3);
+        assert_eq!(selected(&tree), "b");
+        tree.click(1, false);
+        assert_eq!(selected(&tree), "dir");
+        tree.select(2);
+        assert_eq!(selected(&tree), "last");
+    }
+
+    #[test]
+    fn reveal_expands_ancestors_and_refresh_sees_new_files() {
+        let root = fixture("reveal", &["a/b/c.rs", "a/other.rs"]);
+        let mut tree = tree(std::slice::from_ref(&root));
+        tree.set_height(3);
+        tree.reveal(&root.join("a/b/c.rs"));
+        assert_eq!(selected(&tree), "c.rs");
+        assert_eq!(tree.scroll, 1, "scrolled so the selection is visible");
+
+        fs::write(root.join("a/b/new.rs"), "").unwrap();
+        tree.refresh();
+        assert_eq!(selected(&tree), "c.rs");
+        assert!(listing(&tree).contains(&"      new.rs".to_string()));
+    }
+
+    #[test]
+    fn several_roots() {
+        let one = fixture("one", &["x"]);
+        let two = fixture("two", &["y"]);
+        let tree = tree(&[one, two]);
+        assert_eq!(listing(&tree), ["one/", "  x", "two/", "  y"]);
+    }
+
+    #[test]
+    fn deep_rows_stay_inside_the_tree() {
+        let _serial = crate::test_serial();
+        let root = fixture("deep", &["a/b/c/d/e/f/g/h/file.txt"]);
+        let mut tree = tree(std::slice::from_ref(&root));
+        tree.reveal(&root.join("a/b/c/d/e/f/g/h/file.txt"));
+        let screen =
+            opentui::OwnedBuffer::new(16, 12, false, opentui::WidthMethod::Unicode, "test")
+                .unwrap();
+        screen.clear(Rgba::BLACK);
+        tree.draw(&screen, 0, 12, true);
+        let text = screen.to_text(true);
+        for line in text.lines() {
+            let outside: String = line.chars().skip(12).collect();
+            assert_eq!(outside.trim(), "", "{text}");
+        }
+        assert_eq!(truncate("name", 0), "");
+    }
+
+    #[test]
+    fn draws_indented_rows_and_truncates() {
+        let _serial = crate::test_serial();
+        let root = fixture("draw", &["folder/", "a-very-long-file-name.txt"]);
+        let mut tree = tree(&[root]);
+        tree.set_height(4);
+        let screen =
+            opentui::OwnedBuffer::new(16, 4, false, opentui::WidthMethod::Unicode, "test").unwrap();
+        screen.clear(Rgba::BLACK);
+        tree.draw(&screen, 0, 16, true);
+        let text = screen.to_text(true);
+        let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+        assert_eq!(lines[..3], [" ▾ draw", "   ▸ folder", "     a-very-lo…"]);
+    }
+}

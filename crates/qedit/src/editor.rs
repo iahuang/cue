@@ -1,17 +1,21 @@
-//! Editor state and key bindings on top of OpenTUI's `EditBuffer` and
+//! One open file: editing commands on top of OpenTUI's `EditBuffer` and
 //! `EditorView`, which own the text, cursor, selection, and scrolling.
 
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::Instant;
 
 use opentui::{
-    Attributes, Buffer, EditBuffer, EditorView, Rgba, SelectionBehavior, SelectionColors, WrapMode,
+    Attributes, Buffer, EditBuffer, EditorView, Rgba, SelectionBehavior, SelectionColors,
+    WidthMethod, WrapMode,
 };
 
 use crate::document::{self, LineEnding};
 use crate::history::{EditKind, History};
-use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind};
+use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
+use crate::keymap::{Command, Keymap};
 use crate::words;
+use crate::workspace::Workspace;
 
 const STATUS_BG: Rgba = Rgba::rgb(49, 50, 68);
 const STATUS_FG: Rgba = Rgba::rgb(205, 214, 244);
@@ -24,17 +28,19 @@ const SELECTION: SelectionColors = SelectionColors {
     fg: None,
 };
 
-/// Clicks on the same cell within this interval count as a double/triple click.
-const MULTI_CLICK: Duration = Duration::from_millis(400);
 const WHEEL_LINES: u32 = 3;
 /// Line numbers are hidden when they would leave the text less room than this.
 const MIN_TEXT_WIDTH: u32 = 20;
 
 pub enum Action {
     Continue,
-    Quit,
     /// Put this text on the system clipboard.
     Copy(String),
+    /// The file was written, possibly to a new path.
+    Saved,
+    /// The "Save as" prompt was answered with this path, as typed. The app
+    /// resolves it and calls [`Editor::save_as`].
+    SaveAs(PathBuf),
 }
 
 /// The file being edited.
@@ -74,37 +80,67 @@ struct Click {
     count: u32,
 }
 
-pub struct Editor<'eb> {
-    buffer: &'eb EditBuffer,
-    view: EditorView<'eb>,
+pub struct Editor {
+    buffer: Rc<EditBuffer>,
+    view: EditorView<'static>,
     file: File,
     history: History,
     /// The fixed end of the selection that keyboard movement extends from.
     anchor: Option<u32>,
-    /// Text from the last copy or cut, for ^V.
-    clipboard: Option<String>,
     drag: Option<Drag>,
     last_click: Option<Click>,
     wrap: WrapMode,
+    /// The screen column of the editor's left edge.
+    x: u32,
     width: u32,
     height: u32,
     message: Option<Message>,
     prompt: Option<Prompt>,
-    /// ^Q was pressed with unsaved changes; a second press quits.
-    quit_armed: bool,
 }
 
-impl<'eb> Editor<'eb> {
-    /// An editor filling a `width` x `height` screen, with line numbers down
-    /// the left and the last row used for the status bar.
+impl Editor {
+    /// Opens `path`, or a new, unnamed buffer. The error is the reason
+    /// alone, without the path.
+    pub fn open(path: Option<PathBuf>, width: u32, height: u32) -> Result<Editor, String> {
+        let loaded = match &path {
+            Some(path) => Some(document::load(path).map_err(|e| e.to_string())?),
+            None => None,
+        };
+        let buffer = Rc::new(EditBuffer::new(WidthMethod::Unicode).map_err(|e| e.to_string())?);
+        buffer.set_tab_width(4);
+        let mut file = File {
+            path,
+            line_ending: Default::default(),
+        };
+        let mut notice = None;
+        if let Some(loaded) = loaded {
+            buffer.set_text(&loaded.text);
+            buffer.set_cursor(0, 0);
+            file.line_ending = loaded.line_ending;
+            if loaded.mixed_endings {
+                notice = Some(format!(
+                    "Mixed line endings; saving will use {}.",
+                    loaded.line_ending.label()
+                ));
+            }
+        }
+        let mut editor = Editor::new(buffer, file, width, height).map_err(|e| e.to_string())?;
+        if let Some(notice) = notice {
+            editor.show_message(notice, false);
+        }
+        Ok(editor)
+    }
+
+    /// An editor `width` x `height`, with line numbers down the left and the
+    /// last row used for the status bar.
     pub fn new(
-        buffer: &'eb EditBuffer,
+        buffer: Rc<EditBuffer>,
         file: File,
         width: u32,
         height: u32,
-    ) -> opentui::Result<Editor<'eb>> {
+    ) -> opentui::Result<Editor> {
         let (_, view_w, view_h) = text_area(width, height, buffer.line_count());
-        let view = buffer.view(view_w, view_h)?;
+        let view = buffer.shared_view(view_w, view_h)?;
         let wrap = WrapMode::None;
         view.set_wrap_mode(wrap);
         Ok(Editor {
@@ -113,19 +149,20 @@ impl<'eb> Editor<'eb> {
             file,
             history: History::new(),
             anchor: None,
-            clipboard: None,
             drag: None,
             last_click: None,
             wrap,
+            x: 0,
             width,
             height,
             message: None,
             prompt: None,
-            quit_armed: false,
         })
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
+    /// Places the editor at column `x`, `width` x `height`.
+    pub fn set_area(&mut self, x: u32, width: u32, height: u32) {
+        self.x = x;
         self.width = width;
         self.height = height;
         self.sync_view_size();
@@ -146,6 +183,21 @@ impl<'eb> Editor<'eb> {
         text_area(self.width, self.height, self.buffer.line_count())
     }
 
+    /// The file's path; `None` until it is first saved.
+    pub fn path(&self) -> Option<&Path> {
+        self.file.path.as_deref()
+    }
+
+    pub fn is_modified(&self) -> bool {
+        self.history.is_modified()
+    }
+
+    /// An unnamed buffer that was never typed in, which opening a file may
+    /// replace.
+    pub fn is_blank(&self) -> bool {
+        self.file.path.is_none() && !self.buffer.can_undo() && self.buffer.text().is_empty()
+    }
+
     /// Shows `text` in the status bar until the next key press.
     pub fn show_message(&mut self, text: impl Into<String>, error: bool) {
         self.message = Some(Message {
@@ -154,135 +206,95 @@ impl<'eb> Editor<'eb> {
         });
     }
 
-    pub fn handle_key(&mut self, key: Key) -> Action {
+    pub fn clear_message(&mut self) {
         self.message = None;
-        if self.prompt.is_some() {
-            self.handle_prompt_key(key);
-            return Action::Continue;
-        }
+    }
 
-        let Key { code, mods } = key;
-        let quit_armed = std::mem::take(&mut self.quit_armed);
-        let select = mods.shift;
-        // Ctrl and Cmd (Super) are interchangeable for shortcuts. Letters are
-        // compared lowercase: modifyOtherKeys reports Ctrl+Shift+Z as 'Z'.
-        let command = (mods.ctrl || mods.sup) && !mods.alt;
-        // Word and line editing: Alt (Option) is the macOS modifier, Ctrl the
-        // Linux/Windows one. macOS terminals often send Option+Left/Right as
-        // the emacs keys Alt+B/Alt+F, and Option+Delete as Alt+D.
-        let alt = mods.alt && !mods.ctrl && !mods.sup;
-        let word = alt || (mods.ctrl && !mods.alt && !mods.sup);
-        match code {
-            KeyCode::Left if word => self.move_cursor(select, Direction::Backward, |ed| {
-                words::word_left(ed.buffer);
-            }),
-            KeyCode::Right if word => self.move_cursor(select, Direction::Forward, |ed| {
-                words::word_right(ed.buffer);
-            }),
-            KeyCode::Char('b') if alt => self.move_cursor(select, Direction::Backward, |ed| {
-                words::word_left(ed.buffer);
-            }),
-            KeyCode::Char('f') if alt => self.move_cursor(select, Direction::Forward, |ed| {
-                words::word_right(ed.buffer);
-            }),
-            KeyCode::Backspace if word => self.delete_word(Direction::Backward),
-            KeyCode::Delete if word => self.delete_word(Direction::Forward),
-            KeyCode::Char('d') if alt => self.delete_word(Direction::Forward),
-            KeyCode::Up if alt && !select => self.move_lines(Direction::Backward),
-            KeyCode::Down if alt && !select => self.move_lines(Direction::Forward),
-            KeyCode::Char(c) if command => {
-                return self.handle_command(c.to_ascii_lowercase(), mods, quit_armed)
-            }
-            // Anything else with Ctrl/Alt/Cmd held is unbound: never type it.
-            KeyCode::Char(c) if mods.is_plain() => {
+    /// The "Save as" prompt has the keyboard.
+    pub fn prompt_open(&self) -> bool {
+        self.prompt.is_some()
+    }
+
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+    }
+
+    /// Types a key bound to no command. Keys with Ctrl/Alt/Cmd held never
+    /// type.
+    pub fn type_key(&mut self, key: Key) {
+        if let KeyCode::Char(c) = key.code {
+            if key.mods.is_plain() {
                 let mut utf8 = [0u8; 4];
                 let text: &str = c.encode_utf8(&mut utf8);
                 self.edit(EditKind::Type(c), |eb| eb.insert_text(text));
             }
-            KeyCode::Enter => self.edit(EditKind::Other, EditBuffer::new_line),
-            KeyCode::Tab if mods.is_plain() && !mods.shift => {
-                self.edit(EditKind::Type('\t'), |eb| eb.insert_text("\t"))
-            }
-            KeyCode::Backspace => self.delete(EditBuffer::delete_char_backward),
-            KeyCode::Delete => self.delete(EditBuffer::delete_char),
-            KeyCode::Esc => {
+        }
+    }
+
+    /// Runs an editing command; others are ignored. With `select`, a cursor
+    /// movement extends the selection. `clipboard` is shared by all editors.
+    pub fn run(
+        &mut self,
+        command: Command,
+        select: bool,
+        clipboard: &mut Option<String>,
+    ) -> Action {
+        use Direction::{Backward, Forward};
+        match command {
+            Command::Save => return self.save(),
+            Command::Undo => self.undo(),
+            Command::Redo => self.redo(),
+            Command::Copy => return self.copy(clipboard),
+            Command::Cut => return self.cut(clipboard),
+            Command::Paste => self.paste_clipboard(clipboard.as_deref()),
+            Command::SelectAll => self.select_all(),
+            Command::ClearSelection => {
                 self.anchor = None;
                 self.view.clear_selection();
             }
-            // macOS conventions: Cmd+Left/Right go to the line's start/end and
-            // Cmd+Up/Down to the document's; Ctrl+Home/End do the latter too.
-            KeyCode::Left | KeyCode::Home if mods.sup => {
-                self.move_cursor(select, Direction::Backward, |ed| {
-                    ed.view.move_to_visual_line_start()
-                })
+            Command::ToggleWrap => self.toggle_wrap(),
+            Command::NewLine => self.edit(EditKind::Other, EditBuffer::new_line),
+            Command::InsertTab => self.edit(EditKind::Type('\t'), |eb| eb.insert_text("\t")),
+            Command::DeleteBackward => self.delete(EditBuffer::delete_char_backward),
+            Command::DeleteForward => self.delete(EditBuffer::delete_char),
+            Command::DeleteWordBackward => self.delete_word(Backward),
+            Command::DeleteWordForward => self.delete_word(Forward),
+            Command::MoveLinesUp => self.move_lines(Backward),
+            Command::MoveLinesDown => self.move_lines(Forward),
+            Command::CursorLeft if !select && self.collapse_selection(true) => {}
+            Command::CursorRight if !select && self.collapse_selection(false) => {}
+            Command::CursorLeft => {
+                self.move_cursor(select, Backward, |ed| ed.buffer.move_cursor_left())
             }
-            KeyCode::Right | KeyCode::End if mods.sup => {
-                self.move_cursor(select, Direction::Forward, |ed| {
-                    ed.view.move_to_visual_line_end()
-                })
+            Command::CursorRight => {
+                self.move_cursor(select, Forward, |ed| ed.buffer.move_cursor_right())
             }
-            KeyCode::Up if mods.sup => {
-                self.move_cursor(select, Direction::Backward, Self::move_to_document_start)
+            Command::CursorUp => self.move_cursor(select, Backward, |ed| ed.view.move_up_visual()),
+            Command::CursorDown => {
+                self.move_cursor(select, Forward, |ed| ed.view.move_down_visual())
             }
-            KeyCode::Home if mods.ctrl => {
-                self.move_cursor(select, Direction::Backward, Self::move_to_document_start)
-            }
-            KeyCode::Down if mods.sup => {
-                self.move_cursor(select, Direction::Forward, Self::move_to_document_end)
-            }
-            KeyCode::End if mods.ctrl => {
-                self.move_cursor(select, Direction::Forward, Self::move_to_document_end)
-            }
-            KeyCode::Left if !select && self.collapse_selection(true) => {}
-            KeyCode::Right if !select && self.collapse_selection(false) => {}
-            KeyCode::Left => self.move_cursor(select, Direction::Backward, |ed| {
-                ed.buffer.move_cursor_left()
+            Command::WordLeft => self.move_cursor(select, Backward, |ed| {
+                words::word_left(&ed.buffer);
             }),
-            KeyCode::Right => self.move_cursor(select, Direction::Forward, |ed| {
-                ed.buffer.move_cursor_right()
+            Command::WordRight => self.move_cursor(select, Forward, |ed| {
+                words::word_right(&ed.buffer);
             }),
-            KeyCode::Up => {
-                self.move_cursor(select, Direction::Backward, |ed| ed.view.move_up_visual())
+            Command::LineStart => {
+                self.move_cursor(select, Backward, |ed| ed.view.move_to_visual_line_start())
             }
-            KeyCode::Down => {
-                self.move_cursor(select, Direction::Forward, |ed| ed.view.move_down_visual())
+            Command::LineEnd => {
+                self.move_cursor(select, Forward, |ed| ed.view.move_to_visual_line_end())
             }
-            KeyCode::Home => self.move_cursor(select, Direction::Backward, |ed| {
-                ed.view.move_to_visual_line_start()
-            }),
-            KeyCode::End => self.move_cursor(select, Direction::Forward, |ed| {
-                ed.view.move_to_visual_line_end()
-            }),
-            KeyCode::PageUp => self.move_cursor(select, Direction::Backward, |ed| {
+            Command::DocumentStart => {
+                self.move_cursor(select, Backward, Self::move_to_document_start)
+            }
+            Command::DocumentEnd => self.move_cursor(select, Forward, Self::move_to_document_end),
+            Command::CursorPageUp => self.move_cursor(select, Backward, |ed| {
                 (0..ed.page()).for_each(|_| ed.view.move_up_visual())
             }),
-            KeyCode::PageDown => self.move_cursor(select, Direction::Forward, |ed| {
+            Command::CursorPageDown => self.move_cursor(select, Forward, |ed| {
                 (0..ed.page()).for_each(|_| ed.view.move_down_visual())
             }),
-            _ => {}
-        }
-        Action::Continue
-    }
-
-    /// Ctrl/Cmd + `c` (lowercased).
-    fn handle_command(&mut self, c: char, mods: Mods, quit_armed: bool) -> Action {
-        match c {
-            'q' => {
-                if !self.history.is_modified() || quit_armed {
-                    return Action::Quit;
-                }
-                self.quit_armed = true;
-                self.show_message("Unsaved changes. ^Q again to quit, ^S to save.", true);
-            }
-            's' => self.save(),
-            'w' => self.toggle_wrap(),
-            'z' if mods.shift => self.redo(),
-            'z' => self.undo(),
-            'y' => self.redo(),
-            'a' => self.select_all(),
-            'c' => return self.copy(),
-            'x' => return self.cut(),
-            'v' => self.paste_clipboard(),
             _ => {}
         }
         Action::Continue
@@ -301,7 +313,6 @@ impl<'eb> Editor<'eb> {
         match mouse.kind {
             MouseKind::Press(MouseButton::Left) if mouse.y < text_h => {
                 self.message = None;
-                self.quit_armed = false;
                 self.history.break_group();
                 let count = self.click_count(at, now);
                 if mouse.mods.shift && count == 1 {
@@ -358,15 +369,16 @@ impl<'eb> Editor<'eb> {
         }
     }
 
-    /// Draws the frame and returns the terminal cursor position (0-based
-    /// column, row).
-    pub fn draw(&self, frame: &Buffer) -> (u32, u32) {
-        frame.clear(Rgba::terminal_default([0, 0, 0]));
+    /// Draws the editor at its column and returns the terminal cursor
+    /// position (0-based column, row). The keymap labels the status bar's
+    /// shortcut hints, and the workspace shortens the file's path.
+    pub fn draw(&self, frame: &Buffer, keymap: &Keymap, workspace: &Workspace) -> (u32, u32) {
         self.sync_view_size();
-        let (text_x, _, _) = self.text_area();
+        let (gutter, _, _) = self.text_area();
+        let text_x = self.x + gutter;
         frame.draw_editor_view(&self.view, text_x as i32, 0);
-        self.draw_line_numbers(frame, text_x);
-        match self.draw_status(frame) {
+        self.draw_line_numbers(frame, gutter);
+        match self.draw_status(frame, keymap, workspace) {
             Some(prompt_cursor) => prompt_cursor,
             None => {
                 let cursor = self.view.visual_cursor();
@@ -393,7 +405,7 @@ impl<'eb> Editor<'eb> {
                 (LINE_NUMBER, Attributes::NONE)
             };
             let number = format!("{:>digits$}", row.line + 1);
-            frame.draw_text(&number, 1, y as u32, fg, None, attributes);
+            frame.draw_text(&number, self.x + 1, y as u32, fg, None, attributes);
         }
     }
 
@@ -408,7 +420,7 @@ impl<'eb> Editor<'eb> {
             // the deletion.
             self.history.break_group();
         }
-        let steps = replaced + f(self.buffer);
+        let steps = replaced + f(&self.buffer);
         self.history.record(kind, steps);
     }
 
@@ -420,7 +432,7 @@ impl<'eb> Editor<'eb> {
             self.history.break_group();
             self.history.record(EditKind::Other, removed);
         } else {
-            let steps = delete_char(self.buffer);
+            let steps = delete_char(&self.buffer);
             self.history.record(EditKind::Delete, steps);
         }
     }
@@ -432,7 +444,7 @@ impl<'eb> Editor<'eb> {
             self.delete(|_| 0);
             return;
         }
-        let eb = self.buffer;
+        let eb = &*self.buffer;
         let from = eb.cursor();
         let target = match direction {
             Direction::Backward => words::word_left(eb),
@@ -456,7 +468,7 @@ impl<'eb> Editor<'eb> {
     /// Alt+Up/Down: swaps the lines holding the cursor or selection with the
     /// line above or below, keeping the cursor and selection on the moved text.
     fn move_lines(&mut self, direction: Direction) {
-        let eb = self.buffer;
+        let eb = &*self.buffer;
         let cursor = eb.cursor();
         let selection = self.view.selection().filter(|(s, e)| s != e);
         let pos = |offset: u32| eb.offset_to_position(offset).map(|p| (p.row, p.col));
@@ -521,7 +533,7 @@ impl<'eb> Editor<'eb> {
 
     /// The offset of the end of `row` (before its line break).
     fn line_end_offset(&self, row: u32) -> u32 {
-        let eb = self.buffer;
+        let eb = &*self.buffer;
         if row + 1 < eb.line_count() {
             return eb.position_to_offset(row + 1, 0) - 1;
         }
@@ -568,7 +580,7 @@ impl<'eb> Editor<'eb> {
 
     // --- clipboard ---------------------------------------------------------
 
-    fn copy(&mut self) -> Action {
+    fn copy(&mut self, clipboard: &mut Option<String>) -> Action {
         let text = self.view.selected_text();
         if text.is_empty() {
             self.show_message("Nothing selected.", false);
@@ -578,12 +590,12 @@ impl<'eb> Editor<'eb> {
             format!("Copied {} characters.", text.chars().count()),
             false,
         );
-        self.clipboard = Some(text.clone());
+        *clipboard = Some(text.clone());
         Action::Copy(text)
     }
 
-    fn cut(&mut self) -> Action {
-        let action = self.copy();
+    fn cut(&mut self, clipboard: &mut Option<String>) -> Action {
+        let action = self.copy(clipboard);
         if let Action::Copy(_) = action {
             let steps = self.delete_selection();
             self.history.break_group();
@@ -592,9 +604,9 @@ impl<'eb> Editor<'eb> {
         action
     }
 
-    fn paste_clipboard(&mut self) {
-        match self.clipboard.clone() {
-            Some(text) => self.edit(EditKind::Other, |eb| eb.insert_text(&text)),
+    fn paste_clipboard(&mut self, clipboard: Option<&str>) {
+        match clipboard {
+            Some(text) => self.edit(EditKind::Other, |eb| eb.insert_text(text)),
             None => self.show_message(
                 "Nothing copied yet. Use your terminal's paste for the system clipboard.",
                 false,
@@ -737,19 +749,25 @@ impl<'eb> Editor<'eb> {
     // --- status bar, files, misc --------------------------------------------
 
     /// Returns the cursor position when the prompt has focus.
-    fn draw_status(&self, frame: &Buffer) -> Option<(u32, u32)> {
+    fn draw_status(
+        &self,
+        frame: &Buffer,
+        keymap: &Keymap,
+        workspace: &Workspace,
+    ) -> Option<(u32, u32)> {
         if self.height < 2 {
             return None;
         }
         let y = self.height - 1;
+        let x0 = self.x;
 
         if let Some(prompt) = &self.prompt {
-            frame.fill_rect(0, y, self.width, 1, STATUS_BG);
+            frame.fill_rect(x0, y, self.width, 1, STATUS_BG);
             let label = " Save as: ";
-            frame.draw_text(label, 0, y, STATUS_DIM, None, Attributes::NONE);
-            let x = label.len() as u32;
+            frame.draw_text(label, x0, y, STATUS_DIM, None, Attributes::NONE);
+            let x = x0 + label.len() as u32;
             // Keep the end of a long path visible.
-            let room = self.width.saturating_sub(x + 1) as usize;
+            let room = (x0 + self.width).saturating_sub(x + 1) as usize;
             let chars: Vec<char> = prompt.input.chars().collect();
             let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
             frame.draw_text(&shown, x, y, STATUS_FG, None, Attributes::NONE);
@@ -762,10 +780,10 @@ impl<'eb> Editor<'eb> {
             } else {
                 STATUS_BG
             };
-            frame.fill_rect(0, y, self.width, 1, bg);
+            frame.fill_rect(x0, y, self.width, 1, bg);
             frame.draw_text(
                 &format!(" {}", message.text),
-                0,
+                x0,
                 y,
                 STATUS_FG,
                 None,
@@ -774,10 +792,10 @@ impl<'eb> Editor<'eb> {
             return None;
         }
 
-        frame.fill_rect(0, y, self.width, 1, STATUS_BG);
+        frame.fill_rect(x0, y, self.width, 1, STATUS_BG);
         let cursor = self.buffer.cursor();
         let name = match &self.file.path {
-            Some(path) => path.display().to_string(),
+            Some(path) => workspace.display_path(path),
             None => "[new file]".to_string(),
         };
         let dirty = if self.history.is_modified() {
@@ -802,21 +820,36 @@ impl<'eb> Editor<'eb> {
         // Shorten the path from the left so the rest of the status stays visible.
         let room = (self.width as usize).saturating_sub(info.chars().count() + 1);
         let left = format!(" {}{info}", truncate_left(&name, room));
-        frame.draw_text(&left, 0, y, STATUS_FG, None, Attributes::BOLD);
-        let hints = "^S save  ^Z undo  ^Q quit ";
+        frame.draw_text(&left, x0, y, STATUS_FG, None, Attributes::BOLD);
+        let hints: String = [
+            (Command::Save, "save"),
+            (Command::FocusTree, "files"),
+            (Command::Quit, "quit"),
+        ]
+        .iter()
+        .filter_map(|&(command, name)| Some(format!("{:#} {name}  ", keymap.shortcut(command)?)))
+        .collect();
+        let hints = hints.strip_suffix(' ').unwrap_or(&hints);
         let hints_x = self.width.saturating_sub(hints.len() as u32);
         if hints_x as usize > left.chars().count() {
-            frame.draw_text(hints, hints_x, y, STATUS_DIM, None, Attributes::NONE);
+            frame.draw_text(hints, x0 + hints_x, y, STATUS_DIM, None, Attributes::NONE);
         }
         None
     }
 
-    fn save(&mut self) {
+    /// Writes the file to `path` from now on.
+    pub fn save_as(&mut self, path: PathBuf) -> Action {
+        self.file.path = Some(path);
+        self.save()
+    }
+
+    /// Writes the file, or asks for a name if it has none.
+    fn save(&mut self) -> Action {
         let Some(path) = self.file.path.clone() else {
             self.prompt = Some(Prompt {
                 input: String::new(),
             });
-            return;
+            return Action::Continue;
         };
         let text = self.buffer.text();
         match document::save(&path, &text, self.file.line_ending) {
@@ -828,14 +861,21 @@ impl<'eb> Editor<'eb> {
                     .unwrap_or(path.as_os_str())
                     .to_string_lossy();
                 self.show_message(format!("Wrote {name} ({lines} lines)"), false);
+                Action::Saved
             }
             // Reason first: the status bar clips long paths on the right.
-            Err(err) => self.show_message(format!("Can't save: {err} ({})", path.display()), true),
+            Err(err) => {
+                self.show_message(format!("Can't save: {err} ({})", path.display()), true);
+                Action::Continue
+            }
         }
     }
 
-    fn handle_prompt_key(&mut self, Key { code, mods }: Key) {
-        let prompt = self.prompt.as_mut().expect("prompt is open");
+    /// A key for the "Save as" prompt, while it is open.
+    pub fn handle_prompt_key(&mut self, Key { code, mods }: Key) -> Action {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return Action::Continue;
+        };
         match code {
             KeyCode::Esc => self.prompt = None,
             KeyCode::Char('c' | 'q') if mods.ctrl || mods.sup => self.prompt = None,
@@ -843,8 +883,7 @@ impl<'eb> Editor<'eb> {
                 let input = prompt.input.trim().to_string();
                 self.prompt = None;
                 if !input.is_empty() {
-                    self.file.path = Some(PathBuf::from(input));
-                    self.save();
+                    return Action::SaveAs(PathBuf::from(input));
                 }
             }
             KeyCode::Backspace => {
@@ -853,6 +892,7 @@ impl<'eb> Editor<'eb> {
             KeyCode::Char(c) if mods.is_plain() => prompt.input.push(c),
             _ => {}
         }
+        Action::Continue
     }
 
     fn toggle_wrap(&mut self) {
@@ -908,13 +948,55 @@ fn text_area(width: u32, height: u32, line_count: u32) -> (u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::Mods;
+    use crate::keymap::Context;
     use opentui::{OwnedBuffer, WidthMethod};
     use std::fs;
     use std::sync::MutexGuard;
+    use std::time::Duration;
 
     /// The native core is single-threaded and the harness runs tests in parallel.
     fn serial() -> MutexGuard<'static, ()> {
-        crate::test_serial()
+        let guard = crate::test_serial();
+        CLIPBOARD.with(|clipboard| clipboard.borrow_mut().take());
+        guard
+    }
+
+    thread_local! {
+        /// The clipboard the app would share between editors.
+        static CLIPBOARD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Key handling as the app does it for a focused editor.
+    trait HandleKey {
+        fn handle_key(&mut self, key: Key) -> Action;
+    }
+
+    impl HandleKey for Editor {
+        fn handle_key(&mut self, key: Key) -> Action {
+            self.clear_message();
+            if self.prompt_open() {
+                return match self.handle_prompt_key(key) {
+                    Action::SaveAs(path) => self.save_as(path),
+                    action => action,
+                };
+            }
+            match Keymap::default().lookup(key, Context::Editor) {
+                Some((command, select)) => CLIPBOARD
+                    .with(|clipboard| self.run(command, select, &mut clipboard.borrow_mut())),
+                None => {
+                    self.type_key(key);
+                    Action::Continue
+                }
+            }
+        }
+    }
+
+    /// Draws `editor` on a cleared `screen`, as the app does.
+    fn draw(editor: &Editor, screen: &OwnedBuffer) -> (u32, u32) {
+        screen.clear(Rgba::terminal_default([0, 0, 0]));
+        let workspace = Workspace::new([]).unwrap();
+        editor.draw(screen, &Keymap::default(), &workspace)
     }
 
     fn unnamed() -> File {
@@ -960,7 +1042,7 @@ mod tests {
 
     fn status(editor: &Editor) -> String {
         let screen = OwnedBuffer::new(60, 4, false, WidthMethod::Unicode, "test").unwrap();
-        editor.draw(&screen);
+        draw(editor, &screen);
         screen
             .to_text(true)
             .lines()
@@ -982,13 +1064,13 @@ mod tests {
     fn save_writes_the_file_and_clears_modified() {
         let _serial = serial();
         let path = temp_path("save.txt");
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("one\n");
         let file = File {
             path: Some(path.clone()),
             line_ending: LineEnding::CrLf,
         };
-        let mut editor = Editor::new(&eb, file, 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), file, 60, 4).unwrap();
         assert!(!status(&editor).contains("[+]"));
 
         eb.set_cursor(1, 0);
@@ -1014,8 +1096,8 @@ mod tests {
     fn save_as_prompt_names_a_new_file() {
         let _serial = serial();
         let path = temp_path("prompted.txt");
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         press(&mut editor, "hi");
         ctrl(&mut editor, 's');
         assert!(status(&editor).starts_with(" Save as:"));
@@ -1033,28 +1115,10 @@ mod tests {
     }
 
     #[test]
-    fn quit_asks_again_only_with_unsaved_changes() {
-        let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
-        let mut clean = Editor::new(&eb, unnamed(), 60, 4).unwrap();
-        assert!(matches!(ctrl(&mut clean, 'q'), Action::Quit));
-        drop(clean);
-
-        let mut dirty = Editor::new(&eb, unnamed(), 60, 4).unwrap();
-        press(&mut dirty, "x");
-        assert!(matches!(ctrl(&mut dirty, 'q'), Action::Continue));
-        assert!(status(&dirty).contains("Unsaved changes"));
-        // Any other key disarms the confirmation.
-        press(&mut dirty, "y");
-        assert!(matches!(ctrl(&mut dirty, 'q'), Action::Continue));
-        assert!(matches!(ctrl(&mut dirty, 'q'), Action::Quit));
-    }
-
-    #[test]
     fn undo_and_redo_step_through_words_and_restore_the_cursor() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         press(&mut editor, "hello world");
         key(&mut editor, KeyCode::Enter);
         press(&mut editor, "again");
@@ -1090,9 +1154,9 @@ mod tests {
     #[test]
     fn delete_forward_is_one_undo_step() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("abcdef");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         eb.set_cursor(0, 1);
         key(&mut editor, KeyCode::Delete);
         key(&mut editor, KeyCode::Delete);
@@ -1113,9 +1177,9 @@ mod tests {
     #[test]
     fn shift_arrows_select_and_typing_replaces() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("hello world");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         eb.set_cursor(0, 6);
         for _ in 0..5 {
             shift(&mut editor, KeyCode::Right);
@@ -1142,9 +1206,9 @@ mod tests {
     #[test]
     fn vertical_moves_leave_a_selection_from_the_matching_edge() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("0123456789\nabcdefghij\nklmnopqrst\nuvwxyz");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 8).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 8).unwrap();
         let pos = |eb: &EditBuffer| (eb.cursor().row, eb.cursor().col);
 
         // Select forward (1,2) -> (2,5), cursor at the end: select `from` to
@@ -1217,9 +1281,9 @@ mod tests {
     #[test]
     fn word_jumps_select_and_delete() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("let x = foo(bar);\nnext");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 6).unwrap();
         alt(&mut editor, KeyCode::Right, false);
         assert_eq!(pos(&eb), (0, 3));
         alt(&mut editor, KeyCode::Right, true);
@@ -1259,9 +1323,9 @@ mod tests {
     #[test]
     fn alt_up_down_move_lines() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("one\ntwo\nthree\nfour");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 8).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 8).unwrap();
 
         eb.set_cursor(1, 2);
         alt(&mut editor, KeyCode::Down, false);
@@ -1287,9 +1351,9 @@ mod tests {
     #[test]
     fn alt_up_down_move_selected_lines_and_keep_the_selection() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("a\nbb\ncc\nd\ne");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 8).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 8).unwrap();
 
         // Select from (1,1) to (2,1): lines "bb" and "cc".
         eb.set_cursor(1, 1);
@@ -1316,9 +1380,9 @@ mod tests {
     #[test]
     fn moving_the_last_line_keeps_line_breaks_consistent() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("x\n漢字 wide\nlast");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 8).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 8).unwrap();
         eb.set_cursor(2, 4);
         alt(&mut editor, KeyCode::Up, false);
         assert_eq!(eb.text(), "x\nlast\n漢字 wide");
@@ -1333,9 +1397,9 @@ mod tests {
     #[test]
     fn select_all_cut_and_paste() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("one\ntwo");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         ctrl(&mut editor, 'a');
         assert_eq!(editor.view.selected_text(), "one\ntwo");
         let Action::Copy(text) = ctrl(&mut editor, 'x') else {
@@ -1355,9 +1419,9 @@ mod tests {
     #[test]
     fn backspace_deletes_only_the_selection() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("abcdef");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         eb.set_cursor(0, 2);
         shift(&mut editor, KeyCode::Right);
         shift(&mut editor, KeyCode::Right);
@@ -1373,8 +1437,8 @@ mod tests {
     #[test]
     fn cmd_shortcuts_match_ctrl() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         press(&mut editor, "one two");
         cmd(&mut editor, 'a');
         let Action::Copy(text) = cmd(&mut editor, 'c') else {
@@ -1414,8 +1478,8 @@ mod tests {
     #[test]
     fn modified_keys_never_type() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         let alt = Mods {
             alt: true,
             ..Mods::NONE
@@ -1437,9 +1501,9 @@ mod tests {
     #[test]
     fn cmd_arrows_follow_macos_conventions() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("first line\nsecond line\nthird");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         eb.set_cursor(1, 3);
         let cmd_key = |editor: &mut Editor, code, shift| {
             editor.handle_key(Key::new(
@@ -1470,9 +1534,9 @@ mod tests {
     #[test]
     fn mouse_click_drag_and_multi_click() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("hello world\nsecond line");
-        let mut editor = Editor::new(&eb, unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
         let t0 = Instant::now();
         let left = MouseButton::Left;
 
@@ -1559,17 +1623,17 @@ mod tests {
     #[test]
     fn wheel_scrolls_and_keeps_cursor_in_view() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         let text: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
         eb.set_text(&text.join("\n"));
         eb.set_cursor(0, 0);
-        let mut editor = Editor::new(&eb, unnamed(), 60, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 6).unwrap();
         let now = Instant::now();
         for _ in 0..4 {
             mouse(&mut editor, MouseKind::ScrollDown, 0, 0, now);
         }
         let screen = OwnedBuffer::new(60, 6, false, WidthMethod::Unicode, "test").unwrap();
-        let (_, cursor_row) = editor.draw(&screen);
+        let (_, cursor_row) = draw(&editor, &screen);
         let first = screen
             .to_text(true)
             .lines()
@@ -1582,7 +1646,7 @@ mod tests {
         for _ in 0..10 {
             mouse(&mut editor, MouseKind::ScrollUp, 0, 0, now);
         }
-        editor.draw(&screen);
+        draw(&editor, &screen);
         assert_eq!(
             screen.to_text(true).lines().next().unwrap().trim_end(),
             "  1  line 0"
@@ -1591,7 +1655,7 @@ mod tests {
 
     fn screen_lines(editor: &Editor, width: u32, height: u32) -> (Vec<String>, (u32, u32)) {
         let screen = OwnedBuffer::new(width, height, false, WidthMethod::Unicode, "test").unwrap();
-        let cursor = editor.draw(&screen);
+        let cursor = draw(editor, &screen);
         let lines = screen
             .to_text(true)
             .lines()
@@ -1603,10 +1667,10 @@ mod tests {
     #[test]
     fn line_numbers_label_first_rows_and_widen_with_the_text() {
         let _serial = serial();
-        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("one\ntwo two two two two two two\nthree");
         eb.set_cursor(1, 2);
-        let mut editor = Editor::new(&eb, unnamed(), 30, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), 30, 6).unwrap();
         let (lines, cursor) = screen_lines(&editor, 30, 6);
         assert_eq!(
             lines[..3],
@@ -1638,7 +1702,7 @@ mod tests {
         assert_eq!(editor.view.viewport().width, 30 - 5);
 
         // Too narrow to spare the columns: no numbers.
-        editor.resize(20, 6);
+        editor.set_area(0, 20, 6);
         editor.handle_key(Key::new(KeyCode::Home, Mods::CTRL));
         let (lines, cursor) = screen_lines(&editor, 20, 6);
         assert_eq!(lines[0], "one", "{lines:?}");
