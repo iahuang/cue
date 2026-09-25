@@ -119,6 +119,24 @@ pub const VirtualLineOutput = struct {
     cached_line_wrap_indices: *std.ArrayListUnmanaged(u32),
     cached_line_first_vline: *std.ArrayListUnmanaged(u32),
     cached_line_vline_counts: *std.ArrayListUnmanaged(u32),
+
+    /// Sizes every array for at least one virtual line per source line. The
+    /// arrays live in an arena, where growing by doubling copies them and
+    /// strands the old buffers, so this matters for large documents.
+    /// Best effort: on OOM the builders still grow the arrays as needed.
+    fn reserveLines(self: VirtualLineOutput, allocator: Allocator, line_count: u32) void {
+        self.virtual_lines.ensureTotalCapacity(allocator, line_count) catch return;
+        inline for (.{
+            self.cached_line_starts,
+            self.cached_line_widths,
+            self.cached_line_sources,
+            self.cached_line_wrap_indices,
+            self.cached_line_first_vline,
+            self.cached_line_vline_counts,
+        }) |list| {
+            list.ensureTotalCapacity(allocator, line_count) catch return;
+        }
+    }
 };
 
 /// Result from measuring dimensions without modifying cache
@@ -1594,6 +1612,7 @@ pub const UnifiedTextBufferView = struct {
             .current_vline = VirtualLine.init(),
         };
 
+        output.reserveLines(allocator, text_buffer.getLineCount());
         text_buffer.walkLinesAndSegments(&ctx, Context.segment_callback, Context.line_end_callback);
         return !ctx.failed;
     }
@@ -2396,6 +2415,7 @@ pub const UnifiedTextBufferView = struct {
 
         defer if (comptime wrap_mode == .word) wrap_ctx.word_line_chunks.deinit(allocator);
         // Retain unchanged chunks and reclaim layouts detached by incremental edits.
+        if (comptime calculation == .render) result.reserveLines(allocator, text_buffer.getLineCount());
         if (comptime calculation == .render and wrap_mode == .word) text_buffer.layout_cache.beginLayout();
         text_buffer.walkLinesAndSegments(&wrap_ctx, WrapContext.segment_callback, WrapContext.line_end_callback);
         // Failed traversal leaves live chunks unmarked; sibling views may still borrow them.

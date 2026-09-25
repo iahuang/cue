@@ -33,3 +33,9 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   instead of `globalArena`. The view's layout arenas sat on the never-freeing
   global arena, so every relayout (one per edit) leaked the whole layout,
   about 700 bytes per line of the document.
+- `src/text-buffer-view.zig`: `VirtualLineOutput.reserveLines` presizes the
+  layout arrays to the line count before each relayout, instead of growing
+  them by doubling inside an arena.
+- `src/rope.zig`: `rebuildMarkerCache` looks up each marker list once and
+  presizes it from the root's marker counts, instead of a hash lookup per
+  marker.

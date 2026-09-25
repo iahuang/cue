@@ -1185,8 +1185,11 @@ pub fn Rope(comptime T: type) type {
 
             self.marker_cache.clear();
 
+            const PositionList = std.ArrayListUnmanaged(MarkerPosition);
             const RebuildContext = struct {
                 cache: *MarkerCache,
+                /// Each marker type's list, looked up once rather than hashed per leaf.
+                lists: [MarkerTagCount]*PositionList,
                 current_leaf: u32 = 0,
                 current_weight: u32 = 0,
 
@@ -1196,10 +1199,10 @@ pub fn Rope(comptime T: type) type {
 
                     const tag = std.meta.activeTag(data.*);
 
-                    var is_marker = false;
-                    inline for (T.MarkerTypes) |mt| {
+                    var marker_list: ?*PositionList = null;
+                    inline for (T.MarkerTypes, 0..) |mt, i| {
                         if (tag == mt) {
-                            is_marker = true;
+                            marker_list = context.lists[i];
                             break;
                         }
                     }
@@ -1212,15 +1215,8 @@ pub fn Rope(comptime T: type) type {
                         break :blk 1;
                     } else 1;
 
-                    if (is_marker) {
-                        const gop = context.cache.positions.getOrPut(tag) catch |e| {
-                            return .{ .keep_walking = false, .err = e };
-                        };
-                        if (!gop.found_existing) {
-                            gop.value_ptr.* = .empty;
-                        }
-
-                        gop.value_ptr.append(context.cache.allocator, .{
+                    if (marker_list) |list| {
+                        list.append(context.cache.allocator, .{
                             .leaf_index = context.current_leaf,
                             .global_weight = context.current_weight,
                         }) catch |e| {
@@ -1234,7 +1230,18 @@ pub fn Rope(comptime T: type) type {
                 }
             };
 
-            var ctx = RebuildContext{ .cache = &self.marker_cache };
+            // Create every list up front (so the pointers stay valid during the
+            // walk) and size it from the root's marker counts.
+            const marker_counts = self.root.metrics().marker_counts;
+            var lists: [MarkerTagCount]*PositionList = undefined;
+            inline for (T.MarkerTypes, 0..) |mt, i| {
+                const gop = try self.marker_cache.positions.getOrPut(mt);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.ensureTotalCapacity(self.marker_cache.allocator, marker_counts[i]);
+                lists[i] = gop.value_ptr;
+            }
+
+            var ctx = RebuildContext{ .cache = &self.marker_cache, .lists = lists };
             try self.walk(&ctx, RebuildContext.walker);
 
             self.marker_cache.version = self.version;
