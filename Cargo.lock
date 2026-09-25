@@ -19,3 +19,12 @@ dependencies = [
 [[package]]
 name = "opentui-sys"
 version = "0.1.0"
+
+[[package]]
+name = "qedit"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "opentui",
+ "opentui-sys",
+]

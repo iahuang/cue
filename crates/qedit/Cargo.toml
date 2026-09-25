@@ -1,0 +1,12 @@
+[package]
+name = "qedit"
+version = "0.1.0"
+description = "A terminal text editor built on OpenTUI's native core"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opentui = { path = "../opentui" }
+# Only for its `links` metadata (DEP_OPENTUI_LIB_DIR) in build.rs.
+opentui-sys = { path = "../opentui-sys" }
+libc = "0.2"

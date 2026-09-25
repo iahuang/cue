@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/opentui-sys", "crates/opentui"]
+members = ["crates/opentui-sys", "crates/opentui", "crates/qedit"]
 
 [workspace.package]
 edition = "2021"
