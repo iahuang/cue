@@ -42,7 +42,7 @@ pub use buffer::{Buffer, FrameBuffer, OwnedBuffer};
 pub use color::{Attributes, Rgba};
 pub use edit::{
     EditBuffer, EditorView, LogicalCursor, SelectionBehavior, SelectionColors, Viewport,
-    VisualCursor,
+    VisibleLine, VisualCursor,
 };
 pub use error::{Error, Result};
 pub use renderer::{Output, RenderStatus, Renderer};

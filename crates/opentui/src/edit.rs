@@ -33,6 +33,14 @@ pub struct Viewport {
     pub height: u32,
 }
 
+/// A row of an [`EditorView`]'s viewport after wrapping: the text line it
+/// shows, and which wrapped segment of that line (0 for its first row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisibleLine {
+    pub line: u32,
+    pub wrap: u32,
+}
+
 fn local_selection_flags(move_cursor: bool, behavior: SelectionBehavior) -> u8 {
     let behavior = match behavior {
         SelectionBehavior::Cell => 0,
@@ -499,6 +507,40 @@ impl EditorView<'_> {
     pub fn scroll_to(&self, x: u32, y: u32, move_cursor: bool) {
         let vp = self.viewport();
         unsafe { sys::editorViewSetViewport(self.handle, x, y, vp.width, vp.height, move_cursor) }
+    }
+
+    /// The rows in the viewport, top to bottom, after scrolling the cursor
+    /// into view.
+    pub fn visible_lines(&self) -> Vec<VisibleLine> {
+        let mut info = sys::ExternalLineInfo {
+            start_cols_ptr: std::ptr::null(),
+            start_cols_len: 0,
+            width_cols_ptr: std::ptr::null(),
+            width_cols_len: 0,
+            sources_ptr: std::ptr::null(),
+            sources_len: 0,
+            wraps_ptr: std::ptr::null(),
+            wraps_len: 0,
+            width_cols_max: 0,
+        };
+        unsafe { sys::editorViewGetLineInfoDirect(self.handle, &mut info) };
+        let len = info.sources_len.min(info.wraps_len) as usize;
+        if len == 0 {
+            return Vec::new();
+        }
+        // The arrays belong to the view's layout cache, which stays put until
+        // the next layout; copy them out now.
+        let (sources, wraps) = unsafe {
+            (
+                std::slice::from_raw_parts(info.sources_ptr, len),
+                std::slice::from_raw_parts(info.wraps_ptr, len),
+            )
+        };
+        sources
+            .iter()
+            .zip(wraps)
+            .map(|(&line, &wrap)| VisibleLine { line, wrap })
+            .collect()
     }
 
     /// Wrapped lines in the whole document.

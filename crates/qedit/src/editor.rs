@@ -17,6 +17,8 @@ const STATUS_BG: Rgba = Rgba::rgb(49, 50, 68);
 const STATUS_FG: Rgba = Rgba::rgb(205, 214, 244);
 const STATUS_DIM: Rgba = Rgba::rgb(147, 153, 178);
 const STATUS_ERROR_BG: Rgba = Rgba::rgb(180, 60, 80);
+const LINE_NUMBER: Rgba = Rgba::rgb(108, 112, 134);
+const LINE_NUMBER_CURRENT: Rgba = Rgba::rgb(205, 214, 244);
 const SELECTION: SelectionColors = SelectionColors {
     bg: Rgba::rgb(69, 71, 110),
     fg: None,
@@ -25,6 +27,8 @@ const SELECTION: SelectionColors = SelectionColors {
 /// Clicks on the same cell within this interval count as a double/triple click.
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 const WHEEL_LINES: u32 = 3;
+/// Line numbers are hidden when they would leave the text less room than this.
+const MIN_TEXT_WIDTH: u32 = 20;
 
 pub enum Action {
     Continue,
@@ -91,15 +95,15 @@ pub struct Editor<'eb> {
 }
 
 impl<'eb> Editor<'eb> {
-    /// An editor filling a `width` x `height` screen, with the last row used
-    /// for the status bar.
+    /// An editor filling a `width` x `height` screen, with line numbers down
+    /// the left and the last row used for the status bar.
     pub fn new(
         buffer: &'eb EditBuffer,
         file: File,
         width: u32,
         height: u32,
     ) -> opentui::Result<Editor<'eb>> {
-        let (view_w, view_h) = text_area(width, height);
+        let (_, view_w, view_h) = text_area(width, height, buffer.line_count());
         let view = buffer.view(view_w, view_h)?;
         let wrap = WrapMode::None;
         view.set_wrap_mode(wrap);
@@ -124,8 +128,22 @@ impl<'eb> Editor<'eb> {
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
-        let (view_w, view_h) = text_area(width, height);
-        self.view.set_viewport_size(view_w, view_h);
+        self.sync_view_size();
+    }
+
+    /// Fits the view to the text area, which narrows or widens as the line
+    /// count gains or loses digits.
+    fn sync_view_size(&self) {
+        let (_, width, height) = self.text_area();
+        let vp = self.view.viewport();
+        if (vp.width, vp.height) != (width, height) {
+            self.view.set_viewport_size(width, height);
+        }
+    }
+
+    /// The text area as (x, width, height).
+    fn text_area(&self) -> (u32, u32, u32) {
+        text_area(self.width, self.height, self.buffer.line_count())
     }
 
     /// Shows `text` in the status bar until the next key press.
@@ -274,8 +292,12 @@ impl<'eb> Editor<'eb> {
         if self.prompt.is_some() {
             return;
         }
-        let (text_w, text_h) = text_area(self.width, self.height);
-        let at = (mouse.x.min(text_w - 1), mouse.y.min(text_h - 1));
+        let (text_x, text_w, text_h) = self.text_area();
+        // Clicks on the line numbers go to the start of the line.
+        let at = (
+            mouse.x.saturating_sub(text_x).min(text_w - 1),
+            mouse.y.min(text_h - 1),
+        );
         match mouse.kind {
             MouseKind::Press(MouseButton::Left) if mouse.y < text_h => {
                 self.message = None;
@@ -340,13 +362,38 @@ impl<'eb> Editor<'eb> {
     /// column, row).
     pub fn draw(&self, frame: &Buffer) -> (u32, u32) {
         frame.clear(Rgba::terminal_default([0, 0, 0]));
-        frame.draw_editor_view(&self.view, 0, 0);
+        self.sync_view_size();
+        let (text_x, _, _) = self.text_area();
+        frame.draw_editor_view(&self.view, text_x as i32, 0);
+        self.draw_line_numbers(frame, text_x);
         match self.draw_status(frame) {
             Some(prompt_cursor) => prompt_cursor,
             None => {
                 let cursor = self.view.visual_cursor();
-                (cursor.col, cursor.row)
+                (text_x + cursor.col, cursor.row)
             }
+        }
+    }
+
+    /// Numbers the first row of each visible line in the `gutter` columns
+    /// left of the text, highlighting the cursor's line.
+    fn draw_line_numbers(&self, frame: &Buffer, gutter: u32) {
+        if gutter == 0 {
+            return;
+        }
+        let current = self.buffer.cursor().row;
+        let digits = gutter as usize - 3;
+        for (y, row) in self.view.visible_lines().iter().enumerate() {
+            if row.wrap != 0 {
+                continue;
+            }
+            let (fg, attributes) = if row.line == current {
+                (LINE_NUMBER_CURRENT, Attributes::BOLD)
+            } else {
+                (LINE_NUMBER, Attributes::NONE)
+            };
+            let number = format!("{:>digits$}", row.line + 1);
+            frame.draw_text(&number, 1, y as u32, fg, None, attributes);
         }
     }
 
@@ -817,10 +864,7 @@ impl<'eb> Editor<'eb> {
     }
 
     fn page(&self) -> u32 {
-        text_area(self.width, self.height)
-            .1
-            .saturating_sub(1)
-            .max(1)
+        self.text_area().2.saturating_sub(1).max(1)
     }
 }
 
@@ -839,9 +883,26 @@ fn truncate_left(s: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-/// The text area: everything but the status bar row.
-fn text_area(width: u32, height: u32) -> (u32, u32) {
-    (width.max(1), height.saturating_sub(1).max(1))
+/// Columns for line numbers: the widest number with a space before it and
+/// two after, or none when the screen is too narrow to spare them.
+fn gutter_width(width: u32, line_count: u32) -> u32 {
+    let gutter = line_count.max(1).ilog10() + 4;
+    if width >= gutter + MIN_TEXT_WIDTH {
+        gutter
+    } else {
+        0
+    }
+}
+
+/// The text area, as (x, width, height): everything right of the line
+/// numbers and above the status bar row.
+fn text_area(width: u32, height: u32, line_count: u32) -> (u32, u32, u32) {
+    let gutter = gutter_width(width, line_count);
+    (
+        gutter,
+        width.saturating_sub(gutter).max(1),
+        height.saturating_sub(1).max(1),
+    )
 }
 
 #[cfg(test)]
@@ -881,11 +942,15 @@ mod tests {
         editor.handle_key(Key::new(KeyCode::Char(c), Mods::CTRL))
     }
 
+    /// Line numbers take this many columns while the text has under 10 lines.
+    const GUTTER: u32 = 4;
+
+    /// A mouse event at text column `x` (right of the line numbers).
     fn mouse(editor: &mut Editor, kind: MouseKind, x: u32, y: u32, now: Instant) {
         editor.handle_mouse(
             Mouse {
                 kind,
-                x,
+                x: GUTTER + x,
                 y,
                 mods: Mods::NONE,
             },
@@ -1472,7 +1537,7 @@ mod tests {
         editor.handle_mouse(
             Mouse {
                 kind: MouseKind::Press(left),
-                x: 5,
+                x: GUTTER + 5,
                 y: 1,
                 mods: Mods::SHIFT,
             },
@@ -1512,7 +1577,7 @@ mod tests {
             .unwrap()
             .trim_end()
             .to_string();
-        assert_eq!(first, "line 12");
+        assert_eq!(first, " 13  line 12");
         assert!(cursor_row < 5);
         for _ in 0..10 {
             mouse(&mut editor, MouseKind::ScrollUp, 0, 0, now);
@@ -1520,7 +1585,63 @@ mod tests {
         editor.draw(&screen);
         assert_eq!(
             screen.to_text(true).lines().next().unwrap().trim_end(),
-            "line 0"
+            "  1  line 0"
         );
+    }
+
+    fn screen_lines(editor: &Editor, width: u32, height: u32) -> (Vec<String>, (u32, u32)) {
+        let screen = OwnedBuffer::new(width, height, false, WidthMethod::Unicode, "test").unwrap();
+        let cursor = editor.draw(&screen);
+        let lines = screen
+            .to_text(true)
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        (lines, cursor)
+    }
+
+    #[test]
+    fn line_numbers_label_first_rows_and_widen_with_the_text() {
+        let _serial = serial();
+        let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+        eb.set_text("one\ntwo two two two two two two\nthree");
+        eb.set_cursor(1, 2);
+        let mut editor = Editor::new(&eb, unnamed(), 30, 6).unwrap();
+        let (lines, cursor) = screen_lines(&editor, 30, 6);
+        assert_eq!(
+            lines[..3],
+            [" 1  one", " 2  two two two two two two tw", " 3  three"]
+        );
+        assert_eq!(cursor, (GUTTER + 2, 1), "cursor is right of the numbers");
+
+        // Wrapped rows are left unnumbered.
+        ctrl(&mut editor, 'w');
+        let (lines, _) = screen_lines(&editor, 30, 6);
+        assert_eq!(
+            lines[..4],
+            [
+                " 1  one",
+                " 2  two two two two two two",
+                "    two",
+                " 3  three"
+            ]
+        );
+
+        // A tenth line adds a digit, narrowing the text.
+        ctrl(&mut editor, 'w');
+        eb.set_cursor(2, 5);
+        for _ in 0..7 {
+            key(&mut editor, KeyCode::Enter);
+        }
+        let (lines, _) = screen_lines(&editor, 30, 6);
+        assert_eq!(lines[4], " 10", "{lines:?}");
+        assert_eq!(editor.view.viewport().width, 30 - 5);
+
+        // Too narrow to spare the columns: no numbers.
+        editor.resize(20, 6);
+        editor.handle_key(Key::new(KeyCode::Home, Mods::CTRL));
+        let (lines, cursor) = screen_lines(&editor, 20, 6);
+        assert_eq!(lines[0], "one", "{lines:?}");
+        assert_eq!(cursor, (0, 0));
     }
 }
