@@ -13,6 +13,9 @@ pub struct Mods {
     pub shift: bool,
     pub alt: bool,
     pub ctrl: bool,
+    /// Super: Cmd on macOS, the Windows/logo key elsewhere. Only reported by
+    /// terminals using the kitty keyboard protocol that pass the key through.
+    pub sup: bool,
 }
 
 impl Mods {
@@ -20,20 +23,42 @@ impl Mods {
         shift: false,
         alt: false,
         ctrl: false,
+        sup: false,
+    };
+    #[cfg(test)]
+    pub const SHIFT: Mods = Mods {
+        shift: true,
+        ..Mods::NONE
     };
     pub const CTRL: Mods = Mods {
-        shift: false,
-        alt: false,
         ctrl: true,
+        ..Mods::NONE
+    };
+    #[cfg(test)]
+    pub const SUPER: Mods = Mods {
+        sup: true,
+        ..Mods::NONE
     };
 
-    /// Decodes an xterm/kitty modifier parameter (1 + bitmask).
+    /// No modifier that turns a key into a command (Shift alone still types).
+    pub fn is_plain(self) -> bool {
+        !self.ctrl && !self.alt && !self.sup
+    }
+
+    /// Decodes an xterm/kitty modifier parameter: 1 + a bitmask of shift (1),
+    /// alt (2), ctrl (4), super (8), hyper (16), meta (32), caps lock (64),
+    /// and num lock (128).
     fn from_param(param: u32) -> Mods {
         let bits = param.saturating_sub(1);
         Mods {
             shift: bits & 1 != 0,
-            alt: bits & 2 != 0,
+            // Meta is Alt on most keyboards.
+            alt: bits & (2 | 32) != 0,
             ctrl: bits & 4 != 0,
+            // Hyper is rare; treat it like Super so it never types text.
+            sup: bits & (8 | 16) != 0,
+            // Caps Lock and Num Lock are states, not modifiers: ignored so
+            // they can't change what a key does.
         }
     }
 }
@@ -69,9 +94,40 @@ impl Key {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    Press(MouseButton),
+    Release(MouseButton),
+    /// Motion with a button held.
+    Drag(MouseButton),
+    /// Motion with no button held (only reported in any-motion mode).
+    Move,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+}
+
+/// A mouse event at a 0-based cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mouse {
+    pub kind: MouseKind,
+    pub x: u32,
+    pub y: u32,
+    pub mods: Mods,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Key(Key),
+    Mouse(Mouse),
     Paste(String),
     /// A terminal reply (DECRPM, DA, OSC color, cursor report, ...), to be
     /// passed to `Renderer::process_capability_response`.
@@ -199,19 +255,31 @@ fn parse_one(b: &[u8]) -> Option<(Token, usize)> {
             let end = find(&b[2..], b"\x1b\\")? + 4;
             Some((Token::Event(Event::Reply(b[..end].to_vec())), end))
         }
-        ESC => Some((key_token(KeyCode::Esc, Mods::NONE), 1)),
+        // ESC + an escape sequence (ESC ESC [ D): some macOS terminals send
+        // Option+arrow this way. Alt applied to the inner key.
+        ESC => match b.get(2) {
+            None => None,
+            Some(b'[' | b'O') => {
+                let (token, len) = parse_one(&b[1..])?;
+                Some((with_alt(token), len + 1))
+            }
+            Some(_) => Some((key_token(KeyCode::Esc, Mods::NONE), 1)),
+        },
         _ => {
             // ESC followed by a key is Alt+key.
             let (token, len) = parse_plain(&b[1..])?;
-            let token = match token {
-                Token::Event(Event::Key(mut key)) => {
-                    key.mods.alt = true;
-                    Token::Event(Event::Key(key))
-                }
-                other => other,
-            };
-            Some((token, len + 1))
+            Some((with_alt(token), len + 1))
         }
+    }
+}
+
+fn with_alt(token: Token) -> Token {
+    match token {
+        Token::Event(Event::Key(mut key)) => {
+            key.mods.alt = true;
+            Token::Event(Event::Key(key))
+        }
+        other => other,
     }
 }
 
@@ -259,6 +327,9 @@ fn parse_csi(b: &[u8]) -> Option<(Token, usize)> {
     let reply = || Some((Token::Event(Event::Reply(b[..len].to_vec())), len));
 
     let params = &b[2..i];
+    if params.first() == Some(&b'<') && matches!(final_byte, b'M' | b'm') {
+        return Some((parse_sgr_mouse(&params[1..], final_byte == b'm'), len));
+    }
     if matches!(params.first(), Some(b'?' | b'>' | b'=' | b'<'))
         || params.iter().any(|c| (0x20..=0x2f).contains(c))
         || matches!(final_byte, b'R' | b't' | b'c' | b'n' | b'y')
@@ -325,6 +396,52 @@ fn parse_csi(b: &[u8]) -> Option<(Token, usize)> {
         _ => return reply(),
     };
     Some((key_token(code, mods), len))
+}
+
+/// SGR mouse report: `CSI < button ; x ; y M` (press/motion) or `m` (release).
+fn parse_sgr_mouse(params: &[u8], release: bool) -> Token {
+    let nums: Vec<u32> = std::str::from_utf8(params)
+        .unwrap_or("")
+        .split(';')
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let &[code, x, y] = nums.as_slice() else {
+        return Token::Ignored;
+    };
+    let mods = Mods {
+        shift: code & 4 != 0,
+        alt: code & 8 != 0,
+        ctrl: code & 16 != 0,
+        sup: false,
+    };
+    let button = match code & 3 {
+        0 => Some(MouseButton::Left),
+        1 => Some(MouseButton::Middle),
+        2 => Some(MouseButton::Right),
+        _ => None,
+    };
+    let kind = if code & 64 != 0 {
+        match code & 3 {
+            0 => MouseKind::ScrollUp,
+            1 => MouseKind::ScrollDown,
+            2 => MouseKind::ScrollLeft,
+            _ => MouseKind::ScrollRight,
+        }
+    } else if code & 32 != 0 {
+        button.map_or(MouseKind::Move, MouseKind::Drag)
+    } else {
+        match (button, release) {
+            (Some(b), false) => MouseKind::Press(b),
+            (Some(b), true) => MouseKind::Release(b),
+            (None, _) => return Token::Ignored,
+        }
+    };
+    Token::Event(Event::Mouse(Mouse {
+        kind,
+        x: x.saturating_sub(1),
+        y: y.saturating_sub(1),
+        mods,
+    }))
 }
 
 fn codepoint_token(cp: u32, mods: Mods) -> Token {
@@ -404,7 +521,7 @@ mod tests {
         let shift_ctrl = Mods {
             shift: true,
             ctrl: true,
-            alt: false,
+            ..Mods::NONE
         };
         assert_eq!(
             keys(p.feed(b"\x1b[A\x1bOB\x1b[1;6C\x1b[D\x1b[3~\x1b[H\x1b[4~")),
@@ -428,6 +545,81 @@ mod tests {
             [ctrl('q'), ctrl('q'), key(KeyCode::Enter), key(KeyCode::Esc)],
             "the key release (event 3) is dropped"
         );
+    }
+
+    #[test]
+    fn super_modifier_and_lock_keys() {
+        let mut p = Parser::new();
+        let sup_shift = Mods {
+            shift: true,
+            ..Mods::SUPER
+        };
+        assert_eq!(
+            keys(p.feed(
+                b"\x1b[99;9u\x1b[122:90;10u\x1b[99;73u\x1b[97;65u\x1b[99;137u\x1b[1;9D\x1b[99;33u"
+            )),
+            [
+                Key::new(KeyCode::Char('c'), Mods::SUPER),
+                // Cmd+Shift+Z: base key 'z' with the shifted alternate 'Z'.
+                Key::new(KeyCode::Char('z'), sup_shift),
+                // Caps Lock (+64) and Num Lock (+128) are ignored.
+                Key::new(KeyCode::Char('c'), Mods::SUPER),
+                key(KeyCode::Char('a')),
+                Key::new(KeyCode::Char('c'), Mods::SUPER),
+                Key::new(KeyCode::Left, Mods::SUPER),
+                // Meta counts as Alt.
+                Key::new(
+                    KeyCode::Char('c'),
+                    Mods {
+                        alt: true,
+                        ..Mods::NONE
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn option_arrow_encodings() {
+        let mut p = Parser::new();
+        let alt = |code| {
+            Key::new(
+                code,
+                Mods {
+                    alt: true,
+                    ..Mods::NONE
+                },
+            )
+        };
+        let alt_shift = |code| {
+            Key::new(
+                code,
+                Mods {
+                    alt: true,
+                    shift: true,
+                    ..Mods::NONE
+                },
+            )
+        };
+        assert_eq!(
+            keys(p.feed(
+                b"\x1b[1;3D\x1b[1;4C\x1bb\x1bf\x1b\x1b[D\x1b\x1bOC\x1b\x7f\x1b[3;3~\x1b[127;3u"
+            )),
+            [
+                alt(KeyCode::Left),
+                alt_shift(KeyCode::Right),
+                alt(KeyCode::Char('b')),
+                alt(KeyCode::Char('f')),
+                alt(KeyCode::Left),
+                alt(KeyCode::Right),
+                alt(KeyCode::Backspace),
+                alt(KeyCode::Delete),
+                alt(KeyCode::Backspace),
+            ]
+        );
+        // Two Esc presses are still two Esc keys once input goes quiet.
+        assert!(p.feed(b"\x1b\x1b").is_empty());
+        assert_eq!(keys(p.flush()), [key(KeyCode::Esc), key(KeyCode::Esc)]);
     }
 
     #[test]
@@ -469,6 +661,29 @@ mod tests {
             ]
         );
         assert!(events.contains(&Event::Key(key(KeyCode::Char('q')))));
+    }
+
+    #[test]
+    fn sgr_mouse_reports() {
+        let mut p = Parser::new();
+        let events =
+            p.feed(b"\x1b[<0;5;3M\x1b[<32;6;3M\x1b[<0;6;3m\x1b[<65;1;1M\x1b[<4;10;2M\x1b[<35;2;2M");
+        let mouse = |kind, x, y, mods| Event::Mouse(Mouse { kind, x, y, mods });
+        let shift = Mods::SHIFT;
+        assert_eq!(
+            events,
+            [
+                mouse(MouseKind::Press(MouseButton::Left), 4, 2, Mods::NONE),
+                mouse(MouseKind::Drag(MouseButton::Left), 5, 2, Mods::NONE),
+                mouse(MouseKind::Release(MouseButton::Left), 5, 2, Mods::NONE),
+                mouse(MouseKind::ScrollDown, 0, 0, Mods::NONE),
+                mouse(MouseKind::Press(MouseButton::Left), 9, 1, shift),
+                mouse(MouseKind::Move, 1, 1, Mods::NONE),
+            ]
+        );
+        // Split across reads.
+        assert!(p.feed(b"\x1b[<0;1").is_empty());
+        assert_eq!(p.feed(b"2;4M").len(), 1);
     }
 
     #[test]

@@ -2,8 +2,46 @@ use std::marker::PhantomData;
 
 use opentui_sys as sys;
 
+use crate::color::opt_ptr;
 use crate::thread::Claim;
-use crate::{ffi_len, read_native_string, Error, Result, WidthMethod, WrapMode};
+use crate::{ffi_len, read_native_string, Error, Result, Rgba, WidthMethod, WrapMode};
+
+/// How a selection made from viewport cells snaps (`SelectionBehavior`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionBehavior {
+    #[default]
+    Cell,
+    /// Whole words, as for a double click.
+    Word,
+    /// Whole lines, as for a triple click.
+    Line,
+}
+
+/// Selection highlight colors. `fg` of `None` keeps the text's own color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionColors {
+    pub bg: Rgba,
+    pub fg: Option<Rgba>,
+}
+
+/// An [`EditorView`]'s visible region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Viewport {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn local_selection_flags(move_cursor: bool, behavior: SelectionBehavior) -> u8 {
+    let behavior = match behavior {
+        SelectionBehavior::Cell => 0,
+        SelectionBehavior::Word => 1,
+        SelectionBehavior::Line => 2,
+    };
+    // bit 0: update cursor, bit 1: follow cursor, bits 2+: behavior
+    u8::from(move_cursor) | behavior << 2
+}
 
 /// A cursor position in the underlying text: `row` is the line and `col` the
 /// display column within it. `offset` is in the native cursor-offset units
@@ -42,6 +80,15 @@ impl From<sys::ExternalVisualCursor> for VisualCursor {
 ///
 /// Like [`TextBuffer`](crate::TextBuffer), mutation takes `&self` so the text
 /// can change while [`EditorView`]s borrow it.
+///
+/// # Undo history
+///
+/// The native buffer snapshots the text before every edit; [`undo`](Self::undo)
+/// and [`redo`](Self::redo) step one snapshot at a time. Edits return how many
+/// snapshots they recorded, so callers can group several edits (a typed word,
+/// a replaced selection) into one user-visible undo step. The count is not
+/// always 1: nothing is recorded for a no-op, and a forward delete records an
+/// extra snapshot natively.
 pub struct EditBuffer {
     handle: sys::Handle,
     _claim: Claim,
@@ -60,7 +107,7 @@ impl EditBuffer {
         })
     }
 
-    /// Replaces the whole text and resets the cursor.
+    /// Replaces the whole text, resets the cursor, and clears the undo history.
     pub fn set_text(&self, text: &str) {
         unsafe { sys::editBufferSetText(self.handle, text.as_ptr(), ffi_len(text.len(), "text")) }
     }
@@ -81,27 +128,76 @@ impl EditBuffer {
     }
 
     /// Inserts at the cursor and moves the cursor past the inserted text.
-    pub fn insert_text(&self, text: &str) {
+    /// Returns the undo snapshots recorded.
+    pub fn insert_text(&self, text: &str) -> u32 {
         unsafe {
             sys::editBufferInsertText(self.handle, text.as_ptr(), ffi_len(text.len(), "text"))
         }
+        u32::from(!text.is_empty())
     }
 
-    /// Splits the line at the cursor.
-    pub fn new_line(&self) {
+    /// Splits the line at the cursor. Returns the undo snapshots recorded.
+    pub fn new_line(&self) -> u32 {
         unsafe { sys::editBufferNewLine(self.handle) }
+        1
     }
 
     /// Backspace: deletes the grapheme before the cursor, joining lines at
-    /// the start of a line.
-    pub fn delete_char_backward(&self) {
+    /// the start of a line. Returns the undo snapshots recorded.
+    pub fn delete_char_backward(&self) -> u32 {
+        let before = self.byte_size();
         unsafe { sys::editBufferDeleteCharBackward(self.handle) }
+        // Natively a snapshot is taken only when a range is actually deleted.
+        u32::from(self.byte_size() != before)
     }
 
     /// Delete: deletes the grapheme after the cursor, joining lines at the end
-    /// of a line.
-    pub fn delete_char(&self) {
+    /// of a line. Returns the undo snapshots recorded.
+    pub fn delete_char(&self) -> u32 {
+        let before = self.byte_size();
         unsafe { sys::editBufferDeleteChar(self.handle) }
+        // `deleteForward` snapshots unconditionally, then `deleteRange`
+        // snapshots again when something is deleted.
+        1 + u32::from(self.byte_size() != before)
+    }
+
+    /// Restores the text and cursor from before the last snapshot. Returns
+    /// false when there is nothing to undo.
+    pub fn undo(&self) -> bool {
+        if !self.can_undo() {
+            return false;
+        }
+        // The output is cursor metadata that the buffer has already applied.
+        let mut meta = [0u8; 64];
+        unsafe { sys::editBufferUndo(self.handle, meta.as_mut_ptr(), meta.len() as u32) };
+        true
+    }
+
+    /// Reapplies the last undone snapshot. Returns false when there is
+    /// nothing to redo.
+    pub fn redo(&self) -> bool {
+        if !self.can_redo() {
+            return false;
+        }
+        let mut meta = [0u8; 64];
+        unsafe { sys::editBufferRedo(self.handle, meta.as_mut_ptr(), meta.len() as u32) };
+        true
+    }
+
+    pub fn can_undo(&self) -> bool {
+        unsafe { sys::editBufferCanUndo(self.handle) }
+    }
+
+    pub fn can_redo(&self) -> bool {
+        unsafe { sys::editBufferCanRedo(self.handle) }
+    }
+
+    pub fn clear_history(&self) {
+        unsafe { sys::editBufferClearHistory(self.handle) }
+    }
+
+    fn byte_size(&self) -> u32 {
+        unsafe { sys::textBufferGetByteSize(sys::editBufferGetTextBuffer(self.handle)) }
     }
 
     pub fn move_cursor_left(&self) {
@@ -136,6 +232,58 @@ impl EditBuffer {
         }
     }
 
+    /// Places the cursor at a native offset (see [`LogicalCursor::offset`]).
+    pub fn set_cursor_by_offset(&self, offset: u32) {
+        unsafe { sys::editBufferSetCursorByOffset(self.handle, offset) }
+    }
+
+    /// The offset of a line and display column. Offsets count display
+    /// columns, plus one for each line break before the position.
+    pub fn position_to_offset(&self, row: u32, col: u32) -> u32 {
+        unsafe { sys::editBufferPositionToOffset(self.handle, row, col) }
+    }
+
+    /// The line and display column of an offset, if it is inside the text.
+    pub fn offset_to_position(&self, offset: u32) -> Option<LogicalCursor> {
+        let mut out = sys::ExternalLogicalCursor {
+            row: 0,
+            col: 0,
+            offset: 0,
+        };
+        let ok = unsafe { sys::editBufferOffsetToPosition(self.handle, offset, &mut out) };
+        ok.then_some(LogicalCursor {
+            row: out.row,
+            col: out.col,
+            offset: out.offset,
+        })
+    }
+
+    /// The text between two offsets.
+    pub fn text_range(&self, start: u32, end: u32) -> String {
+        let (start, end) = (start.min(end), start.max(end));
+        if start == end {
+            return String::new();
+        }
+        // Offsets count columns; a column holds at most one grapheme, which
+        // rarely exceeds 16 bytes.
+        read_native_string((end - start) as usize * 16 + 1, |out| unsafe {
+            sys::editBufferGetTextRange(
+                self.handle,
+                start,
+                end,
+                out.as_mut_ptr(),
+                ffi_len(out.len(), "output"),
+            )
+        })
+    }
+
+    /// Deletes between two (row, col) positions and leaves the cursor at the
+    /// start. Returns the undo snapshots recorded.
+    pub fn delete_range(&self, start: (u32, u32), end: (u32, u32)) -> u32 {
+        unsafe { sys::editBufferDeleteRange(self.handle, start.0, start.1, end.0, end.1) }
+        u32::from(start != end)
+    }
+
     /// Places the cursor at a line and display column, clamped to the text.
     pub fn set_cursor(&self, row: u32, col: u32) {
         unsafe { sys::editBufferSetCursorToLineCol(self.handle, row, col) }
@@ -153,6 +301,7 @@ impl EditBuffer {
         }
         Ok(EditorView {
             handle,
+            edit_buffer: self.handle,
             _buffer: PhantomData,
         })
     }
@@ -174,6 +323,7 @@ impl Drop for EditBuffer {
 /// Draw it with [`Buffer::draw_editor_view`](crate::Buffer::draw_editor_view).
 pub struct EditorView<'eb> {
     handle: sys::Handle,
+    edit_buffer: sys::Handle,
     // An owned child of the edit buffer natively; the borrow keeps it from
     // outliving it.
     _buffer: PhantomData<&'eb EditBuffer>,
@@ -227,6 +377,133 @@ impl EditorView<'_> {
     /// Visible lines after wrapping.
     pub fn virtual_line_count(&self) -> u32 {
         unsafe { sys::editorViewGetVirtualLineCount(self.handle) }
+    }
+
+    /// The selected range as `(start, end)` offsets, if any.
+    pub fn selection(&self) -> Option<(u32, u32)> {
+        let packed = unsafe { sys::editorViewGetSelection(self.handle) };
+        (packed != u64::MAX).then_some(((packed >> 32) as u32, packed as u32))
+    }
+
+    /// Selects `start..end` (cursor offsets; either order).
+    pub fn set_selection(&self, start: u32, end: u32, colors: SelectionColors) {
+        self.reset_local_selection();
+        let (start, end) = (start.min(end), start.max(end));
+        unsafe {
+            sys::editorViewSetSelection(
+                self.handle,
+                start,
+                end,
+                colors.bg.as_ptr(),
+                opt_ptr(&colors.fg),
+            )
+        }
+    }
+
+    /// Starts a selection from viewport cells, as for a mouse press. With
+    /// `move_cursor`, the cursor moves to `focus`. Returns whether anything
+    /// changed.
+    pub fn set_local_selection(
+        &self,
+        anchor: (i32, i32),
+        focus: (i32, i32),
+        behavior: SelectionBehavior,
+        move_cursor: bool,
+        colors: SelectionColors,
+    ) -> bool {
+        unsafe {
+            sys::editorViewSetLocalSelection(
+                self.handle,
+                anchor.0,
+                anchor.1,
+                focus.0,
+                focus.1,
+                colors.bg.as_ptr(),
+                opt_ptr(&colors.fg),
+                local_selection_flags(move_cursor, behavior),
+            )
+        }
+    }
+
+    /// Moves the focus of a selection started with
+    /// [`set_local_selection`](Self::set_local_selection), as for a mouse drag.
+    pub fn update_local_selection(
+        &self,
+        anchor: (i32, i32),
+        focus: (i32, i32),
+        behavior: SelectionBehavior,
+        move_cursor: bool,
+        colors: SelectionColors,
+    ) -> bool {
+        unsafe {
+            sys::editorViewUpdateLocalSelection(
+                self.handle,
+                anchor.0,
+                anchor.1,
+                focus.0,
+                focus.1,
+                colors.bg.as_ptr(),
+                opt_ptr(&colors.fg),
+                local_selection_flags(move_cursor, behavior),
+            )
+        }
+    }
+
+    fn reset_local_selection(&self) {
+        unsafe { sys::editorViewResetLocalSelection(self.handle) }
+    }
+
+    /// Removes any selection. The text is unchanged.
+    pub fn clear_selection(&self) {
+        self.reset_local_selection();
+        unsafe { sys::editorViewResetSelection(self.handle) }
+    }
+
+    pub fn selected_text(&self) -> String {
+        if self.selection().is_none() {
+            return String::new();
+        }
+        let size =
+            unsafe { sys::textBufferGetByteSize(sys::editBufferGetTextBuffer(self.edit_buffer)) };
+        read_native_string(size as usize + 1, |out| unsafe {
+            sys::editorViewGetSelectedTextBytes(
+                self.handle,
+                out.as_mut_ptr(),
+                ffi_len(out.len(), "output"),
+            )
+        })
+    }
+
+    /// Deletes the selected text, leaving the cursor at its start. Returns the
+    /// undo snapshots recorded.
+    pub fn delete_selected_text(&self) -> u32 {
+        let has_range = matches!(self.selection(), Some((start, end)) if start != end);
+        unsafe { sys::editorViewDeleteSelectedText(self.handle) }
+        u32::from(has_range)
+    }
+
+    /// The visible region, in wrapped lines and columns.
+    pub fn viewport(&self) -> Viewport {
+        let (mut x, mut y, mut width, mut height) = (0, 0, 0, 0);
+        unsafe { sys::editorViewGetViewport(self.handle, &mut x, &mut y, &mut width, &mut height) };
+        Viewport {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Scrolls to `x`, `y`. With `move_cursor`, the cursor is moved into the
+    /// new viewport; otherwise the next layout scrolls back to the cursor.
+    pub fn scroll_to(&self, x: u32, y: u32, move_cursor: bool) {
+        let vp = self.viewport();
+        unsafe { sys::editorViewSetViewport(self.handle, x, y, vp.width, vp.height, move_cursor) }
+    }
+
+    /// Wrapped lines in the whole document.
+    pub fn total_virtual_line_count(&self) -> u32 {
+        unsafe { sys::editorViewGetTotalVirtualLineCount(self.handle) }
     }
 
     fn query(

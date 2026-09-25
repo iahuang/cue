@@ -124,6 +124,26 @@ impl Renderer {
         unsafe { sys::setCursorPosition(self.handle, x, y, visible) }
     }
 
+    /// Enables mouse reporting (clicks, drags, and wheel, in SGR encoding).
+    /// With `movement`, motion without a button pressed is reported too.
+    /// Disabled again when the renderer is dropped.
+    pub fn enable_mouse(&mut self, movement: bool) {
+        unsafe { sys::enableMouse(self.handle, movement) }
+    }
+
+    pub fn disable_mouse(&mut self) {
+        unsafe { sys::disableMouse(self.handle) }
+    }
+
+    /// Copies `text` to the system clipboard through the terminal (OSC 52).
+    /// Terminals may ignore or refuse the request; there is no confirmation.
+    pub fn copy_to_clipboard(&mut self, text: &str) -> bool {
+        // Target 0 is the clipboard ("c").
+        unsafe {
+            sys::copyToClipboardOSC52(self.handle, 0, text.as_ptr(), ffi_len(text.len(), "text"))
+        }
+    }
+
     /// Renders on a native background thread instead of in `render`.
     pub fn set_use_thread(&mut self, use_thread: bool) {
         unsafe { sys::setUseThread(self.handle, use_thread) }

@@ -2,13 +2,15 @@
 
 mod document;
 mod editor;
+mod history;
 mod input;
 mod terminal;
+mod words;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opentui::{EditBuffer, Output, Renderer, WidthMethod};
 
@@ -60,7 +62,7 @@ fn parse_args() -> Result<Option<PathBuf>, ExitCode> {
     }
     match first {
         Some(arg) if arg == "-h" || arg == "--help" => {
-            println!("{USAGE}\n\nOpens FILE (or a new, unnamed buffer). ^S saves, ^W toggles wrapping, ^Q quits.");
+            println!("{USAGE}\n\nOpens FILE (or a new, unnamed buffer). ^S save, ^Z/^Y undo/redo, ^A select all, ^C/^X/^V copy/cut/paste,\n^W toggle wrap, ^Q quit. Shift+movement or the mouse selects.");
             Err(ExitCode::SUCCESS)
         }
         Some(arg) => Ok(Some(PathBuf::from(arg))),
@@ -78,6 +80,8 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let (mut width, mut height) = terminal::size();
     let mut renderer = Renderer::new(width, height, Output::Stdout)?;
     renderer.setup_terminal(true);
+    // Clicks, drags, and the wheel; plain motion isn't needed.
+    renderer.enable_mouse(false);
 
     let buffer = EditBuffer::new(WidthMethod::Unicode)?;
     buffer.set_tab_width(4);
@@ -131,11 +135,14 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 
         for event in events.drain(..) {
             match event {
-                Event::Key(key) => {
-                    if let Action::Quit = editor.handle_key(key) {
-                        return Ok(());
+                Event::Key(key) => match editor.handle_key(key) {
+                    Action::Quit => return Ok(()),
+                    Action::Copy(text) => {
+                        renderer.copy_to_clipboard(&text);
                     }
-                }
+                    Action::Continue => {}
+                },
+                Event::Mouse(mouse) => editor.handle_mouse(mouse, Instant::now()),
                 Event::Paste(text) => editor.paste(&text),
                 Event::Reply(bytes) => renderer.process_capability_response(&bytes),
             }
@@ -148,4 +155,12 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
             editor.resize(width, height);
         }
     }
+}
+
+/// Serializes tests that use the native core, which is single-threaded,
+/// across every module in this test binary.
+#[cfg(test)]
+fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }

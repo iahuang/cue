@@ -40,7 +40,10 @@ mod tty;
 
 pub use buffer::{Buffer, FrameBuffer, OwnedBuffer};
 pub use color::{Attributes, Rgba};
-pub use edit::{EditBuffer, EditorView, LogicalCursor, VisualCursor};
+pub use edit::{
+    EditBuffer, EditorView, LogicalCursor, SelectionBehavior, SelectionColors, Viewport,
+    VisualCursor,
+};
 pub use error::{Error, Result};
 pub use renderer::{Output, RenderStatus, Renderer};
 pub use text::{TextBuffer, TextBufferView, WidthMethod, WrapMode};

@@ -111,3 +111,36 @@ fn visual_line_start_and_end_follow_wrapping() {
         eb.cursor().col
     );
 }
+
+#[test]
+fn offsets_ranges_and_deletes() {
+    let _serial = serial();
+    let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+    eb.set_text("héllo 漢字\nsecond\tx\nend");
+    // Offsets count display columns (漢 and 字 are two wide) plus one per newline.
+    assert_eq!(eb.position_to_offset(1, 0), 11);
+    // A tab counts as its display width: 2 by default.
+    assert_eq!(eb.position_to_offset(2, 0), 11 + 6 + 2 + 1 + 1);
+    let pos = eb.offset_to_position(8).unwrap();
+    assert_eq!((pos.row, pos.col), (0, 8));
+    assert_eq!(eb.offset_to_position(10_000), None);
+
+    assert_eq!(eb.text_range(6, 10), "漢字");
+    assert_eq!(eb.text_range(10, 17), "\nsecond");
+    assert_eq!(
+        eb.text_range(17, 10),
+        "\nsecond",
+        "reversed bounds are normalized"
+    );
+    assert_eq!(eb.text_range(3, 3), "");
+
+    eb.set_cursor_by_offset(13);
+    assert_eq!((eb.cursor().row, eb.cursor().col), (1, 2));
+
+    assert_eq!(eb.delete_range((0, 5), (1, 6)), 1);
+    assert_eq!(eb.text(), "héllo\tx\nend");
+    assert_eq!((eb.cursor().row, eb.cursor().col), (0, 5));
+    assert_eq!(eb.delete_range((0, 1), (0, 1)), 0);
+    assert!(eb.undo());
+    assert_eq!(eb.text(), "héllo 漢字\nsecond\tx\nend");
+}
