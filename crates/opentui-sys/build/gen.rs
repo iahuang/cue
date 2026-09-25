@@ -61,6 +61,8 @@ pub struct Output {
     /// Body of a test that references every declaration, so a symbol missing
     /// from the library fails at link time.
     pub link_test: String,
+    /// Name of every exported function: the library's entire public ABI.
+    pub exports: Vec<String>,
     /// Every Zig file the output depends on, for `rerun-if-changed`.
     pub inputs: Vec<PathBuf>,
 }
@@ -76,6 +78,7 @@ pub fn generate(src_dir: &Path) -> Result<Output, String> {
     Ok(Output {
         bindings: gen.render(),
         link_test,
+        exports: gen.fns.iter().map(|f| f.name.clone()).collect(),
         inputs: gen.modules.values().map(|m| m.path.clone()).collect(),
     })
 }

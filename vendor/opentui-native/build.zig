@@ -32,6 +32,9 @@ const SUPPORTED_TARGETS = [_]SupportedTarget{
 const DEFAULT_MACOS_SDK_PATH = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
 
 const LIB_NAME = "opentui";
+
+// Set once from `-Dlinkage` in build(); read by every buildTarget() call.
+var library_linkage: std.builtin.LinkMode = .dynamic;
 const ROOT_SOURCE_FILE = "src/lib.zig";
 const GHOSTTY_VT_VERSION = "0.1.0-dev+b988efcf";
 
@@ -512,6 +515,7 @@ pub fn build(b: *std.Build) void {
     const debug_use_llvm = b.option(bool, "debug-llvm", "Use LLVM backend for debug/test artifacts");
     const target_option = b.option([]const u8, "library-target", "Build shared library for a specific target (e.g., 'x86_64-linux-gnu.2.17').");
     const build_all = b.option(bool, "all", "Build for all supported targets") orelse false;
+    library_linkage = b.option(std.builtin.LinkMode, "linkage", "Build the library as a dynamic (default) or static library") orelse .dynamic;
     const gpa_safe_stats = b.option(bool, "gpa-safe-stats", "Enable GPA safety checks for trustworthy allocator stats") orelse false;
     const macos_sdk_path = resolveMacOSSDKPath(b);
     const build_options = b.addOptions();
@@ -742,8 +746,14 @@ fn buildTarget(
     const lib = b.addLibrary(.{
         .name = LIB_NAME,
         .root_module = module,
-        .linkage = .dynamic,
+        .linkage = library_linkage,
     });
+    if (library_linkage == .static) {
+        // A shared library carries these runtimes inside it; carry them in
+        // the archive too, so consumers need not supply Zig's versions.
+        lib.bundle_compiler_rt = true;
+        lib.bundle_ubsan_rt = true;
+    }
 
     if (target.result.os.tag == .linux and optimize != .Debug) lib.build_id = .sha1;
 
