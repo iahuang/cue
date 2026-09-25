@@ -24,3 +24,12 @@ git subtree pull --prefix=vendor/opentui-native /path/to/opentui native-only --s
 
 and update the commit above. The split is deterministic, so repeated splits
 share history and pulls merge without conflicts.
+
+### Local changes
+
+Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
+
+- `src/lib.zig`: `createEditorView` allocates the view from `globalAllocator`
+  instead of `globalArena`. The view's layout arenas sat on the never-freeing
+  global arena, so every relayout (one per edit) leaked the whole layout,
+  about 700 bytes per line of the document.
