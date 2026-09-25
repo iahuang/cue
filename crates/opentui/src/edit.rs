@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 use opentui_sys as sys;
 
@@ -303,15 +304,31 @@ impl EditBuffer {
 
     /// A new view for laying out and drawing this buffer.
     pub fn view(&self, width: u32, height: u32) -> Result<EditorView<'_>> {
+        Ok(EditorView {
+            handle: self.create_view(width, height)?,
+            edit_buffer: self.handle,
+            _owner: None,
+            _buffer: PhantomData,
+        })
+    }
+
+    /// Like [`view`](Self::view), but the view holds a reference to the
+    /// buffer instead of borrowing it, so the two can be stored together.
+    pub fn shared_view(self: &Rc<Self>, width: u32, height: u32) -> Result<EditorView<'static>> {
+        Ok(EditorView {
+            handle: self.create_view(width, height)?,
+            edit_buffer: self.handle,
+            _owner: Some(Rc::clone(self)),
+            _buffer: PhantomData,
+        })
+    }
+
+    fn create_view(&self, width: u32, height: u32) -> Result<sys::Handle> {
         let handle = unsafe { sys::createEditorView(self.handle, width, height) };
         if handle == sys::INVALID_HANDLE {
             return Err(Error::CreateFailed("editor view"));
         }
-        Ok(EditorView {
-            handle,
-            edit_buffer: self.handle,
-            _buffer: PhantomData,
-        })
+        Ok(handle)
     }
 
     /// The native handle, for calling [`sys`](crate::sys) functions directly.
@@ -333,7 +350,9 @@ pub struct EditorView<'eb> {
     handle: sys::Handle,
     edit_buffer: sys::Handle,
     // An owned child of the edit buffer natively; the borrow keeps it from
-    // outliving it.
+    // outliving it, or for a shared view, the reference does. `Drop`
+    // destroys the view before the reference is released.
+    _owner: Option<Rc<EditBuffer>>,
     _buffer: PhantomData<&'eb EditBuffer>,
 }
 

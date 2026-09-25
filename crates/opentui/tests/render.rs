@@ -90,3 +90,16 @@ fn objects_are_confined_to_one_thread() {
         .unwrap();
     assert_eq!(other, Some(Error::WrongThread));
 }
+
+#[test]
+fn with_clip_keeps_drawing_inside_the_rectangle() {
+    let _serial = serial();
+    let buffer = OwnedBuffer::new(8, 2, false, WidthMethod::Unicode, "clip").unwrap();
+    buffer.clear(Rgba::BLACK);
+    buffer.with_clip(2, 0, 3, 1, || {
+        buffer.draw_text("abcdefgh", 0, 0, Rgba::WHITE, None, Attributes::NONE);
+        buffer.draw_text("abcdefgh", 0, 1, Rgba::WHITE, None, Attributes::NONE);
+    });
+    buffer.draw_text("after", 0, 1, Rgba::WHITE, None, Attributes::NONE);
+    assert_eq!(buffer.to_text(true), "  cde   \nafter   \n");
+}

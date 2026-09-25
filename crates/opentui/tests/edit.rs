@@ -144,3 +144,17 @@ fn offsets_ranges_and_deletes() {
     assert!(eb.undo());
     assert_eq!(eb.text(), "héllo 漢字\nsecond\tx\nend");
 }
+
+#[test]
+fn shared_view_keeps_its_buffer_alive() {
+    let _serial = serial();
+    let view = {
+        let eb = std::rc::Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("kept");
+        eb.shared_view(10, 2).unwrap()
+    };
+    let screen = OwnedBuffer::new(10, 2, false, WidthMethod::Unicode, "test").unwrap();
+    screen.clear(Rgba::BLACK);
+    screen.draw_editor_view(&view, 0, 0);
+    assert!(screen.to_text(true).starts_with("kept"));
+}

@@ -94,6 +94,28 @@ impl Buffer {
         unsafe { sys::bufferDrawEditorView(self.handle, view.raw_handle(), x, y) }
     }
 
+    /// Runs `draw` with drawing clipped to the `width` x `height` rectangle
+    /// at (`x`, `y`): nothing drawn meanwhile lands outside it.
+    pub fn with_clip<R>(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        draw: impl FnOnce() -> R,
+    ) -> R {
+        unsafe { sys::bufferPushScissorRect(self.handle, x as i32, y as i32, width, height) };
+        // Pop even if `draw` panics, so the clip can't outlive this call.
+        struct Pop(sys::Handle);
+        impl Drop for Pop {
+            fn drop(&mut self) {
+                unsafe { sys::bufferPopScissorRect(self.0) }
+            }
+        }
+        let _pop = Pop(self.handle);
+        draw()
+    }
+
     /// The buffer's characters as text, one row per line if `line_breaks`.
     pub fn to_text(&self, line_breaks: bool) -> String {
         let cells = self.width() as usize * self.height() as usize;
