@@ -1,0 +1,12 @@
+[package]
+name = "opentui"
+version = "0.1.0"
+description = "Safe Rust bindings to the OpenTUI Zig core"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opentui-sys = { path = "../opentui-sys" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
