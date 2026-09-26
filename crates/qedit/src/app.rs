@@ -29,6 +29,7 @@ use crate::file_index::FileIndex;
 use crate::find;
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
+use crate::line_edit::Edit;
 use crate::picker::{Choice, Mode, Picker, PickerAction};
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::theme::Theme;
@@ -104,47 +105,28 @@ pub struct App {
     find_memory: find::Memory,
 }
 
-/// A popup's query line, which typing and pasting edit.
+/// A popup's query line, which typing, pasting, and the editor's cursor
+/// keys edit.
 trait QueryInput {
-    fn insert(&mut self, text: &str);
-    fn delete_backward(&mut self);
-    fn delete_word_backward(&mut self);
+    fn edit(&mut self, edit: Edit);
 }
 
 impl QueryInput for Picker {
-    fn insert(&mut self, text: &str) {
-        Picker::insert(self, text);
-    }
-    fn delete_backward(&mut self) {
-        Picker::delete_backward(self);
-    }
-    fn delete_word_backward(&mut self) {
-        Picker::delete_word_backward(self);
+    fn edit(&mut self, edit: Edit) {
+        Picker::edit(self, edit);
     }
 }
 
 /// The find bar's focused field.
 impl QueryInput for Editor {
-    fn insert(&mut self, text: &str) {
-        self.find_insert(text);
-    }
-    fn delete_backward(&mut self) {
-        self.find_delete_backward();
-    }
-    fn delete_word_backward(&mut self) {
-        self.find_delete_word_backward();
+    fn edit(&mut self, edit: Edit) {
+        self.find_edit(edit);
     }
 }
 
 impl QueryInput for SearchModal {
-    fn insert(&mut self, text: &str) {
-        SearchModal::insert(self, text);
-    }
-    fn delete_backward(&mut self) {
-        SearchModal::delete_backward(self);
-    }
-    fn delete_word_backward(&mut self) {
-        SearchModal::delete_word_backward(self);
+    fn edit(&mut self, edit: Edit) {
+        SearchModal::edit(self, edit);
     }
 }
 
@@ -283,30 +265,35 @@ impl App {
         find.then(|| self.editor_mut() as &mut dyn QueryInput)
     }
 
-    /// A key for a popup's query: typing, or the editor's keys for deleting
-    /// and pasting.
+    /// A key for a popup's query: typing, or the editor's keys for moving
+    /// the cursor, deleting, and pasting.
     fn edit_query(&mut self, key: Key) {
         let binding = self.keymap.lookup(key, Context::Editor);
         let clipboard = self.clipboard.clone();
-        let Some(input) = self.query_input() else {
-            return;
+        let mut buf = [0; 4];
+        let edit = match binding.map(|(command, _)| command) {
+            Some(Command::DeleteBackward) => Edit::DeleteBackward,
+            Some(Command::DeleteForward) => Edit::DeleteForward,
+            Some(Command::DeleteWordBackward) => Edit::DeleteWordBackward,
+            Some(Command::DeleteWordForward) => Edit::DeleteWordForward,
+            Some(Command::CursorLeft) => Edit::Left,
+            Some(Command::CursorRight) => Edit::Right,
+            Some(Command::WordLeft) => Edit::WordLeft,
+            Some(Command::WordRight) => Edit::WordRight,
+            Some(Command::LineStart | Command::DocumentStart) => Edit::Start,
+            Some(Command::LineEnd | Command::DocumentEnd) => Edit::End,
+            Some(Command::Paste) => match &clipboard {
+                Some(text) => Edit::Insert(text.lines().next().unwrap_or("")),
+                None => return,
+            },
+            Some(_) => return,
+            None => match key.code {
+                KeyCode::Char(c) if key.mods.is_plain() => Edit::Insert(c.encode_utf8(&mut buf)),
+                _ => return,
+            },
         };
-        match binding {
-            Some((Command::DeleteBackward, _)) => input.delete_backward(),
-            Some((Command::DeleteWordBackward, _)) => input.delete_word_backward(),
-            Some((Command::Paste, _)) => {
-                if let Some(text) = &clipboard {
-                    input.insert(text.lines().next().unwrap_or(""));
-                }
-            }
-            Some(_) => {}
-            None => {
-                if let KeyCode::Char(c) = key.code {
-                    if key.mods.is_plain() {
-                        input.insert(c.encode_utf8(&mut [0; 4]));
-                    }
-                }
-            }
+        if let Some(input) = self.query_input() {
+            input.edit(edit);
         }
     }
 
@@ -475,7 +462,7 @@ impl App {
         if let Some(input) = self.query_input() {
             // Terminals send newlines in pastes as CR.
             let line = text.split(['\r', '\n']).next().unwrap_or("");
-            input.insert(line);
+            input.edit(Edit::Insert(line));
             self.note_find_memory();
         } else if self.focus == Focus::Editor {
             self.editor_mut().paste(text);

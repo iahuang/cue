@@ -17,7 +17,8 @@ use opentui::{Attributes, Buffer, Rgba};
 
 use crate::editor::STATUS_BG;
 use crate::keymap::{Command, Context, Keymap};
-use crate::picker::{self, BG, DIM, FG, SELECTED_BG};
+use crate::line_edit::{Caret, Edit};
+use crate::picker::{BG, DIM, FG, SELECTED_BG};
 use crate::search::{Query, Toggle};
 
 /// Past this many matches, the rest aren't found.
@@ -102,6 +103,8 @@ pub struct FindBar {
     /// Typing replaces the query instead of adding to it: it came from the
     /// selection or the last find.
     pub replace_query: bool,
+    /// The cursor in the query, and in the replacement.
+    pub carets: [Caret; 2],
     /// In order. Never empty ranges.
     pub matches: Vec<Match>,
     /// The text has more matches than were found.
@@ -125,6 +128,7 @@ impl FindBar {
             memory,
             replacing: false,
             focus: Some(Field::Find),
+            carets: Default::default(),
             matches: Vec::new(),
             truncated: false,
             error: None,
@@ -145,22 +149,28 @@ impl FindBar {
 
     // --- editing the fields ------------------------------------------------------
 
-    /// Adds typed or pasted text to the focused field.
-    pub fn insert(&mut self, text: &str) {
-        if let Some(field) = self.field_mut() {
-            field.push_str(text);
-        }
-    }
-
-    pub fn delete_backward(&mut self) {
-        if let Some(field) = self.field_mut() {
-            field.pop();
-        }
-    }
-
-    pub fn delete_word_backward(&mut self) {
-        if let Some(field) = self.field_mut() {
-            picker::delete_word_backward(field);
+    /// Edits the focused field: typing, pasting, deleting, or moving the
+    /// cursor. Changing the query marks the matches for finding again.
+    pub fn edit(&mut self, edit: Edit) {
+        let Some(field) = self.focus else {
+            return;
+        };
+        let caret = &mut self.carets[field as usize];
+        match field {
+            Field::Find => {
+                let text = &mut self.memory.query.text;
+                let changed = if std::mem::take(&mut self.replace_query) {
+                    caret.edit_selected(text, edit)
+                } else {
+                    caret.edit(text, edit)
+                };
+                if changed {
+                    self.epoch = None;
+                }
+            }
+            Field::Replace => {
+                caret.edit(&mut self.memory.replacement, edit);
+            }
         }
     }
 
@@ -168,21 +178,6 @@ impl FindBar {
         toggle.flip(&mut self.memory.query);
         self.replace_query = false;
         self.epoch = None;
-    }
-
-    /// The focused field's text. Changing the query marks the matches for
-    /// finding again.
-    fn field_mut(&mut self) -> Option<&mut String> {
-        match self.focus? {
-            Field::Find => {
-                self.epoch = None;
-                if std::mem::take(&mut self.replace_query) {
-                    self.memory.query.text.clear();
-                }
-                Some(&mut self.memory.query.text)
-            }
-            Field::Replace => Some(&mut self.memory.replacement),
-        }
     }
 
     // --- matches -----------------------------------------------------------------
@@ -273,12 +268,10 @@ impl FindBar {
             let placeholder: String = placeholder.chars().take(room).collect();
             frame.draw_text(&placeholder, text_x, y, DIM, None, Attributes::NONE);
         }
-        // Keep the end in view, where typing goes.
-        let chars: Vec<char> = text.chars().collect();
-        let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
+        let (shown, column) = self.carets[field as usize].view(text, room);
         let bg = (field == Field::Find && self.replace_query).then_some(SELECTED_BG);
         frame.draw_text(&shown, text_x, y, FG, bg, Attributes::NONE);
-        (self.focus == Some(field)).then_some((text_x + shown.chars().count() as u32, y))
+        (self.focus == Some(field)).then_some((text_x + column as u32, y))
     }
 
     /// Lays out a bar at column `x`, `width` wide: on the first row, the

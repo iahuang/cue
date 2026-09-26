@@ -15,6 +15,7 @@ use opentui::{Attributes, Buffer, Rgba};
 
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
+use crate::line_edit::{Caret, Edit};
 use crate::picker::{self, Area, DIM, FG, MATCH_FG, SELECTED_BG};
 use crate::search::{FileMatches, Line, Query, Search, Toggle, CONTEXT_LINES};
 use crate::workspace::Workspace;
@@ -81,6 +82,7 @@ pub struct SearchModal {
     /// Unsaved text of open files, searched instead of what's on disk.
     unsaved: HashMap<PathBuf, String>,
     query: Query,
+    caret: Caret,
     /// The query was filled in on opening: typing replaces it.
     replace_query: bool,
     /// The search in progress, if any.
@@ -145,6 +147,7 @@ impl SearchModal {
             unsaved,
             replace_query: !query.text.is_empty(),
             query,
+            caret: Caret::default(),
             search: None,
             stale: false,
             error: None,
@@ -202,20 +205,16 @@ impl SearchModal {
         SearchAction::Continue
     }
 
-    /// Adds typed or pasted text to the query.
-    pub fn insert(&mut self, text: &str) {
-        self.take_query().push_str(text);
-        self.query_changed();
-    }
-
-    pub fn delete_backward(&mut self) {
-        self.take_query().pop();
-        self.query_changed();
-    }
-
-    pub fn delete_word_backward(&mut self) {
-        picker::delete_word_backward(self.take_query());
-        self.query_changed();
+    /// Edits the query: typing, pasting, deleting, or moving the cursor.
+    pub fn edit(&mut self, edit: Edit) {
+        let changed = if std::mem::take(&mut self.replace_query) {
+            self.caret.edit_selected(&mut self.query.text, edit)
+        } else {
+            self.caret.edit(&mut self.query.text, edit)
+        };
+        if changed {
+            self.query_changed();
+        }
     }
 
     /// A click on a line opens the file there, on a toggle flips it; one
@@ -304,14 +303,6 @@ impl SearchModal {
     }
 
     // --- searching -----------------------------------------------------------
-
-    /// The query's text, emptied first if it was filled in on opening.
-    fn take_query(&mut self) -> &mut String {
-        if std::mem::take(&mut self.replace_query) {
-            self.query.text.clear();
-        }
-        &mut self.query.text
-    }
 
     fn toggle(&mut self, toggle: Toggle) {
         toggle.flip(&mut self.query);
@@ -581,15 +572,14 @@ impl SearchModal {
             frame.draw_text(&self.hints, x + 2, bottom, DIM, None, Attributes::NONE);
         }
 
-        // The query, its end kept in view, and the toggles right of it.
+        // The query, the cursor kept in view, and the toggles right of it.
         let toggles = self.toggles(area);
         let text_x = x + 2;
         let room = toggles[0].1.start.saturating_sub(text_x + 1) as usize;
-        let chars: Vec<char> = self.query.text.chars().collect();
-        let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
+        let (shown, column) = self.caret.view(&self.query.text, room);
         let query_bg = self.replace_query.then_some(SELECTED_BG);
         frame.draw_text(&shown, text_x, y + 1, FG, query_bg, Attributes::NONE);
-        let cursor = (text_x + shown.chars().count() as u32, y + 1);
+        let cursor = (text_x + column as u32, y + 1);
         if self.query.text.is_empty() {
             let hint: String = "Search in files"
                 .chars()
@@ -898,7 +888,7 @@ mod tests {
         let a = "one\ntwo\nfind me\nthree\nfour\nfive\nsix\nseven\nfind find\n";
         let root = fixture("excerpts", &[("b.txt", "find\n"), ("A/a.txt", a)]);
         let mut modal = modal(&root, Memory::default(), None, 30);
-        modal.insert("find");
+        modal.edit(Edit::Insert("find"));
         wait(&mut modal);
         let text = screen(&modal).join("\n");
         let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
@@ -955,7 +945,7 @@ mod tests {
     fn toggles_and_invalid_regexes() {
         let root = fixture("toggles", &[("a.txt", "Foo foo\n")]);
         let mut modal = modal(&root, Memory::default(), None, 12);
-        modal.insert("foo");
+        modal.edit(Edit::Insert("foo"));
         wait(&mut modal);
         assert_eq!(modal.matches.len(), 2);
         modal.run(Command::SearchToggleCase);
@@ -972,7 +962,7 @@ mod tests {
             mods: Mods::NONE,
         });
         assert!(modal.query.regex);
-        modal.insert("(");
+        modal.edit(Edit::Insert("("));
         let text = screen(&modal).join("\n");
         assert!(text.contains("Invalid regex:"), "{text}");
         assert!(modal.matches.is_empty());
@@ -982,7 +972,7 @@ mod tests {
     fn reopening_searches_again_and_keeps_the_selected_match() {
         let root = fixture("reopen", &[("a.txt", "x\nx\nx\n"), ("b.txt", "x\n")]);
         let mut first = modal(&root, Memory::default(), None, 20);
-        first.insert("x");
+        first.edit(Edit::Insert("x"));
         wait(&mut first);
         first.run(Command::PickerDown);
         first.run(Command::PickerDown);
@@ -997,7 +987,7 @@ mod tests {
         );
 
         // Typing replaces the query filled in on opening.
-        second.insert("y");
+        second.edit(Edit::Insert("y"));
         assert_eq!(second.query.text, "y");
         wait(&mut second);
         assert_eq!(second.matches.len(), 1);
@@ -1013,6 +1003,12 @@ mod tests {
         let mut fourth = modal(&root, first.memory(), Some("y"), 20);
         wait(&mut fourth);
         assert_eq!(fourth.selected, 0);
+
+        // Moving the cursor keeps the query filled in on opening.
+        let mut fifth = modal(&root, first.memory(), None, 20);
+        fifth.edit(Edit::Left);
+        fifth.edit(Edit::Insert("y"));
+        assert_eq!(fifth.query.text, "yx");
     }
 
     #[test]
@@ -1020,7 +1016,7 @@ mod tests {
         let text: String = (0..60).map(|i| format!("line {i} hit\n")).collect();
         let root = fixture("clicks", &[("a.txt", &text)]);
         let mut modal = modal(&root, Memory::default(), None, 12);
-        modal.insert("hit");
+        modal.edit(Edit::Insert("hit"));
         wait(&mut modal);
         let rows = modal.body_rows();
         for _ in 0..20 {
@@ -1055,7 +1051,7 @@ mod tests {
         let long = format!("{}needle{}", "é".repeat(300), "y".repeat(300));
         let root = fixture("long", &[("a.txt", &wide), ("b.txt", &long)]);
         let mut modal = modal(&root, Memory::default(), None, 12);
-        modal.insert("needle");
+        modal.edit(Edit::Insert("needle"));
         wait(&mut modal);
         let text = screen(&modal).join("\n");
         let lines: Vec<&str> = text.lines().collect();

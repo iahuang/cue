@@ -9,6 +9,7 @@ mod history;
 mod input;
 mod keymap;
 mod language;
+mod line_edit;
 mod picker;
 mod search;
 mod search_modal;

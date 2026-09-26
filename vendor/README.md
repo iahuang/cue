@@ -52,3 +52,12 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   styles and redoes them when a layer is redefined; `getStyleCount` leaves
   them out. Without a syntax style set, the highest priority still wins.
   `setSyntaxStyle` rebuilds the spans of lines with overlapping highlights.
+- `src/editor-view.zig`: `setWrapMode` scrolls the viewport back to the left
+  when wrapping, since `ensureCursorVisible` never moves it sideways while
+  wrapped, and keeps the text at the top of the viewport there, since
+  rewrapping renumbers the rows. `makeCursorVisible`, while wrapped, puts the
+  cursor on the target row itself instead of at its logical column in the
+  row's line, which in a line wrapped over several rows could be out of view
+  and scroll the viewport straight back.
+  `getVisualEOL` (End) treats a line wider than the viewport as one overwide
+  grapheme only while wrapping; unwrapped, End did nothing on such lines.

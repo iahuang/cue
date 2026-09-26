@@ -173,7 +173,28 @@ pub const EditorView = struct {
 
             self.text_buffer_view.updateVirtualLines();
             const vlines = self.text_buffer_view.virtual_lines.items;
-            if (target_visual_row < vlines.len) {
+            if (target_visual_row < vlines.len and self.text_buffer_view.wrap_mode != .none) {
+                // A wrapped line spans rows: put the cursor on the target row
+                // itself. Its logical column in the target's line can be on
+                // another row of it, out of view, and the next render would
+                // scroll the viewport back to it.
+                const boundary = self.text_buffer_view.getSelectionOccupancy() == .boundary;
+                const target_visual_col = if (boundary)
+                    @min(vcursor.visual_col, vlines[target_visual_row].width_cols)
+                else
+                    clampVisualColToStayOnVisualRow(vlines, target_visual_row, vcursor.visual_col);
+                const new_vcursor = self.visualToLogicalCursor(target_visual_row, target_visual_col) orelse return;
+                if (self.edit_buffer.cursors.items.len > 0) {
+                    self.edit_buffer.cursors.items[0] = .{
+                        .row = new_vcursor.logical_row,
+                        .col = new_vcursor.logical_col,
+                        .desired_col = new_vcursor.logical_col,
+                        .offset = new_vcursor.offset,
+                    };
+                    self.cursor_visual_affinity = null;
+                    if (boundary) self.setCursorAffinityForAbsoluteRow(target_visual_row);
+                }
+            } else if (target_visual_row < vlines.len) {
                 const target_vline = &vlines[target_visual_row];
                 const target_logical_row = @as(u32, @intCast(target_vline.source_line));
 
@@ -500,7 +521,34 @@ pub const EditorView = struct {
 
     pub fn setWrapMode(self: *EditorView, mode: tb.WrapMode) void {
         self.cursor_visual_affinity = null;
-        self.text_buffer_view.setWrapMode(mode);
+        const view = self.text_buffer_view;
+        const old_vp = view.getViewport();
+        if (view.wrap_mode == mode or old_vp == null) {
+            view.setWrapMode(mode);
+            return;
+        }
+        var vp = old_vp.?;
+
+        // The viewport's rows are virtual lines, which rewrapping renumbers:
+        // keep the text at the top of the viewport there.
+        view.updateVirtualLines();
+        const old_vlines = view.virtual_lines.items;
+        const top: ?struct { row: u32, col: u32 } = if (vp.y < old_vlines.len) .{
+            .row = @intCast(old_vlines[vp.y].source_line),
+            .col = old_vlines[vp.y].source_col_start,
+        } else null;
+
+        view.setWrapMode(mode);
+
+        // Wrapped lines fit the viewport's width: there is nothing to the side
+        // to scroll to, and ensureCursorVisible leaves x alone while wrapping.
+        if (mode != .none) vp.x = 0;
+        if (top) |t| {
+            const total = view.getVirtualLineCount();
+            const max_y = if (total > vp.height) total - vp.height else 0;
+            vp.y = @min(view.findVisualLineIndex(t.row, t.col), max_y);
+        }
+        view.setViewport(vp);
     }
 
     pub fn getPrimaryCursor(self: *const EditorView) eb.Cursor {
@@ -878,7 +926,8 @@ pub const EditorView = struct {
         const vline = &vlines[vcursor.visual_row];
         const viewport_width = if (self.text_buffer_view.getViewport()) |vp| vp.width else vline.width_cols;
         // Keep an overwide grapheme atomic instead of targeting a synthetic wrap cell.
-        const oversized_visual_line = vline.width_cols > viewport_width;
+        // Unwrapped, any line longer than the viewport is wider than it.
+        const oversized_visual_line = self.text_buffer_view.wrap_mode != .none and vline.width_cols > viewport_width;
         var target_visual_col = if (self.text_buffer_view.getSelectionOccupancy() == .boundary)
             vline.width_cols
         else if (oversized_visual_line)

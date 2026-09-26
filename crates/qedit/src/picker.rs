@@ -23,6 +23,7 @@ use opentui::{Attributes, Buffer, Rgba};
 use crate::file_index::FileIndex;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Context, Keymap};
+use crate::line_edit::{Caret, Edit};
 use crate::workspace::Workspace;
 
 /// The terminal's own background, as behind the editor; the border sets
@@ -114,6 +115,7 @@ impl Item {
 
 pub struct Picker {
     query: String,
+    caret: Caret,
     /// Recently opened files, most recent first. Listed before the rest.
     recent: Vec<Item>,
     /// The workspace's files, from the file index.
@@ -164,6 +166,7 @@ impl Picker {
             .collect();
         let mut picker = Picker {
             query: String::new(),
+            caret: Caret::default(),
             recent: recent
                 .into_iter()
                 .map(|path| Item::file(path, workspace, "recent"))
@@ -201,6 +204,7 @@ impl Picker {
             Mode::Files => needle,
             Mode::Commands => format!(">{needle}"),
         };
+        self.caret.move_to_end();
         self.query_changed();
     }
 
@@ -250,21 +254,11 @@ impl Picker {
         PickerAction::Continue
     }
 
-    /// Adds typed or pasted text to the query.
-    pub fn insert(&mut self, text: &str) {
-        self.query.push_str(text);
-        self.query_changed();
-    }
-
-    pub fn delete_backward(&mut self) {
-        self.query.pop();
-        self.query_changed();
-    }
-
-    /// Deletes back to the start of the word, or of the query after a `/`.
-    pub fn delete_word_backward(&mut self) {
-        delete_word_backward(&mut self.query);
-        self.query_changed();
+    /// Edits the query: typing, pasting, deleting, or moving the cursor.
+    pub fn edit(&mut self, edit: Edit) {
+        if self.caret.edit(&mut self.query, edit) {
+            self.query_changed();
+        }
     }
 
     /// A click on a result picks it; one outside the popup closes it.
@@ -458,13 +452,13 @@ impl Picker {
         draw_frame(frame, area, title);
         draw_status(frame, area, &self.status(noun));
 
-        // The query, its end kept in view.
+        // The query, the cursor kept in view.
         let text_x = x + 2;
         let room = width.saturating_sub(4) as usize;
-        let chars: Vec<char> = self.query.chars().collect();
-        let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
+        let (shown, column) = self.caret.view(&self.query, room);
+        let shown_width = shown.chars().count();
         frame.draw_text(&shown, text_x, y + 1, FG, None, Attributes::NONE);
-        let cursor = (text_x + shown.chars().count() as u32, y + 1);
+        let cursor = (text_x + column as u32, y + 1);
         if self.needle().is_empty() {
             let hint = match self.mode() {
                 Mode::Files => "Search files by name, or type > for commands",
@@ -472,9 +466,10 @@ impl Picker {
             };
             let hint: String = hint
                 .chars()
-                .take(room.saturating_sub(shown.chars().count() + 1))
+                .take(room.saturating_sub(shown_width + 1))
                 .collect();
-            frame.draw_text(&hint, cursor.0 + 1, y + 1, DIM, None, Attributes::NONE);
+            let hint_x = text_x + shown_width as u32 + 1;
+            frame.draw_text(&hint, hint_x, y + 1, DIM, None, Attributes::NONE);
         }
 
         let list = y + 3;
@@ -649,19 +644,6 @@ pub fn draw_status(frame: &Buffer, area: Area, status: &str) {
     frame.draw_text(status, x, y, DIM, None, Attributes::NONE);
 }
 
-/// Deletes the end of `query` back to the start of a word, or just one
-/// character of punctuation such as `/`.
-pub fn delete_word_backward(query: &mut String) {
-    let trimmed = query.trim_end_matches(char::is_whitespace);
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let start = match trimmed.chars().next_back() {
-        Some(c) if is_word(c) => trimmed.trim_end_matches(is_word).len(),
-        Some(c) => trimmed.len() - c.len_utf8(),
-        None => 0,
-    };
-    query.truncate(start);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,25 +699,46 @@ mod tests {
             &["abracadabra.rs", "src/about.rs", "crab.rs", "src/main.rs"],
         );
         let mut picker = picker(&root, Mode::Files, Vec::new());
-        picker.insert("abcr");
+        picker.edit(Edit::Insert("abcr"));
         assert_eq!(listed(&picker), ["abracadabra.rs"]);
-        picker.delete_backward();
-        picker.delete_backward();
+        picker.edit(Edit::DeleteBackward);
+        picker.edit(Edit::DeleteBackward);
         let mut ab = listed(&picker);
         ab.sort();
         assert_eq!(ab, ["abracadabra.rs", "crab.rs", "src/about.rs"]);
 
-        picker.delete_word_backward();
+        picker.edit(Edit::DeleteWordBackward);
         assert_eq!(picker.query, "");
-        picker.insert("main");
+        picker.edit(Edit::Insert("main"));
         assert_eq!(listed(&picker), ["src/main.rs"]);
+    }
+
+    #[test]
+    fn edits_the_query_at_the_cursor() {
+        let root = fixture("cursor", &["src/main.rs", "src/about.rs"]);
+        let mut picker = picker(&root, Mode::Files, Vec::new());
+        picker.edit(Edit::Insert("ain"));
+        picker.edit(Edit::Start);
+        picker.edit(Edit::Insert("m"));
+        assert_eq!(picker.query, "main");
+        assert_eq!(listed(&picker), ["src/main.rs"]);
+        picker.edit(Edit::Right);
+        picker.edit(Edit::DeleteForward);
+        assert_eq!(picker.query, "man");
+
+        // Deleting the `>` lists files.
+        picker.set_mode(Mode::Commands);
+        picker.edit(Edit::Start);
+        picker.edit(Edit::DeleteForward);
+        assert_eq!(picker.mode(), Mode::Files);
+        assert_eq!(picker.query, "man");
     }
 
     #[test]
     fn prefers_shorter_paths_among_equal_matches() {
         let root = fixture("shorter", &["deep/nested/mod.rs", "src/mod.rs"]);
         let mut picker = picker(&root, Mode::Files, Vec::new());
-        picker.insert("mod");
+        picker.edit(Edit::Insert("mod"));
         assert_eq!(listed(&picker), ["src/mod.rs", "deep/nested/mod.rs"]);
     }
 
@@ -745,7 +748,7 @@ mod tests {
         let recent = vec![root.join("c.rs"), root.join("b.rs")];
         let mut picker = picker(&root, Mode::Files, recent);
         assert_eq!(listed(&picker), ["c.rs", "b.rs", "a.rs"]);
-        picker.insert("rs");
+        picker.edit(Edit::Insert("rs"));
         assert_eq!(
             listed(&picker),
             ["c.rs", "b.rs", "a.rs"],
@@ -785,7 +788,7 @@ mod tests {
     fn a_leading_angle_bracket_lists_commands() {
         let root = fixture("commands", &["a.rs"]);
         let mut picker = picker(&root, Mode::Files, Vec::new());
-        picker.insert(">wrap");
+        picker.edit(Edit::Insert(">wrap"));
         assert_eq!(picker.mode(), Mode::Commands);
         assert_eq!(selected(&picker), "Toggle Word Wrap editor:toggle-wrap");
         assert_eq!(
@@ -796,12 +799,12 @@ mod tests {
         picker.set_mode(Mode::Files);
         assert_eq!(picker.query, "wrap");
         picker.set_mode(Mode::Commands);
-        picker.delete_word_backward();
-        picker.insert("select-all");
+        picker.edit(Edit::DeleteWordBackward);
+        picker.edit(Edit::Insert("select-all"));
         assert_eq!(selected(&picker), "Select All editor:select-all");
 
         // Picker navigation isn't listed.
-        picker.delete_word_backward();
+        picker.edit(Edit::DeleteWordBackward);
         assert_eq!(picker.query, ">select-");
         picker.query = ">".to_string();
         picker.query_changed();
@@ -863,7 +866,7 @@ mod tests {
             60,
             12,
         );
-        picker.insert("name");
+        picker.edit(Edit::Insert("name"));
         let screen =
             opentui::OwnedBuffer::new(60, 12, false, opentui::WidthMethod::Unicode, "test")
                 .unwrap();

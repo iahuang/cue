@@ -21,6 +21,7 @@ use crate::history::{EditKind, History};
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
 use crate::language::{self, Language};
+use crate::line_edit::Edit;
 use crate::search::Toggle;
 use crate::syntax::{self, Highlighter};
 use crate::theme::{self, Theme};
@@ -977,6 +978,7 @@ impl Editor {
         if let Some(text) = selected {
             if text != bar.memory.query.text {
                 bar.memory.query.text = text;
+                bar.carets[Field::Find as usize].move_to_end();
                 bar.epoch = None;
             }
             bar.origin = origin;
@@ -1045,24 +1047,11 @@ impl Editor {
         }
     }
 
-    /// Adds typed or pasted text to the focused find bar field.
-    pub fn find_insert(&mut self, text: &str) {
+    /// Edits the focused find bar field: typing, pasting, deleting, or
+    /// moving the cursor.
+    pub fn find_edit(&mut self, edit: Edit) {
         if let Some(bar) = &mut self.find {
-            bar.insert(text);
-        }
-        self.sync_find();
-    }
-
-    pub fn find_delete_backward(&mut self) {
-        if let Some(bar) = &mut self.find {
-            bar.delete_backward();
-        }
-        self.sync_find();
-    }
-
-    pub fn find_delete_word_backward(&mut self) {
-        if let Some(bar) = &mut self.find {
-            bar.delete_word_backward();
+            bar.edit(edit);
         }
         self.sync_find();
     }
@@ -2357,6 +2346,73 @@ mod tests {
         assert_eq!(editor.selected_text(), None);
     }
 
+    #[test]
+    fn wrapping_drops_the_sideways_scroll_and_keeps_the_top_line() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let long = "abcdefghij ".repeat(20);
+        let mut lines: Vec<String> = (0..60).map(|i| format!("line {i}")).collect();
+        for line in &mut lines[..5] {
+            *line = long.clone();
+        }
+        lines[30] = long.clone();
+        eb.set_text(&lines.join("\n"));
+        eb.set_cursor(30, 0);
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 16).unwrap();
+        // End goes to the end of a line wider than the view.
+        key(&mut editor, KeyCode::End);
+        assert_eq!(eb.cursor().col, long.len() as u32);
+        key(&mut editor, KeyCode::Home);
+        eb.set_cursor(30, 150);
+        let _ = screen_lines(&editor, 40, 16);
+        let vp = editor.view.viewport();
+        assert!(vp.x > 0, "scrolled sideways to the cursor: {vp:?}");
+        editor.view.scroll_to(vp.x, 26, false);
+        let (lines, _) = screen_lines(&editor, 40, 16);
+        assert_eq!(lines[0], " 27", "{lines:?}");
+
+        editor.toggle_wrap();
+        let (lines, cursor) = screen_lines(&editor, 40, 16);
+        assert_eq!(editor.view.viewport().x, 0);
+        assert_eq!(lines[0], " 27  line 26", "{lines:?}");
+        assert!(lines[cursor.1 as usize].contains("abcdefghij"), "{lines:?}");
+
+        editor.toggle_wrap();
+        let (lines, _) = screen_lines(&editor, 40, 16);
+        assert!(lines[0].starts_with(" 27"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_past_long_wrapped_lines() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let long = "abcdefghij ".repeat(60);
+        let mut lines: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        lines[10] = long.clone();
+        lines[25] = long;
+        eb.set_text(&lines.join("\n"));
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 10).unwrap();
+        editor.toggle_wrap();
+        let _ = screen_lines(&editor, 40, 10);
+        let vp = editor.view.viewport();
+        let max_y = editor.view.total_virtual_line_count() - vp.height;
+        let mut y = 0;
+        while y < max_y {
+            editor.scroll(0, 3);
+            let _ = screen_lines(&editor, 40, 10);
+            let next = editor.view.viewport().y;
+            assert_eq!(next, (y + 3).min(max_y), "scrolling down from {y}");
+            y = next;
+        }
+        while y > 0 {
+            editor.scroll(0, -3);
+            let _ = screen_lines(&editor, 40, 10);
+            let next = editor.view.viewport().y;
+            assert_eq!(next, y.saturating_sub(3), "scrolling up from {y}");
+            y = next;
+        }
+    }
+
     /// The text of `row`, trimmed, and which of its columns have `bg`.
     fn row_with_bg(
         editor: &Editor,
@@ -2390,7 +2446,7 @@ mod tests {
 
     fn find_query(editor: &mut Editor, text: &str) {
         editor.show_find(&find::Memory::default(), false);
-        editor.find_insert(text);
+        editor.find_edit(Edit::Insert(text));
     }
 
     #[test]
@@ -2402,7 +2458,7 @@ mod tests {
         let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 100, 6).unwrap();
         eb.set_cursor(0, 1);
         find_query(&mut editor, "a");
-        editor.find_insert("b");
+        editor.find_edit(Edit::Insert("b"));
         assert_eq!(editor.selected_text().as_deref(), Some("ab"));
         assert_eq!(pos(&eb), (0, 6), "the first match after the cursor");
         let (text, current) = row_with_bg(&editor, 100, 6, 0, CURRENT_MATCH.bg);
@@ -2429,14 +2485,14 @@ mod tests {
         assert_eq!(pos(&eb), (2, 3), "and back");
 
         // No match: nothing selected, the cursor back where finding started.
-        editor.find_insert("zz");
+        editor.find_edit(Edit::Insert("zz"));
         assert_eq!(editor.selected_text(), None);
         assert_eq!(pos(&eb), (2, 1));
         assert!(row_with_bg(&editor, 100, 6, 0, MATCH_BG)
             .0
             .contains("no matches"));
-        editor.find_delete_backward();
-        editor.find_delete_backward();
+        editor.find_edit(Edit::DeleteBackward);
+        editor.find_edit(Edit::DeleteBackward);
         assert_eq!(pos(&eb), (2, 3));
 
         // Closing leaves the match selected, without highlights.
@@ -2685,7 +2741,7 @@ mod tests {
             None,
             "opening doesn't move the cursor"
         );
-        editor.find_insert("f");
+        editor.find_edit(Edit::Insert("f"));
         assert_eq!(
             editor.find_memory().unwrap().query.text,
             "f",
@@ -2703,7 +2759,7 @@ mod tests {
         // An invalid regex says why in the status bar.
         let mut clipboard = None;
         editor.run(Command::SearchToggleRegex, false, &mut clipboard);
-        editor.find_insert("(");
+        editor.find_edit(Edit::Insert("("));
         let (status, _) = row_with_bg(&editor, 40, 6, 5, MATCH_BG);
         assert!(status.contains("Invalid regex: "), "{status}");
         assert!(row_with_bg(&editor, 40, 6, 0, MATCH_BG)
@@ -2749,7 +2805,7 @@ mod tests {
         // The expander shows the replacement; its buttons replace.
         click(&mut editor, column(&row, "▸"), 0);
         assert_eq!(editor.find_field(), Some(Field::Replace));
-        editor.find_insert("bar");
+        editor.find_edit(Edit::Insert("bar"));
         let (replace_row, _) = row_with_bg(&editor, 40, 6, 1, MATCH_BG);
         click(&mut editor, column(&replace_row, "all"), 1);
         assert_eq!(eb.text(), "Foo bar");
