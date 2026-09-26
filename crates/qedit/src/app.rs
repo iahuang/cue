@@ -21,8 +21,15 @@
 //!
 //! Each editor has its own find bar (Ctrl+F); the app remembers the last
 //! query, so finding in another file starts from it.
+//!
+//! Terminals (Ctrl+Alt+T) are the app's too, like open files: a panel shows
+//! one, and it keeps running when the panel moves on. While one has the
+//! keyboard, keys go to its shell, but for a few (see
+//! [`Keymap::lookup_terminal`]).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
@@ -33,14 +40,15 @@ use crate::document::{self, Document};
 use crate::editor::{Action, Editor};
 use crate::file_index::FileIndex;
 use crate::find;
-use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
+use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
 use crate::layout::{self, Axis, Direction, Layout, PanelId, Rect};
 use crate::line_edit::Edit;
 use crate::panel::Panel;
-use crate::picker::{Choice, Mode, Picker, PickerAction};
+use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::status;
+use crate::terminal::Terminal;
 use crate::theme::Theme;
 use crate::tree::{FileTree, TreeAction};
 use crate::workspace::Workspace;
@@ -56,8 +64,16 @@ const DEFAULT_TREE_WIDTH: u32 = 30;
 const MIN_TREE_WIDTH: u32 = 12;
 /// The tree hides rather than leave the panels narrower than this.
 const MIN_EDITOR_WIDTH: u32 = 40;
-/// How many recently shown files the picker lists first.
+/// How many recently shown files and terminals the picker lists first.
 const RECENT_FILES: usize = 50;
+
+/// Something a panel showed, for the picker to list first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Recent {
+    File(PathBuf),
+    /// A terminal, by id.
+    Terminal(u32),
+}
 
 /// What the main loop should do after the app handled input.
 pub enum AppAction {
@@ -119,6 +135,16 @@ pub struct App {
     documents: Vec<Rc<Document>>,
     /// The styles every editor's highlights use.
     theme: Rc<Theme>,
+    /// Running terminals, and exited ones still shown, in the order they
+    /// were started.
+    terminals: Vec<Rc<RefCell<Terminal>>>,
+    /// The id for the next new terminal.
+    next_terminal: u32,
+    /// The terminal prefix (Ctrl+`) was pressed: the next key is a qedit
+    /// shortcut.
+    terminal_prefix: bool,
+    /// The terminal last told it has the keyboard.
+    focused_terminal: Option<Rc<RefCell<Terminal>>>,
     layout: Layout,
     /// The panels in the layout, in no particular order. Never empty.
     panels: Vec<Panel>,
@@ -145,8 +171,8 @@ pub struct App {
     picker: Option<Picker>,
     /// Every file in the workspace, for the picker.
     files: FileIndex,
-    /// Files shown in the editor, most recent first.
-    recent: Vec<PathBuf>,
+    /// Files and terminals shown in the active panel, most recent first.
+    recent: Vec<Recent>,
     /// Workspace search, while open. Never open with the picker.
     search: Option<SearchModal>,
     /// What the last search left behind, for the next one.
@@ -216,6 +242,10 @@ impl App {
             tree,
             documents: vec![doc.clone()],
             theme,
+            terminals: Vec::new(),
+            next_terminal: 1,
+            terminal_prefix: false,
+            focused_terminal: None,
             layout: Layout::Panel(0),
             panels: vec![Panel::new(0)],
             active: 0,
@@ -260,6 +290,33 @@ impl App {
 
     fn dispatch_key(&mut self, key: Key) -> AppAction {
         self.active_panel_mut().clear_message();
+        let prefixed = std::mem::take(&mut self.terminal_prefix);
+        if let Some(terminal) = self.keyboard_terminal() {
+            if terminal.borrow().exit().is_none() {
+                let command = self.keymap.lookup_terminal(key);
+                if command != Some(Command::Quit) {
+                    self.quit_armed = false;
+                }
+                if prefixed {
+                    return self.prefixed_key(&terminal, key);
+                }
+                return match command {
+                    Some(command) => self.run(command, false),
+                    None => {
+                        terminal.borrow_mut().send_key(key);
+                        AppAction::Continue
+                    }
+                };
+            }
+            // With the shell gone, keys are qedit's, but Enter starts a
+            // new one.
+            if key == Key::new(KeyCode::Enter, Mods::NONE) {
+                if let Err(err) = terminal.borrow_mut().restart() {
+                    self.show_message(format!("Can't start a shell: {err}"), true);
+                }
+                return AppAction::Continue;
+            }
+        }
         if self.editor().is_some_and(Editor::prompt_open) {
             let action = match self.editor_mut() {
                 Some(editor) => editor.handle_prompt_key(key),
@@ -395,6 +452,18 @@ impl App {
             Command::FocusPanelRight => self.focus_panel(Direction::Right),
             Command::FocusPanelUp => self.focus_panel(Direction::Up),
             Command::FocusPanelDown => self.focus_panel(Direction::Down),
+            Command::NewTerminal => self.new_terminal(),
+            Command::TerminalPrefix if self.keyboard_terminal().is_some() => {
+                self.terminal_prefix = true;
+                let message = format!(
+                    "Next shortcut goes to qedit; {} again sends it to the shell.",
+                    self.shortcut(Command::TerminalPrefix)
+                );
+                self.show_message(message, false);
+            }
+            Command::Copy | Command::Cut | Command::Paste if self.active_terminal().is_some() => {
+                return self.terminal_clipboard(command);
+            }
             Command::Find | Command::FindReplace => {
                 self.focus = Focus::Editor;
                 let memory = self.find_memory.clone();
@@ -490,8 +559,9 @@ impl App {
         };
         if let MouseKind::Press(_) = mouse.kind {
             // Like a key press, a click dismisses messages, the quit
-            // confirmation, and the "Save as" prompt.
+            // confirmation, the terminal prefix, and the "Save as" prompt.
             self.quit_armed = false;
+            self.terminal_prefix = false;
             self.active_panel_mut().clear_message();
             if let Some(editor) = self.editor_mut() {
                 editor.cancel_prompt();
@@ -649,7 +719,12 @@ impl App {
 
     /// Text pasted through the terminal.
     pub fn paste(&mut self, text: &str) {
-        if let Some(input) = self.query_input() {
+        let terminal = self
+            .keyboard_terminal()
+            .filter(|terminal| terminal.borrow().exit().is_none());
+        if let Some(terminal) = terminal {
+            terminal.borrow_mut().paste(text);
+        } else if let Some(input) = self.query_input() {
             // Terminals send newlines in pastes as CR.
             let line = text.split(['\r', '\n']).next().unwrap_or("");
             input.edit(Edit::Insert(line));
@@ -673,6 +748,7 @@ impl App {
             doc.follow_edits();
         }
         self.editor_mut();
+        self.note_terminal_focus();
     }
 
     /// Draws the frame and returns where the terminal cursor goes (0-based
@@ -725,20 +801,34 @@ impl App {
         cursor.filter(|_| self.focus == Focus::Editor)
     }
 
-    /// Catches up on work in the background: listing the workspace's files
-    /// and searching them. Returns whether the screen needs redrawing.
+    /// Catches up on work in the background: output from terminals, and
+    /// listing the workspace's files and searching them. Returns whether the
+    /// screen needs redrawing.
     pub fn poll(&mut self) -> bool {
-        let searched = self.search.as_mut().is_some_and(SearchModal::poll);
-        if !self.files.poll() {
-            return searched;
+        let mut changed = false;
+        for terminal in &self.terminals {
+            changed |= terminal.borrow_mut().poll();
         }
-        match &mut self.picker {
-            Some(picker) => {
+        if changed {
+            self.prune_terminals();
+        }
+        changed |= self.search.as_mut().is_some_and(SearchModal::poll);
+        if self.files.poll() {
+            if let Some(picker) = &mut self.picker {
                 picker.set_files(&self.files);
-                true
+                changed = true;
             }
-            None => searched,
         }
+        changed
+    }
+
+    /// The terminals' ptys, to wait on with the keyboard: for output, and
+    /// with `true`, for taking input that's waiting.
+    pub fn watched(&self) -> Vec<(RawFd, bool)> {
+        self.terminals
+            .iter()
+            .filter_map(|terminal| terminal.borrow().watch())
+            .collect()
     }
 
     // --- panels -----------------------------------------------------------------
@@ -792,6 +882,7 @@ impl App {
             }
         }
         self.prune_documents();
+        self.prune_terminals();
     }
 
     /// Moves the keyboard to the panel next to the active one in
@@ -844,18 +935,9 @@ impl App {
                     // which is shown until this one is done.
                     self.files.refresh();
                 }
-                // Listed first, most recent first. The file on screen is left
-                // out so that Enter goes back to the previous one.
-                let shown = self.editor().and_then(Editor::path);
-                let recent = self
-                    .recent
-                    .iter()
-                    .filter(|path| shown.as_ref() != Some(*path) && path.is_file())
-                    .cloned()
-                    .collect();
+                let recent = self.recent_items();
                 self.picker = Some(Picker::new(
                     mode,
-                    &self.workspace,
                     &self.keymap,
                     recent,
                     &self.files,
@@ -879,6 +961,12 @@ impl App {
                         }
                     }
                     Choice::Command(command) => return self.run(command, false),
+                    Choice::Terminal(id) => {
+                        let terminal = self.terminals.iter().find(|t| t.borrow().id() == id);
+                        if let Some(terminal) = terminal.cloned() {
+                            self.show_terminal(terminal);
+                        }
+                    }
                 }
             }
         }
@@ -964,6 +1052,7 @@ impl App {
             editor.blur_find();
         }
         let existing = self.find_document(&path);
+        let had_terminal = self.panels[active].terminal().is_some();
         let (doc, notice) = match &existing {
             Some(doc) => (doc.clone(), None),
             None => match Document::open(Some(path.clone()), self.theme.clone()) {
@@ -1010,6 +1099,9 @@ impl App {
             self.preview = None;
         }
         self.prune_documents();
+        if had_terminal {
+            self.prune_terminals();
+        }
         self.show_active_in_tree();
         true
     }
@@ -1060,14 +1152,59 @@ impl App {
         self.preview.as_ref().is_some_and(|p| Rc::ptr_eq(p, doc))
     }
 
-    /// Moves the file on screen to the front of the recent files.
+    /// Moves the file or terminal on screen to the front of the recent
+    /// ones.
     fn note_recent(&mut self) {
-        let Some(path) = self.editor().and_then(Editor::path) else {
-            return;
+        let shown = match (self.active_terminal(), self.editor().and_then(Editor::path)) {
+            (Some(terminal), _) => Recent::Terminal(terminal.borrow().id()),
+            (None, Some(path)) => Recent::File(path),
+            (None, None) => return,
         };
-        self.recent.retain(|recent| *recent != path);
-        self.recent.insert(0, path);
+        self.recent.retain(|recent| *recent != shown);
+        self.recent.insert(0, shown);
         self.recent.truncate(RECENT_FILES);
+    }
+
+    /// What the picker lists first: the files and terminals shown recently,
+    /// most recent first, then any other terminals. What's on screen is
+    /// left out, so that Enter goes back to what was shown before it.
+    fn recent_items(&self) -> Vec<Item> {
+        let shown = match (self.active_terminal(), self.editor().and_then(Editor::path)) {
+            (Some(terminal), _) => Some(Recent::Terminal(terminal.borrow().id())),
+            (None, Some(path)) => Some(Recent::File(path)),
+            (None, None) => None,
+        };
+        let terminal_item = |terminal: &Rc<RefCell<Terminal>>| {
+            let terminal = terminal.borrow();
+            let running = match terminal.exit() {
+                Some(_) => "exited".to_string(),
+                None => terminal.program().unwrap_or_default(),
+            };
+            Item::terminal(terminal.id(), &terminal.name(), &running)
+        };
+        let mut items: Vec<Item> = self
+            .recent
+            .iter()
+            .filter(|recent| shown.as_ref() != Some(*recent))
+            .filter_map(|recent| match recent {
+                Recent::File(path) => path
+                    .is_file()
+                    .then(|| Item::file(path.clone(), &self.workspace, "recent")),
+                Recent::Terminal(id) => self
+                    .terminals
+                    .iter()
+                    .find(|terminal| terminal.borrow().id() == *id)
+                    .map(terminal_item),
+            })
+            .collect();
+        for terminal in &self.terminals {
+            let id = terminal.borrow().id();
+            let listed = self.recent.contains(&Recent::Terminal(id));
+            if !listed && shown != Some(Recent::Terminal(id)) {
+                items.push(terminal_item(terminal));
+            }
+        }
+        items
     }
 
     /// The open file at `path`, however it was named.
@@ -1112,16 +1249,40 @@ impl App {
                 None => "[new file]".to_string(),
             })
             .collect();
-        if unsaved.is_empty() || self.quit_armed {
+        let running: Vec<String> = self
+            .terminals
+            .iter()
+            .map(|terminal| terminal.borrow())
+            .filter(|terminal| terminal.is_busy())
+            .map(|terminal| {
+                terminal
+                    .program()
+                    .unwrap_or_else(|| "A program".to_string())
+            })
+            .collect();
+        if (unsaved.is_empty() && running.is_empty()) || self.quit_armed {
             return AppAction::Quit;
         }
         self.quit_armed = true;
-        let message = format!(
-            "Unsaved changes in {}. {} again to quit, {} to save.",
-            unsaved.join(", "),
-            self.shortcut(Command::Quit),
-            self.shortcut(Command::Save),
-        );
+        let mut reasons = Vec::new();
+        if !unsaved.is_empty() {
+            reasons.push(format!("Unsaved changes in {}.", unsaved.join(", ")));
+        }
+        match running.as_slice() {
+            [] => {}
+            [program] => reasons.push(format!("{program} is running in a terminal.")),
+            programs => reasons.push(format!("{} are running in terminals.", programs.join(", "))),
+        }
+        let quit = self.shortcut(Command::Quit);
+        let message = if unsaved.is_empty() {
+            format!("{} {quit} again to quit.", reasons.join(" "))
+        } else {
+            let save = self.shortcut(Command::Save);
+            format!(
+                "{} {quit} again to quit, {save} to save.",
+                reasons.join(" ")
+            )
+        };
         self.show_message(message, true);
         AppAction::Continue
     }
@@ -1154,6 +1315,140 @@ impl App {
             }
             Action::SaveAs(input) => self.save_as(&input),
         }
+    }
+
+    // --- terminals --------------------------------------------------------------
+
+    /// Starts a shell in the workspace's first folder, in the active panel.
+    fn new_terminal(&mut self) {
+        let cwd = match self.workspace.roots().first() {
+            Some(root) => root.clone(),
+            None => std::env::current_dir().unwrap_or_default(),
+        };
+        let body = self.active_panel().body();
+        let id = self.next_terminal;
+        match Terminal::new(id, &cwd, body) {
+            Ok(terminal) => {
+                self.next_terminal += 1;
+                let terminal = Rc::new(RefCell::new(terminal));
+                self.terminals.push(terminal.clone());
+                self.show_terminal(terminal);
+            }
+            Err(err) => self.show_message(format!("Can't start a shell: {err}"), true),
+        }
+    }
+
+    /// Shows `terminal` in the active panel, and gives it the keyboard. It
+    /// leaves any other panel showing it, since its pty has one size.
+    fn show_terminal(&mut self, terminal: Rc<RefCell<Terminal>>) {
+        for panel in &mut self.panels {
+            if panel
+                .terminal()
+                .is_some_and(|shown| Rc::ptr_eq(shown, &terminal))
+            {
+                panel.hide_terminal();
+            }
+        }
+        self.active_panel_mut().show_terminal(terminal);
+        self.focus = Focus::Editor;
+        self.prune_documents();
+        self.prune_terminals();
+        self.show_active_in_tree();
+    }
+
+    /// The terminal in the active panel, if any.
+    fn active_terminal(&self) -> Option<Rc<RefCell<Terminal>>> {
+        self.active_panel().terminal().cloned()
+    }
+
+    /// The terminal keys go to, if one has the keyboard.
+    fn keyboard_terminal(&self) -> Option<Rc<RefCell<Terminal>>> {
+        let popup = self.picker.is_some() || self.search.is_some();
+        if self.focus != Focus::Editor || popup {
+            return None;
+        }
+        self.active_terminal()
+    }
+
+    /// A key after the terminal prefix: a qedit shortcut, as if no terminal
+    /// had the keyboard. The prefix again goes to the shell, and Esc
+    /// cancels.
+    fn prefixed_key(&mut self, terminal: &Rc<RefCell<Terminal>>, key: Key) -> AppAction {
+        if self.keymap.lookup_terminal(key) == Some(Command::TerminalPrefix) {
+            terminal.borrow_mut().send_key(key);
+            return AppAction::Continue;
+        }
+        if key == Key::new(KeyCode::Esc, Mods::NONE) {
+            return AppAction::Continue;
+        }
+        match self.keymap.lookup(key, Context::Editor) {
+            Some((command, select)) => self.run(command, select),
+            None => {
+                self.show_message(format!("{key} isn't a qedit shortcut."), false);
+                AppAction::Continue
+            }
+        }
+    }
+
+    /// Copies the active terminal's selection, or pastes the last text
+    /// copied in qedit into it. (The terminal qedit runs in pastes its own
+    /// clipboard itself.)
+    fn terminal_clipboard(&mut self, command: Command) -> AppAction {
+        let Some(terminal) = self.active_terminal() else {
+            return AppAction::Continue;
+        };
+        if command == Command::Paste {
+            if let Some(text) = self.clipboard.clone() {
+                if terminal.borrow().exit().is_none() {
+                    terminal.borrow_mut().paste(&text);
+                }
+            }
+            return AppAction::Continue;
+        }
+        let Some(text) = terminal.borrow().selected_text() else {
+            return AppAction::Continue;
+        };
+        self.clipboard = Some(text.clone());
+        AppAction::Copy(text)
+    }
+
+    /// Tells terminals when they get or lose the keyboard, for programs
+    /// that asked to know.
+    fn note_terminal_focus(&mut self) {
+        let focused = self.keyboard_terminal();
+        let same = match (&focused, &self.focused_terminal) {
+            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        if let Some(old) = self.focused_terminal.take() {
+            old.borrow_mut().focus(false);
+        }
+        if let Some(new) = &focused {
+            new.borrow_mut().focus(true);
+        }
+        self.focused_terminal = focused;
+    }
+
+    /// Closes terminals whose shell exited and that no panel shows.
+    fn prune_terminals(&mut self) {
+        let panels = &self.panels;
+        self.terminals.retain(|terminal| {
+            terminal.borrow().exit().is_none()
+                || panels.iter().any(|panel| {
+                    panel
+                        .terminal()
+                        .is_some_and(|shown| Rc::ptr_eq(shown, terminal))
+                })
+        });
+        let terminals = &self.terminals;
+        self.recent.retain(|recent| match recent {
+            Recent::File(_) => true,
+            Recent::Terminal(id) => terminals.iter().any(|t| t.borrow().id() == *id),
+        });
     }
 
     // --- layout and helpers ----------------------------------------------------
@@ -1283,6 +1578,10 @@ mod tests {
         fn ed_mut(&mut self) -> &mut Editor {
             self.editor_mut().expect("a file is shown")
         }
+
+        fn ed_is_shown(&self) -> bool {
+            self.editor().is_some()
+        }
     }
 
     fn app(root: &Path, file: Option<&str>) -> App {
@@ -1406,6 +1705,106 @@ mod tests {
         ctrl(&mut app, 'v');
         assert!(screen(&app).contains("copy me"));
         assert!(app.ed().is_modified());
+    }
+
+    /// Polls `app` until `done`, or panics after a few seconds.
+    fn wait_until(app: &mut App, what: &str, mut done: impl FnMut(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(app) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}:\n{}",
+                screen(app)
+            );
+            app.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn terminals_take_the_keyboard_and_outlive_their_panel() {
+        let _serial = crate::test_serial();
+        let root = fixture("terminal", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        let ctrl_alt = Mods {
+            alt: true,
+            ..Mods::CTRL
+        };
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('t'), ctrl_alt));
+        assert!(app.active_terminal().is_some());
+        assert!(app.editor().is_none());
+        assert_eq!(app.focus, Focus::Editor);
+
+        type_text(&mut app, "echo $((6*7))");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the shell's output", |app| {
+            screen(app)
+                .lines()
+                .any(|line| line.trim_end().ends_with("│42"))
+        });
+        assert!(!app.ed_is_shown(), "typing went to the shell");
+
+        // Ctrl+Shift+P is qedit's; Ctrl+P would be the shell's.
+        app.handle_key(Key::new(KeyCode::Char('p'), ctrl_shift));
+        assert!(app.picker.is_some());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none());
+
+        // So is Ctrl+P after the prefix, Ctrl+`, which the status bar hints.
+        assert!(screen(&app).contains("^` qedit keys"), "{}", screen(&app));
+        let prefix = Key::new(KeyCode::Char('`'), Mods::CTRL);
+        app.handle_key(prefix);
+        assert!(screen(&app).contains("Next shortcut goes to qedit"));
+        ctrl(&mut app, 'p');
+        assert!(app.picker.is_some());
+        key(&mut app, KeyCode::Esc);
+        // Esc after it cancels; a key that's no shortcut says so.
+        app.handle_key(prefix);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.terminal_prefix);
+        app.handle_key(prefix);
+        ctrl(&mut app, 'j');
+        assert!(screen(&app).contains("Ctrl+J isn't a qedit shortcut."));
+        assert!(app.picker.is_none());
+
+        // A program running keeps quitting from being immediate.
+        type_text(&mut app, "sleep 30");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "sleep to run", |app| {
+            app.terminals[0].borrow().is_busy()
+        });
+        let quit = Key::new(KeyCode::Char('q'), ctrl_shift);
+        assert!(matches!(app.handle_key(quit), AppAction::Continue));
+        assert!(
+            screen(&app).contains("sleep is running in a terminal."),
+            "{}",
+            screen(&app)
+        );
+
+        // Opening a file replaces the terminal, which keeps running.
+        app.open(&root.join("a.txt"), false);
+        assert!(app.active_terminal().is_none());
+        assert!(screen(&app).contains("alpha"));
+        assert_eq!(app.terminals.len(), 1);
+        assert!(app.terminals[0].borrow().exit().is_none());
+
+        // The picker lists it first, as the last thing shown: Enter goes back.
+        ctrl(&mut app, 'p');
+        assert!(
+            screen(&app).contains("Terminal 1 sleep"),
+            "{}",
+            screen(&app)
+        );
+        key(&mut app, KeyCode::Enter);
+        assert!(app.active_terminal().is_some());
+        // And from there, back to the file.
+        app.handle_key(Key::new(KeyCode::Char('p'), ctrl_shift));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.ed().path().is_some_and(|path| path.ends_with("a.txt")));
     }
 
     #[test]

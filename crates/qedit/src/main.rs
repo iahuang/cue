@@ -13,6 +13,7 @@ mod layout;
 mod line_edit;
 mod panel;
 mod picker;
+mod pty;
 mod search;
 mod search_modal;
 mod status;
@@ -20,6 +21,7 @@ mod syntax;
 mod terminal;
 mod theme;
 mod tree;
+mod tty;
 mod words;
 mod workspace;
 
@@ -39,6 +41,9 @@ use workspace::Workspace;
 const ESC_TIMEOUT: Duration = Duration::from_millis(30);
 /// Upper bound on a wait, so terminal resizes are picked up promptly.
 const IDLE_POLL: Duration = Duration::from_millis(100);
+/// While output streams into a terminal, the screen is drawn at most this
+/// often, so drawing doesn't slow reading it.
+const FRAME: Duration = Duration::from_millis(8);
 
 fn main() -> ExitCode {
     // The renderer restores the terminal when dropped during unwinding; hold
@@ -112,7 +117,7 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
         None => (cwd, None),
     };
     let workspace = Workspace::new([root])?;
-    let (mut width, mut height) = terminal::size();
+    let (mut width, mut height) = tty::size();
     let mut app = App::new(workspace, file, width, height)?;
 
     let mut renderer = Renderer::new(width, height, Output::Stdout)?;
@@ -121,6 +126,9 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     renderer.enable_mouse(false);
     let mut parser = Parser::new();
 
+    // When stdin last had input, to tell a lone ESC from the start of a
+    // sequence split across reads.
+    let mut last_input = Instant::now();
     loop {
         {
             let frame = renderer.next_buffer()?;
@@ -130,21 +138,31 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         renderer.render(false);
+        let drawn = Instant::now();
 
-        // Wait for input; after a partial sequence, only briefly.
+        // Wait for input, or output in a terminal; after a partial
+        // sequence, only briefly.
+        let mut changed = false;
         let mut events = loop {
-            let timeout = if parser.has_pending() {
-                ESC_TIMEOUT
-            } else {
-                IDLE_POLL
-            };
-            let bytes = terminal::read_input(timeout)?;
-            let events = if bytes.is_empty() {
+            let mut timeout = IDLE_POLL;
+            if parser.has_pending() {
+                timeout = timeout.min(ESC_TIMEOUT.saturating_sub(last_input.elapsed()));
+            }
+            if changed {
+                timeout = timeout.min(FRAME.saturating_sub(drawn.elapsed()));
+            }
+            let bytes = tty::read_input(timeout, &app.watched())?;
+            let events = if !bytes.is_empty() {
+                last_input = Instant::now();
+                parser.feed(&bytes)
+            } else if parser.has_pending() && last_input.elapsed() >= ESC_TIMEOUT {
                 parser.flush()
             } else {
-                parser.feed(&bytes)
+                Vec::new()
             };
-            if !events.is_empty() || terminal::size() != (width, height) || app.poll() {
+            changed |= app.poll();
+            let resized = tty::size() != (width, height);
+            if !events.is_empty() || resized || (changed && drawn.elapsed() >= FRAME) {
                 break events;
             }
         };
@@ -171,7 +189,7 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let size = terminal::size();
+        let size = tty::size();
         if size != (width, height) {
             (width, height) = size;
             renderer.resize(width, height);

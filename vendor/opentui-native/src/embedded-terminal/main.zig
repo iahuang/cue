@@ -40,6 +40,7 @@ pub const EmbeddedTerminal = struct {
     mouse_last_cell: ?ghostty.Coordinate = null,
     force_redraw: bool = true,
     transparent_background: bool = false,
+    host_palette: bool = false,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, options: Options) Error!*EmbeddedTerminal {
         if (options.cols == 0 or options.rows == 0) return error.InvalidValue;
@@ -96,6 +97,19 @@ pub const EmbeddedTerminal = struct {
         self.terminal.scrollViewport(.{ .delta = delta });
     }
 
+    pub fn scrollToBottom(self: *EmbeddedTerminal) void {
+        self.terminal.scrollViewport(.bottom);
+    }
+
+    pub fn isAlternateScreen(self: *EmbeddedTerminal) bool {
+        return self.terminal.screens.active_key == .alternate;
+    }
+
+    /// The title set by escape sequences (OSC 0/2), or "".
+    pub fn title(self: *EmbeddedTerminal) [:0]const u8 {
+        return self.terminal.getTitle() orelse "";
+    }
+
     pub fn setSelection(self: *EmbeddedTerminal, start: ghostty.Coordinate, end: ghostty.Coordinate) Error!void {
         const screen = self.terminal.screens.active;
         const start_pin = screen.pages.pin(.{ .viewport = start }) orelse return error.InvalidValue;
@@ -126,6 +140,15 @@ pub const EmbeddedTerminal = struct {
         self.force_redraw = true;
     }
 
+    /// Composes default and palette colors as the host terminal's own
+    /// (SGR 39/49 and indexed colors), so they follow its theme, rather
+    /// than as RGB from Ghostty's palette. Inverse video and the selection
+    /// become the inverse attribute, which the host applies.
+    pub fn setHostPalette(self: *EmbeddedTerminal, enabled: bool) void {
+        self.host_palette = enabled;
+        self.force_redraw = true;
+    }
+
     pub fn compose(self: *EmbeddedTerminal, target: *buffer.OptimizedBuffer, x: i32, y: i32) Error!void {
         self.render_state.update(self.allocator, &self.terminal) catch |err| {
             self.render_state.deinit(self.allocator);
@@ -137,7 +160,10 @@ pub const EmbeddedTerminal = struct {
             self.render_state.dirty = .full;
             self.force_redraw = false;
         }
-        try compositor.compose(self.allocator, &self.render_state, target, x, y, self.transparent_background);
+        try compositor.compose(self.allocator, &self.render_state, target, x, y, .{
+            .transparent_background = self.transparent_background,
+            .host_palette = self.host_palette,
+        });
     }
 
     pub fn cursor(self: *EmbeddedTerminal) Cursor {
@@ -162,9 +188,13 @@ pub const EmbeddedTerminal = struct {
     }
 
     pub fn encodeKey(self: *EmbeddedTerminal, key: ghostty.Key) Error![]u8 {
+        var options: ghostty.KeyEncodeOptions = .fromTerminal(&self.terminal);
+        // Keys come from the host terminal, which already decided whether
+        // Option is Alt: a key reported with Alt is meant as Alt.
+        options.macos_option_as_alt = .true;
         var output: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer output.deinit();
-        ghostty.encodeKey(&output.writer, key.event(), .fromTerminal(&self.terminal)) catch return error.OutOfMemory;
+        ghostty.encodeKey(&output.writer, key.event(), options) catch return error.OutOfMemory;
         return output.toOwnedSlice();
     }
 

@@ -1,6 +1,7 @@
 //! The picker: a popup list that narrows as you type. It lists the
-//! workspace's files (Ctrl+P), or, when the query starts with `>`, every
-//! command with its shortcut (Ctrl+K), as in Sublime and VS Code.
+//! workspace's files (Ctrl+P), after what was shown recently, terminals
+//! included, or, when the query starts with `>`, every command with its
+//! shortcut (Ctrl+K), as in Sublime and VS Code.
 //!
 //! Matching is fuzzy: the query's characters must appear in order, so `abcr`
 //! finds `abracadabra.rs`. Matches at word starts, after `/`, and in runs
@@ -54,6 +55,8 @@ pub enum Mode {
 pub enum Choice {
     File(PathBuf),
     Command(Command),
+    /// A terminal, by its id.
+    Terminal(u32),
 }
 
 /// What the app should do after the picker handled input.
@@ -91,6 +94,22 @@ impl Item {
         }
     }
 
+    /// Terminal `id`, labeled `name` and, dimmed, `detail` (what's running
+    /// in it).
+    pub fn terminal(id: u32, name: &str, running: &str) -> Item {
+        let text = if running.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name} {running}")
+        };
+        Item {
+            dim: name.chars().count()..text.chars().count(),
+            text,
+            detail: "terminal".to_string(),
+            choice: Choice::Terminal(id),
+        }
+    }
+
     fn command(command: Command, keymap: &Keymap) -> Item {
         let title = command.title();
         let text = format!("{title} {}", command.id());
@@ -108,7 +127,7 @@ impl Item {
     fn path(&self) -> Option<&Path> {
         match &self.choice {
             Choice::File(path) => Some(path),
-            Choice::Command(_) => None,
+            Choice::Command(_) | Choice::Terminal(_) => None,
         }
     }
 }
@@ -116,7 +135,8 @@ impl Item {
 pub struct Picker {
     query: String,
     caret: Caret,
-    /// Recently opened files, most recent first. Listed before the rest.
+    /// What was shown recently, files and terminals, most recent first.
+    /// Listed before the rest.
     recent: Vec<Item>,
     /// The workspace's files, from the file index.
     files: Rc<Vec<Item>>,
@@ -140,14 +160,14 @@ pub struct Picker {
 }
 
 impl Picker {
-    /// A picker for `mode` over a screen `width` x `height`. `recent` files
-    /// are listed first, most recent first, then the rest of the `index`;
-    /// the keymap labels commands with their shortcuts.
+    /// A picker for `mode` over a screen `width` x `height`. `recent` items
+    /// (see [`Item::file`] and [`Item::terminal`]) are listed first, then
+    /// the rest of the `index`'s files; the keymap labels commands with
+    /// their shortcuts.
     pub fn new(
         mode: Mode,
-        workspace: &Workspace,
         keymap: &Keymap,
-        recent: Vec<PathBuf>,
+        recent: Vec<Item>,
         index: &FileIndex,
         width: u32,
         height: u32,
@@ -167,10 +187,7 @@ impl Picker {
         let mut picker = Picker {
             query: String::new(),
             caret: Caret::default(),
-            recent: recent
-                .into_iter()
-                .map(|path| Item::file(path, workspace, "recent"))
-                .collect(),
+            recent,
             files: Rc::new(Vec::new()),
             duplicates: Vec::new(),
             listing: false,
@@ -676,7 +693,11 @@ mod tests {
 
     fn picker(root: &Path, mode: Mode, recent: Vec<PathBuf>) -> Picker {
         let (workspace, index) = index(root);
-        Picker::new(mode, &workspace, &Keymap::default(), recent, &index, 80, 24)
+        let recent = recent
+            .into_iter()
+            .map(|path| Item::file(path, &workspace, "recent"))
+            .collect();
+        Picker::new(mode, &Keymap::default(), recent, &index, 80, 24)
     }
 
     /// The listed texts, best match first.
@@ -764,16 +785,8 @@ mod tests {
     #[test]
     fn new_files_keep_the_selection() {
         let root = fixture("new-files", &["b.rs", "d.rs"]);
-        let (workspace, mut index) = index(&root);
-        let mut picker = Picker::new(
-            Mode::Files,
-            &workspace,
-            &Keymap::default(),
-            Vec::new(),
-            &index,
-            80,
-            24,
-        );
+        let (_, mut index) = index(&root);
+        let mut picker = Picker::new(Mode::Files, &Keymap::default(), Vec::new(), &index, 80, 24);
         picker.run(Command::PickerDown);
         assert_eq!(selected(&picker), "d.rs");
         fs::write(root.join("a.rs"), "").unwrap();
@@ -856,16 +869,8 @@ mod tests {
         let _serial = crate::test_serial();
         let long = format!("{}/name.rs", "folder".repeat(20));
         let root = fixture("draw", &[&long, "short.rs"]);
-        let (workspace, index) = index(&root);
-        let mut picker = Picker::new(
-            Mode::Files,
-            &workspace,
-            &Keymap::default(),
-            Vec::new(),
-            &index,
-            60,
-            12,
-        );
+        let (_, index) = index(&root);
+        let mut picker = Picker::new(Mode::Files, &Keymap::default(), Vec::new(), &index, 60, 12);
         picker.edit(Edit::Insert("name"));
         let screen =
             opentui::OwnedBuffer::new(60, 12, false, opentui::WidthMethod::Unicode, "test")

@@ -61,6 +61,20 @@ impl Rgba {
         self.0[3] as u8
     }
 
+    /// The palette entry, for a color made with [`Rgba::indexed`].
+    pub const fn palette_index(self) -> Option<u8> {
+        if (self.0[1] >> 8) as u8 == INTENT_INDEXED {
+            Some((self.0[0] >> 8) as u8)
+        } else {
+            None
+        }
+    }
+
+    /// Whether this is the terminal's default color.
+    pub const fn is_terminal_default(self) -> bool {
+        (self.0[1] >> 8) as u8 == INTENT_DEFAULT
+    }
+
     pub(crate) fn as_ptr(&self) -> *const u16 {
         self.0.as_ptr()
     }

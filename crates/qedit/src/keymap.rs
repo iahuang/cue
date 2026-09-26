@@ -86,6 +86,8 @@ commands! {
     FocusPanelRight => "panel:focus-right", "Focus Panel Right";
     FocusPanelUp => "panel:focus-up", "Focus Panel Above";
     FocusPanelDown => "panel:focus-down", "Focus Panel Below";
+    NewTerminal => "terminal:new", "New Terminal";
+    TerminalPrefix => "terminal:prefix", "Terminal: Send Next Shortcut to qedit";
     TreeUp => "tree:up", "File Tree: Select Previous";
     TreeDown => "tree:down", "File Tree: Select Next";
     TreeExpand => "tree:expand", "File Tree: Expand";
@@ -128,6 +130,9 @@ pub enum Context {
     /// The find bar's replacement, while it has focus. The find bar's keys
     /// work there too.
     Replace,
+    /// A terminal, which gets every key but a few (see
+    /// [`Keymap::lookup_terminal`]).
+    Terminal,
 }
 
 impl Context {
@@ -150,9 +155,8 @@ impl Command {
         match self {
             Quit | Palette | Save | GoToFile | SearchWorkspace | Find | FindReplace | FindNext
             | FindPrevious | ToggleTree | FocusTree | FocusEditor | SplitRight | SplitDown
-            | ClosePanel | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown => {
-                Context::Global
-            }
+            | ClosePanel | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown
+            | NewTerminal => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose => {
@@ -160,6 +164,7 @@ impl Command {
             }
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
             FindSwitchField | FindClose => Context::Find,
+            TerminalPrefix => Context::Terminal,
             Replace | ReplaceAll => Context::Replace,
             _ => Context::Editor,
         }
@@ -281,6 +286,7 @@ impl Default for Keymap {
             (Right, FocusPanelRight),
             (Up, FocusPanelUp),
             (Down, FocusPanelDown),
+            (Char('t'), NewTerminal),
         ] {
             bindings.push((key(code, CTRL_ALT), command));
             bindings.push((key(code, SUPER_ALT), command));
@@ -375,6 +381,24 @@ impl Default for Keymap {
                 context: Context::Find,
             });
         }
+        // In a terminal, Ctrl+C and Ctrl+V are the shell's; as in Linux
+        // terminals, Ctrl+Shift copies and pastes. Ctrl+` makes the next
+        // shortcut qedit's, as in tmux (VS Code's terminal toggle; shells
+        // don't use it). Terminals without the kitty keyboard protocol send
+        // it as Ctrl+Space.
+        for (key, command) in [
+            (key(Char('`'), Mods::CTRL), TerminalPrefix),
+            (key(Char('c'), CTRL_SHIFT), Copy),
+            (key(Char('c'), SUPER), Copy),
+            (key(Char('v'), CTRL_SHIFT), Paste),
+            (key(Char('v'), SUPER), Paste),
+        ] {
+            bindings.push(Binding {
+                key,
+                command,
+                context: Context::Terminal,
+            });
+        }
         Keymap { bindings }
     }
 }
@@ -403,6 +427,48 @@ impl Keymap {
         self.find(unshifted, context)
             .filter(|command| command.ignores_shift())
             .map(|command| (command, command.extends_selection()))
+    }
+
+    /// The command bound to `key` in a terminal, which gets the key when
+    /// there is none. The shell has the keys a terminal would send it:
+    /// qedit keeps only its terminal bindings, and global shortcuts with
+    /// Cmd (Super), Ctrl+Alt, or Ctrl+Shift, which shells don't use.
+    /// Ctrl+Shift+key runs the global command of Ctrl+key (Ctrl+Shift+P
+    /// goes to a file), since the shell keeps Ctrl+key. Terminals without
+    /// the kitty keyboard protocol send Ctrl+Shift+key as Ctrl+key, so
+    /// there the shell gets it.
+    pub fn lookup_terminal(&self, key: Key) -> Option<Command> {
+        let key = normalize(key);
+        let bound = |key, context| {
+            self.bindings
+                .iter()
+                .find(|b| b.key == key && b.context == context)
+                .map(|b| b.command)
+        };
+        if let Some(command) = bound(key, Context::Terminal) {
+            return Some(command);
+        }
+        let Mods {
+            shift,
+            alt,
+            ctrl,
+            sup,
+        } = key.mods;
+        if !(sup || (ctrl && (alt || shift))) {
+            return None;
+        }
+        bound(key, Context::Global).or_else(|| {
+            let unshifted = Key::new(
+                key.code,
+                Mods {
+                    shift: false,
+                    ..key.mods
+                },
+            );
+            (ctrl && shift && !alt && !sup)
+                .then(|| bound(unshifted, Context::Global))
+                .flatten()
+        })
     }
 
     /// The key shown for `command`, if it has one.
@@ -481,6 +547,7 @@ impl fmt::Display for Key {
         match self.code {
             KeyCode::Char(' ') => f.write_str("Space"),
             KeyCode::Char(c) => write!(f, "{}", c.to_uppercase()),
+            KeyCode::F(n) => write!(f, "F{n}"),
             code => write!(f, "{code:?}"),
         }
     }
@@ -688,6 +755,55 @@ mod tests {
                 Key::new(KeyCode::Char('z'), mods(true, false, true, false))
             ),
             "^Shift+Z"
+        );
+    }
+
+    #[test]
+    fn terminals_get_keys_but_qedits_chords() {
+        let keymap = Keymap::default();
+        let key =
+            |c, shift, alt, ctrl, sup| Key::new(KeyCode::Char(c), mods(shift, alt, ctrl, sup));
+        let lookup = |key| keymap.lookup_terminal(key);
+        // The shell's: Ctrl+key, Alt+key, Esc, arrows.
+        for key in [
+            key('p', false, false, true, false),
+            key('w', false, false, true, false),
+            key('c', false, false, true, false),
+            key('q', false, false, true, false),
+            key('\\', false, false, true, false),
+            key('b', false, true, false, false),
+            Key::new(KeyCode::Esc, Mods::NONE),
+            Key::new(KeyCode::Left, Mods::CTRL),
+        ] {
+            assert_eq!(lookup(key), None, "{key}");
+        }
+        // qedit's: Ctrl+Shift runs Ctrl's global command, and Cmd, Ctrl+Alt,
+        // and explicit Ctrl+Shift bindings are kept.
+        for (key, command) in [
+            (key('p', true, false, true, false), Command::GoToFile),
+            (key('P', false, false, true, false), Command::GoToFile),
+            (key('k', true, false, true, false), Command::Palette),
+            (key('w', true, false, true, false), Command::ClosePanel),
+            (key('q', true, false, true, false), Command::Quit),
+            (key('f', true, false, true, false), Command::SearchWorkspace),
+            (key('\\', true, false, true, false), Command::SplitDown),
+            (key('p', false, false, false, true), Command::GoToFile),
+            (key('t', false, true, true, false), Command::NewTerminal),
+            (
+                Key::new(KeyCode::Left, mods(false, true, true, false)),
+                Command::FocusPanelLeft,
+            ),
+            (key('c', true, false, true, false), Command::Copy),
+            (key('c', false, false, false, true), Command::Copy),
+            (key('v', true, false, true, false), Command::Paste),
+            (key('`', false, false, true, false), Command::TerminalPrefix),
+        ] {
+            assert_eq!(lookup(key), Some(command), "{key}");
+        }
+        // Cmd with an editing key is the editor's, not the shell's or qedit's.
+        assert_eq!(
+            lookup(Key::new(KeyCode::Left, mods(false, false, false, true))),
+            None
         );
     }
 }

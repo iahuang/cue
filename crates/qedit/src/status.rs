@@ -12,6 +12,8 @@ use crate::keymap::{Command, Keymap};
 pub enum Status {
     /// The cursor's position and the file's details.
     Info(String),
+    /// What a terminal is running.
+    Terminal(String),
     /// Shown until the next key press.
     Message { text: String, error: bool },
     /// The "Save as" prompt, with what's been typed.
@@ -23,7 +25,7 @@ impl Status {
     #[cfg(test)]
     pub fn text(&self) -> String {
         match self {
-            Status::Info(info) => format!(" {info}"),
+            Status::Info(info) | Status::Terminal(info) => format!(" {info}"),
             Status::Message { text, .. } => format!(" {text}"),
             Status::Prompt(input) => format!("{PROMPT}{input}"),
         }
@@ -59,21 +61,26 @@ pub fn draw(
             frame.draw_text(&format!(" {text}"), 0, y, STATUS_FG, None, Attributes::BOLD);
             None
         }
-        Status::Info(info) => {
+        Status::Info(info) | Status::Terminal(info) => {
             frame.fill_rect(0, y, width, 1, STATUS_BG);
             let left = format!(" {info}");
             frame.draw_text(&left, 0, y, STATUS_FG, None, Attributes::NONE);
-            let hints: String = [
-                (Command::Save, "save"),
-                (Command::FocusTree, "files"),
-                (Command::Palette, "commands"),
-                (Command::Quit, "quit"),
-            ]
-            .iter()
-            .filter_map(|&(command, name)| {
-                Some(format!("{:#} {name}  ", keymap.shortcut(command)?))
-            })
-            .collect();
+            // In a terminal, those keys are the shell's.
+            let hints: &[(Command, &str)] = match status {
+                Status::Terminal(_) => &[(Command::TerminalPrefix, "qedit keys")],
+                _ => &[
+                    (Command::Save, "save"),
+                    (Command::FocusTree, "files"),
+                    (Command::Palette, "commands"),
+                    (Command::Quit, "quit"),
+                ],
+            };
+            let hints: String = hints
+                .iter()
+                .filter_map(|&(command, name)| {
+                    Some(format!("{:#} {name}  ", keymap.shortcut(command)?))
+                })
+                .collect();
             let hints = hints.strip_suffix(' ').unwrap_or(&hints);
             let hints_x = width.saturating_sub(hints.len() as u32);
             if hints_x as usize > left.chars().count() {

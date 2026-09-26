@@ -18,7 +18,7 @@ tier 0 - required for use at all
     - figure out how themes should work. should qedit bundle themes or should it inherit the terminal's therme? (for now: syntax colors are the terminal's own 16 ANSI colors, so they follow its theme)
   - find and replace (done: ctrl+F opens a find bar floating at the top right of the editor, as in VS Code, that highlights every match as you type and selects the nearest one; the selection, if on one line, becomes the query. enter / shift+enter or ctrl+G / ctrl+shift+G step through matches, alt+C/W/R toggle case, whole word, regex, like workspace search. ctrl+H (cmd+alt+F), or clicking its ▸, adds a replace row: enter replaces the current match and moves to the next, alt+enter replaces all as one undo step, and `$1` / `${name}` expand regex groups. the last query carries over to other files.)
   - basic language awareness for features like autoclosing brackets, quotes
-- command pallete (done): ctrl+K (cmd+K too, though most mac terminals eat it to clear the screen). typing `>` in ctrl+P switches to commands, like sublime/vscode. ctrl+shift+P is awkward to hit, and ctrl+space arrives as a NUL byte that also toggles macOS input sources.
+- command pallete (done): ctrl+K (cmd+K too, though most mac terminals eat it to clear the screen). typing `>` in ctrl+P switches to commands, like sublime/vscode. ctrl+shift+P is awkward to hit, and ctrl+space toggles macOS input sources (and, in terminals without the kitty keyboard protocol, arrives as a NUL byte).
   - actions such as file save, copy, paste ideally prefixed with like `editor:copy` (done: every shortcut is a named command like `editor:copy`, listed with its shortcut in `qedit --help` and in the palette)
   - philosophy: any action which has a keyboard shortcut should also be findable in the command pallete. and likewise you should be able to see the shortcut there.
 
@@ -36,7 +36,7 @@ tier 1 - ergonomics
   - panels should maybe require an empty state like if you split a panel, then the twin should default to an empty state from which you can open a file or a terminal or whatever. (done: a new split is empty and lists the shortcuts for opening something. closing the last panel empties it.)
 - tabs
   - tabs highest-level rather than be. they're really "layouts" in the strict sense. you only see one tab at a time. switching tabs switches the panel layouts
-- embedded terminal (see above)
+- embedded terminal (see above) (partial: ctrl+alt+T starts your login shell, in the workspace's folder, in the active panel. keys go to the shell except qedit's chords: cmd, ctrl+alt, and ctrl+shift ones, where ctrl+shift+key does what ctrl+key does elsewhere (ctrl+shift+P goes to a file). ctrl+shift+C/V copy and paste. the mouse goes to programs that ask for it (shift+drag still selects); otherwise dragging selects and the wheel scrolls back. colors follow the terminal qedit runs in. a terminal keeps running when its panel shows something else; ctrl+P lists terminals with the recent files, by when they were last shown, so ctrl+P enter flips between a terminal and the file before it. ctrl+` makes the next key a qedit shortcut, as in tmux (ctrl+` then ctrl+P); pressed twice, the shell gets it.)
   - not really special in any layout sense, unlike some editors where the terminal has to go on the bottom or on the side or whatever
   - lingering questions:
     - should we allow the same terminal instance to appear multiple times in a layout?

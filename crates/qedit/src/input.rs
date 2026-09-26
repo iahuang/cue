@@ -85,6 +85,8 @@ pub enum KeyCode {
     End,
     PageUp,
     PageDown,
+    /// A function key, F1 to F12.
+    F(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +243,10 @@ fn parse_one(b: &[u8]) -> Option<(Token, usize)> {
                 b'D' => KeyCode::Left,
                 b'H' => KeyCode::Home,
                 b'F' => KeyCode::End,
+                b'P' => KeyCode::F(1),
+                b'Q' => KeyCode::F(2),
+                b'R' => KeyCode::F(3),
+                b'S' => KeyCode::F(4),
                 _ => return Some((Token::Ignored, 3)),
             };
             Some((key_token(key, Mods::NONE), 3))
@@ -294,8 +300,11 @@ fn parse_plain(b: &[u8]) -> Option<(Token, usize)> {
         b'\t' => Key::new(KeyCode::Tab, Mods::NONE),
         0x7f | 0x08 => Key::new(KeyCode::Backspace, Mods::NONE),
         c @ 0x01..=0x1a => Key::new(KeyCode::Char((b'a' + c - 1) as char), Mods::CTRL),
+        0x00 => Key::new(KeyCode::Char(' '), Mods::CTRL),
         0x1c => Key::new(KeyCode::Char('\\'), Mods::CTRL),
-        0x00 | 0x1d..=0x1f => return Some((Token::Ignored, 1)),
+        0x1d => Key::new(KeyCode::Char(']'), Mods::CTRL),
+        0x1e => Key::new(KeyCode::Char('^'), Mods::CTRL),
+        0x1f => Key::new(KeyCode::Char('_'), Mods::CTRL),
         lead => {
             let width = match lead {
                 0x00..=0x7f => 1,
@@ -365,6 +374,11 @@ fn parse_csi(b: &[u8]) -> Option<(Token, usize)> {
         b'D' => KeyCode::Left,
         b'H' => KeyCode::Home,
         b'F' => KeyCode::End,
+        // F1, F2, and F4 with modifiers, or from kitty. F3's `R` would be
+        // a cursor position report; kitty sends `13~` instead.
+        b'P' => KeyCode::F(1),
+        b'Q' => KeyCode::F(2),
+        b'S' => KeyCode::F(4),
         b'Z' => {
             let mods = Mods {
                 shift: true,
@@ -379,6 +393,9 @@ fn parse_csi(b: &[u8]) -> Option<(Token, usize)> {
             Some(4 | 8) => KeyCode::End,
             Some(5) => KeyCode::PageUp,
             Some(6) => KeyCode::PageDown,
+            Some(n @ 11..=15) => KeyCode::F(n as u8 - 10),
+            Some(n @ 17..=21) => KeyCode::F(n as u8 - 11),
+            Some(n @ 23..=24) => KeyCode::F(n as u8 - 12),
             Some(200) => return Some((Token::PasteStart, len)),
             // modifyOtherKeys: CSI 27 ; mods ; codepoint ~
             Some(27) => match field(2, 0) {
@@ -509,6 +526,26 @@ mod tests {
                 key(KeyCode::Backspace),
                 ctrl('q'),
                 ctrl('\\'),
+            ]
+        );
+    }
+
+    #[test]
+    fn function_keys_and_the_other_control_bytes() {
+        let mut p = Parser::new();
+        assert_eq!(
+            keys(p.feed(b"\x1bOP\x1bOR\x1b[15~\x1b[24~\x1b[1;5Q\x1b[13;2~\x00\x1d\x1e\x1f")),
+            [
+                key(KeyCode::F(1)),
+                key(KeyCode::F(3)),
+                key(KeyCode::F(5)),
+                key(KeyCode::F(12)),
+                Key::new(KeyCode::F(2), Mods::CTRL),
+                Key::new(KeyCode::F(3), Mods::SHIFT),
+                ctrl(' '),
+                ctrl(']'),
+                ctrl('^'),
+                ctrl('_'),
             ]
         );
     }

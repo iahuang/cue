@@ -61,3 +61,13 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   and scroll the viewport straight back.
   `getVisualEOL` (End) treats a line wider than the viewport as one overwide
   grapheme only while wrapping; unwrapped, End did nothing on such lines.
+- `src/embedded-terminal/`, `src/lib.zig`: for qedit's terminals.
+  `setHostPalette` (`embeddedTerminalSetHostPalette`) composes default and
+  palette colors as the host terminal's own (SGR 39/49 and indexed colors)
+  instead of RGB from Ghostty's palette, so shells follow the host's theme;
+  inverse video and the selection become the inverse attribute there. Palette
+  slots a program redefined (OSC 4) stay RGB. Composing skips cells outside
+  the buffer's scissor rect (`set` ignores it). `encodeKey` treats Alt as Alt
+  on macOS, since the host terminal already decided what Option is. New
+  exports: `embeddedTerminalScrollToBottom`, `embeddedTerminalIsAlternateScreen`,
+  and `embeddedTerminalGetTitle`.

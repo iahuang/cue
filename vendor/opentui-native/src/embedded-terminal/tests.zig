@@ -391,6 +391,91 @@ test "embedded terminal keeps explicit backgrounds opaque when transparent" {
     try std.testing.expect(ansi.intent(target.get(0, 0).?.bg) != ansi.ColorIntent.default);
 }
 
+test "embedded terminal composes host palette colors as the host terminal's" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    var target = try buffer.OptimizedBuffer.init(std.testing.allocator, 6, 1, .{ .pool = pool });
+    defer target.deinit();
+
+    const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 6, .rows = 1 });
+    defer terminal.deinit();
+    terminal.setHostPalette(true);
+    // Plain, red on green, truecolor, inverse, then slot 4 redefined (OSC 4).
+    try terminal.write("a\x1b[31;42mb\x1b[0;38;2;1;2;3mc\x1b[0;7md\x1b]4;4;rgb:12/34/56\x07\x1b[0;34me");
+    try terminal.compose(target, 0, 0);
+
+    const plain = target.get(0, 0).?;
+    try std.testing.expectEqual(ansi.ColorIntent.default, ansi.intent(plain.fg));
+    try std.testing.expectEqual(ansi.ColorIntent.default, ansi.intent(plain.bg));
+    const red = target.get(1, 0).?;
+    try std.testing.expectEqual(ansi.ColorIntent.indexed, ansi.intent(red.fg));
+    try std.testing.expectEqual(@as(u8, 1), ansi.slot(red.fg));
+    try std.testing.expectEqual(ansi.ColorIntent.indexed, ansi.intent(red.bg));
+    try std.testing.expectEqual(@as(u8, 2), ansi.slot(red.bg));
+    try std.testing.expectEqual(ansi.ColorIntent.rgb, ansi.intent(target.get(2, 0).?.fg));
+    // Inverse keeps the default intents where they are and lets the host swap.
+    const inverse = target.get(3, 0).?;
+    try std.testing.expectEqual(ansi.ColorIntent.default, ansi.intent(inverse.fg));
+    try std.testing.expect(inverse.attributes & ansi.TextAttributes.INVERSE != 0);
+    const redefined = target.get(4, 0).?;
+    try std.testing.expectEqual(ansi.ColorIntent.rgb, ansi.intent(redefined.fg));
+    try std.testing.expectEqual(@as(u8, 0x12), ansi.red(redefined.fg));
+    // The row's tail is the host's default background.
+    try std.testing.expectEqual(ansi.ColorIntent.default, ansi.intent(target.get(5, 0).?.bg));
+}
+
+test "embedded terminal composition respects the scissor rect" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    var target = try buffer.OptimizedBuffer.init(std.testing.allocator, 6, 1, .{ .pool = pool });
+    defer target.deinit();
+    target.clear(ansi.rgbColor(0, 0, 0, 255), null);
+    for (0..6) |x| {
+        var cell = target.get(@intCast(x), 0).?;
+        cell.char = 'Q';
+        target.set(@intCast(x), 0, cell);
+    }
+
+    const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 6, .rows = 1 });
+    defer terminal.deinit();
+    try terminal.write("\x1b[7mab");
+    try target.pushScissorRect(0, 0, 1, 1);
+    try terminal.compose(target, 0, 0);
+    target.popScissorRect();
+
+    try std.testing.expectEqual(@as(u32, 'a'), target.get(0, 0).?.char);
+    // The inverse cell and the cleared tail outside the rect are untouched.
+    try std.testing.expectEqual(@as(u32, 'Q'), target.get(1, 0).?.char);
+    try std.testing.expectEqual(@as(u32, 'Q'), target.get(4, 0).?.char);
+}
+
+test "embedded terminal encodes Alt as an escape prefix" {
+    const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 4, .rows = 1 });
+    defer terminal.deinit();
+    const key = try terminal.encodeKey(.{ .key = .key_b, .mods = .{ .alt = true }, .utf8 = "b", .unshifted_codepoint = 'b' });
+    defer terminal.freeEncoded(key);
+    try std.testing.expectEqualStrings("\x1bb", key);
+}
+
+test "embedded terminal reports its title, alternate screen, and scrolls to the bottom" {
+    const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 4, .rows = 2 });
+    defer terminal.deinit();
+    try std.testing.expectEqualStrings("", terminal.title());
+    try terminal.write("\x1b]2;hello\x07");
+    try std.testing.expectEqualStrings("hello", terminal.title());
+
+    try std.testing.expect(!terminal.isAlternateScreen());
+    try terminal.write("\x1b[?1049h");
+    try std.testing.expect(terminal.isAlternateScreen());
+    try terminal.write("\x1b[?1049l");
+
+    try terminal.write("1\r\n2\r\n3\r\n4");
+    terminal.scroll(-2);
+    try std.testing.expect(terminal.terminal.screens.active.pages.viewport != .active);
+    terminal.scrollToBottom();
+    try std.testing.expect(terminal.terminal.screens.active.pages.viewport == .active);
+}
+
 comptime {
     _ = ghostty;
 }

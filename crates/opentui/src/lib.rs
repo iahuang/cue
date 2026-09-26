@@ -2,7 +2,8 @@
 //!
 //! This wraps the native rendering layer: a double-buffered cell renderer that
 //! diffs frames into minimal terminal output, standalone cell buffers, and
-//! rope-backed text buffers with wrapping views. OpenTUI's component tree,
+//! rope-backed text buffers with wrapping views, and a terminal emulator to
+//! embed. OpenTUI's component tree,
 //! layout glue, and input parsing live in its TypeScript layer and are not
 //! part of this crate.
 //!
@@ -35,6 +36,7 @@ mod edit;
 mod error;
 mod renderer;
 mod style;
+mod terminal;
 mod text;
 mod thread;
 mod tty;
@@ -48,6 +50,10 @@ pub use edit::{
 pub use error::{Error, Result};
 pub use renderer::{Output, RenderStatus, Renderer};
 pub use style::SyntaxStyle;
+pub use terminal::{
+    Cursor, CursorStyle, EmbeddedTerminal, KeyAction, KeyEvent, KeyMods, MouseAction, MouseButton,
+    MouseEvent,
+};
 pub use text::{TextBuffer, TextBufferView, WidthMethod, WrapMode};
 
 /// Raw bindings, for functionality this crate does not wrap yet.
