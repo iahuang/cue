@@ -46,6 +46,11 @@ use crate::tree::{FileTree, TreeAction};
 use crate::workspace::Workspace;
 
 const DIVIDER: Rgba = Rgba::rgb(69, 71, 90);
+/// Tints where a panel dragged by its header would land.
+const DROP_TINT: Rgba = Rgba::rgba(137, 180, 250, 56);
+/// How far sideways a header that resizes a split is dragged, before it's
+/// dragged up or down, to move its panel instead.
+const MOVE_THRESHOLD: u32 = 3;
 
 const DEFAULT_TREE_WIDTH: u32 = 30;
 const MIN_TREE_WIDTH: u32 = 12;
@@ -75,9 +80,34 @@ enum MouseTarget {
     Tree,
     /// The tree's divider.
     Divider,
-    /// Where two panels meet.
+    /// The divider between panels side by side.
     Handle(Vec<bool>),
+    /// A panel's header, which drags the panel (see [`HeaderDrag`]).
+    Header(PanelId),
     Panel(PanelId),
+}
+
+/// A panel's header being dragged. A header with a panel above it is also
+/// the handle between them. Dragged up or down first, it resizes their
+/// split, until it leaves the panel's columns. Dragged sideways first, past
+/// [`MOVE_THRESHOLD`], or out of the panel's columns, it moves the panel,
+/// to wherever it's released, and the split goes back to how it was.
+/// Deciding by the first movement keeps a quick drag up or down, which
+/// drifts sideways, resizing.
+struct HeaderDrag {
+    /// The split the header resizes, if any.
+    handle: Option<Vec<bool>>,
+    /// The cell it was grabbed at.
+    x: u32,
+    y: u32,
+    /// The layout when it was grabbed.
+    before: Layout,
+    /// It went up or down first, so it resizes until it leaves the
+    /// panel's columns.
+    resizing: bool,
+    moving: bool,
+    /// Where the panel goes if released now.
+    drop: Option<layout::Drop>,
 }
 
 pub struct App {
@@ -105,6 +135,7 @@ pub struct App {
     width: u32,
     height: u32,
     mouse_target: Option<MouseTarget>,
+    header_drag: Option<HeaderDrag>,
     /// Quit was asked for with unsaved changes; asking again quits.
     quit_armed: bool,
     /// The file opened as a preview, which the next preview replaces.
@@ -196,6 +227,7 @@ impl App {
             width,
             height,
             mouse_target: None,
+            header_drag: None,
             quit_armed: false,
             preview: None,
             last_tree_click: None,
@@ -441,6 +473,8 @@ impl App {
         }
         let target = match mouse.kind {
             MouseKind::Press(_) => {
+                // In case the last drag's release never came.
+                self.header_drag = None;
                 let at = self.target_at(mouse.x, mouse.y);
                 self.mouse_target = at.clone();
                 at
@@ -487,21 +521,14 @@ impl App {
                     self.layout();
                 }
             }
-            MouseTarget::Handle(path) => match mouse.kind {
-                MouseKind::Drag(MouseButton::Left) => {
+            MouseTarget::Handle(path) => {
+                if let MouseKind::Drag(MouseButton::Left) = mouse.kind {
                     let area = self.main_area();
                     self.layout.drag(&path, area, mouse.x, mouse.y);
                     self.layout();
                 }
-                // A panel's header is a handle when there's one above it;
-                // clicking it still gives it the keyboard.
-                MouseKind::Press(MouseButton::Left) => {
-                    if let Some(id) = self.panel_at(mouse.x, mouse.y) {
-                        self.activate(id);
-                    }
-                }
-                _ => {}
-            },
+            }
+            MouseTarget::Header(id) => self.drag_header(id, mouse, now),
             MouseTarget::Panel(id) => {
                 if let MouseKind::Press(MouseButton::Left) = mouse.kind {
                     self.activate(id);
@@ -534,20 +561,90 @@ impl App {
             .layout
             .handles(area)
             .into_iter()
-            .find(|handle| handle.rect.contains(x, y))
+            .find(|handle| handle.axis == Axis::Horizontal && handle.rect.contains(x, y))
         {
             return Some(MouseTarget::Handle(handle.path));
         }
-        self.panel_at(x, y).map(MouseTarget::Panel)
+        let (id, rect) = self
+            .layout
+            .panels(area)
+            .into_iter()
+            .find(|(_, rect)| rect.contains(x, y))?;
+        Some(if y == rect.y {
+            MouseTarget::Header(id)
+        } else {
+            MouseTarget::Panel(id)
+        })
     }
 
-    /// The panel at screen cell (`x`, `y`), if any.
-    fn panel_at(&self, x: u32, y: u32) -> Option<PanelId> {
-        self.layout
-            .panels(self.main_area())
-            .into_iter()
-            .find(|(_, rect)| rect.contains(x, y))
-            .map(|(id, _)| id)
+    /// A mouse event on panel `id`'s header, or dragged from it: a click
+    /// gives the panel the keyboard, and a drag resizes the split above it
+    /// or moves the panel (see [`HeaderDrag`]).
+    fn drag_header(&mut self, id: PanelId, mouse: Mouse, now: Instant) {
+        let area = self.main_area();
+        match mouse.kind {
+            MouseKind::Press(MouseButton::Left) => {
+                self.activate(id);
+                let handle = self
+                    .layout
+                    .handles(area)
+                    .into_iter()
+                    .find(|handle| handle.rect.contains(mouse.x, mouse.y))
+                    .map(|handle| handle.path);
+                self.header_drag = Some(HeaderDrag {
+                    handle,
+                    x: mouse.x,
+                    y: mouse.y,
+                    before: self.layout.clone(),
+                    resizing: false,
+                    moving: false,
+                    drop: None,
+                });
+            }
+            MouseKind::Drag(MouseButton::Left) => {
+                let Some(drag) = &mut self.header_drag else {
+                    return;
+                };
+                if !drag.moving {
+                    let columns = self.layout.panels(area).into_iter().find(|&(p, _)| p == id);
+                    let within = columns
+                        .is_some_and(|(_, rect)| (rect.x..rect.x + rect.width).contains(&mouse.x));
+                    let (dx, dy) = (mouse.x.abs_diff(drag.x), mouse.y.abs_diff(drag.y));
+                    // Cells are about twice as tall as they're wide, so
+                    // this is well under 45 degrees from level.
+                    let sideways = !drag.resizing && dx >= MOVE_THRESHOLD && dx > 3 * dy;
+                    if drag.handle.is_none() || sideways || !within {
+                        drag.moving = true;
+                        self.layout = drag.before.clone();
+                    } else if dy > 0 {
+                        drag.resizing = true;
+                    }
+                }
+                match (&drag.handle, drag.moving) {
+                    (_, true) => drag.drop = self.layout.drop_at(area, id, mouse.x, mouse.y),
+                    (Some(path), false) if drag.resizing => {
+                        self.layout.drag(path, area, mouse.x, mouse.y)
+                    }
+                    _ => {}
+                }
+                self.layout();
+            }
+            MouseKind::Release(MouseButton::Left) => {
+                let Some(drag) = self.header_drag.take() else {
+                    return;
+                };
+                if let Some(drop) = drag.drop.filter(|_| drag.moving) {
+                    self.layout.drop_panel(id, drop);
+                    self.layout();
+                }
+            }
+            MouseKind::ScrollUp | MouseKind::ScrollDown => {
+                if let Some(panel) = self.panels.iter_mut().find(|panel| panel.id == id) {
+                    panel.handle_mouse(mouse, now);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Text pasted through the terminal.
@@ -614,6 +711,10 @@ impl App {
                     frame.draw_text("│", rect.x, y, DIVIDER, None, Attributes::NONE);
                 }
             }
+        }
+        if let Some(drop) = self.header_drag.as_ref().and_then(|drag| drag.drop) {
+            let rect = drop.rect;
+            frame.fill_rect(rect.x, rect.y, rect.width, rect.height, DROP_TINT);
         }
         if let Some(search) = &self.search {
             return search.draw(frame);
@@ -2237,6 +2338,100 @@ mod tests {
                 height: 6
             }
         );
+    }
+
+    #[test]
+    fn panels_move_by_their_headers() {
+        let _serial = crate::test_serial();
+        let root = fixture("panel-move", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'b');
+        ctrl(&mut app, '\\');
+        assert!(app.open(&root.join("b.txt"), false));
+        let mouse = |app: &mut App, kind, x, y| {
+            app.handle_mouse(
+                Mouse {
+                    kind,
+                    x,
+                    y,
+                    mods: Mods::NONE,
+                },
+                Instant::now(),
+            );
+        };
+        let area = |app: &App, id| app.panels.iter().find(|p| p.id == id).unwrap().area();
+        let tinted = |app: &App, x, y| {
+            let frame = OwnedBuffer::new(80, 10, false, WidthMethod::Unicode, "t").unwrap();
+            app.draw(&frame);
+            frame.bg_at(x, y) != Some(Rgba::terminal_default([0, 0, 0]))
+        };
+
+        // Dropped in the middle of the other panel, they swap. Over itself,
+        // it would stay.
+        mouse(&mut app, MouseKind::Press(MouseButton::Left), 10, 0);
+        assert_eq!(app.active, 0, "grabbing a header gives it the keyboard");
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 20, 0);
+        assert!(app.header_drag.as_ref().unwrap().drop.is_none());
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 60, 4);
+        assert!(tinted(&app, 60, 4), "the landing spot is tinted");
+        mouse(&mut app, MouseKind::Release(MouseButton::Left), 60, 4);
+        assert_eq!(area(&app, 0).x, 41);
+        assert!(cells(&app, 0, 41..80).contains("a.txt"), "{}", screen(&app));
+        assert!(cells(&app, 0, 0..40).contains("b.txt"));
+
+        // Dropped near the bottom of the other panel, it goes below it.
+        mouse(&mut app, MouseKind::Press(MouseButton::Left), 60, 0);
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 10, 8);
+        mouse(&mut app, MouseKind::Release(MouseButton::Left), 10, 8);
+        assert_eq!(
+            area(&app, 1),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 5
+            }
+        );
+        assert_eq!(
+            area(&app, 0),
+            Rect {
+                x: 0,
+                y: 5,
+                width: 80,
+                height: 4
+            }
+        );
+
+        // Its header now resizes the split above it when dragged up or
+        // down, even drifting sideways, as quick drags do.
+        mouse(&mut app, MouseKind::Press(MouseButton::Left), 40, 5);
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 44, 3);
+        assert_eq!(area(&app, 0).y, 3);
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 50, 4);
+        assert_eq!(area(&app, 0).y, 4);
+        assert!(app.header_drag.as_ref().is_some_and(|d| !d.moving));
+        mouse(&mut app, MouseKind::Release(MouseButton::Left), 50, 4);
+
+        // Dragged sideways first, the panel moves.
+        mouse(&mut app, MouseKind::Press(MouseButton::Left), 40, 4);
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 41, 4);
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 44, 3);
+        assert!(app.header_drag.as_ref().is_some_and(|d| d.moving));
+        assert_eq!(area(&app, 0).y, 4, "the split is back where it was");
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 4, 2);
+        mouse(&mut app, MouseKind::Release(MouseButton::Left), 4, 2);
+        assert_eq!(
+            area(&app, 0),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 9
+            }
+        );
+        assert_eq!(area(&app, 1).x, 41);
+        assert!(app.header_drag.is_none());
+        assert!(!tinted(&app, 4, 2));
     }
 
     #[test]

@@ -16,10 +16,21 @@
 
 # feat
 
+- file ops
 - rename, move, copy, delete in file tree
 - new file (create)
 - new file (unsaved buffer)
 - file picker for open, save
 
-- dim gitignored files, folders
+- dim gitignored files, folders in the file tree and also exclude them from the search + file picker
+- support for nerdfonts
 
+- spaces versus tabs; ideally infer based on existing file content
+
+- file watcher to reflect updates to the filetree as well as to currently open buffers. follow vscode/zed convention--don't update the file if there r unsaved changes; instead enter "unsaved with conficts" mode where the next save will prompt you to either overwrite or defer to disk.
+
+- select + tab to indent, shift-tab to deindent
+
+# long-term
+
+- truecolor theming support

@@ -4,6 +4,10 @@
 //! stacked, at a ratio, and each leaf is a panel. Panels side by side have a
 //! one-column divider between them. Stacked panels need none: the lower
 //! one's header divides them. Dragging either resizes the split.
+//!
+//! A panel dragged by its header moves: dropped near an edge of another
+//! panel, it splits that panel's room on that side; dropped in the middle,
+//! the two swap places.
 
 /// Names a panel for as long as it's open.
 pub type PanelId = u32;
@@ -13,6 +17,9 @@ pub type PanelId = u32;
 pub const MIN_WIDTH: u32 = 20;
 /// The header and two rows of text.
 pub const MIN_HEIGHT: u32 = 3;
+/// How near an edge of a panel, as a share of its size, a panel dropped on
+/// it goes beside it rather than in its place.
+const EDGE: f32 = 1.0 / 3.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
@@ -52,6 +59,17 @@ impl Rect {
     }
 }
 
+/// Where a panel dragged by its header would go if dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Drop {
+    /// The panel it's dropped on.
+    pub target: PanelId,
+    /// The side of the target it goes, or `None` to swap with it.
+    pub side: Option<Direction>,
+    /// The room it would take, as the layout is now, to preview.
+    pub rect: Rect,
+}
+
 /// Where a split's two sides meet, which dragging moves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handle {
@@ -80,21 +98,127 @@ impl Layout {
     /// Splits panel `target` in two, with `new` right of it or below it.
     /// Returns false if there's no such panel.
     pub fn split(&mut self, target: PanelId, new: PanelId, axis: Axis) -> bool {
+        let side = match axis {
+            Axis::Horizontal => Direction::Right,
+            Axis::Vertical => Direction::Down,
+        };
+        self.insert(target, new, side)
+    }
+
+    /// Splits panel `target` in two, with `new` on its `side`. Returns false
+    /// if there's no such panel.
+    fn insert(&mut self, target: PanelId, new: PanelId, side: Direction) -> bool {
         match self {
             Layout::Panel(id) if *id == target => {
+                let axis = match side {
+                    Direction::Left | Direction::Right => Axis::Horizontal,
+                    Direction::Up | Direction::Down => Axis::Vertical,
+                };
+                let (first, second) = match side {
+                    Direction::Left | Direction::Up => (new, target),
+                    Direction::Right | Direction::Down => (target, new),
+                };
                 *self = Layout::Split {
                     axis,
                     ratio: 0.5,
-                    first: Box::new(Layout::Panel(target)),
-                    second: Box::new(Layout::Panel(new)),
+                    first: Box::new(Layout::Panel(first)),
+                    second: Box::new(Layout::Panel(second)),
                 };
                 true
             }
             Layout::Panel(_) => false,
             Layout::Split { first, second, .. } => {
-                first.split(target, new, axis) || second.split(target, new, axis)
+                first.insert(target, new, side) || second.insert(target, new, side)
             }
         }
+    }
+
+    /// Moves panel `id` where `drop` says. Returns false if either panel is
+    /// missing or they're the same.
+    pub fn drop_panel(&mut self, id: PanelId, drop: Drop) -> bool {
+        let ids = self.panels(Rect::default());
+        let has = |panel| ids.iter().any(|&(p, _)| p == panel);
+        if id == drop.target || !has(id) || !has(drop.target) {
+            return false;
+        }
+        match drop.side {
+            Some(side) => {
+                self.remove(id);
+                self.insert(drop.target, id, side)
+            }
+            None => {
+                self.swap(id, drop.target);
+                true
+            }
+        }
+    }
+
+    /// Swaps panels `a` and `b`, wherever they are.
+    fn swap(&mut self, a: PanelId, b: PanelId) {
+        match self {
+            Layout::Panel(id) if *id == a => *id = b,
+            Layout::Panel(id) if *id == b => *id = a,
+            Layout::Panel(_) => {}
+            Layout::Split { first, second, .. } => {
+                first.swap(a, b);
+                second.swap(a, b);
+            }
+        }
+    }
+
+    /// Where panel `dragged`, dragged by its header to (`x`, `y`), would go,
+    /// when the layout fills `area`: beside the panel there, on the side
+    /// whose edge is near, or in its place in the middle. Too little room
+    /// to split the panel there leaves only swapping. `None` over the
+    /// dragged panel itself, or no panel.
+    pub fn drop_at(&self, area: Rect, dragged: PanelId, x: u32, y: u32) -> Option<Drop> {
+        let (target, rect) = self
+            .panels(area)
+            .into_iter()
+            .find(|(_, rect)| rect.contains(x, y))?;
+        if target == dragged {
+            return None;
+        }
+        // How far across the panel, from 0 to 1, in the middle of the cell.
+        let across =
+            |at: u32, start: u32, size: u32| (at - start) as f32 / size as f32 + 0.5 / size as f32;
+        let (fx, fy) = (
+            across(x, rect.x, rect.width),
+            across(y, rect.y, rect.height),
+        );
+        let (near, side) = [
+            (fx, Direction::Left),
+            (1.0 - fx, Direction::Right),
+            (fy, Direction::Up),
+            (1.0 - fy, Direction::Down),
+        ]
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))?;
+        let mut side = (near < EDGE).then_some(side);
+        if let Some(to) = side {
+            // The target has the dragged panel's room too once it's gone.
+            let mut without = self.clone();
+            without.remove(dragged);
+            let room = without
+                .panels(area)
+                .into_iter()
+                .find(|&(id, _)| id == target)
+                .map(|(_, rect)| rect)?;
+            let fits = match to {
+                Direction::Left | Direction::Right => room.width > 2 * MIN_WIDTH,
+                Direction::Up | Direction::Down => room.height >= 2 * MIN_HEIGHT,
+            };
+            side = side.filter(|_| fits);
+        }
+        let half = |axis, ratio| divide(rect, axis, ratio);
+        let rect = match side {
+            None => rect,
+            Some(Direction::Left) => half(Axis::Horizontal, 0.5).0,
+            Some(Direction::Right) => half(Axis::Horizontal, 0.5).1,
+            Some(Direction::Up) => half(Axis::Vertical, 0.5).0,
+            Some(Direction::Down) => half(Axis::Vertical, 0.5).1,
+        };
+        Some(Drop { target, side, rect })
     }
 
     /// Removes panel `id`, giving its room to the other side of its split.
@@ -402,6 +526,88 @@ mod tests {
         assert_eq!(panels[2].1, rect(71, 6, 20, 24));
         layout.drag(&[true], AREA, 70, 29);
         assert_eq!(layout.panels(AREA)[2].1.height, MIN_HEIGHT);
+    }
+
+    #[test]
+    fn dropping_a_panel_near_an_edge_puts_it_beside() {
+        use Direction::*;
+        let layout = three();
+        // Near 3's left edge, and near its bottom.
+        let drop = layout.drop_at(AREA, 1, 55, 22).unwrap();
+        assert_eq!((drop.target, drop.side), (3, Some(Left)));
+        assert_eq!(drop.rect, rect(51, 15, 20, 15));
+        let drop = layout.drop_at(AREA, 1, 70, 28).unwrap();
+        assert_eq!((drop.target, drop.side), (3, Some(Down)));
+        assert_eq!(drop.rect, rect(51, 23, 40, 7));
+
+        let mut moved = layout.clone();
+        assert!(moved.drop_panel(1, drop));
+        assert_eq!(
+            moved.panels(AREA),
+            [
+                (2, rect(10, 0, 81, 15)),
+                (3, rect(10, 15, 81, 8)),
+                (1, rect(10, 23, 81, 7)),
+            ]
+        );
+
+        // 2 over 1, both left of 3.
+        let mut moved = layout.clone();
+        let drop = layout.drop_at(AREA, 2, 30, 1).unwrap();
+        assert_eq!((drop.target, drop.side), (1, Some(Up)));
+        assert!(moved.drop_panel(2, drop));
+        assert_eq!(
+            moved.panels(AREA),
+            [
+                (2, rect(10, 0, 40, 15)),
+                (1, rect(10, 15, 40, 15)),
+                (3, rect(51, 0, 40, 30)),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_a_panel_in_the_middle_swaps() {
+        let layout = three();
+        let drop = layout.drop_at(AREA, 3, 30, 15).unwrap();
+        assert_eq!(
+            drop,
+            Drop {
+                target: 1,
+                side: None,
+                rect: rect(10, 0, 40, 30)
+            }
+        );
+        let mut swapped = layout.clone();
+        assert!(swapped.drop_panel(3, drop));
+        assert_eq!(
+            swapped.panels(AREA),
+            [
+                (3, rect(10, 0, 40, 30)),
+                (2, rect(51, 0, 40, 15)),
+                (1, rect(51, 15, 40, 15)),
+            ]
+        );
+
+        // Not on itself, the divider, or a panel that's gone.
+        assert_eq!(layout.drop_at(AREA, 1, 30, 15), None);
+        assert_eq!(layout.drop_at(AREA, 1, 50, 15), None);
+        let mut same = layout.clone();
+        assert!(!same.drop_panel(9, drop));
+        assert!(!same.drop_panel(1, drop));
+        assert_eq!(same, layout);
+    }
+
+    #[test]
+    fn a_panel_too_small_to_split_can_only_be_swapped() {
+        let narrow = Rect { width: 60, ..AREA };
+        let layout = three();
+        // 3 is 29 wide, even without 2: too narrow to split side by side.
+        let drop = layout.drop_at(narrow, 2, 45, 22).unwrap();
+        assert_eq!((drop.target, drop.side), (3, None));
+        // Without 2, 3 is 30 high, and splits.
+        let drop = layout.drop_at(narrow, 2, 45, 29).unwrap();
+        assert_eq!((drop.target, drop.side), (3, Some(Direction::Down)));
     }
 
     #[test]
