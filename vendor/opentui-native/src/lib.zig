@@ -3018,6 +3018,12 @@ export fn editorViewSetViewportSize(view_handle: NativeHandle, width: u32, heigh
     object_ptr.setViewportSize(width, height);
 }
 
+/// qedit patch: see `EditorView.takeCursor`.
+export fn editorViewTakeCursor(view_handle: NativeHandle) void {
+    const object_ptr = acquireEditorView(view_handle) orelse return;
+    object_ptr.takeCursor();
+}
+
 export fn editorViewSetWrapMode(view_handle: NativeHandle, mode: u8) void {
     const object_ptr = acquireEditorView(view_handle) orelse return;
     const wrapMode: text_buffer.WrapMode = switch (mode) {

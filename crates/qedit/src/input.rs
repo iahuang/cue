@@ -294,7 +294,8 @@ fn parse_plain(b: &[u8]) -> Option<(Token, usize)> {
         b'\t' => Key::new(KeyCode::Tab, Mods::NONE),
         0x7f | 0x08 => Key::new(KeyCode::Backspace, Mods::NONE),
         c @ 0x01..=0x1a => Key::new(KeyCode::Char((b'a' + c - 1) as char), Mods::CTRL),
-        0x00 | 0x1c..=0x1f => return Some((Token::Ignored, 1)),
+        0x1c => Key::new(KeyCode::Char('\\'), Mods::CTRL),
+        0x00 | 0x1d..=0x1f => return Some((Token::Ignored, 1)),
         lead => {
             let width = match lead {
                 0x00..=0x7f => 1,
@@ -499,7 +500,7 @@ mod tests {
     fn text_and_control_keys() {
         let mut p = Parser::new();
         assert_eq!(
-            keys(p.feed(b"hi\r\t\x7f\x11")),
+            keys(p.feed(b"hi\r\t\x7f\x11\x1c")),
             [
                 key(KeyCode::Char('h')),
                 key(KeyCode::Char('i')),
@@ -507,6 +508,7 @@ mod tests {
                 key(KeyCode::Tab),
                 key(KeyCode::Backspace),
                 ctrl('q'),
+                ctrl('\\'),
             ]
         );
     }

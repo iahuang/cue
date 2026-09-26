@@ -3762,3 +3762,43 @@ test "EditorView - convert word selection to cell keeps the range and moves focu
     try std.testing.expectEqual(@as(u32, 0), converted_cursor.row);
     try std.testing.expectEqual(@as(u32, 9), converted_cursor.col);
 }
+
+test "EditorView - only the view that took the cursor follows it" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    var eb = try EditBuffer.init(std.testing.allocator, pool, link_pool, .wcwidth, null);
+    defer eb.deinit();
+
+    var a = try EditorView.init(std.testing.allocator, eb, 80, 5);
+    defer a.deinit();
+    var b = try EditorView.init(std.testing.allocator, eb, 80, 5);
+
+    try eb.insertText("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19");
+    _ = a.getVirtualLines();
+    _ = b.getVirtualLines();
+    try std.testing.expect(a.getViewport().?.y > 0);
+    try std.testing.expect(b.getViewport().?.y > 0);
+
+    // B takes the cursor: moving it scrolls B, and A stays put, even as
+    // it's resized, drawn, or asked to move the cursor into view.
+    b.takeCursor();
+    try std.testing.expect(b.followsCursor() and !a.followsCursor());
+    const a_y = a.getViewport().?.y;
+    try eb.gotoLine(0);
+    _ = a.getVirtualLines();
+    _ = b.getVirtualLines();
+    a.setViewportSize(80, 6);
+    a.setViewport(.{ .x = 0, .y = a_y, .width = 80, .height = 6 }, true);
+    try std.testing.expectEqual(a_y, a.getViewport().?.y);
+    try std.testing.expectEqual(@as(u32, 0), b.getViewport().?.y);
+    try std.testing.expectEqual(@as(u32, 0), eb.getPrimaryCursor().row);
+
+    // Once B is gone, every view follows again.
+    b.deinit();
+    try std.testing.expect(a.followsCursor());
+    _ = a.getVirtualLines();
+    try std.testing.expectEqual(@as(u32, 0), a.getViewport().?.y);
+}

@@ -494,6 +494,13 @@ impl EditorView<'_> {
         unsafe { sys::editorViewSetScrollMargin(self.handle, margin) }
     }
 
+    /// Makes this the one view of its buffer that scrolls to keep the
+    /// cursor in sight. The buffer's other views stay where they are as the
+    /// cursor moves. Until a view takes it, every view follows the cursor.
+    pub fn take_cursor(&self) {
+        unsafe { sys::editorViewTakeCursor(self.handle) }
+    }
+
     /// The cursor relative to the viewport, after scrolling it into view.
     pub fn visual_cursor(&self) -> VisualCursor {
         self.query(sys::editorViewGetVisualCursor)

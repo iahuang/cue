@@ -27,13 +27,13 @@ tier 0 - required for use at all
 tier 1 - ergonomics
 
 - window organization
-  - the space right of the file explorer is divided into "panels". you can vertically or horizontally split a panel in two
-  - a panel can represent either a text editor or a terminal (keep this representationally flexible)
+  - the space right of the file explorer is divided into "panels". you can vertically or horizontally split a panel in two (done: ctrl+\ splits right, ctrl+shift+\ splits down (legacy terminals send it as ctrl+\, so there it's in the palette), ctrl+W closes a panel and gives its room to its neighbor. ctrl+alt+arrows move between panels, and left of the leftmost is the file tree. the layout is a split tree. each panel has a header naming its file, dimmed when inactive; one status bar along the bottom shows the active panel's line/col, messages, and prompts.)
+  - a panel can represent either a text editor or a terminal (keep this representationally flexible) (partial: editors only. open files are documents the app owns, and panels hold views of them, so a file stays open when no panel shows it. the same file can be open in two panels: shared text and undo, separate cursor and scroll.)
   - panels do not have tabs
-  - the identity of a panel is not static. when you have a panel focused, and you say open another file through ctrl+P the viewed thing gets replaced
-  - panels should be resizable
+  - the identity of a panel is not static. when you have a panel focused, and you say open another file through ctrl+P the viewed thing gets replaced (done: each panel remembers its cursor and scroll in every file it has shown)
+  - panels should be resizable (done: drag the divider between side-by-side panels, or the header of the lower of two stacked ones)
   - figure out some way of enabling panel reorganization. this is nontrivial i think.
-  - panels should maybe require an empty state like if you split a panel, then the twin should default to an empty state from which you can open a file or a terminal or whatever.
+  - panels should maybe require an empty state like if you split a panel, then the twin should default to an empty state from which you can open a file or a terminal or whatever. (done: a new split is empty and lists the shortcuts for opening something. closing the last panel empties it.)
 - tabs
   - tabs highest-level rather than be. they're really "layouts" in the strict sense. you only see one tab at a time. switching tabs switches the panel layouts
 - embedded terminal (see above)

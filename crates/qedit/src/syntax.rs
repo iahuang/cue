@@ -31,6 +31,9 @@ const PARSE_BUDGET: Duration = Duration::from_millis(300);
 /// At most this many captures are highlighted at once, which bounds the work
 /// for a screen of very long lines.
 const MAX_CAPTURES: usize = 20_000;
+/// How many stretches of lines stay highlighted at once: one per panel
+/// showing the text, so panels don't take turns repainting.
+const MAX_PAINTED: usize = 4;
 
 /// A language's grammar and compiled highlight query.
 struct Grammar {
@@ -77,8 +80,9 @@ pub struct Highlighter {
     line_starts: Vec<usize>,
     /// The buffer's content epoch when `text` was taken.
     epoch: Option<u64>,
-    /// The lines highlighted since.
-    painted: Option<Range<u32>>,
+    /// The stretches of lines highlighted since, least recently asked for
+    /// first.
+    painted: Vec<Range<u32>>,
     /// The text was too big, or took too long to parse; it stays plain.
     gave_up: bool,
 }
@@ -104,7 +108,7 @@ impl Highlighter {
             text: String::new(),
             line_starts: vec![0],
             epoch: None,
-            painted: None,
+            painted: Vec::new(),
             gave_up: false,
         })
     }
@@ -118,7 +122,7 @@ impl Highlighter {
         let epoch = buffer.content_epoch();
         if self.epoch != Some(epoch) {
             self.epoch = Some(epoch);
-            self.painted = None;
+            self.painted.clear();
             if !self.reparse(buffer.text()) {
                 self.gave_up = true;
                 self.tree = None;
@@ -128,19 +132,37 @@ impl Highlighter {
                 return;
             }
         }
-        if self
+        if let Some(i) = self
             .painted
-            .as_ref()
-            .is_some_and(|p| p.start <= visible.start && visible.end <= p.end)
+            .iter()
+            .position(|p| p.start <= visible.start && visible.end <= p.end)
         {
+            let painted = self.painted.remove(i);
+            self.painted.push(painted);
             return;
         }
         let margin = visible.len() as u32;
         let lines = visible.start.saturating_sub(margin)
             ..(visible.end + margin).min(self.line_starts.len() as u32);
-        let highlights = self.highlights(buffer, lines.clone());
+        self.painted.push(lines);
+        if self.painted.len() > MAX_PAINTED {
+            self.painted.remove(0);
+        }
+        // Overlapping stretches are highlighted once.
+        let mut stretches = self.painted.clone();
+        stretches.sort_by_key(|lines| lines.start);
+        let mut merged: Vec<Range<u32>> = Vec::new();
+        for lines in stretches {
+            match merged.last_mut() {
+                Some(last) if lines.start <= last.end => last.end = last.end.max(lines.end),
+                _ => merged.push(lines),
+            }
+        }
+        let highlights: Vec<Highlight> = merged
+            .into_iter()
+            .flat_map(|lines| self.highlights(buffer, lines))
+            .collect();
         buffer.replace_highlights(HIGHLIGHTS, &highlights);
-        self.painted = Some(lines);
     }
 
     /// Parses `text`, reusing the tree of the text before for what didn't
@@ -697,6 +719,32 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn keeps_several_stretches_highlighted() {
+        let _serial = crate::test_serial();
+        let theme = Theme::new().unwrap();
+        let mut highlighter = Highlighter::new(rust(), &theme).unwrap();
+        let buffer = EditBuffer::new(opentui::WidthMethod::Unicode).unwrap();
+        buffer.set_text(&"fn f() {}\n".repeat(300));
+        // As two panels draw, far apart, and draw again.
+        highlighter.sync(&buffer, 0..10);
+        highlighter.sync(&buffer, 200..210);
+        let painted = highlighter.painted.clone();
+        assert_eq!(painted, [0..20, 190..220]);
+        highlighter.sync(&buffer, 0..10);
+        assert_eq!(
+            highlighter.painted,
+            [190..220, 0..20],
+            "nothing new to paint"
+        );
+        // The least recently drawn goes first.
+        for start in [50, 100, 250] {
+            highlighter.sync(&buffer, start..start + 10);
+        }
+        assert_eq!(highlighter.painted.len(), MAX_PAINTED);
+        assert!(!highlighter.painted.contains(&(190..220)));
     }
 
     #[test]

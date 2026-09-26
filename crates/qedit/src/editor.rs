@@ -1,37 +1,46 @@
-//! One open file: editing commands on top of OpenTUI's `EditBuffer` and
-//! `EditorView`, which own the text, cursor, selection, and scrolling.
+//! A view of an open file: editing commands on top of OpenTUI's
+//! `EditBuffer` and `EditorView`, which own the text, cursor, selection, and
+//! scrolling.
+//!
+//! Several editors, in different panels, may show one [`Document`]. The
+//! buffer has one cursor, which belongs to the editor last used (see
+//! [`Editor::attach`]); the others keep theirs parked in the document.
 //!
 //! Over the top right of the text, the find bar (Ctrl+F) finds and replaces
 //! in the file: it highlights every match and selects the current one.
 
-use std::cell::RefCell;
+use std::cell::RefMut;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use opentui::{
     Attributes, Buffer, EditBuffer, EditorView, Highlight, Rgba, SelectionBehavior,
-    SelectionColors, Viewport, WidthMethod, WrapMode,
+    SelectionColors, Viewport, WrapMode,
 };
 
-use crate::document::{self, LineEnding};
+#[cfg(test)]
+use crate::document::File;
+use crate::document::{self, Document};
 use crate::find::{self, Field, FindBar, Match, Target};
 use crate::history::{EditKind, History};
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
-use crate::language::{self, Language};
 use crate::line_edit::Edit;
 use crate::search::Toggle;
-use crate::syntax::{self, Highlighter};
-use crate::theme::{self, Theme};
+use crate::status::Status;
+#[cfg(test)]
+use crate::theme::Theme;
 use crate::words;
-use crate::workspace::Workspace;
 
 pub const STATUS_BG: Rgba = Rgba::rgb(49, 50, 68);
-const STATUS_FG: Rgba = Rgba::rgb(205, 214, 244);
-const STATUS_DIM: Rgba = Rgba::rgb(147, 153, 178);
-const STATUS_ERROR_BG: Rgba = Rgba::rgb(180, 60, 80);
+pub const STATUS_FG: Rgba = Rgba::rgb(205, 214, 244);
+pub const STATUS_DIM: Rgba = Rgba::rgb(147, 153, 178);
+/// The header of a panel the keyboard isn't in.
+pub const INACTIVE_STATUS_BG: Rgba = Rgba::rgb(36, 37, 52);
+pub const STATUS_ERROR_BG: Rgba = Rgba::rgb(180, 60, 80);
 const LINE_NUMBER: Rgba = Rgba::rgb(108, 112, 134);
 const LINE_NUMBER_CURRENT: Rgba = Rgba::rgb(205, 214, 244);
 const SELECTION: SelectionColors = SelectionColors {
@@ -59,13 +68,6 @@ pub enum Action {
     /// The "Save as" prompt was answered with this path, as typed. The app
     /// resolves it and calls [`Editor::save_as`].
     SaveAs(PathBuf),
-}
-
-/// The file being edited.
-pub struct File {
-    /// `None` until the buffer is first saved.
-    pub path: Option<PathBuf>,
-    pub line_ending: LineEnding,
 }
 
 struct Message {
@@ -99,22 +101,20 @@ struct Click {
 }
 
 pub struct Editor {
+    /// Tells the editors of a document apart, for its cursor.
+    id: u64,
+    doc: Rc<Document>,
+    /// The document's buffer.
     buffer: Rc<EditBuffer>,
     view: EditorView<'static>,
-    file: File,
-    /// What the file is written in, if known.
-    language: Option<&'static Language>,
-    theme: Rc<Theme>,
-    /// Highlights the text on screen as it's drawn, if qedit knows how.
-    syntax: RefCell<Option<Highlighter>>,
-    history: History,
     /// The fixed end of the selection that keyboard movement extends from.
     anchor: Option<u32>,
     drag: Option<Drag>,
     last_click: Option<Click>,
     wrap: WrapMode,
-    /// The screen column of the editor's left edge.
+    /// The screen column of the editor's left edge, and row of its top.
     x: u32,
+    y: u32,
     width: u32,
     height: u32,
     message: Option<Message>,
@@ -123,46 +123,8 @@ pub struct Editor {
 }
 
 impl Editor {
-    /// Opens `path`, or a new, unnamed buffer. The error is the reason
-    /// alone, without the path.
-    pub fn open(
-        path: Option<PathBuf>,
-        theme: Rc<Theme>,
-        width: u32,
-        height: u32,
-    ) -> Result<Editor, String> {
-        let loaded = match &path {
-            Some(path) => Some(document::load(path).map_err(|e| e.to_string())?),
-            None => None,
-        };
-        let buffer = Rc::new(EditBuffer::new(WidthMethod::Unicode).map_err(|e| e.to_string())?);
-        buffer.set_tab_width(4);
-        let mut file = File {
-            path,
-            line_ending: Default::default(),
-        };
-        let mut notice = None;
-        if let Some(loaded) = loaded {
-            buffer.set_text(&loaded.text);
-            buffer.set_cursor(0, 0);
-            file.line_ending = loaded.line_ending;
-            if loaded.mixed_endings {
-                notice = Some(format!(
-                    "Mixed line endings; saving will use {}.",
-                    loaded.line_ending.label()
-                ));
-            }
-        }
-        let mut editor =
-            Editor::new(buffer, file, theme, width, height).map_err(|e| e.to_string())?;
-        if let Some(notice) = notice {
-            editor.show_message(notice, false);
-        }
-        Ok(editor)
-    }
-
-    /// An editor `width` x `height`, with line numbers down the left and the
-    /// last row used for the status bar.
+    /// An editor `width` x `height` of `buffer`'s text, saved to `file`.
+    #[cfg(test)]
     pub fn new(
         buffer: Rc<EditBuffer>,
         file: File,
@@ -170,38 +132,99 @@ impl Editor {
         width: u32,
         height: u32,
     ) -> opentui::Result<Editor> {
+        Editor::show(Rc::new(Document::new(buffer, file, theme)), width, height)
+    }
+
+    /// An editor `width` x `height` of `doc`, with line numbers down the
+    /// left. It starts with the buffer's cursor.
+    pub fn show(doc: Rc<Document>, width: u32, height: u32) -> opentui::Result<Editor> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let buffer = doc.buffer.clone();
         let (_, view_w, view_h) = text_area(width, height, buffer.line_count());
         let view = buffer.shared_view(view_w, view_h)?;
         let wrap = WrapMode::None;
         view.set_wrap_mode(wrap);
-        buffer.set_syntax_style(Some(theme.syntax_style()));
-        buffer.set_default_fg(Some(theme::TEXT));
-        let language = detect_language(&buffer, file.path.as_deref());
-        let syntax = language.and_then(|language| Highlighter::new(language, &theme));
-        Ok(Editor {
+        let mut editor = Editor {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            doc,
             buffer,
             view,
-            file,
-            language,
-            theme,
-            syntax: RefCell::new(syntax),
-            history: History::new(),
             anchor: None,
             drag: None,
             last_click: None,
             wrap,
             x: 0,
+            y: 0,
             width,
             height,
             message: None,
             prompt: None,
             find: None,
-        })
+        };
+        editor.attach();
+        Ok(editor)
     }
 
-    /// Places the editor at column `x`, `width` x `height`.
-    pub fn set_area(&mut self, x: u32, width: u32, height: u32) {
+    /// The document shown.
+    pub fn document(&self) -> &Rc<Document> {
+        &self.doc
+    }
+
+    /// Gives this editor the buffer's cursor, if another editor of the
+    /// document had it, and keeps the view on it. Call it before editing,
+    /// moving, or scrolling; the other editors' views stay where they are.
+    pub fn attach(&mut self) {
+        let doc = &self.doc;
+        if doc.cursor_owner.get() == Some(self.id) {
+            return;
+        }
+        if let Some(owner) = doc.cursor_owner.get() {
+            doc.park(owner);
+        }
+        doc.cursor_owner.set(Some(self.id));
+        self.view.take_cursor();
+        // Typing in one editor and then another makes two undo steps.
+        doc.history.borrow_mut().break_group();
+        if let Some(parked) = doc.unpark(self.id) {
+            if parked.epoch != self.buffer.content_epoch() {
+                // Edited elsewhere: the selection may cover other text now.
+                self.anchor = None;
+                self.view.clear_selection();
+            }
+            self.buffer.set_cursor(parked.row, parked.col);
+        }
+        // The document's find highlights are this editor's matches.
+        match &mut self.find {
+            Some(bar) => {
+                bar.epoch = bar.epoch.map(|_| u64::MAX);
+                self.sync_find();
+            }
+            None => self.buffer.remove_highlights(FIND_HIGHLIGHTS),
+        }
+    }
+
+    /// The cursor's row and column: the buffer's, or where it was parked
+    /// while another editor of the document has it.
+    fn cursor(&self) -> (u32, u32) {
+        match self.doc.parked(self.id) {
+            Some(parked) if self.doc.cursor_owner.get() != Some(self.id) => {
+                (parked.row, parked.col)
+            }
+            _ => {
+                let cursor = self.buffer.cursor();
+                (cursor.row, cursor.col)
+            }
+        }
+    }
+
+    fn history(&self) -> RefMut<'_, History> {
+        self.doc.history.borrow_mut()
+    }
+
+    /// Places the editor at column `x`, row `y`, `width` x `height`.
+    pub fn set_area(&mut self, x: u32, y: u32, width: u32, height: u32) {
         self.x = x;
+        self.y = y;
         self.width = width;
         self.height = height;
         self.sync_view_size();
@@ -233,21 +256,23 @@ impl Editor {
     }
 
     /// The file's path; `None` until it is first saved.
-    pub fn path(&self) -> Option<&Path> {
-        self.file.path.as_deref()
+    pub fn path(&self) -> Option<PathBuf> {
+        self.doc.path()
     }
 
+    #[cfg(test)]
     pub fn is_modified(&self) -> bool {
-        self.history.is_modified()
+        self.doc.is_modified()
     }
 
-    /// An unnamed buffer that was never typed in, which opening a file may
-    /// replace.
+    /// An unnamed document that was never typed in, which opening a file
+    /// may replace.
     pub fn is_blank(&self) -> bool {
-        self.file.path.is_none() && !self.buffer.can_undo() && self.buffer.text().is_empty()
+        self.doc.is_blank()
     }
 
     /// The whole text, with `\n` line breaks.
+    #[cfg(test)]
     pub fn text(&self) -> String {
         self.buffer.text()
     }
@@ -264,7 +289,7 @@ impl Editor {
     /// cursor at its start if it's empty. A line off screen is scrolled to
     /// a third of the way down.
     pub fn select_in_line(&mut self, row: u32, range: Range<usize>) {
-        self.history.break_group();
+        self.history().break_group();
         self.anchor = None;
         self.view.clear_selection();
         // Before the cursor moves: the view follows it.
@@ -444,7 +469,7 @@ impl Editor {
         match mouse.kind {
             MouseKind::Press(MouseButton::Left) if mouse.y < text_h => {
                 self.message = None;
-                self.history.break_group();
+                self.history().break_group();
                 let count = self.click_count(at, now);
                 if mouse.mods.shift && count == 1 {
                     self.extend_selection_to(at);
@@ -556,15 +581,15 @@ impl Editor {
         }
     }
 
-    /// Draws the editor at its column and returns the terminal cursor
-    /// position (0-based column, row). The keymap labels the status bar's
-    /// shortcut hints, and the workspace shortens the file's path.
-    pub fn draw(&self, frame: &Buffer, keymap: &Keymap, workspace: &Workspace) -> (u32, u32) {
+    /// Draws the editor in its area and returns the terminal cursor
+    /// position (0-based column, row). The keymap labels the find bar's
+    /// buttons.
+    pub fn draw(&self, frame: &Buffer, keymap: &Keymap) -> (u32, u32) {
         self.sync_view_size();
         self.sync_syntax();
         let (gutter, _, _) = self.text_area();
         let text_x = self.x + gutter;
-        frame.draw_editor_view(&self.view, text_x as i32, 0);
+        frame.draw_editor_view(&self.view, text_x as i32, self.y as i32);
         self.draw_line_numbers(frame, gutter);
         let find_cursor = self
             .find
@@ -572,20 +597,17 @@ impl Editor {
             .zip(self.find_area())
             .and_then(|(bar, area)| {
                 let (x, width, _) = area;
-                bar.draw(frame, (x, 0, width), self.current_match(), keymap)
+                bar.draw(frame, (x, self.y, width), self.current_match(), keymap)
             });
-        match self.draw_status(frame, keymap, workspace) {
-            Some(prompt_cursor) => prompt_cursor,
-            None => find_cursor.unwrap_or_else(|| {
-                let cursor = self.view.visual_cursor();
-                (text_x + cursor.col, cursor.row)
-            }),
-        }
+        find_cursor.unwrap_or_else(|| {
+            let cursor = self.view.visual_cursor();
+            (text_x + cursor.col, self.y + cursor.row)
+        })
     }
 
     /// Highlights the lines about to be drawn.
     fn sync_syntax(&self) {
-        let mut syntax = self.syntax.borrow_mut();
+        let mut syntax = self.doc.syntax.borrow_mut();
         let Some(highlighter) = syntax.as_mut() else {
             return;
         };
@@ -601,7 +623,7 @@ impl Editor {
         if gutter == 0 {
             return;
         }
-        let current = self.buffer.cursor().row;
+        let (current, _) = self.cursor();
         let digits = gutter as usize - 3;
         for (y, row) in self.view.visible_lines().iter().enumerate() {
             if row.wrap != 0 {
@@ -613,7 +635,7 @@ impl Editor {
                 (LINE_NUMBER, Attributes::NONE)
             };
             let number = format!("{:>digits$}", row.line + 1);
-            frame.draw_text(&number, self.x + 1, y as u32, fg, None, attributes);
+            frame.draw_text(&number, self.x + 1, self.y + y as u32, fg, None, attributes);
         }
     }
 
@@ -626,10 +648,10 @@ impl Editor {
         if replaced > 0 {
             // Typing over a selection starts a new undo step that includes
             // the deletion.
-            self.history.break_group();
+            self.history().break_group();
         }
         let steps = replaced + f(&self.buffer);
-        self.history.record(kind, steps);
+        self.history().record(kind, steps);
     }
 
     /// Backspace/Delete: removes the selection if there is one, otherwise a
@@ -637,11 +659,11 @@ impl Editor {
     fn delete(&mut self, delete_char: impl FnOnce(&EditBuffer) -> u32) {
         let removed = self.delete_selection();
         if removed > 0 {
-            self.history.break_group();
-            self.history.record(EditKind::Other, removed);
+            self.history().break_group();
+            self.history().record(EditKind::Other, removed);
         } else {
             let steps = delete_char(&self.buffer);
-            self.history.record(EditKind::Delete, steps);
+            self.history().record(EditKind::Delete, steps);
         }
     }
 
@@ -668,9 +690,9 @@ impl Editor {
             Direction::Backward => ((to.row, to.col), (from.row, from.col)),
             Direction::Forward => ((from.row, from.col), (to.row, to.col)),
         };
-        self.history.break_group();
+        self.history().break_group();
         let steps = eb.delete_range(start, end);
-        self.history.record(EditKind::Other, steps);
+        self.history().record(EditKind::Other, steps);
     }
 
     /// Alt+Up/Down: swaps the lines holding the cursor or selection with the
@@ -702,7 +724,7 @@ impl Editor {
             .anchor
             .is_some_and(|a| Some(a) == selection.map(|(s, _)| s));
 
-        self.history.break_group();
+        self.history().break_group();
         let steps = if up {
             // Remove the line above, then reinsert it after the block.
             let prev_start = eb.position_to_offset(first - 1, 0);
@@ -725,7 +747,7 @@ impl Editor {
             eb.set_cursor(first, 0);
             removed + eb.insert_text(&format!("{next_text}\n"))
         };
-        self.history.record(EditKind::Other, steps);
+        self.history().record(EditKind::Other, steps);
 
         let shift = |(row, col): (u32, u32)| if up { (row - 1, col) } else { (row + 1, col) };
         let (row, col) = shift((cursor.row, cursor.col));
@@ -765,7 +787,8 @@ impl Editor {
     }
 
     fn undo(&mut self) {
-        match self.history.undo() {
+        let undo = self.history().undo();
+        match undo {
             Some(steps) => (0..steps).for_each(|_| {
                 self.buffer.undo();
             }),
@@ -776,7 +799,8 @@ impl Editor {
     }
 
     fn redo(&mut self) {
-        match self.history.redo() {
+        let redo = self.history().redo();
+        match redo {
             Some(steps) => (0..steps).for_each(|_| {
                 self.buffer.redo();
             }),
@@ -806,8 +830,8 @@ impl Editor {
         let action = self.copy(clipboard);
         if let Action::Copy(_) = action {
             let steps = self.delete_selection();
-            self.history.break_group();
-            self.history.record(EditKind::Other, steps);
+            self.history().break_group();
+            self.history().record(EditKind::Other, steps);
         }
         action
     }
@@ -829,7 +853,7 @@ impl Editor {
     /// movement starts from the selection edge it heads away from: its start
     /// when moving backward (Up, Home, ...), its end when moving forward.
     fn move_cursor(&mut self, select: bool, direction: Direction, movement: impl FnOnce(&Self)) {
-        self.history.break_group();
+        self.history().break_group();
         if !select {
             if let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) {
                 let edge = match direction {
@@ -855,7 +879,7 @@ impl Editor {
         let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) else {
             return false;
         };
-        self.history.break_group();
+        self.history().break_group();
         self.anchor = None;
         self.view.clear_selection();
         self.view
@@ -864,7 +888,7 @@ impl Editor {
     }
 
     fn select_all(&mut self) {
-        self.history.break_group();
+        self.history().break_group();
         self.move_to_document_end();
         self.anchor = Some(0);
         self.select_to_cursor(0);
@@ -949,7 +973,7 @@ impl Editor {
         let y = (vp.y as i64 + dy).clamp(0, max_y as i64) as u32;
         let x = (vp.x as i64 + dx).max(0) as u32;
         if (x, y) != (vp.x, vp.y) {
-            self.history.break_group();
+            self.history().break_group();
             self.view.scroll_to(x, y, true);
         }
     }
@@ -1097,7 +1121,7 @@ impl Editor {
         {
             return;
         }
-        let style = self.theme.find_match;
+        let style = self.doc.theme.find_match;
         let Some(bar) = &mut self.find else {
             return;
         };
@@ -1173,7 +1197,7 @@ impl Editor {
             return;
         };
         bar.origin = m.offsets.start;
-        self.history.break_group();
+        self.history().break_group();
         let vp = self.view.viewport();
         self.view.set_cursor_by_offset(m.offsets.end);
         self.anchor = Some(m.offsets.start);
@@ -1225,9 +1249,9 @@ impl Editor {
             let text = self.buffer.text();
             let replacer = find::Replacer::new(&bar.memory.query, &bar.memory.replacement);
             let replacement = replacer.expand(&text, m.bytes.clone());
-            self.history.break_group();
+            self.history().break_group();
             self.edit(EditKind::Other, |eb| eb.insert_text(&replacement));
-            self.history.break_group();
+            self.history().break_group();
             self.sync_find();
         }
         let Some(bar) = &self.find else {
@@ -1265,10 +1289,10 @@ impl Editor {
         };
         // Matches never span lines, so the cursor's line keeps its place.
         let cursor = self.buffer.cursor();
-        self.history.break_group();
+        self.history().break_group();
         let steps = self.buffer.replace_text(&replaced);
-        self.history.record(EditKind::Other, steps);
-        self.history.break_group();
+        self.history().record(EditKind::Other, steps);
+        self.history().break_group();
         self.anchor = None;
         self.view.clear_selection();
         self.buffer.set_cursor(cursor.row, cursor.col);
@@ -1277,134 +1301,68 @@ impl Editor {
         self.sync_find();
     }
 
-    // --- status bar, files, misc --------------------------------------------
+    // --- status, files, misc --------------------------------------------------
 
-    /// Returns the cursor position when the prompt has focus.
-    fn draw_status(
-        &self,
-        frame: &Buffer,
-        keymap: &Keymap,
-        workspace: &Workspace,
-    ) -> Option<(u32, u32)> {
-        if self.height < 2 {
-            return None;
-        }
-        let y = self.height - 1;
-        let x0 = self.x;
-
+    /// What the status bar shows while this editor is active.
+    pub fn status(&self) -> Status {
         if let Some(prompt) = &self.prompt {
-            frame.fill_rect(x0, y, self.width, 1, STATUS_BG);
-            let label = " Save as: ";
-            frame.draw_text(label, x0, y, STATUS_DIM, None, Attributes::NONE);
-            let x = x0 + label.len() as u32;
-            // Keep the end of a long path visible.
-            let room = (x0 + self.width).saturating_sub(x + 1) as usize;
-            let chars: Vec<char> = prompt.input.chars().collect();
-            let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
-            frame.draw_text(&shown, x, y, STATUS_FG, None, Attributes::NONE);
-            return Some((x + shown.chars().count() as u32, y));
+            return Status::Prompt(prompt.input.clone());
         }
-
+        if let Some(message) = &self.message {
+            return Status::Message {
+                text: message.text.clone(),
+                error: message.error,
+            };
+        }
         // While typing a query that isn't a valid regex, why.
-        let find_error = self
+        if let Some(error) = self
             .find
             .as_ref()
             .filter(|bar| bar.focus == Some(Field::Find))
             .and_then(FindBar::error)
-            .map(|error| Message {
+        {
+            return Status::Message {
                 text: format!("Invalid regex: {error}"),
                 error: true,
-            });
-        if let Some(message) = self.message.as_ref().or(find_error.as_ref()) {
-            let bg = if message.error {
-                STATUS_ERROR_BG
-            } else {
-                STATUS_BG
             };
-            frame.fill_rect(x0, y, self.width, 1, bg);
-            frame.draw_text(
-                &format!(" {}", message.text),
-                x0,
-                y,
-                STATUS_FG,
-                None,
-                Attributes::BOLD,
-            );
-            return None;
         }
-
-        frame.fill_rect(x0, y, self.width, 1, STATUS_BG);
-        let cursor = self.buffer.cursor();
-        let name = match &self.file.path {
-            Some(path) => workspace.display_path(path),
-            None => "[new file]".to_string(),
-        };
-        let dirty = if self.history.is_modified() {
-            " [+]"
-        } else {
-            ""
-        };
-        let wrap = match self.wrap {
-            WrapMode::None => "nowrap",
-            _ => "wrap",
-        };
+        let (row, col) = self.cursor();
         let selected = match self.view.selection() {
             Some((start, end)) if start != end => format!(" ({} sel)", end - start),
             _ => String::new(),
         };
-        let language = self.language.map_or("Plain Text", |l| l.name);
-        let info = format!(
-            "{dirty}  Ln {}, Col {}{selected}  {language}  {}  {wrap}",
-            cursor.row + 1,
-            cursor.col + 1,
-            self.file.line_ending.label(),
-        );
-        // Shorten the path from the left so the rest of the status stays visible.
-        let room = (self.width as usize).saturating_sub(info.chars().count() + 1);
-        let left = format!(" {}{info}", truncate_left(&name, room));
-        frame.draw_text(&left, x0, y, STATUS_FG, None, Attributes::BOLD);
-        let hints: String = [
-            (Command::Save, "save"),
-            (Command::FocusTree, "files"),
-            (Command::Palette, "commands"),
-            (Command::Quit, "quit"),
-        ]
-        .iter()
-        .filter_map(|&(command, name)| Some(format!("{:#} {name}  ", keymap.shortcut(command)?)))
-        .collect();
-        let hints = hints.strip_suffix(' ').unwrap_or(&hints);
-        let hints_x = self.width.saturating_sub(hints.len() as u32);
-        if hints_x as usize > left.chars().count() {
-            frame.draw_text(hints, x0 + hints_x, y, STATUS_DIM, None, Attributes::NONE);
-        }
-        None
+        let language = self.doc.language.get().map_or("Plain Text", |l| l.name);
+        let line_ending = self.doc.file.borrow().line_ending.label();
+        let wrap = match self.wrap {
+            WrapMode::None => "nowrap",
+            _ => "wrap",
+        };
+        Status::Info(format!(
+            "Ln {}, Col {}{selected}  {language}  {line_ending}  {wrap}",
+            row + 1,
+            col + 1,
+        ))
     }
 
     /// Writes the file to `path` from now on.
     pub fn save_as(&mut self, path: PathBuf) -> Action {
-        self.file.path = Some(path);
-        let language = detect_language(&self.buffer, self.file.path.as_deref());
-        if language.map(|l| l.name) != self.language.map(|l| l.name) {
-            self.language = language;
-            self.buffer.remove_highlights(syntax::HIGHLIGHTS);
-            let highlighter = language.and_then(|language| Highlighter::new(language, &self.theme));
-            self.syntax = RefCell::new(highlighter);
-        }
+        self.doc.rename(path);
         self.save()
     }
 
     /// Writes the file, or asks for a name if it has none.
     fn save(&mut self) -> Action {
-        let Some(path) = self.file.path.clone() else {
+        let Some(path) = self.path() else {
             self.prompt = Some(Prompt {
                 input: String::new(),
             });
             return Action::Continue;
         };
         let text = self.buffer.text();
-        match document::save(&path, &text, self.file.line_ending) {
+        let line_ending = self.doc.file.borrow().line_ending;
+        match document::save(&path, &text, line_ending) {
             Ok(()) => {
-                self.history.mark_saved();
+                self.history().mark_saved();
                 let lines = self.buffer.line_count();
                 let name = path
                     .file_name()
@@ -1458,6 +1416,12 @@ impl Editor {
     }
 }
 
+impl Drop for Editor {
+    fn drop(&mut self) {
+        self.doc.forget(self.id);
+    }
+}
+
 /// Moves the cursor right over `bytes` bytes of its line, a grapheme at a
 /// time so that tabs and wide characters are counted as the engine lays
 /// them out, and returns its offset. Stops at the end of the line.
@@ -1483,17 +1447,6 @@ fn cell((x, y): (u32, u32)) -> (i32, i32) {
     (x as i32, y as i32)
 }
 
-/// The last `max` characters of `s`, marked with a leading ellipsis if cut.
-fn truncate_left(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    let tail: String = s.chars().skip(count - keep).collect();
-    format!("…{tail}")
-}
-
 /// Columns for line numbers: the widest number with a space before it and
 /// two after, or none when the screen is too narrow to spare them.
 fn gutter_width(width: u32, line_count: u32) -> u32 {
@@ -1506,29 +1459,19 @@ fn gutter_width(width: u32, line_count: u32) -> u32 {
 }
 
 /// The text area, as (x, width, height): everything right of the line
-/// numbers and above the status bar row.
+/// numbers.
 fn text_area(width: u32, height: u32, line_count: u32) -> (u32, u32, u32) {
     let gutter = gutter_width(width, line_count);
-    (
-        gutter,
-        width.saturating_sub(gutter).max(1),
-        height.saturating_sub(1).max(1),
-    )
-}
-
-/// The language of the file at `path`, holding `buffer`'s text.
-fn detect_language(buffer: &EditBuffer, path: Option<&Path>) -> Option<&'static Language> {
-    language::detect(path, || {
-        let text = buffer.text();
-        text.lines().next().unwrap_or_default().to_string()
-    })
+    (gutter, width.saturating_sub(gutter).max(1), height.max(1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::LineEnding;
     use crate::input::Mods;
     use crate::keymap::Context;
+    use crate::theme;
     use crate::theme::MATCH_BG;
     use opentui::{OwnedBuffer, WidthMethod};
     use std::fs;
@@ -1575,8 +1518,7 @@ mod tests {
     /// Draws `editor` on a cleared `screen`, as the app does.
     fn draw(editor: &Editor, screen: &OwnedBuffer) -> (u32, u32) {
         screen.clear(Rgba::terminal_default([0, 0, 0]));
-        let workspace = Workspace::new([]).unwrap();
-        editor.draw(screen, &Keymap::default(), &workspace)
+        editor.draw(screen, &Keymap::default())
     }
 
     fn theme() -> Rc<Theme> {
@@ -1624,16 +1566,9 @@ mod tests {
         );
     }
 
+    /// The status bar's text while `editor` is active.
     fn status(editor: &Editor) -> String {
-        let screen = OwnedBuffer::new(60, 4, false, WidthMethod::Unicode, "test").unwrap();
-        draw(editor, &screen);
-        screen
-            .to_text(true)
-            .lines()
-            .nth(3)
-            .unwrap()
-            .trim_end()
-            .to_string()
+        editor.status().text()
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -1655,15 +1590,11 @@ mod tests {
             line_ending: LineEnding::CrLf,
         };
         let mut editor = Editor::new(eb.clone(), file, theme(), 60, 4).unwrap();
-        assert!(!status(&editor).contains("[+]"));
+        assert!(!editor.is_modified());
 
         eb.set_cursor(1, 0);
         press(&mut editor, "two");
-        assert!(
-            status(&editor).contains("save.txt [+]"),
-            "{}",
-            status(&editor)
-        );
+        assert!(editor.is_modified());
 
         ctrl(&mut editor, 's');
         assert_eq!(fs::read_to_string(&path).unwrap(), "one\r\ntwo");
@@ -1673,7 +1604,7 @@ mod tests {
             status(&editor)
         );
         key(&mut editor, KeyCode::Left);
-        assert!(!status(&editor).contains("[+]"), "{}", status(&editor));
+        assert!(!editor.is_modified());
     }
 
     #[test]
@@ -1755,10 +1686,7 @@ mod tests {
             ctrl(&mut editor, 'z');
             assert_eq!(eb.text(), *text);
         }
-        assert!(
-            !status(&editor).contains("[+]"),
-            "back at the (empty) saved state"
-        );
+        assert!(!editor.is_modified(), "back at the (empty) saved state");
         ctrl(&mut editor, 'z');
         assert_eq!(status(&editor), " Nothing to undo.");
 
@@ -2226,16 +2154,6 @@ mod tests {
             t3 + Duration::from_secs(1),
         );
         assert_eq!(editor.view.selected_text(), "hello world\nsecon");
-
-        // Clicks on the status bar are ignored.
-        mouse(
-            &mut editor,
-            MouseKind::Press(left),
-            1,
-            3,
-            t3 + Duration::from_secs(2),
-        );
-        assert_eq!(editor.view.selected_text(), "hello world\nsecon");
     }
 
     #[test]
@@ -2362,11 +2280,11 @@ mod tests {
             key(&mut editor, KeyCode::Enter);
         }
         let (lines, _) = screen_lines(&editor, 30, 6);
-        assert_eq!(lines[4], " 10", "{lines:?}");
+        assert_eq!(lines[5], " 10", "{lines:?}");
         assert_eq!(editor.view.viewport().width, 30 - 5);
 
         // Too narrow to spare the columns: no numbers.
-        editor.set_area(0, 20, 6);
+        editor.set_area(0, 0, 20, 6);
         editor.handle_key(Key::new(KeyCode::Home, Mods::CTRL));
         let (lines, cursor) = screen_lines(&editor, 20, 6);
         assert_eq!(lines[0], "one", "{lines:?}");
@@ -2750,8 +2668,7 @@ mod tests {
 
         editor.run(Command::ReplaceAll, false, &mut clipboard);
         assert_eq!(eb.text(), "<1> <22>\nb3 <4>");
-        let (status, _) = row_with_bg(&editor, 40, 8, 7, MATCH_BG);
-        assert!(status.contains("Replaced 2 matches."), "{status}");
+        assert_eq!(status(&editor), " Replaced 2 matches.");
         ctrl(&mut editor, 'z');
         assert_eq!(eb.text(), "<1> a22\nb3 a4", "one undo step");
         ctrl(&mut editor, 'z');
@@ -2814,8 +2731,11 @@ mod tests {
         let mut clipboard = None;
         editor.run(Command::SearchToggleRegex, false, &mut clipboard);
         editor.find_edit(Edit::Insert("("));
-        let (status, _) = row_with_bg(&editor, 40, 6, 5, MATCH_BG);
-        assert!(status.contains("Invalid regex: "), "{status}");
+        assert!(
+            status(&editor).starts_with(" Invalid regex: "),
+            "{}",
+            status(&editor)
+        );
         assert!(row_with_bg(&editor, 40, 6, 0, MATCH_BG)
             .0
             .contains("invalid regex"));

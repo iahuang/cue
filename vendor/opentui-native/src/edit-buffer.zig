@@ -149,6 +149,10 @@ pub const EditBuffer = struct {
     events: event_emitter.EventEmitter(EditBufferEvent),
     segment_splitter: UnifiedRope.Node.LeafSplitFn,
     event_sink: ?*event_bus.EventSink,
+    /// The one view that keeps the cursor in sight (qedit patch). With
+    /// several views of a buffer, the others keep their own scroll position
+    /// as the cursor moves. Null: every view follows the cursor.
+    cursor_owner: ?*const anyopaque = null,
 
     pub fn init(
         allocator: Allocator,

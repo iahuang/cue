@@ -57,8 +57,9 @@ pub const EditorView = struct {
 
     fn onCursorChanged(ctx: *anyopaque) void {
         const self: *EditorView = @ptrCast(@alignCast(ctx));
-        self.desired_visual_col = null;
         self.updatePlaceholderVisibility();
+        if (!self.followsCursor()) return;
+        self.desired_visual_col = null;
 
         const cursor = self.edit_buffer.getPrimaryCursor();
         if (self.cursor_visual_affinity) |affinity| {
@@ -117,6 +118,9 @@ pub const EditorView = struct {
         defer global_allocator.destroy(self);
 
         self.edit_buffer.events.off(.cursorChanged, self.cursor_changed_listener);
+        if (self.edit_buffer.cursor_owner == @as(*const anyopaque, @ptrCast(self))) {
+            self.edit_buffer.cursor_owner = null;
+        }
 
         if (self.placeholder_syntax_style) |style| {
             style.deinit();
@@ -145,6 +149,19 @@ pub const EditorView = struct {
         }
     }
 
+    /// Makes this the view that keeps the buffer's cursor in sight; the
+    /// buffer's other views stop following it (qedit patch).
+    pub fn takeCursor(self: *EditorView) void {
+        self.edit_buffer.cursor_owner = self;
+    }
+
+    /// Whether the cursor is this view's to keep in sight: it took the
+    /// cursor, or no view has.
+    pub fn followsCursor(self: *const EditorView) bool {
+        const owner = self.edit_buffer.cursor_owner orelse return true;
+        return owner == @as(*const anyopaque, @ptrCast(self));
+    }
+
     pub fn getViewport(self: *const EditorView) ?tbv.Viewport {
         return self.text_buffer_view.getViewport();
     }
@@ -153,6 +170,7 @@ pub const EditorView = struct {
     /// Unlike ensureCursorVisible, this moves the cursor, not the viewport.
     /// Respects scroll margins to prevent immediate re-scrolling by ensureCursorVisible.
     pub fn makeCursorVisible(self: *EditorView) void {
+        if (!self.followsCursor()) return;
         const vp = self.text_buffer_view.getViewport() orelse return;
         const cursor = self.edit_buffer.getPrimaryCursor();
         const vcursor = self.getPrimaryVisualCursorAbsolute();
@@ -307,6 +325,7 @@ pub const EditorView = struct {
     pub fn updateBeforeRender(self: *EditorView) void {
         self.updatePlaceholderVisibility();
 
+        if (!self.followsCursor()) return;
         const has_selection = self.text_buffer_view.selection != null;
 
         if (!has_selection or self.selection_follow_cursor) {
@@ -534,6 +553,7 @@ pub const EditorView = struct {
             });
         }
 
+        if (!self.followsCursor()) return;
         const vcursor = self.getPrimaryVisualCursorAbsolute();
         self.ensureCursorVisible(vcursor.visual_row);
     }

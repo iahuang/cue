@@ -79,6 +79,13 @@ commands! {
     ToggleTree => "tree:toggle", "Show or Hide File Tree";
     FocusTree => "tree:focus", "Focus File Tree";
     FocusEditor => "editor:focus", "Focus Editor";
+    SplitRight => "panel:split-right", "Split Panel Right";
+    SplitDown => "panel:split-down", "Split Panel Down";
+    ClosePanel => "panel:close", "Close Panel";
+    FocusPanelLeft => "panel:focus-left", "Focus Panel Left";
+    FocusPanelRight => "panel:focus-right", "Focus Panel Right";
+    FocusPanelUp => "panel:focus-up", "Focus Panel Above";
+    FocusPanelDown => "panel:focus-down", "Focus Panel Below";
     TreeUp => "tree:up", "File Tree: Select Previous";
     TreeDown => "tree:down", "File Tree: Select Next";
     TreeExpand => "tree:expand", "File Tree: Expand";
@@ -142,7 +149,10 @@ impl Command {
         use Command::*;
         match self {
             Quit | Palette | Save | GoToFile | SearchWorkspace | Find | FindReplace | FindNext
-            | FindPrevious | ToggleTree | FocusTree | FocusEditor => Context::Global,
+            | FindPrevious | ToggleTree | FocusTree | FocusEditor | SplitRight | SplitDown
+            | ClosePanel | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown => {
+                Context::Global
+            }
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose => {
@@ -233,6 +243,9 @@ impl Default for Keymap {
             ('f', Find),
             // Ctrl+G, as in VS Code on macOS and in browsers.
             ('g', FindNext),
+            // Ctrl+\ as in VS Code; Ctrl+W as closing a tab does.
+            ('\\', SplitRight),
+            ('w', ClosePanel),
         ] {
             bindings.push((key(Char(c), Mods::CTRL), command));
             bindings.push((key(Char(c), SUPER), command));
@@ -251,6 +264,27 @@ impl Default for Keymap {
         // palette has it.
         bindings.push((key(Char('h'), Mods::CTRL), FindReplace));
         bindings.push((key(Char('f'), SUPER_ALT), FindReplace));
+        // Legacy terminals send it as Ctrl+\, which splits right; there,
+        // the command palette has it. Some report the shifted key, `|`.
+        bindings.push((key(Char('\\'), CTRL_SHIFT), SplitDown));
+        bindings.push((key(Char('\\'), SUPER_SHIFT), SplitDown));
+        bindings.push((key(Char('|'), CTRL_SHIFT), SplitDown));
+        bindings.push((key(Char('|'), SUPER_SHIFT), SplitDown));
+        // Ctrl+Alt rather than Ctrl alone, which macOS keeps for switching
+        // desktops.
+        const CTRL_ALT: Mods = Mods {
+            alt: true,
+            ..Mods::CTRL
+        };
+        for (code, command) in [
+            (Left, FocusPanelLeft),
+            (Right, FocusPanelRight),
+            (Up, FocusPanelUp),
+            (Down, FocusPanelDown),
+        ] {
+            bindings.push((key(code, CTRL_ALT), command));
+            bindings.push((key(code, SUPER_ALT), command));
+        }
 
         bindings.extend([
             (key(Esc, Mods::NONE), ClearSelection),

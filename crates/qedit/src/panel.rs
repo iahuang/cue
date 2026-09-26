@@ -1,0 +1,324 @@
+//! A panel: one area of the layout, showing an open file, or nothing yet.
+//!
+//! Panels have no tabs. Opening a file in a panel replaces what it shows,
+//! but the panel keeps an editor for each file it has shown, so going back
+//! to one finds the cursor and scroll position where they were. Files stay
+//! open when a panel moves on from them or closes; the app owns them.
+//!
+//! A header across the top names the file, brighter on the active panel.
+//! An empty panel, as a new split starts, lists how to open something.
+
+use std::path::Path;
+use std::rc::Rc;
+use std::time::Instant;
+
+use opentui::{Attributes, Buffer};
+
+use crate::document::Document;
+use crate::editor::{Editor, INACTIVE_STATUS_BG, STATUS_BG, STATUS_DIM, STATUS_FG};
+use crate::input::{Mouse, MouseKind};
+use crate::keymap::{Command, Keymap};
+use crate::layout::{PanelId, Rect};
+use crate::status::Status;
+use crate::workspace::Workspace;
+
+/// What an empty panel suggests.
+const SUGGESTIONS: &[Command] = &[
+    Command::GoToFile,
+    Command::SearchWorkspace,
+    Command::Palette,
+    Command::ClosePanel,
+];
+
+pub struct Panel {
+    pub id: PanelId,
+    /// An editor for each file shown, most recently opened last.
+    editors: Vec<Editor>,
+    /// The editor on screen; `None` while empty.
+    current: Option<usize>,
+    /// While empty, a message for the status bar until the next key press.
+    message: Option<(String, bool)>,
+    area: Rect,
+}
+
+impl Panel {
+    pub fn new(id: PanelId) -> Panel {
+        Panel {
+            id,
+            editors: Vec::new(),
+            current: None,
+            message: None,
+            area: Rect::default(),
+        }
+    }
+
+    pub fn area(&self) -> Rect {
+        self.area
+    }
+
+    pub fn set_area(&mut self, area: Rect) {
+        self.area = area;
+        let body = self.body();
+        for editor in &mut self.editors {
+            editor.set_area(body.x, body.y, body.width, body.height);
+        }
+    }
+
+    /// The area below the header.
+    fn body(&self) -> Rect {
+        let area = self.area;
+        Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width.max(1),
+            height: area.height.saturating_sub(1),
+        }
+    }
+
+    /// The editor on screen, if any.
+    pub fn editor(&self) -> Option<&Editor> {
+        self.editors.get(self.current?)
+    }
+
+    /// The editor on screen, if any, with the buffer's cursor.
+    pub fn editor_mut(&mut self) -> Option<&mut Editor> {
+        let editor = self.editors.get_mut(self.current?)?;
+        editor.attach();
+        Some(editor)
+    }
+
+    /// The document on screen, if any.
+    pub fn document(&self) -> Option<&Rc<Document>> {
+        self.editor().map(Editor::document)
+    }
+
+    /// Whether `doc` is on screen here.
+    pub fn shows(&self, doc: &Rc<Document>) -> bool {
+        self.document().is_some_and(|shown| Rc::ptr_eq(shown, doc))
+    }
+
+    /// Whether the panel has an editor of `doc`, on screen or not.
+    pub fn has(&self, doc: &Rc<Document>) -> bool {
+        self.editors
+            .iter()
+            .any(|editor| Rc::ptr_eq(editor.document(), doc))
+    }
+
+    /// Shows `doc`, where it was left if it was shown here before. An
+    /// unnamed document left behind that was never typed in is dropped.
+    pub fn show(&mut self, doc: &Rc<Document>) -> opentui::Result<()> {
+        let index = match self
+            .editors
+            .iter()
+            .position(|editor| Rc::ptr_eq(editor.document(), doc))
+        {
+            Some(index) => index,
+            None => {
+                let body = self.body();
+                let mut editor = Editor::show(doc.clone(), body.width, body.height)?;
+                editor.set_area(body.x, body.y, body.width, body.height);
+                self.editors.push(editor);
+                self.editors.len() - 1
+            }
+        };
+        let left = self.current.replace(index);
+        self.message = None;
+        if let Some(left) = left.filter(|&left| left != index && self.editors[left].is_blank()) {
+            self.editors.remove(left);
+            if index > left {
+                self.current = Some(index - 1);
+            }
+        }
+        if let Some(editor) = self.editor_mut() {
+            editor.clear_message();
+        }
+        Ok(())
+    }
+
+    /// Drops the editor of `doc`, which must not be on screen.
+    pub fn forget(&mut self, doc: &Rc<Document>) {
+        let Some(index) = self
+            .editors
+            .iter()
+            .position(|editor| Rc::ptr_eq(editor.document(), doc))
+        else {
+            return;
+        };
+        debug_assert_ne!(self.current, Some(index));
+        self.editors.remove(index);
+        if let Some(current) = self.current.filter(|&current| current > index) {
+            self.current = Some(current - 1);
+        }
+    }
+
+    /// Empties the panel, dropping its editors.
+    pub fn clear(&mut self) {
+        self.editors.clear();
+        self.current = None;
+        self.message = None;
+    }
+
+    /// Shows `text` in the status bar until the next key press.
+    pub fn show_message(&mut self, text: String, error: bool) {
+        match self.editor_mut() {
+            Some(editor) => editor.show_message(text, error),
+            None => self.message = Some((text, error)),
+        }
+    }
+
+    pub fn clear_message(&mut self) {
+        self.message = None;
+        if let Some(editor) = self.current.and_then(|i| self.editors.get_mut(i)) {
+            editor.clear_message();
+        }
+    }
+
+    /// What the status bar shows while this panel is active.
+    pub fn status(&self) -> Status {
+        match (self.editor(), &self.message) {
+            (Some(editor), _) => editor.status(),
+            (None, Some((text, error))) => Status::Message {
+                text: text.clone(),
+                error: *error,
+            },
+            (None, None) => Status::Info(String::new()),
+        }
+    }
+
+    /// A mouse event at screen cell (`mouse.x`, `mouse.y`), in the panel or
+    /// dragged from it. Clicks on the header don't reach the text.
+    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) {
+        let body = self.body();
+        if mouse.y < body.y && matches!(mouse.kind, MouseKind::Press(_)) {
+            return;
+        }
+        let local = Mouse {
+            x: mouse.x.saturating_sub(body.x),
+            y: mouse.y.saturating_sub(body.y),
+            ..mouse
+        };
+        if let Some(editor) = self.editor_mut() {
+            editor.handle_mouse(local, now);
+        }
+    }
+
+    /// Draws the panel in its area, and returns where the terminal cursor
+    /// goes. The `active` panel has the keyboard, or gets it back from the
+    /// file tree. A `preview`'s name is in italics, as in the file tree.
+    pub fn draw(
+        &self,
+        frame: &Buffer,
+        keymap: &Keymap,
+        workspace: &Workspace,
+        active: bool,
+        preview: bool,
+    ) -> Option<(u32, u32)> {
+        let area = self.area;
+        frame.with_clip(area.x, area.y, area.width, area.height, || {
+            self.draw_header(frame, workspace, active, preview);
+            match self.editor() {
+                Some(editor) => Some(editor.draw(frame, keymap)),
+                None => {
+                    self.draw_empty(frame, keymap);
+                    None
+                }
+            }
+        })
+    }
+
+    /// The file's name, with [+] if it has unsaved changes, then dimmed,
+    /// the folder it's in.
+    fn draw_header(&self, frame: &Buffer, workspace: &Workspace, active: bool, preview: bool) {
+        let area = self.area;
+        let (bg, fg) = if active {
+            (STATUS_BG, STATUS_FG)
+        } else {
+            (INACTIVE_STATUS_BG, STATUS_DIM)
+        };
+        frame.fill_rect(area.x, area.y, area.width, 1, bg);
+        let Some(doc) = self.document() else {
+            frame.draw_text(
+                " No file",
+                area.x,
+                area.y,
+                STATUS_DIM,
+                None,
+                Attributes::NONE,
+            );
+            return;
+        };
+        let (name, folder) = match doc.path() {
+            Some(path) => {
+                let shown = workspace.display_path(&path);
+                let shown = Path::new(&shown);
+                let name = shown.file_name().map_or_else(
+                    || shown.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                let folder = shown
+                    .parent()
+                    .map(|folder| folder.display().to_string())
+                    .unwrap_or_default();
+                (name, folder)
+            }
+            None => ("[new file]".to_string(), String::new()),
+        };
+        let dirty = if doc.is_modified() { " [+]" } else { "" };
+        let room = area.width.saturating_sub(1) as usize;
+        let name = truncate_left(&format!("{name}{dirty}"), room);
+        let mut attributes = Attributes::BOLD;
+        if preview {
+            attributes |= Attributes::ITALIC;
+        }
+        frame.draw_text(&name, area.x + 1, area.y, fg, None, attributes);
+        let used = 1 + name.chars().count() + 2;
+        let room = (area.width as usize).saturating_sub(used + 1);
+        if !folder.is_empty() && room > 1 {
+            let folder = truncate_left(&folder, room);
+            let x = area.x + used as u32;
+            frame.draw_text(&folder, x, area.y, STATUS_DIM, None, Attributes::NONE);
+        }
+    }
+
+    /// Lists shortcuts to open something, centered below the header.
+    fn draw_empty(&self, frame: &Buffer, keymap: &Keymap) {
+        let body = self.body();
+        let lines: Vec<(&str, String)> = SUGGESTIONS
+            .iter()
+            .map(|&command| {
+                let key = keymap
+                    .shortcut(command)
+                    .map_or(String::new(), |key| key.to_string());
+                (command.title(), key)
+            })
+            .collect();
+        let title_width = lines
+            .iter()
+            .map(|(title, _)| title.len())
+            .max()
+            .unwrap_or(0);
+        let key_width = lines.iter().map(|(_, key)| key.len()).max().unwrap_or(0);
+        let width = (title_width + 3 + key_width) as u32;
+        if body.height >= lines.len() as u32 && body.width > width {
+            let x = body.x + (body.width - width) / 2;
+            let y = body.y + (body.height - lines.len() as u32) / 2;
+            for (i, (title, key)) in lines.iter().enumerate() {
+                let y = y + i as u32;
+                frame.draw_text(title, x, y, STATUS_DIM, None, Attributes::NONE);
+                let key_x = x + width - key.len() as u32;
+                frame.draw_text(key, key_x, y, STATUS_FG, None, Attributes::NONE);
+            }
+        }
+    }
+}
+
+/// The last `max` characters of `s`, marked with a leading ellipsis if cut.
+fn truncate_left(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let tail: String = s.chars().skip(count - keep).collect();
+    format!("…{tail}")
+}
