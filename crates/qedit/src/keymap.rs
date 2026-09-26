@@ -185,7 +185,6 @@ impl Default for Keymap {
             ('x', Cut),
             ('v', Paste),
             ('a', SelectAll),
-            ('w', ToggleWrap),
             // Ctrl+B and Ctrl+E as in VS Code (there Ctrl+Shift+E): "B" for
             // the sidebar, "E" for the explorer.
             ('b', ToggleTree),
@@ -405,9 +404,12 @@ mod tests {
 
     #[test]
     fn every_command_has_a_shortcut() {
+        // Reached only from the command palette.
+        const UNBOUND: &[Command] = &[Command::ToggleWrap];
         let keymap = Keymap::default();
         for &command in Command::ALL {
-            assert!(keymap.shortcut(command).is_some(), "{}", command.id());
+            let bound = keymap.shortcut(command).is_some();
+            assert_eq!(bound, !UNBOUND.contains(&command), "{}", command.id());
         }
     }
 

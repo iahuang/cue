@@ -1746,7 +1746,7 @@ mod tests {
         assert_eq!(cursor, (GUTTER + 2, 1), "cursor is right of the numbers");
 
         // Wrapped rows are left unnumbered.
-        ctrl(&mut editor, 'w');
+        editor.toggle_wrap();
         let (lines, _) = screen_lines(&editor, 30, 6);
         assert_eq!(
             lines[..4],
@@ -1759,7 +1759,7 @@ mod tests {
         );
 
         // A tenth line adds a digit, narrowing the text.
-        ctrl(&mut editor, 'w');
+        editor.toggle_wrap();
         eb.set_cursor(2, 5);
         for _ in 0..7 {
             key(&mut editor, KeyCode::Enter);
