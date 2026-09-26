@@ -129,6 +129,16 @@ impl Buffer {
         })
     }
 
+    /// The foreground of cell (`x`, `y`), or `None` outside the buffer.
+    pub fn fg_at(&self, x: u32, y: u32) -> Option<Rgba> {
+        if x >= self.width() || y >= self.height() {
+            return None;
+        }
+        let index = y as usize * self.width() as usize + x as usize;
+        let fg = unsafe { sys::bufferGetFgPtr(self.handle) };
+        (!fg.is_null()).then(|| Rgba(unsafe { *fg.add(index) }))
+    }
+
     /// The background of cell (`x`, `y`), or `None` outside the buffer.
     pub fn bg_at(&self, x: u32, y: u32) -> Option<Rgba> {
         if x >= self.width() || y >= self.height() {

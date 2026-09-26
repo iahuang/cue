@@ -50,12 +50,37 @@ impl Renderer {
         if handle == sys::INVALID_HANDLE {
             return Err(Error::CreateFailed("renderer"));
         }
-        Ok(Renderer {
+        let renderer = Renderer {
             handle,
             raw_mode: None,
             terminal_is_setup: false,
             _claim: claim,
-        })
+        };
+        if output == Output::Stdout {
+            renderer.forward_environment();
+        }
+        Ok(renderer)
+    }
+
+    /// Passes the process environment to the native terminal detection,
+    /// which learns from `TERM`, `COLORTERM`, `TERM_PROGRAM`, and the like
+    /// what the terminal supports. Without it, no palette colors are sent:
+    /// every color goes out as RGB.
+    fn forward_environment(&self) {
+        for (key, value) in std::env::vars_os() {
+            let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+                continue;
+            };
+            unsafe {
+                sys::setTerminalEnvVar(
+                    self.handle,
+                    key.as_ptr(),
+                    ffi_len(key.len(), "variable name"),
+                    value.as_ptr(),
+                    ffi_len(value.len(), "variable value"),
+                );
+            }
+        }
     }
 
     /// Puts stdin in raw mode, switches terminal modes, and sends capability

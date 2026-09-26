@@ -4,6 +4,7 @@
 //! Over the top right of the text, the find bar (Ctrl+F) finds and replaces
 //! in the file: it highlights every match and selects the current one.
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -11,7 +12,7 @@ use std::time::Instant;
 
 use opentui::{
     Attributes, Buffer, EditBuffer, EditorView, Highlight, Rgba, SelectionBehavior,
-    SelectionColors, SyntaxStyle, Viewport, WidthMethod, WrapMode,
+    SelectionColors, Viewport, WidthMethod, WrapMode,
 };
 
 use crate::document::{self, LineEnding};
@@ -19,7 +20,10 @@ use crate::find::{self, Field, FindBar, Match, Target};
 use crate::history::{EditKind, History};
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
+use crate::language::{self, Language};
 use crate::search::Toggle;
+use crate::syntax::{self, Highlighter};
+use crate::theme::{self, Theme};
 use crate::words;
 use crate::workspace::Workspace;
 
@@ -33,8 +37,7 @@ const SELECTION: SelectionColors = SelectionColors {
     bg: Rgba::rgb(69, 71, 110),
     fg: None,
 };
-/// The find bar's matches, and the current one, which is selected.
-const MATCH_BG: Rgba = Rgba::rgb(95, 85, 55);
+/// The find bar's current match, which is selected.
 const CURRENT_MATCH: SelectionColors = SelectionColors {
     bg: Rgba::rgb(249, 226, 175),
     fg: Some(Rgba::rgb(30, 30, 46)),
@@ -98,6 +101,11 @@ pub struct Editor {
     buffer: Rc<EditBuffer>,
     view: EditorView<'static>,
     file: File,
+    /// What the file is written in, if known.
+    language: Option<&'static Language>,
+    theme: Rc<Theme>,
+    /// Highlights the text on screen as it's drawn, if qedit knows how.
+    syntax: RefCell<Option<Highlighter>>,
     history: History,
     /// The fixed end of the selection that keyboard movement extends from.
     anchor: Option<u32>,
@@ -111,14 +119,17 @@ pub struct Editor {
     message: Option<Message>,
     prompt: Option<Prompt>,
     find: Option<FindBar>,
-    /// The style highlighting the find bar's matches, once made.
-    match_style: Option<u32>,
 }
 
 impl Editor {
     /// Opens `path`, or a new, unnamed buffer. The error is the reason
     /// alone, without the path.
-    pub fn open(path: Option<PathBuf>, width: u32, height: u32) -> Result<Editor, String> {
+    pub fn open(
+        path: Option<PathBuf>,
+        theme: Rc<Theme>,
+        width: u32,
+        height: u32,
+    ) -> Result<Editor, String> {
         let loaded = match &path {
             Some(path) => Some(document::load(path).map_err(|e| e.to_string())?),
             None => None,
@@ -141,7 +152,8 @@ impl Editor {
                 ));
             }
         }
-        let mut editor = Editor::new(buffer, file, width, height).map_err(|e| e.to_string())?;
+        let mut editor =
+            Editor::new(buffer, file, theme, width, height).map_err(|e| e.to_string())?;
         if let Some(notice) = notice {
             editor.show_message(notice, false);
         }
@@ -153,6 +165,7 @@ impl Editor {
     pub fn new(
         buffer: Rc<EditBuffer>,
         file: File,
+        theme: Rc<Theme>,
         width: u32,
         height: u32,
     ) -> opentui::Result<Editor> {
@@ -160,10 +173,17 @@ impl Editor {
         let view = buffer.shared_view(view_w, view_h)?;
         let wrap = WrapMode::None;
         view.set_wrap_mode(wrap);
+        buffer.set_syntax_style(Some(theme.syntax_style()));
+        buffer.set_default_fg(Some(theme::TEXT));
+        let language = detect_language(&buffer, file.path.as_deref());
+        let syntax = language.and_then(|language| Highlighter::new(language, &theme));
         Ok(Editor {
             buffer,
             view,
             file,
+            language,
+            theme,
+            syntax: RefCell::new(syntax),
             history: History::new(),
             anchor: None,
             drag: None,
@@ -175,7 +195,6 @@ impl Editor {
             message: None,
             prompt: None,
             find: None,
-            match_style: None,
         })
     }
 
@@ -533,6 +552,7 @@ impl Editor {
     /// shortcut hints, and the workspace shortens the file's path.
     pub fn draw(&self, frame: &Buffer, keymap: &Keymap, workspace: &Workspace) -> (u32, u32) {
         self.sync_view_size();
+        self.sync_syntax();
         let (gutter, _, _) = self.text_area();
         let text_x = self.x + gutter;
         frame.draw_editor_view(&self.view, text_x as i32, 0);
@@ -551,6 +571,18 @@ impl Editor {
                 let cursor = self.view.visual_cursor();
                 (text_x + cursor.col, cursor.row)
             }),
+        }
+    }
+
+    /// Highlights the lines about to be drawn.
+    fn sync_syntax(&self) {
+        let mut syntax = self.syntax.borrow_mut();
+        let Some(highlighter) = syntax.as_mut() else {
+            return;
+        };
+        let lines = self.view.visible_lines();
+        if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
+            highlighter.sync(&self.buffer, first.line..last.line + 1);
         }
     }
 
@@ -1068,7 +1100,7 @@ impl Editor {
         {
             return;
         }
-        let style = self.match_style();
+        let style = self.theme.find_match;
         let Some(bar) = &mut self.find else {
             return;
         };
@@ -1114,8 +1146,7 @@ impl Editor {
                 tag: FIND_HIGHLIGHTS,
             })
             .collect();
-        self.buffer.remove_highlights(FIND_HIGHLIGHTS);
-        self.buffer.add_highlights(&highlights);
+        self.buffer.replace_highlights(FIND_HIGHLIGHTS, &highlights);
         if jump {
             let origin = bar.origin;
             match bar.next_from(origin) {
@@ -1127,22 +1158,6 @@ impl Editor {
                 }
             }
         }
-    }
-
-    /// The style id for highlighting matches, made on first use.
-    fn match_style(&mut self) -> u32 {
-        if let Some(id) = self.match_style {
-            return id;
-        }
-        // Without a style, matches aren't highlighted; the current one is
-        // still selected.
-        let id = SyntaxStyle::new().map_or(0, |style| {
-            let id = style.register("find.match", None, Some(MATCH_BG), Attributes::NONE);
-            self.buffer.set_syntax_style(Some(Rc::new(style)));
-            id
-        });
-        self.match_style = Some(id);
-        id
     }
 
     /// The match that is selected, if any.
@@ -1340,8 +1355,9 @@ impl Editor {
             Some((start, end)) if start != end => format!(" ({} sel)", end - start),
             _ => String::new(),
         };
+        let language = self.language.map_or("Plain Text", |l| l.name);
         let info = format!(
-            "{dirty}  Ln {}, Col {}{selected}  {}  {wrap}",
+            "{dirty}  Ln {}, Col {}{selected}  {language}  {}  {wrap}",
             cursor.row + 1,
             cursor.col + 1,
             self.file.line_ending.label(),
@@ -1370,6 +1386,13 @@ impl Editor {
     /// Writes the file to `path` from now on.
     pub fn save_as(&mut self, path: PathBuf) -> Action {
         self.file.path = Some(path);
+        let language = detect_language(&self.buffer, self.file.path.as_deref());
+        if language.map(|l| l.name) != self.language.map(|l| l.name) {
+            self.language = language;
+            self.buffer.remove_highlights(syntax::HIGHLIGHTS);
+            let highlighter = language.and_then(|language| Highlighter::new(language, &self.theme));
+            self.syntax = RefCell::new(highlighter);
+        }
         self.save()
     }
 
@@ -1496,11 +1519,20 @@ fn text_area(width: u32, height: u32, line_count: u32) -> (u32, u32, u32) {
     )
 }
 
+/// The language of the file at `path`, holding `buffer`'s text.
+fn detect_language(buffer: &EditBuffer, path: Option<&Path>) -> Option<&'static Language> {
+    language::detect(path, || {
+        let text = buffer.text();
+        text.lines().next().unwrap_or_default().to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::input::Mods;
     use crate::keymap::Context;
+    use crate::theme::MATCH_BG;
     use opentui::{OwnedBuffer, WidthMethod};
     use std::fs;
     use std::sync::MutexGuard;
@@ -1548,6 +1580,10 @@ mod tests {
         screen.clear(Rgba::terminal_default([0, 0, 0]));
         let workspace = Workspace::new([]).unwrap();
         editor.draw(screen, &Keymap::default(), &workspace)
+    }
+
+    fn theme() -> Rc<Theme> {
+        Rc::new(Theme::new().unwrap())
     }
 
     fn unnamed() -> File {
@@ -1621,7 +1657,7 @@ mod tests {
             path: Some(path.clone()),
             line_ending: LineEnding::CrLf,
         };
-        let mut editor = Editor::new(eb.clone(), file, 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), file, theme(), 60, 4).unwrap();
         assert!(!status(&editor).contains("[+]"));
 
         eb.set_cursor(1, 0);
@@ -1648,7 +1684,7 @@ mod tests {
         let _serial = serial();
         let path = temp_path("prompted.txt");
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         press(&mut editor, "hi");
         ctrl(&mut editor, 's');
         assert!(status(&editor).starts_with(" Save as:"));
@@ -1666,10 +1702,44 @@ mod tests {
     }
 
     #[test]
+    fn status_shows_the_language() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let file = File {
+            path: Some(PathBuf::from("main.rs")),
+            line_ending: LineEnding::Lf,
+        };
+        let editor = Editor::new(eb, file, theme(), 60, 4).unwrap();
+        assert!(
+            status(&editor).contains("  Rust  LF"),
+            "{}",
+            status(&editor)
+        );
+
+        // A new file has none until it's named; then its #! line counts.
+        let path = temp_path("script");
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("#!/usr/bin/env bash\n");
+        let mut editor = Editor::new(eb, unnamed(), theme(), 60, 4).unwrap();
+        assert!(
+            status(&editor).contains("  Plain Text  LF"),
+            "{}",
+            status(&editor)
+        );
+        editor.save_as(path);
+        editor.clear_message();
+        assert!(
+            status(&editor).contains("  Shell  LF"),
+            "{}",
+            status(&editor)
+        );
+    }
+
+    #[test]
     fn undo_and_redo_step_through_words_and_restore_the_cursor() {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         press(&mut editor, "hello world");
         key(&mut editor, KeyCode::Enter);
         press(&mut editor, "again");
@@ -1707,7 +1777,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("abcdef");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         eb.set_cursor(0, 1);
         key(&mut editor, KeyCode::Delete);
         key(&mut editor, KeyCode::Delete);
@@ -1730,7 +1800,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("hello world");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         eb.set_cursor(0, 6);
         for _ in 0..5 {
             shift(&mut editor, KeyCode::Right);
@@ -1759,7 +1829,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("0123456789\nabcdefghij\nklmnopqrst\nuvwxyz");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 8).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 8).unwrap();
         let pos = |eb: &EditBuffer| (eb.cursor().row, eb.cursor().col);
 
         // Select forward (1,2) -> (2,5), cursor at the end: select `from` to
@@ -1834,7 +1904,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("let x = foo(bar);\nnext");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 6).unwrap();
         alt(&mut editor, KeyCode::Right, false);
         assert_eq!(pos(&eb), (0, 3));
         alt(&mut editor, KeyCode::Right, true);
@@ -1876,7 +1946,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("one\ntwo\nthree\nfour");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 8).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 8).unwrap();
 
         eb.set_cursor(1, 2);
         alt(&mut editor, KeyCode::Down, false);
@@ -1904,7 +1974,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("a\nbb\ncc\nd\ne");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 8).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 8).unwrap();
 
         // Select from (1,1) to (2,1): lines "bb" and "cc".
         eb.set_cursor(1, 1);
@@ -1933,7 +2003,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("x\n漢字 wide\nlast");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 8).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 8).unwrap();
         eb.set_cursor(2, 4);
         alt(&mut editor, KeyCode::Up, false);
         assert_eq!(eb.text(), "x\nlast\n漢字 wide");
@@ -1950,7 +2020,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("one\ntwo");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         ctrl(&mut editor, 'a');
         assert_eq!(editor.view.selected_text(), "one\ntwo");
         let Action::Copy(text) = ctrl(&mut editor, 'x') else {
@@ -1972,7 +2042,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("abcdef");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         eb.set_cursor(0, 2);
         shift(&mut editor, KeyCode::Right);
         shift(&mut editor, KeyCode::Right);
@@ -1989,7 +2059,7 @@ mod tests {
     fn cmd_shortcuts_match_ctrl() {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         press(&mut editor, "one two");
         cmd(&mut editor, 'a');
         let Action::Copy(text) = cmd(&mut editor, 'c') else {
@@ -2030,7 +2100,7 @@ mod tests {
     fn modified_keys_never_type() {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         let alt = Mods {
             alt: true,
             ..Mods::NONE
@@ -2054,7 +2124,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("first line\nsecond line\nthird");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         eb.set_cursor(1, 3);
         let cmd_key = |editor: &mut Editor, code, shift| {
             editor.handle_key(Key::new(
@@ -2087,7 +2157,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("hello world\nsecond line");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 4).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         let t0 = Instant::now();
         let left = MouseButton::Left;
 
@@ -2178,7 +2248,7 @@ mod tests {
         let text: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
         eb.set_text(&text.join("\n"));
         eb.set_cursor(0, 0);
-        let mut editor = Editor::new(eb.clone(), unnamed(), 60, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 6).unwrap();
         let now = Instant::now();
         for _ in 0..4 {
             mouse(&mut editor, MouseKind::ScrollDown, 0, 0, now);
@@ -2221,7 +2291,7 @@ mod tests {
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("one\ntwo two two two two two two\nthree");
         eb.set_cursor(1, 2);
-        let mut editor = Editor::new(eb.clone(), unnamed(), 30, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 30, 6).unwrap();
         let (lines, cursor) = screen_lines(&editor, 30, 6);
         assert_eq!(
             lines[..3],
@@ -2268,7 +2338,7 @@ mod tests {
         // A tab and a wide character before the match, which is in bytes.
         lines[30] = "\t日x = needle;".to_string();
         eb.set_text(&lines.join("\n"));
-        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 10).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 10).unwrap();
         let start = lines[30].find("needle").unwrap();
         editor.select_in_line(30, start..start + 6);
         assert_eq!(editor.selected_text().as_deref(), Some("needle"));
@@ -2329,7 +2399,7 @@ mod tests {
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         // A tab and a wide character before a match: highlights are in columns.
         eb.set_text("ab\tab 漢ab\nnone\nxab");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 100, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 100, 6).unwrap();
         eb.set_cursor(0, 1);
         find_query(&mut editor, "a");
         editor.find_insert("b");
@@ -2379,11 +2449,142 @@ mod tests {
     }
 
     #[test]
+    fn find_matches_keep_the_color_of_highlighted_text() {
+        const KEYWORD: Rgba = Rgba::rgb(200, 100, 250);
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("let a = let");
+        let theme = theme();
+        let keyword = theme.register("keyword", Some(KEYWORD), None);
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme, 100, 4).unwrap();
+        eb.add_highlights(&[0, 8].map(|start| Highlight {
+            line: 0,
+            start,
+            end: start + 3,
+            style: keyword,
+            priority: 0,
+            tag: 2,
+        }));
+        // The first match is selected; the second is only highlighted.
+        find_query(&mut editor, "et");
+        let screen = OwnedBuffer::new(100, 4, false, WidthMethod::Unicode, "test").unwrap();
+        draw(&editor, &screen);
+        let matched: Vec<u32> = (0..100)
+            .filter(|&x| screen.bg_at(x, 0) == Some(MATCH_BG))
+            .collect();
+        assert_eq!(matched.len(), 2, "{matched:?}");
+        for x in matched {
+            assert_eq!(screen.fg_at(x, 0), Some(KEYWORD), "column {x}");
+        }
+    }
+
+    /// The color of the first `needle` on screen row `row`.
+    fn fg_of(editor: &Editor, width: u32, height: u32, row: u32, needle: &str) -> Option<Rgba> {
+        let screen = OwnedBuffer::new(width, height, false, WidthMethod::Unicode, "test").unwrap();
+        draw(editor, &screen);
+        let text = screen.to_text(true).lines().nth(row as usize)?.to_string();
+        let x = text.find(needle)?;
+        // Wide characters (CJK, in tests) take two cells but appear once.
+        let col = text[..x]
+            .chars()
+            .map(|c| if c >= '\u{2e80}' { 2 } else { 1 })
+            .sum();
+        screen.fg_at(col, row)
+    }
+
+    fn rust_file() -> File {
+        File {
+            path: Some(PathBuf::from("main.rs")),
+            line_ending: LineEnding::Lf,
+        }
+    }
+
+    const KEYWORD: Rgba = Rgba::indexed(5);
+    const FUNCTION: Rgba = Rgba::indexed(4);
+    const COMMENT: Rgba = Rgba::indexed(8);
+    const STRING: Rgba = Rgba::indexed(2);
+
+    #[test]
+    fn highlights_syntax_as_the_text_changes() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("fn main() {}\n// done");
+        let mut editor = Editor::new(eb.clone(), rust_file(), theme(), 40, 6).unwrap();
+        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(KEYWORD));
+        assert_eq!(fg_of(&editor, 40, 6, 0, "main"), Some(FUNCTION));
+        assert_eq!(fg_of(&editor, 40, 6, 1, "done"), Some(COMMENT));
+        // Punctuation isn't colored: it's the terminal's own text color.
+        assert_eq!(fg_of(&editor, 40, 6, 0, "()"), Some(theme::TEXT));
+
+        // A new line above: the colors move down with their text.
+        eb.set_cursor(0, 0);
+        key(&mut editor, KeyCode::Enter);
+        assert_eq!(fg_of(&editor, 40, 6, 1, "fn"), Some(KEYWORD));
+        assert_eq!(fg_of(&editor, 40, 6, 2, "done"), Some(COMMENT));
+
+        // Typing changes what the text is, and undoing changes it back.
+        eb.set_cursor(1, 0);
+        press(&mut editor, "//");
+        assert_eq!(fg_of(&editor, 40, 6, 1, "main"), Some(COMMENT));
+        ctrl(&mut editor, 'z');
+        assert_eq!(fg_of(&editor, 40, 6, 1, "main"), Some(FUNCTION));
+        eb.set_cursor(1, 0);
+        press(&mut editor, "let s = \"");
+        eb.set_cursor(1, 99);
+        press(&mut editor, "\";");
+        assert_eq!(fg_of(&editor, 40, 6, 1, "main"), Some(STRING));
+
+        // Unnamed buffers stay plain.
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("fn main() {}");
+        let editor = Editor::new(eb, unnamed(), theme(), 40, 6).unwrap();
+        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(theme::TEXT));
+    }
+
+    #[test]
+    fn highlights_across_lines_and_after_tabs() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("/* one\ntwo */ fn a() {}\n\t漢 fn b() {}");
+        let editor = Editor::new(eb.clone(), rust_file(), theme(), 40, 6).unwrap();
+        assert_eq!(fg_of(&editor, 40, 6, 0, "one"), Some(COMMENT));
+        assert_eq!(fg_of(&editor, 40, 6, 1, "two"), Some(COMMENT));
+        assert_eq!(fg_of(&editor, 40, 6, 1, "fn"), Some(KEYWORD));
+        assert_eq!(fg_of(&editor, 40, 6, 1, "a()"), Some(FUNCTION));
+        // Columns, not bytes: the tab and wide character come before.
+        assert_eq!(fg_of(&editor, 40, 6, 2, "fn"), Some(KEYWORD));
+        assert_eq!(fg_of(&editor, 40, 6, 2, "b()"), Some(FUNCTION));
+    }
+
+    #[test]
+    fn highlights_where_the_view_scrolls_to() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let text: String = (0..300).map(|i| format!("fn f{i}() {{}}\n")).collect();
+        eb.set_text(&text);
+        let editor = Editor::new(eb.clone(), rust_file(), theme(), 40, 11).unwrap();
+        // Every row on screen, however far down, and back up.
+        for line in [0, 290, 150, 0] {
+            eb.set_cursor(line, 0);
+            for row in 0..10 {
+                assert_eq!(
+                    fg_of(&editor, 40, 11, row, "fn"),
+                    Some(KEYWORD),
+                    "row {row}"
+                );
+            }
+            let name = format!("f{line}()");
+            let shown = (0..10).find_map(|row| fg_of(&editor, 40, 11, row, &name));
+            assert_eq!(shown, Some(FUNCTION), "{name}");
+        }
+    }
+
+    #[test]
     fn find_follows_edits_and_undo() {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("one x\ntwo x");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 6).unwrap();
         find_query(&mut editor, "x");
         editor.blur_find();
         let count = |editor: &Editor| editor.find.as_ref().unwrap().matches.len();
@@ -2411,7 +2612,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("a1 a22\nb3 a4");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 8).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 8).unwrap();
         let memory = find::Memory {
             query: crate::search::Query {
                 text: r"a(\d+)".to_string(),
@@ -2469,7 +2670,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("foo bar foo");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 6).unwrap();
         let memory = find::Memory {
             query: crate::search::Query {
                 text: "old".to_string(),
@@ -2515,7 +2716,7 @@ mod tests {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("Foo foo");
-        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 6).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 6).unwrap();
         find_query(&mut editor, "foo");
         assert_eq!(editor.find.as_ref().unwrap().matches.len(), 2);
         let now = Instant::now();
@@ -2563,7 +2764,7 @@ mod tests {
         let mut lines: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
         lines[20] = format!("{}needle", " ".repeat(70));
         eb.set_text(&lines.join("\n"));
-        let mut editor = Editor::new(eb.clone(), unnamed(), 100, 10).unwrap();
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 100, 10).unwrap();
         // Scrolled so line 20 is at the top, where the bar will be.
         editor.view.scroll_to(0, 20, true);
         screen_lines(&editor, 100, 10);

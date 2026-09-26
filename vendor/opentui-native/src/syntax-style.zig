@@ -32,6 +32,11 @@ pub const SyntaxStyle = struct {
 
     merged_cache: std.StringHashMapUnmanaged(StyleDefinition),
 
+    /// Styles made by `layeredStyleId`, keyed by their layers' ids joined
+    /// with ':', and each one's layers, to redo it when a layer changes.
+    layered_ids: std.StringHashMapUnmanaged(u32),
+    layers: std.AutoHashMapUnmanaged(u32, []const u32),
+
     emitter: events.EventEmitter(Event),
 
     pub fn init(global_allocator: Allocator) SyntaxStyleError!*SyntaxStyle {
@@ -52,6 +57,8 @@ pub const SyntaxStyle = struct {
             .id_to_style = .empty,
             .next_id = 1, // Start from 1, 0 can be used as "invalid"
             .merged_cache = .empty,
+            .layered_ids = .empty,
+            .layers = .empty,
             .emitter = events.EventEmitter(Event).init(internal_allocator),
         };
 
@@ -72,6 +79,11 @@ pub const SyntaxStyle = struct {
     fn putStyle(self: *SyntaxStyle, name: []const u8, definition: StyleDefinition) SyntaxStyleError!u32 {
         if (self.name_to_id.get(name)) |existing_id| {
             try self.id_to_style.put(self.allocator, existing_id, definition);
+            self.merged_cache.clearRetainingCapacity();
+            var it = self.layers.iterator();
+            while (it.next()) |entry| {
+                try self.id_to_style.put(self.allocator, entry.key_ptr.*, self.layer(entry.value_ptr.*));
+            }
             return existing_id;
         }
 
@@ -151,6 +163,42 @@ pub const SyntaxStyle = struct {
         return merged;
     }
 
+    /// `ids`' styles applied in order: each one's colors replace the ones
+    /// before, and attributes are OR'd.
+    fn layer(self: *const SyntaxStyle, ids: []const u32) StyleDefinition {
+        var layered: StyleDefinition = .{ .fg = null, .bg = null, .attributes = 0 };
+        for (ids) |id| {
+            const style = self.resolveById(id) orelse continue;
+            if (style.fg) |fg| layered.fg = fg;
+            if (style.bg) |bg| layered.bg = bg;
+            layered.attributes |= style.attributes;
+        }
+        return layered;
+    }
+
+    /// The id of a style that is `ids`' styles layered in order (see
+    /// `layer`), made on first use and redone when one of them is
+    /// redefined. It has no name.
+    pub fn layeredStyleId(self: *SyntaxStyle, ids: []const u32) SyntaxStyleError!u32 {
+        var key_buffer: [512]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&key_buffer);
+        for (ids, 0..) |id, i| {
+            if (i > 0) writer.writeByte(':') catch return SyntaxStyleError.OutOfMemory;
+            writer.print("{d}", .{id}) catch return SyntaxStyleError.OutOfMemory;
+        }
+        const key = writer.buffered();
+        if (self.layered_ids.get(key)) |id| return id;
+
+        const owned_key = self.allocator.dupe(u8, key) catch return SyntaxStyleError.OutOfMemory;
+        const owned_ids = self.allocator.dupe(u32, ids) catch return SyntaxStyleError.OutOfMemory;
+        const id = self.next_id;
+        try self.id_to_style.put(self.allocator, id, self.layer(ids));
+        try self.layers.put(self.allocator, id, owned_ids);
+        try self.layered_ids.put(self.allocator, owned_key, id);
+        self.next_id += 1;
+        return id;
+    }
+
     pub fn clearCache(self: *SyntaxStyle) void {
         self.merged_cache.clearRetainingCapacity();
     }
@@ -160,7 +208,8 @@ pub const SyntaxStyle = struct {
     }
 
     pub fn getStyleCount(self: *const SyntaxStyle) usize {
-        return self.id_to_style.count();
+        // Layered styles are made, not registered.
+        return self.id_to_style.count() - self.layers.count();
     }
 
     pub fn onDestroy(self: *SyntaxStyle, ctx: *anyopaque, handle: *const fn (*anyopaque) void) SyntaxStyleError!void {

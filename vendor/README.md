@@ -44,3 +44,11 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   regex matches (tabs and wide characters make columns differ from bytes).
   `editBufferGetContentEpoch` exposes the text buffer's change counter, and
   `textBufferStartHighlightsTransaction`/`End...` batch highlight updates.
+- `src/text-buffer.zig`, `src/syntax-style.zig`: where highlights overlap,
+  `rebuildLineSpans` layers their styles by priority (colors from higher
+  priorities replace lower ones, attributes are OR'd) instead of using only
+  the highest priority one's, so a find match's background keeps the syntax
+  color of the text under it. `SyntaxStyle.layeredStyleId` makes the layered
+  styles and redoes them when a layer is redefined; `getStyleCount` leaves
+  them out. Without a syntax style set, the highest priority still wins.
+  `setSyntaxStyle` rebuilds the spans of lines with overlapping highlights.

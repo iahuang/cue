@@ -141,7 +141,10 @@ test "TextBuffer styled seek - display widths multiline chunks and links" {
             const offset = tb.measureText(first ++ emoji ++ combining);
             try tb.addHighlightByCharRange(offset, offset + tb.measureText("\tX"), 99, 9, 42);
             try std.testing.expectEqual(2, tb.getLineHighlights(6).len);
-            try std.testing.expectEqual(99, tb.line_spans.items[6].items[0].style_id);
+            // Layered over the chunk's style.
+            const layered = tb.line_spans.items[6].items[0].style_id;
+            const chunk_style = tb.getLineHighlights(6)[0].style_id;
+            try std.testing.expectEqualSlices(u32, &.{ chunk_style, 99 }, style.layers.get(layered).?);
             tb.removeHighlightsByRef(42);
             try std.testing.expectEqual(4, tb.getHighlightCount());
         }
@@ -589,6 +592,78 @@ test "TextBuffer highlights - priority handling in spans" {
         }
     }
     try std.testing.expect(found_high_priority);
+}
+
+test "TextBuffer highlights - overlapping styles are layered by priority" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    var tb = try TextBuffer.init(std.testing.allocator, pool, link_pool, .unicode);
+    defer tb.deinit();
+
+    var syntax_style = try ss.SyntaxStyle.init(std.testing.allocator);
+    defer syntax_style.deinit();
+
+    const red = ansi.rgbaFromFloats(1.0, 0.0, 0.0, 1.0);
+    const blue = ansi.rgbaFromFloats(0.0, 0.0, 1.0, 1.0);
+    const keyword_id = try syntax_style.registerStyle("keyword", red, null, 1);
+    const match_id = try syntax_style.registerStyle("match", null, blue, 2);
+
+    try tb.setText("0123456789");
+    tb.setSyntaxStyle(syntax_style);
+    // Added high priority first: priority decides, not order.
+    try tb.addHighlight(0, 3, 6, match_id, 5, 0);
+    try tb.addHighlight(0, 0, 8, keyword_id, 1, 0);
+
+    const spans = tb.getLineSpans(0);
+    var layered_id: u32 = 0;
+    for (spans) |span| {
+        if (span.col < 3) try std.testing.expectEqual(keyword_id, span.style_id);
+        if (span.col == 3) layered_id = span.style_id;
+    }
+    try std.testing.expect(layered_id != keyword_id and layered_id != match_id);
+    const layered = syntax_style.resolveById(layered_id).?;
+    try std.testing.expectEqual(red, layered.fg.?);
+    try std.testing.expectEqual(blue, layered.bg.?);
+    try std.testing.expectEqual(@as(u32, 3), layered.attributes);
+    // Made, not registered.
+    try std.testing.expectEqual(@as(usize, 2), syntax_style.getStyleCount());
+
+    // Redefining a layer redoes the layered style.
+    const green = ansi.rgbaFromFloats(0.0, 1.0, 0.0, 1.0);
+    _ = try syntax_style.registerStyle("keyword", green, null, 0);
+    try std.testing.expectEqual(green, syntax_style.resolveById(layered_id).?.fg.?);
+}
+
+test "TextBuffer highlights - a higher priority fg replaces the one under it" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    var tb = try TextBuffer.init(std.testing.allocator, pool, link_pool, .unicode);
+    defer tb.deinit();
+
+    var syntax_style = try ss.SyntaxStyle.init(std.testing.allocator);
+    defer syntax_style.deinit();
+
+    const red = ansi.rgbaFromFloats(1.0, 0.0, 0.0, 1.0);
+    const blue = ansi.rgbaFromFloats(0.0, 0.0, 1.0, 1.0);
+    const low = try syntax_style.registerStyle("low", red, null, 0);
+    const high = try syntax_style.registerStyle("high", blue, null, 0);
+
+    try tb.setText("0123456789");
+    tb.setSyntaxStyle(syntax_style);
+    try tb.addHighlight(0, 0, 8, low, 1, 0);
+    try tb.addHighlight(0, 3, 6, high, 2, 0);
+
+    for (tb.getLineSpans(0)) |span| {
+        if (span.col == 3) {
+            try std.testing.expectEqual(blue, syntax_style.resolveById(span.style_id).?.fg.?);
+        }
+    }
 }
 
 // ===== Character Range Highlight Tests =====

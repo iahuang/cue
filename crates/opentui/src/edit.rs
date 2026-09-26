@@ -193,6 +193,11 @@ impl EditBuffer {
         out.into_iter().map(LogicalCursor::from).collect()
     }
 
+    /// The color of text no highlight colors. `None` is white.
+    pub fn set_default_fg(&self, color: Option<Rgba>) {
+        unsafe { sys::textBufferSetDefaultFg(self.text_buffer(), opt_ptr(&color)) }
+    }
+
     /// Styles highlights with `style`'s styles, or with none.
     pub fn set_syntax_style(&self, style: Option<Rc<SyntaxStyle>>) {
         let handle = style
@@ -222,6 +227,17 @@ impl EditBuffer {
     /// Removes the highlights tagged `tag`.
     pub fn remove_highlights(&self, tag: u16) {
         unsafe { sys::textBufferRemoveHighlightsByRef(self.text_buffer(), tag) }
+    }
+
+    /// Replaces the highlights tagged `tag` with `highlights`, which should
+    /// be tagged `tag` too. A line both lose and gain highlights on is
+    /// restyled once.
+    pub fn replace_highlights(&self, tag: u16, highlights: &[Highlight]) {
+        let text_buffer = self.text_buffer();
+        unsafe { sys::textBufferStartHighlightsTransaction(text_buffer) };
+        self.remove_highlights(tag);
+        self.add_highlights(highlights);
+        unsafe { sys::textBufferEndHighlightsTransaction(text_buffer) };
     }
 
     fn text_buffer(&self) -> sys::Handle {

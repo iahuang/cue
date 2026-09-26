@@ -554,6 +554,10 @@ pub const UnifiedTextBuffer = struct {
             (@constCast(prev)).offDestroy(@ptrCast(self), onSyntaxStyleDestroyed);
         }
         self.syntax_style = syntax_style;
+        // Overlapping highlights were layered in the old style.
+        for (self.line_highlights.items, 0..) |hl_list, line_idx| {
+            if (hl_list.items.len > 1) self.rebuildLineSpans(line_idx) catch {};
+        }
     }
 
     pub fn getSyntaxStyle(self: *const Self) ?*const SyntaxStyle {
@@ -906,6 +910,40 @@ pub const UnifiedTextBuffer = struct {
         }
     }
 
+    /// Orders highlights by priority, then by when they were added.
+    fn lowerPriority(highlights: []const Highlight, a: usize, b: usize) bool {
+        if (highlights[a].priority != highlights[b].priority) {
+            return highlights[a].priority < highlights[b].priority;
+        }
+        return a < b;
+    }
+
+    /// The style where the highlights `stack` (lowest priority first)
+    /// overlap: their styles layered in order, so a highlight that sets only
+    /// a background keeps the foreground of those under it. Without a syntax
+    /// style to make the layered style in, the top highlight's style.
+    fn layeredStyle(
+        self: *Self,
+        highlights: []const Highlight,
+        stack: []const usize,
+        ids: *std.ArrayListUnmanaged(u32),
+    ) TextBufferError!u32 {
+        if (stack.len == 0) return 0;
+        const top = highlights[stack[stack.len - 1]].style_id;
+        const syntax_style = self.syntax_style orelse return top;
+        ids.clearRetainingCapacity();
+        for (stack) |hl_idx| {
+            const id = highlights[hl_idx].style_id;
+            // 0 is no style; it adds nothing.
+            if (id != 0) try ids.append(self.global_allocator, id);
+        }
+        return switch (ids.items.len) {
+            0 => 0,
+            1 => ids.items[0],
+            else => @constCast(syntax_style).layeredStyleId(ids.items) catch top,
+        };
+    }
+
     pub fn getLineHighlights(self: *const Self, line_idx: usize) []const Highlight {
         if (line_idx < self.line_highlights.items.len) {
             return self.line_highlights.items[line_idx].items;
@@ -965,21 +1003,22 @@ pub const UnifiedTextBuffer = struct {
 
         var current_col: u32 = 0;
 
-        for (events.items) |event| {
-            // Find current highest priority style before processing event
-            var current_priority: i16 = -1;
-            var current_style: u32 = 0;
-            var it = active.keyIterator();
-            while (it.next()) |hl_idx| {
-                const hl = highlights[hl_idx.*];
-                if (hl.priority > current_priority) {
-                    current_priority = @intCast(hl.priority);
-                    current_style = hl.style_id;
-                }
-            }
+        // The active highlights, lowest priority first, and their styles.
+        var stack: std.ArrayListUnmanaged(usize) = .empty;
+        defer stack.deinit(self.global_allocator);
+        var ids: std.ArrayListUnmanaged(u32) = .empty;
+        defer ids.deinit(self.global_allocator);
 
+        for (events.items) |event| {
             // Emit span for the segment leading up to this event
             if (event.col > current_col) {
+                stack.clearRetainingCapacity();
+                var it = active.keyIterator();
+                while (it.next()) |hl_idx| {
+                    try stack.append(self.global_allocator, hl_idx.*);
+                }
+                std.mem.sort(usize, stack.items, highlights, lowerPriority);
+                const current_style = try self.layeredStyle(highlights, stack.items, &ids);
                 try self.line_spans.items[line_idx].append(self.global_allocator, .{
                     .col = current_col,
                     .style_id = current_style,

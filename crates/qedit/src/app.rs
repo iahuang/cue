@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Instant;
 
 use opentui::{Attributes, Buffer, Rgba};
@@ -30,6 +31,7 @@ use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
 use crate::picker::{Choice, Mode, Picker, PickerAction};
 use crate::search_modal::{Memory, SearchAction, SearchModal};
+use crate::theme::Theme;
 use crate::tree::{FileTree, TreeAction};
 use crate::workspace::Workspace;
 
@@ -70,6 +72,8 @@ pub struct App {
     tree: FileTree,
     /// Open files, in the order they were opened. Never empty.
     editors: Vec<Editor>,
+    /// The styles every editor's highlights use.
+    theme: Rc<Theme>,
     /// The index of the editor on screen.
     current: usize,
     /// Text from the last copy or cut, shared by all editors.
@@ -166,16 +170,20 @@ impl App {
         } else {
             Focus::Tree
         };
-        let editor = Editor::open(file.clone(), width, height).map_err(|reason| match &file {
-            Some(file) => format!("{}: {reason}", file.display()),
-            None => reason,
-        })?;
+        let theme = Rc::new(Theme::new().map_err(|e| e.to_string())?);
+        let editor = Editor::open(file.clone(), theme.clone(), width, height).map_err(
+            |reason| match &file {
+                Some(file) => format!("{}: {reason}", file.display()),
+                None => reason,
+            },
+        )?;
         let mut app = App {
             files: FileIndex::new(&workspace),
             workspace,
             keymap: Keymap::default(),
             tree,
             editors: vec![editor],
+            theme,
             current: 0,
             clipboard: None,
             focus,
@@ -647,7 +655,12 @@ impl App {
                 self.preview = None;
             }
         } else {
-            let editor = match Editor::open(Some(path.clone()), self.width, self.height) {
+            let editor = match Editor::open(
+                Some(path.clone()),
+                self.theme.clone(),
+                self.width,
+                self.height,
+            ) {
                 Ok(editor) => editor,
                 Err(reason) => {
                     // Reason first: the status bar clips long paths on the right.
@@ -1138,7 +1151,8 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("save-as-open", &[("a.txt", "original")]);
         let mut app = app(&root, Some("a.txt"));
-        app.editors.push(Editor::open(None, 80, 10).unwrap());
+        app.editors
+            .push(Editor::open(None, app.theme.clone(), 80, 10).unwrap());
         app.current = 1;
         type_text(&mut app, "other");
         ctrl(&mut app, 's');
