@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use crate::picker::Item;
+use crate::tree;
 use crate::workspace::Workspace;
 
 /// Files beyond this many aren't listed, to bound memory in huge folders.
@@ -182,7 +183,7 @@ fn collect(workspace: &Workspace, progress: bool, sender: &Sender<Message>) {
 }
 
 /// A walk over the workspace's files, or `None` if it has no roots. It
-/// skips `.git` and what `.gitignore` and `.ignore` files exclude, and lists
+/// skips `.git`, `.DS_Store`, and what `.gitignore` and `.ignore` files exclude, and lists
 /// folders inside another root once, as part of it. The file picker and
 /// workspace search use the same rules.
 pub fn walker(workspace: &Workspace) -> Option<WalkBuilder> {
@@ -197,9 +198,10 @@ pub fn walker(workspace: &Workspace) -> Option<WalkBuilder> {
         builder.add(root);
     }
     builder
-        // Dotfiles such as .env are shown, as in the tree; .git never is.
+        // Dotfiles such as .env are shown, as in the tree; .git and
+        // .DS_Store never are.
         .hidden(false)
-        .filter_entry(|entry| entry.file_name() != ".git")
+        .filter_entry(|entry| !tree::is_hidden(entry.file_name()))
         // Honor .gitignore in folders that aren't git repositories too.
         .require_git(false);
     Some(builder)

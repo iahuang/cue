@@ -25,8 +25,13 @@ const SELECTED_BG_UNFOCUSED: Rgba = Rgba::rgb(49, 50, 68);
 /// Rows the mouse wheel scrolls.
 const WHEEL_ROWS: usize = 3;
 
-/// Entries never shown.
-const HIDDEN: &[&str] = &[".git"];
+/// Entries never shown, here or in the file picker and workspace search.
+const HIDDEN: &[&str] = &[".git", ".DS_Store"];
+
+/// Whether an entry named `name` is never shown.
+pub fn is_hidden(name: &std::ffi::OsStr) -> bool {
+    HIDDEN.iter().any(|&hidden| name == hidden)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
@@ -361,7 +366,7 @@ fn read_dir(dir: &Path, depth: usize) -> Vec<Row> {
     };
     let mut rows: Vec<Row> = entries
         .filter_map(Result::ok)
-        .filter(|entry| !HIDDEN.iter().any(|&hidden| entry.file_name() == hidden))
+        .filter(|entry| !is_hidden(&entry.file_name()))
         .map(|entry| {
             let path = entry.path();
             // Follow symlinks to folders. They're read only when expanded,

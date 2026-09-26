@@ -212,6 +212,25 @@ pub const EditorView = struct {
                 }
             }
         }
+        // Horizontal wheel scrolling must move the cursor inside the same
+        // margins used by ensureCursorVisible, or rendering undoes the scroll.
+        // Re-read it after the vertical adjustment above.
+        if (self.text_buffer_view.wrap_mode == .none and vp.width > 0 and self.edit_buffer.cursors.items.len > 0) {
+            const current = &self.edit_buffer.cursors.items[0];
+            const raw_margin = @max(1, @as(u32, @intFromFloat(@as(f32, @floatFromInt(vp.width)) * self.scroll_margin)));
+            const margin = @min(raw_margin, (vp.width - 1) / 2);
+            const left = if (vp.x == 0) 0 else vp.x + margin;
+            const right = vp.x + vp.width - margin - 1;
+            const line_width = iter_mod.lineWidthAt(self.edit_buffer.tb.rope(), current.row);
+            const col = @min(@max(left, @min(current.col, right)), line_width);
+            if (col != current.col) {
+                const offset = iter_mod.coordsToOffset(self.edit_buffer.tb.rope(), current.row, col) orelse return;
+                current.col = col;
+                current.desired_col = col;
+                current.offset = offset;
+                self.cursor_visual_affinity = null;
+            }
+        }
     }
 
     /// Set the scroll margin as a fraction of viewport height (0.0 to 0.5)

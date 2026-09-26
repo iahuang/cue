@@ -482,6 +482,8 @@ impl Editor {
                     self.finish_drag(drag);
                 }
             }
+            MouseKind::ScrollUp if mouse.mods.shift => self.scroll(-(WHEEL_LINES as i64), 0),
+            MouseKind::ScrollDown if mouse.mods.shift => self.scroll(WHEEL_LINES as i64, 0),
             MouseKind::ScrollUp => self.scroll(0, -(WHEEL_LINES as i64)),
             MouseKind::ScrollDown => self.scroll(0, WHEEL_LINES as i64),
             MouseKind::ScrollLeft => self.scroll(-(WHEEL_LINES as i64), 0),
@@ -509,7 +511,13 @@ impl Editor {
             return false;
         }
         // The wheel scrolls the text under the bar.
-        if matches!(mouse.kind, MouseKind::ScrollUp | MouseKind::ScrollDown) {
+        if matches!(
+            mouse.kind,
+            MouseKind::ScrollUp
+                | MouseKind::ScrollDown
+                | MouseKind::ScrollLeft
+                | MouseKind::ScrollRight
+        ) {
             return false;
         }
         if !press {
@@ -2261,6 +2269,52 @@ mod tests {
             screen.to_text(true).lines().next().unwrap().trim_end(),
             "  1  line 0"
         );
+    }
+
+    #[test]
+    fn horizontal_wheel_and_shift_wheel_survive_rendering() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text(&"0123456789".repeat(20));
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 6).unwrap();
+        let now = Instant::now();
+        let wheel = |editor: &mut Editor, kind, mods| {
+            editor.handle_mouse(
+                Mouse {
+                    kind,
+                    x: 20,
+                    y: 0,
+                    mods,
+                },
+                now,
+            );
+            screen_lines(editor, 40, 6)
+        };
+        let (lines, _) = wheel(&mut editor, MouseKind::ScrollRight, Mods::NONE);
+        assert_eq!(editor.view.viewport().x, WHEEL_LINES);
+        assert!(lines[0].starts_with(" 1  3456789"), "{lines:?}");
+        wheel(&mut editor, MouseKind::ScrollDown, Mods::SHIFT);
+        assert_eq!(editor.view.viewport().x, 2 * WHEEL_LINES);
+        assert_eq!(editor.view.viewport().y, 0);
+        wheel(&mut editor, MouseKind::ScrollUp, Mods::SHIFT);
+        assert_eq!(editor.view.viewport().x, WHEEL_LINES);
+        wheel(&mut editor, MouseKind::ScrollLeft, Mods::NONE);
+        assert_eq!(editor.view.viewport().x, 0);
+        wheel(&mut editor, MouseKind::ScrollLeft, Mods::NONE);
+        assert_eq!(editor.view.viewport().x, 0);
+
+        // A floating find bar must let horizontal wheel events through.
+        editor.show_find(&find::Memory::default(), false);
+        wheel(&mut editor, MouseKind::ScrollRight, Mods::NONE);
+        assert_eq!(editor.view.viewport().x, WHEEL_LINES);
+        editor.close_find();
+
+        // Wrapping already fits the text to the viewport.
+        editor.toggle_wrap();
+        wheel(&mut editor, MouseKind::ScrollRight, Mods::NONE);
+        wheel(&mut editor, MouseKind::ScrollDown, Mods::SHIFT);
+        assert_eq!(editor.view.viewport().x, 0);
+        assert_eq!(eb.text(), "0123456789".repeat(20));
     }
 
     fn screen_lines(editor: &Editor, width: u32, height: u32) -> (Vec<String>, (u32, u32)) {
