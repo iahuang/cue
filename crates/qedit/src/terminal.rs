@@ -26,7 +26,7 @@ use opentui::{
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind};
 use crate::layout::Rect;
 use crate::pty::Pty;
-use crate::status::Status;
+use crate::status::{Prompt, PromptKey, Status};
 
 /// Bytes of history kept above the screen.
 const SCROLLBACK: u32 = 10 * 1024 * 1024;
@@ -39,6 +39,10 @@ const WHEEL_ROWS: i32 = 3;
 pub struct Terminal {
     /// Numbers terminals, from 1, in the order they were started.
     id: u32,
+    /// The name it was given, if it was renamed.
+    name: Option<String>,
+    /// The prompt for a new name, while it's open.
+    prompt: Option<Prompt>,
     vt: EmbeddedTerminal,
     pty: Pty,
     cwd: PathBuf,
@@ -63,6 +67,8 @@ impl Terminal {
         let pty = Pty::shell(cwd, cols, rows)?;
         Ok(Terminal {
             id,
+            name: None,
+            prompt: None,
             vt,
             pty,
             cwd: cwd.to_path_buf(),
@@ -129,9 +135,44 @@ impl Terminal {
         self.id
     }
 
-    /// What to call it: "Terminal 2".
+    /// What to call it: the name it was given, or "Terminal 2".
     pub fn name(&self) -> String {
-        format!("Terminal {}", self.id)
+        match &self.name {
+            Some(name) => name.clone(),
+            None => format!("Terminal {}", self.id),
+        }
+    }
+
+    /// Asks for a new name in the status bar, starting from the one it
+    /// was given, if any.
+    pub fn show_rename(&mut self) {
+        let name = self.name.as_deref().unwrap_or_default();
+        self.prompt = Some(Prompt::new("Rename terminal", name));
+    }
+
+    /// The rename prompt has the keyboard.
+    pub fn prompt_open(&self) -> bool {
+        self.prompt.is_some()
+    }
+
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+    }
+
+    /// A key for the rename prompt, while it's open. An empty name goes
+    /// back to the numbered one.
+    pub fn handle_prompt_key(&mut self, key: Key) {
+        let Some(prompt) = &mut self.prompt else {
+            return;
+        };
+        match prompt.handle_key(key) {
+            PromptKey::Continue => {}
+            PromptKey::Cancel => self.prompt = None,
+            PromptKey::Submit(name) => {
+                self.prompt = None;
+                self.name = (!name.is_empty()).then_some(name);
+            }
+        }
     }
 
     /// How the shell ended, once it has.
@@ -177,7 +218,13 @@ impl Terminal {
         self.send(&bytes);
     }
 
+    /// Pastes `text` into the program, or into the rename prompt while
+    /// it's open.
     pub fn paste(&mut self, text: &str) {
+        if let Some(prompt) = &mut self.prompt {
+            prompt.paste(text);
+            return;
+        }
         let bytes = self.vt.encode_paste(text);
         self.send(&bytes);
     }
@@ -187,6 +234,24 @@ impl Terminal {
         let bytes = self.vt.encode_focus(focused);
         if !bytes.is_empty() && !self.closed {
             self.pty.write(&bytes);
+        }
+    }
+
+    /// Clears the screen and the history above it, as Cmd+K does in macOS
+    /// terminals. A shell at its prompt redraws it, keeping what was typed.
+    /// A full-screen program keeps its screen.
+    pub fn clear(&mut self) {
+        self.vt.clear_selection();
+        self.vt.scroll_to_bottom();
+        if self.vt.is_alternate_screen() {
+            return;
+        }
+        // Home, erase the screen, then the history, so nothing erased is
+        // kept in it.
+        let _ = self.vt.write(b"\x1b[H\x1b[2J\x1b[3J");
+        if self.exit.is_none() && !self.pty.is_busy() {
+            // Ctrl+L: the shell clears the screen and redraws its prompt.
+            self.pty.write(b"\x0c");
         }
     }
 
@@ -306,12 +371,18 @@ impl Terminal {
 
     /// What the status bar shows while this terminal is in the active panel.
     pub fn status(&self) -> Status {
+        if let Some(prompt) = &self.prompt {
+            return prompt.status();
+        }
         match self.exit {
             Some(status) => Status::Message {
                 text: format!("{}. Enter starts a new shell.", describe_exit(status)),
                 error: false,
             },
-            None => Status::Terminal(self.program().unwrap_or_default()),
+            None => match self.program() {
+                Some(program) => Status::Terminal(format!("{}  {program}", self.name())),
+                None => Status::Terminal(self.name()),
+            },
         }
     }
 }
@@ -493,22 +564,27 @@ mod tests {
         }
     }
 
+    /// What's on screen, as text.
+    fn screen(term: &Terminal) -> String {
+        let frame = opentui::OwnedBuffer::new(
+            term.area.width,
+            term.area.height,
+            false,
+            opentui::WidthMethod::Unicode,
+            "test",
+        )
+        .unwrap();
+        term.draw(&frame, true);
+        frame.to_text(true)
+    }
+
     /// Polls until a line on screen is `line`, or panics after a few
     /// seconds.
     fn wait_for(term: &mut Terminal, line: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             term.poll();
-            let frame = opentui::OwnedBuffer::new(
-                term.area.width,
-                term.area.height,
-                false,
-                opentui::WidthMethod::Unicode,
-                "test",
-            )
-            .unwrap();
-            term.draw(&frame, true);
-            let screen = frame.to_text(true);
+            let screen = screen(term);
             if screen.lines().any(|shown| shown.trim_end() == line) {
                 return;
             }
@@ -573,5 +649,52 @@ mod tests {
         term.paste("echo again");
         term.send_key(key(KeyCode::Enter, Mods::NONE));
         wait_for(&mut term, "again");
+    }
+
+    #[test]
+    fn clearing_drops_the_screen_and_history_but_keeps_the_prompt() {
+        let _serial = crate::test_serial();
+        let root = Path::new("/tmp").canonicalize().unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 6,
+        };
+        let mut term = Terminal::new(1, &root, area).unwrap();
+        // More than a screenful, so some goes into the history.
+        term.paste("seq 1 20; echo do''ne");
+        term.send_key(key(KeyCode::Enter, Mods::NONE));
+        wait_for(&mut term, "done");
+        // Typed at the prompt, and still there after.
+        term.paste("echo kept");
+
+        term.clear();
+        wait_for_line_ending(&mut term, "echo kept");
+        let shown = screen(&term);
+        assert!(!shown.contains("done"), "{shown}");
+        term.vt.scroll(-100);
+        let history = screen(&term);
+        assert!(!history.contains("20"), "{history}");
+        let first = history.lines().next().unwrap_or_default();
+        assert!(first.trim_end().ends_with("echo kept"), "{history}");
+    }
+
+    /// Polls until the first line on screen ends with `end`.
+    fn wait_for_line_ending(term: &mut Terminal, end: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            term.poll();
+            let screen = screen(term);
+            if screen
+                .lines()
+                .next()
+                .is_some_and(|first| first.trim_end().ends_with(end))
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "no {end:?} first:\n{screen}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

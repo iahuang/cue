@@ -30,7 +30,7 @@ use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::Edit;
 use crate::search::Toggle;
-use crate::status::Status;
+use crate::status::{Prompt, PromptKey, Status};
 #[cfg(test)]
 use crate::theme::Theme;
 use crate::words;
@@ -73,11 +73,6 @@ pub enum Action {
 struct Message {
     text: String,
     error: bool,
-}
-
-/// The "Save as" line editor shown in the status bar.
-struct Prompt {
-    input: String,
 }
 
 /// Which way a cursor movement goes through the text.
@@ -577,7 +572,7 @@ impl Editor {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match &mut self.prompt {
             // Only the first line makes sense in a file name.
-            Some(prompt) => prompt.input.push_str(text.lines().next().unwrap_or("")),
+            Some(prompt) => prompt.paste(&text),
             None => {
                 self.edit(EditKind::Other, |eb| eb.insert_text(&text));
                 self.sync_find();
@@ -1310,7 +1305,7 @@ impl Editor {
     /// What the status bar shows while this editor is active.
     pub fn status(&self) -> Status {
         if let Some(prompt) = &self.prompt {
-            return Status::Prompt(prompt.input.clone());
+            return prompt.status();
         }
         if let Some(message) = &self.message {
             return Status::Message {
@@ -1357,9 +1352,7 @@ impl Editor {
     /// Writes the file, or asks for a name if it has none.
     fn save(&mut self) -> Action {
         let Some(path) = self.path() else {
-            self.prompt = Some(Prompt {
-                input: String::new(),
-            });
+            self.prompt = Some(Prompt::new("Save as", ""));
             return Action::Continue;
         };
         let text = self.buffer.text();
@@ -1384,25 +1377,19 @@ impl Editor {
     }
 
     /// A key for the "Save as" prompt, while it is open.
-    pub fn handle_prompt_key(&mut self, Key { code, mods }: Key) -> Action {
+    pub fn handle_prompt_key(&mut self, key: Key) -> Action {
         let Some(prompt) = self.prompt.as_mut() else {
             return Action::Continue;
         };
-        match code {
-            KeyCode::Esc => self.prompt = None,
-            KeyCode::Char('c' | 'q') if mods.ctrl || mods.sup => self.prompt = None,
-            KeyCode::Enter => {
-                let input = prompt.input.trim().to_string();
+        match prompt.handle_key(key) {
+            PromptKey::Continue => {}
+            PromptKey::Cancel => self.prompt = None,
+            PromptKey::Submit(input) => {
                 self.prompt = None;
                 if !input.is_empty() {
                     return Action::SaveAs(PathBuf::from(input));
                 }
             }
-            KeyCode::Backspace => {
-                prompt.input.pop();
-            }
-            KeyCode::Char(c) if mods.is_plain() => prompt.input.push(c),
-            _ => {}
         }
         Action::Continue
     }

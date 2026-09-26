@@ -87,6 +87,9 @@ commands! {
     FocusPanelUp => "panel:focus-up", "Focus Panel Above";
     FocusPanelDown => "panel:focus-down", "Focus Panel Below";
     NewTerminal => "terminal:new", "New Terminal";
+    ClearTerminal => "terminal:clear", "Clear Terminal";
+    CloseTerminal => "terminal:close", "Close Terminal";
+    RenameTerminal => "terminal:rename", "Rename Terminal";
     TerminalPrefix => "terminal:prefix", "Terminal: Send Next Shortcut to qedit";
     TreeUp => "tree:up", "File Tree: Select Previous";
     TreeDown => "tree:down", "File Tree: Select Next";
@@ -164,7 +167,7 @@ impl Command {
             }
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
             FindSwitchField | FindClose => Context::Find,
-            TerminalPrefix => Context::Terminal,
+            ClearTerminal | CloseTerminal | RenameTerminal | TerminalPrefix => Context::Terminal,
             Replace | ReplaceAll => Context::Replace,
             _ => Context::Editor,
         }
@@ -584,7 +587,12 @@ mod tests {
     #[test]
     fn every_command_has_a_shortcut() {
         // Reached only from the command palette.
-        const UNBOUND: &[Command] = &[Command::ToggleWrap];
+        const UNBOUND: &[Command] = &[
+            Command::ToggleWrap,
+            Command::ClearTerminal,
+            Command::CloseTerminal,
+            Command::RenameTerminal,
+        ];
         let keymap = Keymap::default();
         for &command in Command::ALL {
             let bound = keymap.shortcut(command).is_some();

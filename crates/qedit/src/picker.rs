@@ -162,11 +162,13 @@ pub struct Picker {
 impl Picker {
     /// A picker for `mode` over a screen `width` x `height`. `recent` items
     /// (see [`Item::file`] and [`Item::terminal`]) are listed first, then
-    /// the rest of the `index`'s files; the keymap labels commands with
+    /// the rest of the `index`'s files. The commands listed are those
+    /// `available` where the picker opened, labeled by the keymap with
     /// their shortcuts.
     pub fn new(
         mode: Mode,
         keymap: &Keymap,
+        available: impl Fn(Command) -> bool,
         recent: Vec<Item>,
         index: &FileIndex,
         width: u32,
@@ -182,6 +184,7 @@ impl Picker {
                     Context::Picker | Context::Search | Context::SearchOptions | Context::Find
                 )
             })
+            .filter(|&&command| available(command))
             .map(|&command| Item::command(command, keymap))
             .collect();
         let mut picker = Picker {
@@ -697,7 +700,7 @@ mod tests {
             .into_iter()
             .map(|path| Item::file(path, &workspace, "recent"))
             .collect();
-        Picker::new(mode, &Keymap::default(), recent, &index, 80, 24)
+        Picker::new(mode, &Keymap::default(), |_| true, recent, &index, 80, 24)
     }
 
     /// The listed texts, best match first.
@@ -786,7 +789,15 @@ mod tests {
     fn new_files_keep_the_selection() {
         let root = fixture("new-files", &["b.rs", "d.rs"]);
         let (_, mut index) = index(&root);
-        let mut picker = Picker::new(Mode::Files, &Keymap::default(), Vec::new(), &index, 80, 24);
+        let mut picker = Picker::new(
+            Mode::Files,
+            &Keymap::default(),
+            |_| true,
+            Vec::new(),
+            &index,
+            80,
+            24,
+        );
         picker.run(Command::PickerDown);
         assert_eq!(selected(&picker), "d.rs");
         fs::write(root.join("a.rs"), "").unwrap();
@@ -870,7 +881,15 @@ mod tests {
         let long = format!("{}/name.rs", "folder".repeat(20));
         let root = fixture("draw", &[&long, "short.rs"]);
         let (_, index) = index(&root);
-        let mut picker = Picker::new(Mode::Files, &Keymap::default(), Vec::new(), &index, 60, 12);
+        let mut picker = Picker::new(
+            Mode::Files,
+            &Keymap::default(),
+            |_| true,
+            Vec::new(),
+            &index,
+            60,
+            12,
+        );
         picker.edit(Edit::Insert("name"));
         let screen =
             opentui::OwnedBuffer::new(60, 12, false, opentui::WidthMethod::Unicode, "test")

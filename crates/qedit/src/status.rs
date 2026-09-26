@@ -1,10 +1,12 @@
 //! The status bar along the bottom of the screen. It's the active panel's:
 //! where its cursor is and what its file is written in, a message after a
-//! key press, or the "Save as" prompt. Shortcut hints fill the right.
+//! key press, or a prompt, such as "Save as". Shortcut hints fill the
+//! right.
 
 use opentui::{Attributes, Buffer};
 
 use crate::editor::{STATUS_BG, STATUS_DIM, STATUS_ERROR_BG, STATUS_FG};
+use crate::input::{Key, KeyCode};
 use crate::keymap::{Command, Keymap};
 
 /// What the status bar shows.
@@ -12,12 +14,12 @@ use crate::keymap::{Command, Keymap};
 pub enum Status {
     /// The cursor's position and the file's details.
     Info(String),
-    /// What a terminal is running.
+    /// A terminal's name and what it's running.
     Terminal(String),
     /// Shown until the next key press.
     Message { text: String, error: bool },
-    /// The "Save as" prompt, with what's been typed.
-    Prompt(String),
+    /// A prompt, with what's been typed.
+    Prompt { label: &'static str, input: String },
 }
 
 impl Status {
@@ -27,12 +29,63 @@ impl Status {
         match self {
             Status::Info(info) | Status::Terminal(info) => format!(" {info}"),
             Status::Message { text, .. } => format!(" {text}"),
-            Status::Prompt(input) => format!("{PROMPT}{input}"),
+            Status::Prompt { label, input } => format!(" {label}: {input}"),
         }
     }
 }
 
-const PROMPT: &str = " Save as: ";
+/// A line of text asked for in the status bar, such as a file name.
+pub struct Prompt {
+    label: &'static str,
+    input: String,
+}
+
+/// What a key did to a [`Prompt`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptKey {
+    Continue,
+    Cancel,
+    /// Enter, with what was typed, trimmed.
+    Submit(String),
+}
+
+impl Prompt {
+    /// A prompt labeled `label` ("Save as"), starting with `input` typed.
+    pub fn new(label: &'static str, input: &str) -> Prompt {
+        Prompt {
+            label,
+            input: input.to_string(),
+        }
+    }
+
+    pub fn handle_key(&mut self, Key { code, mods }: Key) -> PromptKey {
+        match code {
+            KeyCode::Esc => return PromptKey::Cancel,
+            KeyCode::Char('c' | 'q') if mods.ctrl || mods.sup => return PromptKey::Cancel,
+            KeyCode::Enter => return PromptKey::Submit(self.input.trim().to_string()),
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) if mods.is_plain() => self.input.push(c),
+            _ => {}
+        }
+        PromptKey::Continue
+    }
+
+    /// Takes the first line of `text`.
+    pub fn paste(&mut self, text: &str) {
+        // Terminals send newlines in pastes as CR.
+        self.input
+            .push_str(text.split(['\r', '\n']).next().unwrap_or(""));
+    }
+
+    pub fn status(&self) -> Status {
+        Status::Prompt {
+            label: self.label,
+            input: self.input.clone(),
+        }
+    }
+}
 
 /// Draws `status` across row `y` of `frame`, `width` wide. Returns where the
 /// terminal cursor goes while the prompt is open.
@@ -44,10 +97,11 @@ pub fn draw(
     keymap: &Keymap,
 ) -> Option<(u32, u32)> {
     match status {
-        Status::Prompt(input) => {
+        Status::Prompt { label, input } => {
             frame.fill_rect(0, y, width, 1, STATUS_BG);
-            frame.draw_text(PROMPT, 0, y, STATUS_DIM, None, Attributes::NONE);
-            let x = PROMPT.len() as u32;
+            let label = format!(" {label}: ");
+            frame.draw_text(&label, 0, y, STATUS_DIM, None, Attributes::NONE);
+            let x = label.chars().count() as u32;
             // Keep the end of a long path visible.
             let room = width.saturating_sub(x + 1) as usize;
             let chars: Vec<char> = input.chars().collect();

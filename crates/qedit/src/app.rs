@@ -292,6 +292,10 @@ impl App {
         self.active_panel_mut().clear_message();
         let prefixed = std::mem::take(&mut self.terminal_prefix);
         if let Some(terminal) = self.keyboard_terminal() {
+            if terminal.borrow().prompt_open() {
+                terminal.borrow_mut().handle_prompt_key(key);
+                return AppAction::Continue;
+            }
             if terminal.borrow().exit().is_none() {
                 let command = self.keymap.lookup_terminal(key);
                 if command != Some(Command::Quit) {
@@ -453,6 +457,19 @@ impl App {
             Command::FocusPanelUp => self.focus_panel(Direction::Up),
             Command::FocusPanelDown => self.focus_panel(Direction::Down),
             Command::NewTerminal => self.new_terminal(),
+            Command::ClearTerminal => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.borrow_mut().clear();
+                }
+            }
+            Command::CloseTerminal => self.close_terminal(),
+            Command::RenameTerminal => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.borrow_mut().show_rename();
+                    // The prompt is in the status bar, and takes the keys.
+                    self.focus = Focus::Editor;
+                }
+            }
             Command::TerminalPrefix if self.keyboard_terminal().is_some() => {
                 self.terminal_prefix = true;
                 let message = format!(
@@ -559,12 +576,15 @@ impl App {
         };
         if let MouseKind::Press(_) = mouse.kind {
             // Like a key press, a click dismisses messages, the quit
-            // confirmation, the terminal prefix, and the "Save as" prompt.
+            // confirmation, the terminal prefix, and prompts.
             self.quit_armed = false;
             self.terminal_prefix = false;
             self.active_panel_mut().clear_message();
             if let Some(editor) = self.editor_mut() {
                 editor.cancel_prompt();
+            }
+            if let Some(terminal) = self.active_terminal() {
+                terminal.borrow_mut().cancel_prompt();
             }
         }
 
@@ -719,9 +739,10 @@ impl App {
 
     /// Text pasted through the terminal.
     pub fn paste(&mut self, text: &str) {
-        let terminal = self
-            .keyboard_terminal()
-            .filter(|terminal| terminal.borrow().exit().is_none());
+        let terminal = self.keyboard_terminal().filter(|terminal| {
+            let terminal = terminal.borrow();
+            terminal.prompt_open() || terminal.exit().is_none()
+        });
         if let Some(terminal) = terminal {
             terminal.borrow_mut().paste(text);
         } else if let Some(input) = self.query_input() {
@@ -936,9 +957,14 @@ impl App {
                     self.files.refresh();
                 }
                 let recent = self.recent_items();
+                // Terminal commands, for the terminal on screen.
+                let terminal = self.active_terminal().is_some();
+                let available =
+                    |command: Command| command.context() != Context::Terminal || terminal;
                 self.picker = Some(Picker::new(
                     mode,
                     &self.keymap,
+                    available,
                     recent,
                     &self.files,
                     self.width,
@@ -1354,6 +1380,17 @@ impl App {
         self.prune_documents();
         self.prune_terminals();
         self.show_active_in_tree();
+    }
+
+    /// Closes the terminal in the active panel, hanging up on its shell and
+    /// whatever it's running. The panel is left empty.
+    fn close_terminal(&mut self) {
+        let Some(terminal) = self.active_terminal() else {
+            return;
+        };
+        self.active_panel_mut().hide_terminal();
+        self.terminals.retain(|t| !Rc::ptr_eq(t, &terminal));
+        self.prune_terminals();
     }
 
     /// The terminal in the active panel, if any.
@@ -1805,6 +1842,99 @@ mod tests {
         app.handle_key(Key::new(KeyCode::Char('p'), ctrl_shift));
         key(&mut app, KeyCode::Enter);
         assert!(app.ed().path().is_some_and(|path| path.ends_with("a.txt")));
+    }
+
+    #[test]
+    fn the_palette_has_terminal_commands_for_the_terminal_on_screen() {
+        let _serial = crate::test_serial();
+        let root = fixture("terminal-commands", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        let palette = |app: &mut App| {
+            app.run(Command::Palette, false);
+            type_text(app, "terminal");
+            let shown = screen(app);
+            key(app, KeyCode::Esc);
+            shown
+        };
+        let shown = palette(&mut app);
+        assert!(shown.contains("New Terminal"), "{shown}");
+        assert!(!shown.contains("Close Terminal"), "{shown}");
+        assert!(!shown.contains("Clear Terminal"), "{shown}");
+
+        app.run(Command::NewTerminal, false);
+        let shown = palette(&mut app);
+        assert!(shown.contains("Close Terminal"), "{shown}");
+        assert!(shown.contains("Clear Terminal"), "{shown}");
+        assert!(shown.contains("Rename Terminal"), "{shown}");
+
+        // Its name is in the status bar. Renaming it asks for another
+        // there, which takes the keys, even from the tree.
+        let status_bar = |app: &App| screen(app).lines().last().unwrap().to_string();
+        assert!(
+            status_bar(&app).starts_with(" Terminal 1"),
+            "{}",
+            status_bar(&app)
+        );
+        app.run(Command::FocusTree, false);
+        app.run(Command::RenameTerminal, false);
+        assert_eq!(status_bar(&app).trim_end(), " Rename terminal:");
+        type_text(&mut app, "bu");
+        app.paste("ild\nrest");
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            status_bar(&app).starts_with(" build"),
+            "{}",
+            status_bar(&app)
+        );
+        // The picker lists it by name.
+        app.run(Command::GoToFile, false);
+        type_text(&mut app, "build");
+        let shown = screen(&app);
+        let above_status = shown.rsplit_once('\n').unwrap().0;
+        assert!(above_status.contains("build"), "{shown}");
+        key(&mut app, KeyCode::Esc);
+        // Renaming starts from the name; Esc keeps it, and an empty name
+        // goes back to the number.
+        app.run(Command::RenameTerminal, false);
+        assert_eq!(status_bar(&app).trim_end(), " Rename terminal: build");
+        key(&mut app, KeyCode::Esc);
+        assert!(
+            status_bar(&app).starts_with(" build"),
+            "{}",
+            status_bar(&app)
+        );
+        app.run(Command::RenameTerminal, false);
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            status_bar(&app).starts_with(" Terminal 1"),
+            "{}",
+            status_bar(&app)
+        );
+
+        // Closing it hangs up on what it's running, and leaves the panel
+        // empty.
+        type_text(&mut app, "sleep 30");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "sleep to run", |app| {
+            app.terminals[0].borrow().is_busy()
+        });
+        app.handle_key(Key::new(KeyCode::Char('k'), ctrl_shift));
+        type_text(&mut app, "close terminal");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.active_terminal().is_none());
+        assert!(app.editor().is_none());
+        assert!(app.terminals.is_empty());
+        assert!(!app.recent.contains(&Recent::Terminal(1)));
+        // Nothing to quit over.
+        let quit = Key::new(KeyCode::Char('q'), ctrl_shift);
+        assert!(matches!(app.handle_key(quit), AppAction::Quit));
     }
 
     #[test]
