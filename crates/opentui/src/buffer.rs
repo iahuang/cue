@@ -129,6 +129,16 @@ impl Buffer {
         })
     }
 
+    /// The background of cell (`x`, `y`), or `None` outside the buffer.
+    pub fn bg_at(&self, x: u32, y: u32) -> Option<Rgba> {
+        if x >= self.width() || y >= self.height() {
+            return None;
+        }
+        let index = y as usize * self.width() as usize + x as usize;
+        let bg = unsafe { sys::bufferGetBgPtr(self.handle) };
+        (!bg.is_null()).then(|| Rgba(unsafe { *bg.add(index) }))
+    }
+
     /// The native handle, for calling [`sys`](crate::sys) functions directly.
     pub fn raw_handle(&self) -> sys::Handle {
         self.handle

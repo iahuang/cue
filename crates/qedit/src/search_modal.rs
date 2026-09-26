@@ -16,7 +16,7 @@ use opentui::{Attributes, Buffer, Rgba};
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::picker::{self, Area, DIM, FG, MATCH_FG, SELECTED_BG};
-use crate::search::{FileMatches, Line, Query, Search, CONTEXT_LINES};
+use crate::search::{FileMatches, Line, Query, Search, Toggle, CONTEXT_LINES};
 use crate::workspace::Workspace;
 
 const LINE_NUMBER: Rgba = Rgba::rgb(108, 112, 134);
@@ -74,42 +74,6 @@ struct MatchAt {
     line: usize,
     /// Which of the line's matches.
     index: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Toggle {
-    Case,
-    Word,
-    Regex,
-}
-
-impl Toggle {
-    const ALL: [Toggle; 3] = [Toggle::Case, Toggle::Word, Toggle::Regex];
-
-    fn label(self) -> &'static str {
-        match self {
-            Toggle::Case => "Aa",
-            Toggle::Word => "ab",
-            Toggle::Regex => ".*",
-        }
-    }
-
-    fn command(self) -> Command {
-        match self {
-            Toggle::Case => Command::SearchToggleCase,
-            Toggle::Word => Command::SearchToggleWord,
-            Toggle::Regex => Command::SearchToggleRegex,
-        }
-    }
-
-    /// What the shortcut hint calls it.
-    fn name(self) -> &'static str {
-        match self {
-            Toggle::Case => "case",
-            Toggle::Word => "word",
-            Toggle::Regex => "regex",
-        }
-    }
 }
 
 pub struct SearchModal {
@@ -229,10 +193,11 @@ impl SearchModal {
             Command::PickerPageDown => self.select_row_step(page as isize),
             Command::PickerAccept => return self.open_selected(),
             Command::PickerClose => return SearchAction::Close,
-            Command::SearchToggleCase => self.toggle(Toggle::Case),
-            Command::SearchToggleWord => self.toggle(Toggle::Word),
-            Command::SearchToggleRegex => self.toggle(Toggle::Regex),
-            _ => {}
+            command => {
+                if let Some(toggle) = Toggle::for_command(command) {
+                    self.toggle(toggle);
+                }
+            }
         }
         SearchAction::Continue
     }
@@ -349,12 +314,7 @@ impl SearchModal {
     }
 
     fn toggle(&mut self, toggle: Toggle) {
-        let flag = match toggle {
-            Toggle::Case => &mut self.query.case_sensitive,
-            Toggle::Word => &mut self.query.whole_word,
-            Toggle::Regex => &mut self.query.regex,
-        };
-        *flag = !*flag;
+        toggle.flip(&mut self.query);
         self.replace_query = false;
         self.query_changed();
     }
@@ -638,11 +598,7 @@ impl SearchModal {
             frame.draw_text(&hint, cursor.0 + 1, y + 1, DIM, None, Attributes::NONE);
         }
         for (toggle, columns) in toggles {
-            let on = match toggle {
-                Toggle::Case => self.query.case_sensitive,
-                Toggle::Word => self.query.whole_word,
-                Toggle::Regex => self.query.regex,
-            };
+            let on = toggle.is_on(&self.query);
             let (fg, bg, attributes) = if on {
                 (FG, Some(SELECTED_BG), Attributes::BOLD)
             } else {

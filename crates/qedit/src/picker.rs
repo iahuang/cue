@@ -152,9 +152,14 @@ impl Picker {
     ) -> Picker {
         let commands = Command::ALL
             .iter()
-            // Moving through the picker, or search, isn't something to pick
-            // from it.
-            .filter(|command| !matches!(command.context(), Context::Picker | Context::Search))
+            // Moving through the picker, search options, and the find bar's
+            // own keys aren't something to pick from it.
+            .filter(|command| {
+                !matches!(
+                    command.context(),
+                    Context::Picker | Context::Search | Context::SearchOptions | Context::Find
+                )
+            })
             .map(|&command| Item::command(command, keymap))
             .collect();
         let mut picker = Picker {

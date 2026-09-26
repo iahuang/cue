@@ -2613,6 +2613,24 @@ export fn editBufferGetTextBuffer(edit_handle: NativeHandle) NativeHandle {
     return handles.getOrInsertBorrowed(.text_buffer, erasePtr(object_ptr.getTextBuffer()), edit_handle) catch INVALID_HANDLE;
 }
 
+/// Changes whenever the text does (and when the tab width changes).
+export fn editBufferGetContentEpoch(edit_handle: NativeHandle) u64 {
+    const object_ptr = acquireEditBuffer(edit_handle) orelse return 0;
+    return object_ptr.getTextBuffer().getContentEpoch();
+}
+
+/// Converts `count` byte offsets into the text as `editBufferGetText` writes
+/// it, which must not decrease, to cursors, in one pass over the text.
+export fn editBufferBytesToCursors(edit_handle: NativeHandle, bytesPtr: [*]const u32, count: u32, outPtr: [*]ExternalLogicalCursor) void {
+    const object_ptr = acquireEditBuffer(edit_handle) orelse return;
+    const positions = globalAllocator.alloc(text_buffer.UnifiedTextBuffer.Position, count) catch return;
+    defer globalAllocator.free(positions);
+    object_ptr.getTextBuffer().byteOffsetsToPositions(bytesPtr[0..count], positions);
+    for (positions, 0..) |position, i| {
+        outPtr[i] = .{ .row = position.row, .col = position.col, .offset = position.offset };
+    }
+}
+
 export fn editBufferSetTabWidth(edit_handle: NativeHandle, width: u8) void {
     const object_ptr = acquireEditBuffer(edit_handle) orelse return;
     object_ptr.setTabWidth(width);
@@ -3331,6 +3349,18 @@ export fn textBufferClearLineHighlights(tb_handle: NativeHandle, line_idx: u32) 
 export fn textBufferClearAllHighlights(tb_handle: NativeHandle) void {
     const object_ptr = acquireTextBuffer(tb_handle) orelse return;
     object_ptr.clearAllHighlights();
+}
+
+/// Defers rebuilding each line's styles until the matching end, so adding
+/// many highlights to a line costs one rebuild.
+export fn textBufferStartHighlightsTransaction(tb_handle: NativeHandle) void {
+    const object_ptr = acquireTextBuffer(tb_handle) orelse return;
+    object_ptr.startHighlightsTransaction();
+}
+
+export fn textBufferEndHighlightsTransaction(tb_handle: NativeHandle) void {
+    const object_ptr = acquireTextBuffer(tb_handle) orelse return;
+    object_ptr.endHighlightsTransaction();
 }
 
 export fn textBufferSetSyntaxStyle(tb_handle: NativeHandle, style_handle: NativeHandle) bool {

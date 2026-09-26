@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -5,7 +6,7 @@ use opentui_sys as sys;
 
 use crate::color::opt_ptr;
 use crate::thread::Claim;
-use crate::{ffi_len, read_native_string, Error, Result, Rgba, WidthMethod, WrapMode};
+use crate::{ffi_len, read_native_string, Error, Result, Rgba, SyntaxStyle, WidthMethod, WrapMode};
 
 /// How a selection made from viewport cells snaps (`SelectionBehavior`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -73,6 +74,30 @@ pub struct VisualCursor {
     pub offset: u32,
 }
 
+/// A styled range of one line, in display columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Highlight {
+    pub line: u32,
+    pub start: u32,
+    pub end: u32,
+    /// A style id from the buffer's [`SyntaxStyle`].
+    pub style: u32,
+    /// Where highlights overlap, the higher priority wins.
+    pub priority: u8,
+    /// Groups highlights for [`EditBuffer::remove_highlights`].
+    pub tag: u16,
+}
+
+impl From<sys::ExternalLogicalCursor> for LogicalCursor {
+    fn from(c: sys::ExternalLogicalCursor) -> Self {
+        LogicalCursor {
+            row: c.row,
+            col: c.col,
+            offset: c.offset,
+        }
+    }
+}
+
 impl From<sys::ExternalVisualCursor> for VisualCursor {
     fn from(c: sys::ExternalVisualCursor) -> Self {
         VisualCursor {
@@ -98,8 +123,16 @@ impl From<sys::ExternalVisualCursor> for VisualCursor {
 /// a replaced selection) into one user-visible undo step. The count is not
 /// always 1: nothing is recorded for a no-op, and a forward delete records an
 /// extra snapshot natively.
+///
+/// # Highlights
+///
+/// Highlights style ranges of lines with a [`SyntaxStyle`]'s styles. They
+/// belong to lines by index and don't move with edits, so callers redo them
+/// when the text changes (see [`content_epoch`](Self::content_epoch)).
 pub struct EditBuffer {
     handle: sys::Handle,
+    /// Kept alive while the native buffer points at it.
+    style: RefCell<Option<Rc<SyntaxStyle>>>,
     _claim: Claim,
 }
 
@@ -112,6 +145,7 @@ impl EditBuffer {
         }
         Ok(EditBuffer {
             handle,
+            style: RefCell::new(None),
             _claim: claim,
         })
     }
@@ -119,6 +153,79 @@ impl EditBuffer {
     /// Replaces the whole text, resets the cursor, and clears the undo history.
     pub fn set_text(&self, text: &str) {
         unsafe { sys::editBufferSetText(self.handle, text.as_ptr(), ffi_len(text.len(), "text")) }
+    }
+
+    /// Replaces the whole text as one undoable edit, moving the cursor to
+    /// the start. Returns the undo snapshots recorded.
+    pub fn replace_text(&self, text: &str) -> u32 {
+        unsafe {
+            sys::editBufferReplaceText(self.handle, text.as_ptr(), ffi_len(text.len(), "text"))
+        }
+        1
+    }
+
+    /// A number that changes whenever the text does.
+    pub fn content_epoch(&self) -> u64 {
+        unsafe { sys::editBufferGetContentEpoch(self.handle) }
+    }
+
+    /// The positions of byte offsets into [`text`](Self::text), which must
+    /// be in increasing order. An offset inside a grapheme counts the whole
+    /// grapheme; offsets past the end are the end of the text.
+    pub fn bytes_to_cursors(&self, bytes: &[u32]) -> Vec<LogicalCursor> {
+        assert!(bytes.is_sorted(), "byte offsets must be in order");
+        let mut out = vec![
+            sys::ExternalLogicalCursor {
+                row: 0,
+                col: 0,
+                offset: 0,
+            };
+            bytes.len()
+        ];
+        unsafe {
+            sys::editBufferBytesToCursors(
+                self.handle,
+                bytes.as_ptr(),
+                ffi_len(bytes.len(), "offsets"),
+                out.as_mut_ptr(),
+            )
+        }
+        out.into_iter().map(LogicalCursor::from).collect()
+    }
+
+    /// Styles highlights with `style`'s styles, or with none.
+    pub fn set_syntax_style(&self, style: Option<Rc<SyntaxStyle>>) {
+        let handle = style
+            .as_ref()
+            .map_or(sys::INVALID_HANDLE, |style| style.raw_handle());
+        unsafe { sys::textBufferSetSyntaxStyle(self.text_buffer(), handle) };
+        *self.style.borrow_mut() = style;
+    }
+
+    /// Adds highlights. Those outside the text are ignored.
+    pub fn add_highlights(&self, highlights: &[Highlight]) {
+        let text_buffer = self.text_buffer();
+        unsafe { sys::textBufferStartHighlightsTransaction(text_buffer) };
+        for h in highlights {
+            let external = sys::ExternalHighlight {
+                start: h.start,
+                end: h.end,
+                style_id: h.style,
+                priority: h.priority,
+                hl_ref: h.tag,
+            };
+            unsafe { sys::textBufferAddHighlight(text_buffer, h.line, &external) };
+        }
+        unsafe { sys::textBufferEndHighlightsTransaction(text_buffer) };
+    }
+
+    /// Removes the highlights tagged `tag`.
+    pub fn remove_highlights(&self, tag: u16) {
+        unsafe { sys::textBufferRemoveHighlightsByRef(self.text_buffer(), tag) }
+    }
+
+    fn text_buffer(&self) -> sys::Handle {
+        unsafe { sys::editBufferGetTextBuffer(self.handle) }
     }
 
     pub fn text(&self) -> String {

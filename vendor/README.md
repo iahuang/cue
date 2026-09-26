@@ -39,3 +39,8 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
 - `src/rope.zig`: `rebuildMarkerCache` looks up each marker list once and
   presizes it from the root's marker counts, instead of a hash lookup per
   marker.
+- `src/text-buffer.zig`, `src/lib.zig`: `editBufferBytesToCursors` converts
+  byte offsets into the text to cursor positions in one pass, for placing
+  regex matches (tabs and wide characters make columns differ from bytes).
+  `editBufferGetContentEpoch` exposes the text buffer's change counter, and
+  `textBufferStartHighlightsTransaction`/`End...` batch highlight updates.

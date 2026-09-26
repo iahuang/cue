@@ -16,7 +16,7 @@ tier 0 - required for use at all
 - editor stuff
   - basic syntax highlighting
     - figure out how themes should work. should qedit bundle themes or should it inherit the terminal's therme?
-  - find and replace
+  - find and replace (done: ctrl+F opens a find bar floating at the top right of the editor, as in VS Code, that highlights every match as you type and selects the nearest one; the selection, if on one line, becomes the query. enter / shift+enter or ctrl+G / ctrl+shift+G step through matches, alt+C/W/R toggle case, whole word, regex, like workspace search. ctrl+H (cmd+alt+F), or clicking its ▸, adds a replace row: enter replaces the current match and moves to the next, alt+enter replaces all as one undo step, and `$1` / `${name}` expand regex groups. the last query carries over to other files.)
   - basic language awareness for features like autoclosing brackets, quotes
 - command pallete (done): ctrl+K (cmd+K too, though most mac terminals eat it to clear the screen). typing `>` in ctrl+P switches to commands, like sublime/vscode. ctrl+shift+P is awkward to hit, and ctrl+space arrives as a NUL byte that also toggles macOS input sources.
   - actions such as file save, copy, paste ideally prefixed with like `editor:copy` (done: every shortcut is a named command like `editor:copy`, listed with its shortcut in `qedit --help` and in the palette)

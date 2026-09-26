@@ -158,3 +158,116 @@ fn shared_view_keeps_its_buffer_alive() {
     screen.draw_editor_view(&view, 0, 0);
     assert!(screen.to_text(true).starts_with("kept"));
 }
+
+#[test]
+fn bytes_convert_to_cursors_across_tabs_wide_characters_and_lines() {
+    let _serial = serial();
+    let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+    let text = "a\tb 漢字x\n\nsecond";
+    eb.set_text(text);
+    assert_eq!(eb.text(), text);
+    let at = |needle: &str| text.find(needle).unwrap() as u32;
+    let bytes = [
+        0,
+        at("b"),
+        at("漢"),
+        at("x"),
+        at("\n"),
+        at("second"),
+        at("cond"),
+        text.len() as u32,
+        text.len() as u32 + 10,
+    ];
+    let cursors: Vec<(u32, u32, u32)> = eb
+        .bytes_to_cursors(&bytes)
+        .iter()
+        .map(|c| (c.row, c.col, c.offset))
+        .collect();
+    // A tab is 2 columns by default and each CJK character 2.
+    assert_eq!(
+        cursors,
+        [
+            (0, 0, 0),
+            (0, 3, 3),
+            (0, 5, 5),
+            (0, 9, 9),
+            (0, 10, 10),
+            (2, 0, 12),
+            (2, 2, 14),
+            (2, 6, 18),
+            (2, 6, 18),
+        ]
+    );
+    for (bytes, cursor) in bytes.iter().zip(eb.bytes_to_cursors(&bytes)).take(7) {
+        assert_eq!(
+            eb.position_to_offset(cursor.row, cursor.col),
+            cursor.offset,
+            "byte {bytes}"
+        );
+    }
+    assert!(eb.bytes_to_cursors(&[]).is_empty());
+    let empty = EditBuffer::new(WidthMethod::Unicode).unwrap();
+    assert_eq!(empty.bytes_to_cursors(&[0, 5])[1].offset, 0);
+}
+
+#[test]
+fn highlights_color_the_view_until_removed() {
+    let _serial = serial();
+    let eb = std::rc::Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+    eb.set_text("one two\nthree");
+    let style = std::rc::Rc::new(opentui::SyntaxStyle::new().unwrap());
+    let red = Rgba::rgb(200, 0, 0);
+    let id = style.register("match", None, Some(red), opentui::Attributes::NONE);
+    assert_ne!(id, 0);
+    eb.set_syntax_style(Some(style));
+    let highlight = |line, start, end| opentui::Highlight {
+        line,
+        start,
+        end,
+        style: id,
+        priority: 1,
+        tag: 7,
+    };
+    eb.add_highlights(&[highlight(0, 4, 7), highlight(1, 0, 2), highlight(9, 0, 1)]);
+    let view = eb.shared_view(10, 2).unwrap();
+    let screen = OwnedBuffer::new(10, 2, false, WidthMethod::Unicode, "test").unwrap();
+    let draw = || {
+        screen.clear(Rgba::BLACK);
+        screen.draw_editor_view(&view, 0, 0);
+        (0..2)
+            .map(|y| {
+                (0..10)
+                    .map(|x| {
+                        if screen.bg_at(x, y) == Some(red) {
+                            '#'
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(draw(), ["....###...", "##........"]);
+    eb.remove_highlights(7);
+    assert_eq!(draw(), [".........."; 2]);
+}
+
+#[test]
+fn replace_text_is_one_undo_step_and_changes_the_epoch() {
+    let _serial = serial();
+    let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+    eb.set_text("before");
+    let epoch = eb.content_epoch();
+    eb.set_cursor(0, 3);
+    assert_eq!(
+        eb.content_epoch(),
+        epoch,
+        "moving the cursor isn't a change"
+    );
+    assert_eq!(eb.replace_text("after\nall"), 1);
+    assert_ne!(eb.content_epoch(), epoch);
+    assert_eq!(eb.text(), "after\nall");
+    assert!(eb.undo());
+    assert_eq!(eb.text(), "before");
+}

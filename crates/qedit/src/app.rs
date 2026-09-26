@@ -12,6 +12,9 @@
 //! (Ctrl+Shift+F) open over everything and have the keyboard until they
 //! close. The workspace's files are listed in the background from the
 //! start, so the picker can show them right away.
+//!
+//! Each editor has its own find bar (Ctrl+F); the app remembers the last
+//! query, so finding in another file starts from it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,7 @@ use opentui::{Attributes, Buffer, Rgba};
 use crate::document;
 use crate::editor::{Action, Editor};
 use crate::file_index::FileIndex;
+use crate::find;
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
 use crate::picker::{Choice, Mode, Picker, PickerAction};
@@ -92,6 +96,8 @@ pub struct App {
     search: Option<SearchModal>,
     /// What the last search left behind, for the next one.
     search_memory: Memory,
+    /// The last find bar's query and replacement.
+    find_memory: find::Memory,
 }
 
 /// A popup's query line, which typing and pasting edit.
@@ -110,6 +116,19 @@ impl QueryInput for Picker {
     }
     fn delete_word_backward(&mut self) {
         Picker::delete_word_backward(self);
+    }
+}
+
+/// The find bar's focused field.
+impl QueryInput for Editor {
+    fn insert(&mut self, text: &str) {
+        self.find_insert(text);
+    }
+    fn delete_backward(&mut self) {
+        self.find_delete_backward();
+    }
+    fn delete_word_backward(&mut self) {
+        self.find_delete_word_backward();
     }
 }
 
@@ -172,6 +191,7 @@ impl App {
             recent: Vec::new(),
             search: None,
             search_memory: Memory::default(),
+            find_memory: find::Memory::default(),
         };
         app.note_recent();
         app.layout();
@@ -187,6 +207,7 @@ impl App {
     pub fn handle_key(&mut self, key: Key) -> AppAction {
         let action = self.dispatch_key(key);
         self.keep_if_edited();
+        self.note_find_memory();
         action
     }
 
@@ -200,7 +221,10 @@ impl App {
             _ if self.search.is_some() => Context::Search,
             _ if self.picker.is_some() => Context::Picker,
             Focus::Tree => Context::Tree,
-            Focus::Editor => Context::Editor,
+            Focus::Editor => self
+                .editor()
+                .find_field()
+                .map_or(Context::Editor, find::Field::context),
         };
         let binding = self.keymap.lookup(key, context);
         if !matches!(binding, Some((Command::Quit, _))) {
@@ -233,14 +257,22 @@ impl App {
         }
     }
 
-    /// The query line of the open popup, if any.
+    /// The query line of the open popup, or the focused find bar field.
     fn query_input(&mut self) -> Option<&mut dyn QueryInput> {
-        if let Some(search) = &mut self.search {
-            return Some(search);
+        if self.search.is_some() {
+            return self
+                .search
+                .as_mut()
+                .map(|search| search as &mut dyn QueryInput);
         }
-        self.picker
-            .as_mut()
-            .map(|picker| picker as &mut dyn QueryInput)
+        if self.picker.is_some() {
+            return self
+                .picker
+                .as_mut()
+                .map(|picker| picker as &mut dyn QueryInput);
+        }
+        let find = self.focus == Focus::Editor && self.editor().find_field().is_some();
+        find.then(|| self.editor_mut() as &mut dyn QueryInput)
     }
 
     /// A key for a popup's query: typing, or the editor's keys for deleting
@@ -296,7 +328,25 @@ impl App {
             Command::GoToFile => self.show_picker(Mode::Files),
             Command::Palette => self.show_picker(Mode::Commands),
             Command::SearchWorkspace => self.show_search(),
-            command if matches!(command.context(), Context::Picker | Context::Search) => {
+            Command::Find | Command::FindReplace => {
+                self.focus = Focus::Editor;
+                let memory = self.find_memory.clone();
+                let replacing = command == Command::FindReplace;
+                self.editor_mut().show_find(&memory, replacing);
+            }
+            // From the command palette, with no find bar open.
+            Command::Replace | Command::ReplaceAll if !self.editor().find_open() => {
+                return self.run(Command::FindReplace, false);
+            }
+            Command::FindNext | Command::FindPrevious => {
+                let memory = self.find_memory.clone();
+                let forward = command == Command::FindNext;
+                self.editor_mut().find_step(&memory, forward);
+            }
+            command
+                if matches!(command.context(), Context::Picker | Context::Search)
+                    || (command.context() == Context::SearchOptions && self.search.is_some()) =>
+            {
                 if let Some(search) = &mut self.search {
                     let action = search.run(command);
                     return self.search_action(action);
@@ -406,6 +456,7 @@ impl App {
                     ..mouse
                 };
                 self.editor_mut().handle_mouse(local, now);
+                self.note_find_memory();
             }
         }
         AppAction::Continue
@@ -417,6 +468,7 @@ impl App {
             // Terminals send newlines in pastes as CR.
             let line = text.split(['\r', '\n']).next().unwrap_or("");
             input.insert(line);
+            self.note_find_memory();
         } else if self.focus == Focus::Editor {
             self.editor_mut().paste(text);
             self.keep_if_edited();
@@ -587,6 +639,8 @@ impl App {
     fn open(&mut self, path: &Path, preview: bool) -> bool {
         let path = document::resolve(path);
         self.editor_mut().clear_message();
+        // Coming back to a file, the keyboard is for its text.
+        self.editor_mut().blur_find();
         if let Some(index) = self.find_editor(&path) {
             self.current = index;
             if !preview && self.preview == Some(index) {
@@ -630,6 +684,15 @@ impl App {
         self.show_active_in_tree();
         self.layout();
         true
+    }
+
+    /// Keeps the find bar's query for finding in other files.
+    fn note_find_memory(&mut self) {
+        if let Some(memory) = self.editor().find_memory() {
+            if *memory != self.find_memory {
+                self.find_memory = memory.clone();
+            }
+        }
     }
 
     /// An edited preview is kept open.
@@ -1451,5 +1514,96 @@ mod tests {
         key(&mut app, KeyCode::Esc);
         assert!(app.search.is_none());
         assert!(app.editor().is_modified(), "the edit is still there");
+    }
+
+    fn with_mods(app: &mut App, code: KeyCode, mods: Mods) -> AppAction {
+        app.handle_key(Key::new(code, mods))
+    }
+
+    #[test]
+    fn find_and_replace_from_the_keyboard() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "find-keys",
+            &[("a.txt", "cat dog cat\nCat\n"), ("b.txt", "a cat\n")],
+        );
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'f');
+        type_text(&mut app, "cat");
+        assert_eq!(
+            app.editor().text(),
+            "cat dog cat\nCat\n",
+            "typing goes to the query"
+        );
+        assert_eq!(app.editor().selected_text().as_deref(), Some("cat"));
+        let text = screen(&app);
+        assert!(text.contains("▸  cat") && text.contains("1 of 3"), "{text}");
+
+        // Enter steps through the matches; Alt+C matches case.
+        key(&mut app, KeyCode::Enter);
+        assert!(screen(&app).contains("2 of 3"));
+        let alt = Mods {
+            alt: true,
+            ..Mods::NONE
+        };
+        with_mods(&mut app, KeyCode::Char('c'), alt);
+        assert!(screen(&app).contains("of 2"), "{}", screen(&app));
+
+        // Ctrl+H shows the replacement; Tab switches fields.
+        ctrl(&mut app, 'h');
+        type_text(&mut app, "cow");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.editor().find_field(), Some(find::Field::Find));
+        key(&mut app, KeyCode::Tab);
+        with_mods(&mut app, KeyCode::Enter, alt);
+        assert_eq!(app.editor().text(), "cow dog cow\nCat\n");
+        assert!(screen(&app).contains("Replaced 2 matches."));
+
+        // Esc closes the bar, and the keys are the text's again.
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.editor().find_open());
+        type_text(&mut app, "!");
+        assert!(app.editor().text().contains('!'));
+
+        // Another file starts from the same query; Ctrl+G finds it without
+        // opening the bar for typing.
+        assert!(app.open(&root.join("b.txt"), false));
+        ctrl(&mut app, 'g');
+        assert_eq!(app.editor().selected_text().as_deref(), Some("cat"));
+        assert_eq!(app.editor().find_field(), None);
+        assert!(screen(&app).contains("1 of 1"));
+        type_text(&mut app, "x");
+        assert_eq!(app.editor().text(), "a x\n", "typing replaced the match");
+    }
+
+    #[test]
+    fn find_bar_takes_pastes_and_palette_commands() {
+        let _serial = crate::test_serial();
+        let root = fixture("find-palette", &[("a.txt", "one two one\n")]);
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'f');
+        app.paste("one\rignored");
+        assert_eq!(app.editor().find_memory().unwrap().query.text, "one");
+        assert_eq!(app.editor().text(), "one two one\n");
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.editor().find_memory().unwrap().query.text, "on");
+
+        // Replace All from the palette, with the bar closed, opens it for a
+        // replacement.
+        key(&mut app, KeyCode::Esc);
+        ctrl(&mut app, 'k');
+        type_text(&mut app, "replace all");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.editor().find_field(), Some(find::Field::Replace));
+        type_text(&mut app, "1");
+        with_mods(
+            &mut app,
+            KeyCode::Enter,
+            Mods {
+                alt: true,
+                ..Mods::NONE
+            },
+        );
+        assert_eq!(app.editor().text(), "1e two 1e\n");
     }
 }

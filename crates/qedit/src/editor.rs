@@ -1,5 +1,8 @@
 //! One open file: editing commands on top of OpenTUI's `EditBuffer` and
 //! `EditorView`, which own the text, cursor, selection, and scrolling.
+//!
+//! Over the top right of the text, the find bar (Ctrl+F) finds and replaces
+//! in the file: it highlights every match and selects the current one.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -7,18 +10,20 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use opentui::{
-    Attributes, Buffer, EditBuffer, EditorView, Rgba, SelectionBehavior, SelectionColors,
-    WidthMethod, WrapMode,
+    Attributes, Buffer, EditBuffer, EditorView, Highlight, Rgba, SelectionBehavior,
+    SelectionColors, SyntaxStyle, Viewport, WidthMethod, WrapMode,
 };
 
 use crate::document::{self, LineEnding};
+use crate::find::{self, Field, FindBar, Match, Target};
 use crate::history::{EditKind, History};
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
+use crate::search::Toggle;
 use crate::words;
 use crate::workspace::Workspace;
 
-const STATUS_BG: Rgba = Rgba::rgb(49, 50, 68);
+pub const STATUS_BG: Rgba = Rgba::rgb(49, 50, 68);
 const STATUS_FG: Rgba = Rgba::rgb(205, 214, 244);
 const STATUS_DIM: Rgba = Rgba::rgb(147, 153, 178);
 const STATUS_ERROR_BG: Rgba = Rgba::rgb(180, 60, 80);
@@ -28,6 +33,14 @@ const SELECTION: SelectionColors = SelectionColors {
     bg: Rgba::rgb(69, 71, 110),
     fg: None,
 };
+/// The find bar's matches, and the current one, which is selected.
+const MATCH_BG: Rgba = Rgba::rgb(95, 85, 55);
+const CURRENT_MATCH: SelectionColors = SelectionColors {
+    bg: Rgba::rgb(249, 226, 175),
+    fg: Some(Rgba::rgb(30, 30, 46)),
+};
+/// Tags the find bar's highlights.
+const FIND_HIGHLIGHTS: u16 = 1;
 
 const WHEEL_LINES: u32 = 3;
 /// Line numbers are hidden when they would leave the text less room than this.
@@ -97,6 +110,9 @@ pub struct Editor {
     height: u32,
     message: Option<Message>,
     prompt: Option<Prompt>,
+    find: Option<FindBar>,
+    /// The style highlighting the find bar's matches, once made.
+    match_style: Option<u32>,
 }
 
 impl Editor {
@@ -158,6 +174,8 @@ impl Editor {
             height,
             message: None,
             prompt: None,
+            find: None,
+            match_style: None,
         })
     }
 
@@ -182,6 +200,16 @@ impl Editor {
     /// The text area as (x, width, height).
     fn text_area(&self) -> (u32, u32, u32) {
         text_area(self.width, self.height, self.buffer.line_count())
+    }
+
+    /// Where the find bar floats, if open: the top right of the text, a
+    /// column in from the edge, as (screen column, width, rows).
+    fn find_area(&self) -> Option<(u32, u32, u32)> {
+        let bar = self.find.as_ref()?;
+        let (gutter, text_w, _) = self.text_area();
+        let width = find::MAX_WIDTH.min(text_w.saturating_sub(1)).max(1);
+        let x = self.x + gutter + text_w.saturating_sub(width + 1);
+        Some((x, width, bar.rows()))
     }
 
     /// The file's path; `None` until it is first saved.
@@ -230,6 +258,12 @@ impl Editor {
             self.anchor = Some(start);
             self.view.set_selection(start, end, SELECTION);
         }
+        self.reveal(vp, row);
+    }
+
+    /// Scrolls line `row`, where the cursor moved, a third of the way down
+    /// if it was off screen in `vp`, the viewport before the move.
+    fn reveal(&self, vp: Viewport, row: u32) {
         // Wrapped, lines and rows differ; the view scrolls the cursor into
         // view by itself.
         if self.wrap == WrapMode::None && !(vp.y..vp.y + vp.height).contains(&row) {
@@ -272,13 +306,26 @@ impl Editor {
                 let mut utf8 = [0u8; 4];
                 let text: &str = c.encode_utf8(&mut utf8);
                 self.edit(EditKind::Type(c), |eb| eb.insert_text(text));
+                self.sync_find();
             }
         }
     }
 
-    /// Runs an editing command; others are ignored. With `select`, a cursor
-    /// movement extends the selection. `clipboard` is shared by all editors.
+    /// Runs an editing or find bar command; others are ignored. With
+    /// `select`, a cursor movement extends the selection. `clipboard` is
+    /// shared by all editors.
     pub fn run(
+        &mut self,
+        command: Command,
+        select: bool,
+        clipboard: &mut Option<String>,
+    ) -> Action {
+        let action = self.run_command(command, select, clipboard);
+        self.sync_find();
+        action
+    }
+
+    fn run_command(
         &mut self,
         command: Command,
         select: bool,
@@ -293,9 +340,22 @@ impl Editor {
             Command::Cut => return self.cut(clipboard),
             Command::Paste => self.paste_clipboard(clipboard.as_deref()),
             Command::SelectAll => self.select_all(),
+            // With nothing selected, Esc closes the find bar.
+            Command::ClearSelection if !self.has_selection() && self.find.is_some() => {
+                self.close_find()
+            }
             Command::ClearSelection => {
                 self.anchor = None;
                 self.view.clear_selection();
+            }
+            Command::FindSwitchField => self.switch_find_field(),
+            Command::FindClose => self.close_find(),
+            Command::Replace => self.replace(),
+            Command::ReplaceAll => self.replace_all(),
+            command if Toggle::for_command(command).is_some() => {
+                if let (Some(bar), Some(toggle)) = (&mut self.find, Toggle::for_command(command)) {
+                    bar.toggle(toggle);
+                }
             }
             Command::ToggleWrap => self.toggle_wrap(),
             Command::NewLine => self.edit(EditKind::Other, EditBuffer::new_line),
@@ -350,6 +410,12 @@ impl Editor {
             return;
         }
         let (text_x, text_w, text_h) = self.text_area();
+        // A drag that started in the text stays with it.
+        let pressed = matches!(mouse.kind, MouseKind::Press(_));
+        if (self.drag.is_none() || pressed) && self.handle_find_mouse(mouse) {
+            self.drag = None;
+            return;
+        }
         // Clicks on the line numbers go to the start of the line.
         let at = (
             mouse.x.saturating_sub(text_x).min(text_w - 1),
@@ -404,13 +470,61 @@ impl Editor {
         }
     }
 
+    /// A mouse event on the find bar, which it handles; returns false if
+    /// it's elsewhere. A press elsewhere gives the text the keyboard.
+    fn handle_find_mouse(&mut self, mouse: Mouse) -> bool {
+        let Some((x, width, rows)) = self.find_area() else {
+            return false;
+        };
+        let screen_x = self.x + mouse.x;
+        let inside = (x..x + width).contains(&screen_x) && mouse.y < rows;
+        let press = matches!(mouse.kind, MouseKind::Press(MouseButton::Left));
+        let Some(bar) = &mut self.find else {
+            return false;
+        };
+        if !inside {
+            if let MouseKind::Press(_) = mouse.kind {
+                bar.focus = None;
+            }
+            return false;
+        }
+        // The wheel scrolls the text under the bar.
+        if matches!(mouse.kind, MouseKind::ScrollUp | MouseKind::ScrollDown) {
+            return false;
+        }
+        if !press {
+            return true;
+        }
+        match bar.target(screen_x, mouse.y) {
+            Target::Field(field) => bar.focus = Some(field),
+            Target::Toggle(toggle) => bar.toggle(toggle),
+            Target::Expander => {
+                bar.replacing = !bar.replacing;
+                bar.focus = Some(if bar.replacing {
+                    Field::Replace
+                } else {
+                    Field::Find
+                });
+            }
+            Target::Close => self.close_find(),
+            Target::Replace => self.replace(),
+            Target::ReplaceAll => self.replace_all(),
+        }
+        self.sync_find();
+        self.keep_clear_of_find();
+        true
+    }
+
     pub fn paste(&mut self, text: &str) {
         // Terminals send newlines in pastes as CR.
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match &mut self.prompt {
             // Only the first line makes sense in a file name.
             Some(prompt) => prompt.input.push_str(text.lines().next().unwrap_or("")),
-            None => self.edit(EditKind::Other, |eb| eb.insert_text(&text)),
+            None => {
+                self.edit(EditKind::Other, |eb| eb.insert_text(&text));
+                self.sync_find();
+            }
         }
     }
 
@@ -423,12 +537,20 @@ impl Editor {
         let text_x = self.x + gutter;
         frame.draw_editor_view(&self.view, text_x as i32, 0);
         self.draw_line_numbers(frame, gutter);
+        let find_cursor = self
+            .find
+            .as_ref()
+            .zip(self.find_area())
+            .and_then(|(bar, area)| {
+                let (x, width, _) = area;
+                bar.draw(frame, (x, 0, width), self.current_match(), keymap)
+            });
         match self.draw_status(frame, keymap, workspace) {
             Some(prompt_cursor) => prompt_cursor,
-            None => {
+            None => find_cursor.unwrap_or_else(|| {
                 let cursor = self.view.visual_cursor();
                 (text_x + cursor.col, cursor.row)
-            }
+            }),
         }
     }
 
@@ -791,6 +913,358 @@ impl Editor {
         }
     }
 
+    fn has_selection(&self) -> bool {
+        self.view.selection().is_some_and(|(s, e)| s != e)
+    }
+
+    // --- find and replace --------------------------------------------------
+
+    /// Opens the find bar with `memory`'s query, or the selection if it's on
+    /// one line, and focuses the query. With the query focused already, it
+    /// closes the bar. With `replacing`, it shows the replacement too and
+    /// focuses it if there's a query; with the replacement focused already,
+    /// it hides it.
+    pub fn show_find(&mut self, memory: &find::Memory, replacing: bool) {
+        let focus = self.find.as_ref().and_then(|bar| bar.focus);
+        match focus {
+            Some(Field::Find) if !replacing => return self.close_find(),
+            Some(Field::Replace) if replacing => {
+                if let Some(bar) = &mut self.find {
+                    bar.replacing = false;
+                    bar.focus = Some(Field::Find);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let selected = self.selected_text().filter(|text| !text.contains('\n'));
+        let origin = self.selection_start();
+        let bar = self
+            .find
+            .get_or_insert_with(|| FindBar::new(memory.clone(), origin));
+        if let Some(text) = selected {
+            if text != bar.memory.query.text {
+                bar.memory.query.text = text;
+                bar.epoch = None;
+            }
+            bar.origin = origin;
+        }
+        bar.replacing |= replacing;
+        let has_query = !bar.memory.query.text.is_empty();
+        bar.focus = Some(if replacing && has_query {
+            Field::Replace
+        } else {
+            Field::Find
+        });
+        // Typing replaces the query, as if it were selected.
+        bar.replace_query = has_query && bar.focus == Some(Field::Find);
+        self.sync_find();
+        self.keep_clear_of_find();
+    }
+
+    /// Selects the next match, or with `forward` false the previous one,
+    /// after the current match or the cursor. With the find bar closed, it
+    /// opens with `memory`'s query, keeping focus in the text, or if there's
+    /// no query, to type one.
+    pub fn find_step(&mut self, memory: &find::Memory, forward: bool) {
+        if self.find.is_none() {
+            if memory.query.text.is_empty() {
+                return self.show_find(memory, false);
+            }
+            let mut bar = FindBar::new(memory.clone(), self.selection_start());
+            bar.focus = None;
+            self.find = Some(bar);
+        }
+        self.sync_find();
+        let Some(bar) = &self.find else {
+            return;
+        };
+        let cursor = self.buffer.cursor().offset;
+        let count = bar.matches.len();
+        let index = match self.current_match() {
+            Some(i) if forward => Some((i + 1) % count),
+            Some(i) => Some((i + count - 1) % count),
+            None if forward => bar.next_from(cursor),
+            None => bar.previous_from(cursor),
+        };
+        if let Some(index) = index {
+            self.select_match(index);
+        }
+    }
+
+    /// The find bar's query and replacement, while it's open.
+    pub fn find_memory(&self) -> Option<&find::Memory> {
+        self.find.as_ref().map(|bar| &bar.memory)
+    }
+
+    /// The find bar field with the keyboard, if any.
+    pub fn find_field(&self) -> Option<Field> {
+        self.find.as_ref().and_then(|bar| bar.focus)
+    }
+
+    pub fn find_open(&self) -> bool {
+        self.find.is_some()
+    }
+
+    /// Gives the keyboard back to the text.
+    pub fn blur_find(&mut self) {
+        if let Some(bar) = &mut self.find {
+            bar.focus = None;
+        }
+    }
+
+    /// Adds typed or pasted text to the focused find bar field.
+    pub fn find_insert(&mut self, text: &str) {
+        if let Some(bar) = &mut self.find {
+            bar.insert(text);
+        }
+        self.sync_find();
+    }
+
+    pub fn find_delete_backward(&mut self) {
+        if let Some(bar) = &mut self.find {
+            bar.delete_backward();
+        }
+        self.sync_find();
+    }
+
+    pub fn find_delete_word_backward(&mut self) {
+        if let Some(bar) = &mut self.find {
+            bar.delete_word_backward();
+        }
+        self.sync_find();
+    }
+
+    /// Closes the find bar, leaving the current match selected.
+    fn close_find(&mut self) {
+        if self.find.take().is_none() {
+            return;
+        }
+        self.buffer.remove_highlights(FIND_HIGHLIGHTS);
+        if let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) {
+            self.view.set_selection(start, end, SELECTION);
+        }
+    }
+
+    fn switch_find_field(&mut self) {
+        let Some(bar) = self.find.as_mut().filter(|bar| bar.replacing) else {
+            return;
+        };
+        bar.focus = match bar.focus {
+            Some(Field::Find) => Some(Field::Replace),
+            _ => Some(Field::Find),
+        };
+        bar.replace_query = false;
+    }
+
+    /// Finds the matches again if the text or the query changed. After the
+    /// query changes, the first match from where finding started is selected.
+    fn sync_find(&mut self) {
+        let epoch = self.buffer.content_epoch();
+        if self
+            .find
+            .as_ref()
+            .is_none_or(|bar| bar.epoch == Some(epoch))
+        {
+            return;
+        }
+        let style = self.match_style();
+        let Some(bar) = &mut self.find else {
+            return;
+        };
+        // Opening the bar doesn't move the cursor; a new query does.
+        let jump = bar.epoch.is_none() && bar.focus == Some(Field::Find);
+        bar.epoch = Some(epoch);
+        let text = self.buffer.text();
+        let (ranges, truncated) = match find::find(&text, &bar.memory.query) {
+            Ok(found) => {
+                bar.error = None;
+                found
+            }
+            Err(error) => {
+                bar.error = Some(error);
+                (Vec::new(), false)
+            }
+        };
+        bar.truncated = truncated;
+        let bytes: Vec<u32> = ranges
+            .iter()
+            .flat_map(|r| [r.start as u32, r.end as u32])
+            .collect();
+        let cursors = self.buffer.bytes_to_cursors(&bytes);
+        bar.matches = ranges
+            .into_iter()
+            .zip(cursors.chunks(2))
+            .map(|(bytes, ends)| Match {
+                bytes,
+                row: ends[0].row,
+                cols: ends[0].col..ends[1].col,
+                offsets: ends[0].offset..ends[1].offset,
+            })
+            .collect();
+        let highlights: Vec<Highlight> = bar
+            .matches
+            .iter()
+            .map(|m| Highlight {
+                line: m.row,
+                start: m.cols.start,
+                end: m.cols.end,
+                style,
+                priority: 1,
+                tag: FIND_HIGHLIGHTS,
+            })
+            .collect();
+        self.buffer.remove_highlights(FIND_HIGHLIGHTS);
+        self.buffer.add_highlights(&highlights);
+        if jump {
+            let origin = bar.origin;
+            match bar.next_from(origin) {
+                Some(index) => self.select_match(index),
+                None => {
+                    self.anchor = None;
+                    self.view.clear_selection();
+                    self.view.set_cursor_by_offset(origin);
+                }
+            }
+        }
+    }
+
+    /// The style id for highlighting matches, made on first use.
+    fn match_style(&mut self) -> u32 {
+        if let Some(id) = self.match_style {
+            return id;
+        }
+        // Without a style, matches aren't highlighted; the current one is
+        // still selected.
+        let id = SyntaxStyle::new().map_or(0, |style| {
+            let id = style.register("find.match", None, Some(MATCH_BG), Attributes::NONE);
+            self.buffer.set_syntax_style(Some(Rc::new(style)));
+            id
+        });
+        self.match_style = Some(id);
+        id
+    }
+
+    /// The match that is selected, if any.
+    fn current_match(&self) -> Option<usize> {
+        let bar = self.find.as_ref()?;
+        let (start, end) = self.view.selection()?;
+        bar.at(start.min(end), start.max(end))
+    }
+
+    /// Selects match `index`, with the cursor at its end, scrolling to it.
+    fn select_match(&mut self, index: usize) {
+        let Some(bar) = &mut self.find else {
+            return;
+        };
+        let Some(m) = bar.matches.get(index).cloned() else {
+            return;
+        };
+        bar.origin = m.offsets.start;
+        self.history.break_group();
+        let vp = self.view.viewport();
+        self.view.set_cursor_by_offset(m.offsets.end);
+        self.anchor = Some(m.offsets.start);
+        self.view
+            .set_selection(m.offsets.start, m.offsets.end, CURRENT_MATCH);
+        self.reveal(vp, m.row);
+        self.keep_clear_of_find();
+    }
+
+    /// Scrolls the text down if the find bar covers the cursor, as it does
+    /// a match near the top right. At the top of the file there's no room
+    /// to, and the bar stays over it.
+    fn keep_clear_of_find(&self) {
+        let Some((x, _, rows)) = self.find_area() else {
+            return;
+        };
+        let (gutter, _, _) = self.text_area();
+        // The bar's first column, in the viewport.
+        let left = x - (self.x + gutter);
+        // Laying out scrolls the cursor into view first.
+        let cursor = self.view.visual_cursor();
+        if cursor.row >= rows || cursor.col <= left {
+            return;
+        }
+        let vp = self.view.viewport();
+        let y = vp.y.saturating_sub(rows - cursor.row);
+        if y != vp.y {
+            self.view.scroll_to(vp.x, y, false);
+        }
+    }
+
+    /// The start of the selection, or the cursor.
+    fn selection_start(&self) -> u32 {
+        match self.view.selection() {
+            Some((start, end)) if start != end => start.min(end),
+            _ => self.buffer.cursor().offset,
+        }
+    }
+
+    /// Replaces the current match and selects the next one. Without a
+    /// current match, it just selects the next one.
+    fn replace(&mut self) {
+        self.sync_find();
+        let Some(bar) = &self.find else {
+            return;
+        };
+        if let Some(index) = self.current_match() {
+            let m = &bar.matches[index];
+            let text = self.buffer.text();
+            let replacer = find::Replacer::new(&bar.memory.query, &bar.memory.replacement);
+            let replacement = replacer.expand(&text, m.bytes.clone());
+            self.history.break_group();
+            self.edit(EditKind::Other, |eb| eb.insert_text(&replacement));
+            self.history.break_group();
+            self.sync_find();
+        }
+        let Some(bar) = &self.find else {
+            return;
+        };
+        if let Some(next) = bar.next_from(self.buffer.cursor().offset) {
+            self.select_match(next);
+        }
+    }
+
+    /// Replaces every match, as one undo step.
+    fn replace_all(&mut self) {
+        self.sync_find();
+        let Some(bar) = &self.find else {
+            return;
+        };
+        if bar.matches.is_empty() {
+            return self.show_message("Nothing to replace.", false);
+        }
+        let text = self.buffer.text();
+        let replacer = find::Replacer::new(&bar.memory.query, &bar.memory.replacement);
+        let mut replaced = String::with_capacity(text.len());
+        let mut end = 0;
+        for m in &bar.matches {
+            replaced.push_str(&text[end..m.bytes.start]);
+            replaced.push_str(&replacer.expand(&text, m.bytes.clone()));
+            end = m.bytes.end;
+        }
+        replaced.push_str(&text[end..]);
+        let count = bar.matches.len();
+        let more = if bar.truncated {
+            " (there are more)"
+        } else {
+            ""
+        };
+        // Matches never span lines, so the cursor's line keeps its place.
+        let cursor = self.buffer.cursor();
+        self.history.break_group();
+        let steps = self.buffer.replace_text(&replaced);
+        self.history.record(EditKind::Other, steps);
+        self.history.break_group();
+        self.anchor = None;
+        self.view.clear_selection();
+        self.buffer.set_cursor(cursor.row, cursor.col);
+        let noun = if count == 1 { "match" } else { "matches" };
+        self.show_message(format!("Replaced {count} {noun}{more}."), false);
+        self.sync_find();
+    }
+
     // --- status bar, files, misc --------------------------------------------
 
     /// Returns the cursor position when the prompt has focus.
@@ -819,7 +1293,17 @@ impl Editor {
             return Some((x + shown.chars().count() as u32, y));
         }
 
-        if let Some(message) = &self.message {
+        // While typing a query that isn't a valid regex, why.
+        let find_error = self
+            .find
+            .as_ref()
+            .filter(|bar| bar.focus == Some(Field::Find))
+            .and_then(FindBar::error)
+            .map(|error| Message {
+                text: format!("Invalid regex: {error}"),
+                error: true,
+            });
+        if let Some(message) = self.message.as_ref().or(find_error.as_ref()) {
             let bg = if message.error {
                 STATUS_ERROR_BG
             } else {
@@ -1801,5 +2285,292 @@ mod tests {
         editor.select_in_line(99, 50..60);
         assert_eq!(eb.cursor().row, 39);
         assert_eq!(editor.selected_text(), None);
+    }
+
+    /// The text of `row`, trimmed, and which of its columns have `bg`.
+    fn row_with_bg(
+        editor: &Editor,
+        width: u32,
+        height: u32,
+        row: u32,
+        bg: Rgba,
+    ) -> (String, String) {
+        let screen = OwnedBuffer::new(width, height, false, WidthMethod::Unicode, "test").unwrap();
+        draw(editor, &screen);
+        let text = screen
+            .to_text(true)
+            .lines()
+            .nth(row as usize)
+            .unwrap()
+            .trim_end()
+            .to_string();
+        let marks = (0..width)
+            .map(|x| {
+                if screen.bg_at(x, row) == Some(bg) {
+                    '#'
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        (text, marks)
+    }
+
+    fn find_query(editor: &mut Editor, text: &str) {
+        editor.show_find(&find::Memory::default(), false);
+        editor.find_insert(text);
+    }
+
+    #[test]
+    fn find_highlights_matches_and_selects_as_you_type() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        // A tab and a wide character before a match: highlights are in columns.
+        eb.set_text("ab\tab 漢ab\nnone\nxab");
+        let mut editor = Editor::new(eb.clone(), unnamed(), 100, 6).unwrap();
+        eb.set_cursor(0, 1);
+        find_query(&mut editor, "a");
+        editor.find_insert("b");
+        assert_eq!(editor.selected_text().as_deref(), Some("ab"));
+        assert_eq!(pos(&eb), (0, 6), "the first match after the cursor");
+        let (text, current) = row_with_bg(&editor, 100, 6, 0, CURRENT_MATCH.bg);
+        assert!(text.starts_with(" 1  ab  ab 漢ab "), "{text}");
+        assert_eq!(current, "        ##");
+        let (_, others) = row_with_bg(&editor, 100, 6, 0, MATCH_BG);
+        assert_eq!(others, "    ##       ##");
+        // The bar floats at the top right, a column in from the edge.
+        let bar = &text[text.find(" ▸ ").unwrap()..];
+        assert!(bar.starts_with(" ▸  ab"), "{bar}");
+        assert!(bar.ends_with("2 of 4  Aa  ab  .*  ×"), "{bar}");
+        let (_, bar_cells) = row_with_bg(&editor, 100, 6, 0, STATUS_BG);
+        assert_eq!(bar_cells.find('#'), Some(100 - 61));
+        assert_eq!(bar_cells.len(), 99);
+
+        let memory = find::Memory::default();
+        editor.find_step(&memory, true);
+        assert_eq!(pos(&eb), (0, 11));
+        editor.find_step(&memory, true);
+        assert_eq!(pos(&eb), (2, 3));
+        editor.find_step(&memory, true);
+        assert_eq!(pos(&eb), (0, 2), "wraps around");
+        editor.find_step(&memory, false);
+        assert_eq!(pos(&eb), (2, 3), "and back");
+
+        // No match: nothing selected, the cursor back where finding started.
+        editor.find_insert("zz");
+        assert_eq!(editor.selected_text(), None);
+        assert_eq!(pos(&eb), (2, 1));
+        assert!(row_with_bg(&editor, 100, 6, 0, MATCH_BG)
+            .0
+            .contains("no matches"));
+        editor.find_delete_backward();
+        editor.find_delete_backward();
+        assert_eq!(pos(&eb), (2, 3));
+
+        // Closing leaves the match selected, without highlights.
+        editor.run(Command::FindClose, false, &mut None);
+        assert!(!editor.find_open());
+        assert_eq!(editor.selected_text().as_deref(), Some("ab"));
+        let (text, others) = row_with_bg(&editor, 100, 6, 0, MATCH_BG);
+        assert_eq!(others, "");
+        assert!(!text.contains('▸'), "{text}");
+    }
+
+    #[test]
+    fn find_follows_edits_and_undo() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("one x\ntwo x");
+        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 6).unwrap();
+        find_query(&mut editor, "x");
+        editor.blur_find();
+        let count = |editor: &Editor| editor.find.as_ref().unwrap().matches.len();
+        assert_eq!(count(&editor), 2);
+        // Typing in the text adds a line before the matches.
+        key(&mut editor, KeyCode::Esc);
+        eb.set_cursor(0, 0);
+        key(&mut editor, KeyCode::Enter);
+        press(&mut editor, "x");
+        assert_eq!(count(&editor), 3);
+        let (_, marks) = row_with_bg(&editor, 40, 6, 2, MATCH_BG);
+        assert_eq!(marks, "        #", "highlights moved down with their line");
+        ctrl(&mut editor, 'z');
+        ctrl(&mut editor, 'z');
+        assert_eq!(count(&editor), 2);
+        let (text, marks) = row_with_bg(&editor, 40, 6, 1, MATCH_BG);
+        assert_eq!((text.as_str(), marks.as_str()), (" 2  two x", "        #"));
+        // Esc with nothing selected closes the bar.
+        key(&mut editor, KeyCode::Esc);
+        assert!(!editor.find_open());
+    }
+
+    #[test]
+    fn replace_one_at_a_time_and_all_at_once() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("a1 a22\nb3 a4");
+        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 8).unwrap();
+        let memory = find::Memory {
+            query: crate::search::Query {
+                text: r"a(\d+)".to_string(),
+                regex: true,
+                ..Default::default()
+            },
+            replacement: "<$1>".to_string(),
+        };
+        editor.show_find(&memory, true);
+        assert_eq!(editor.find_field(), Some(Field::Replace));
+        let mut clipboard = None;
+        // No current match yet: Replace selects the first.
+        editor.run(Command::Replace, false, &mut clipboard);
+        assert_eq!(editor.selected_text().as_deref(), Some("a1"));
+        editor.run(Command::Replace, false, &mut clipboard);
+        assert_eq!(eb.text(), "<1> a22\nb3 a4");
+        assert_eq!(editor.selected_text().as_deref(), Some("a22"), "the next");
+        let (bar, _) = row_with_bg(&editor, 40, 8, 0, MATCH_BG);
+        assert!(bar.contains("1 of 2"), "{bar}");
+        let (replace_row, _) = row_with_bg(&editor, 40, 8, 1, MATCH_BG);
+        assert!(
+            replace_row.contains("<$1>") && replace_row.contains(" all"),
+            "{replace_row}"
+        );
+
+        editor.run(Command::ReplaceAll, false, &mut clipboard);
+        assert_eq!(eb.text(), "<1> <22>\nb3 <4>");
+        let (status, _) = row_with_bg(&editor, 40, 8, 7, MATCH_BG);
+        assert!(status.contains("Replaced 2 matches."), "{status}");
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "<1> a22\nb3 a4", "one undo step");
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "a1 a22\nb3 a4");
+
+        // A replacement that contains the query isn't matched again.
+        let memory = find::Memory {
+            query: crate::search::Query {
+                text: "a".to_string(),
+                ..Default::default()
+            },
+            replacement: "aa".to_string(),
+        };
+        editor.close_find();
+        editor.show_find(&memory, true);
+        editor.run(Command::ReplaceAll, false, &mut clipboard);
+        assert_eq!(eb.text(), "aa1 aa22\nb3 aa4");
+        eb.set_cursor(0, 0);
+        editor.run(Command::Replace, false, &mut clipboard);
+        editor.run(Command::Replace, false, &mut clipboard);
+        assert_eq!(eb.text(), "aaa1 aa22\nb3 aa4");
+    }
+
+    #[test]
+    fn the_selection_seeds_the_query_and_the_shortcut_toggles_the_bar() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("foo bar foo");
+        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 6).unwrap();
+        let memory = find::Memory {
+            query: crate::search::Query {
+                text: "old".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        editor.show_find(&memory, false);
+        assert_eq!(editor.find_memory().unwrap().query.text, "old");
+        assert_eq!(
+            editor.selected_text(),
+            None,
+            "opening doesn't move the cursor"
+        );
+        editor.find_insert("f");
+        assert_eq!(
+            editor.find_memory().unwrap().query.text,
+            "f",
+            "typing replaced it"
+        );
+        editor.show_find(&memory, false);
+        assert!(!editor.find_open(), "pressed again, it closes");
+
+        editor.select_in_line(0, 8..11);
+        editor.show_find(&memory, false);
+        assert_eq!(editor.find_memory().unwrap().query.text, "foo");
+        let (bar, _) = row_with_bg(&editor, 40, 6, 0, MATCH_BG);
+        assert!(bar.contains("2 of 2"), "{bar}");
+
+        // An invalid regex says why in the status bar.
+        let mut clipboard = None;
+        editor.run(Command::SearchToggleRegex, false, &mut clipboard);
+        editor.find_insert("(");
+        let (status, _) = row_with_bg(&editor, 40, 6, 5, MATCH_BG);
+        assert!(status.contains("Invalid regex: "), "{status}");
+        assert!(row_with_bg(&editor, 40, 6, 0, MATCH_BG)
+            .0
+            .contains("invalid regex"));
+    }
+
+    #[test]
+    fn clicks_on_the_find_bar() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("Foo foo");
+        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 6).unwrap();
+        find_query(&mut editor, "foo");
+        assert_eq!(editor.find.as_ref().unwrap().matches.len(), 2);
+        let now = Instant::now();
+        let click = |editor: &mut Editor, x, y| {
+            editor.handle_mouse(
+                Mouse {
+                    kind: MouseKind::Press(MouseButton::Left),
+                    x,
+                    y,
+                    mods: Mods::NONE,
+                },
+                now,
+            );
+        };
+        // Clicks land on what was drawn.
+        let (row, _) = row_with_bg(&editor, 40, 6, 0, MATCH_BG);
+        let column = |row: &str, label: &str| {
+            let byte = row.find(label).unwrap();
+            row[..byte].chars().count() as u32
+        };
+        click(&mut editor, column(&row, "Aa"), 0);
+        assert!(editor.find_memory().unwrap().query.case_sensitive);
+        assert_eq!(editor.find.as_ref().unwrap().matches.len(), 1);
+        // A click in the text gives it the keyboard; one on the query takes it back.
+        click(&mut editor, GUTTER, 1);
+        assert_eq!(editor.find_field(), None);
+        click(&mut editor, column(&row, "foo"), 0);
+        assert_eq!(editor.find_field(), Some(Field::Find));
+
+        // The expander shows the replacement; its buttons replace.
+        click(&mut editor, column(&row, "▸"), 0);
+        assert_eq!(editor.find_field(), Some(Field::Replace));
+        editor.find_insert("bar");
+        let (replace_row, _) = row_with_bg(&editor, 40, 6, 1, MATCH_BG);
+        click(&mut editor, column(&replace_row, "all"), 1);
+        assert_eq!(eb.text(), "Foo bar");
+        click(&mut editor, column(&row, "×"), 0);
+        assert!(!editor.find_open());
+    }
+
+    #[test]
+    fn a_match_under_the_bar_scrolls_into_view() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let mut lines: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        lines[20] = format!("{}needle", " ".repeat(70));
+        eb.set_text(&lines.join("\n"));
+        let mut editor = Editor::new(eb.clone(), unnamed(), 100, 10).unwrap();
+        // Scrolled so line 20 is at the top, where the bar will be.
+        editor.view.scroll_to(0, 20, true);
+        screen_lines(&editor, 100, 10);
+        assert_eq!(editor.view.viewport().y, 20);
+        find_query(&mut editor, "needle");
+        let (_, cursor) = screen_lines(&editor, 100, 10);
+        assert_eq!(editor.view.viewport().y, 19, "one row down, below the bar");
+        assert_eq!(cursor.1, 0, "the cursor is in the query");
     }
 }

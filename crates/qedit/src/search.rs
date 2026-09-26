@@ -22,6 +22,7 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContex
 use ignore::WalkState;
 
 use crate::file_index;
+use crate::keymap::Command;
 use crate::workspace::Workspace;
 
 /// Lines shown before and after each matching line.
@@ -42,8 +43,69 @@ pub struct Query {
     pub regex: bool,
 }
 
+/// An option of a [`Query`], shown as a toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    Case,
+    Word,
+    Regex,
+}
+
+impl Toggle {
+    pub const ALL: [Toggle; 3] = [Toggle::Case, Toggle::Word, Toggle::Regex];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Toggle::Case => "Aa",
+            Toggle::Word => "ab",
+            Toggle::Regex => ".*",
+        }
+    }
+
+    pub fn command(self) -> Command {
+        match self {
+            Toggle::Case => Command::SearchToggleCase,
+            Toggle::Word => Command::SearchToggleWord,
+            Toggle::Regex => Command::SearchToggleRegex,
+        }
+    }
+
+    /// The toggle `command` flips, if any.
+    pub fn for_command(command: Command) -> Option<Toggle> {
+        Toggle::ALL.into_iter().find(|t| t.command() == command)
+    }
+
+    /// What the shortcut hint calls it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Toggle::Case => "case",
+            Toggle::Word => "word",
+            Toggle::Regex => "regex",
+        }
+    }
+
+    pub fn is_on(self, query: &Query) -> bool {
+        match self {
+            Toggle::Case => query.case_sensitive,
+            Toggle::Word => query.whole_word,
+            Toggle::Regex => query.regex,
+        }
+    }
+
+    pub fn flip(self, query: &mut Query) {
+        let flag = match self {
+            Toggle::Case => &mut query.case_sensitive,
+            Toggle::Word => &mut query.whole_word,
+            Toggle::Regex => &mut query.regex,
+        };
+        *flag = !*flag;
+    }
+}
+
 impl Query {
-    fn matcher(&self) -> Result<RegexMatcher, String> {
+    /// A matcher for the query, or why it isn't a valid regex. A match never
+    /// spans lines.
+    pub fn matcher(&self) -> Result<RegexMatcher, String> {
         RegexMatcherBuilder::new()
             .case_insensitive(!self.case_sensitive)
             .word(self.whole_word)

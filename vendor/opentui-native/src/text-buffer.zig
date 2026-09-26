@@ -371,6 +371,72 @@ pub const UnifiedTextBuffer = struct {
         return self.content_epoch;
     }
 
+    /// A position in the text: line, display column, and cursor offset
+    /// (display columns plus one for each line break before it).
+    pub const Position = struct { row: u32, col: u32, offset: u32 };
+
+    /// Converts byte offsets into the plain text (lines joined by `\n`, as
+    /// `getPlainTextIntoBuffer` writes it) to positions, in one pass. `bytes`
+    /// must not decrease. An offset inside a grapheme counts the whole
+    /// grapheme, and offsets past the end map to the end of the text.
+    pub fn byteOffsetsToPositions(self: *const Self, bytes: []const u32, out: []Position) void {
+        const Context = struct {
+            buffer: *const Self,
+            bytes: []const u32,
+            out: []Position,
+            next: usize = 0,
+            /// Bytes before the current chunk or line break.
+            byte_pos: u32 = 0,
+            /// The cursor offset of the current line's start.
+            line_offset: u32 = 0,
+            /// Columns before the current chunk, in its line.
+            col: u32 = 0,
+            /// The end of the text, as far as the walk has got.
+            end: Position = .{ .row = 0, .col = 0, .offset = 0 },
+
+            fn emit(ctx: *@This(), row: u32, col: u32) void {
+                ctx.out[ctx.next] = .{ .row = row, .col = col, .offset = ctx.line_offset + col };
+                ctx.next += 1;
+            }
+
+            fn segment(ctx_ptr: *anyopaque, line_idx: u32, chunk: *const TextChunk, _: u32) void {
+                const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
+                const chunk_bytes = chunk.getBytes(&ctx.buffer.mem_registry);
+                const chunk_end = ctx.byte_pos + @as(u32, @intCast(chunk_bytes.len));
+                var widths: utf8.TextWidthCursor = .{
+                    .text = chunk_bytes,
+                    .tab_width = ctx.buffer.tab_width,
+                    .width_method = ctx.buffer.width_method,
+                };
+                while (ctx.next < ctx.bytes.len and ctx.bytes[ctx.next] < chunk_end) {
+                    const local = ctx.bytes[ctx.next] -| ctx.byte_pos;
+                    ctx.emit(line_idx, ctx.col + widths.advanceTo(local));
+                }
+                ctx.byte_pos = chunk_end;
+                ctx.col += chunk.width_cols;
+            }
+
+            fn lineEnd(ctx_ptr: *anyopaque, info: LineInfo) void {
+                const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
+                // Offsets at the line break.
+                while (ctx.next < ctx.bytes.len and ctx.bytes[ctx.next] <= ctx.byte_pos) {
+                    ctx.emit(info.line_idx, ctx.col);
+                }
+                ctx.end = .{ .row = info.line_idx, .col = ctx.col, .offset = ctx.line_offset + ctx.col };
+                ctx.byte_pos += 1;
+                ctx.line_offset += ctx.col + 1;
+                ctx.col = 0;
+            }
+        };
+
+        const count = @min(bytes.len, out.len);
+        var ctx: Context = .{ .buffer = self, .bytes = bytes[0..count], .out = out[0..count] };
+        self.walkLinesAndSegments(&ctx, Context.segment, Context.lineEnd);
+        while (ctx.next < count) : (ctx.next += 1) {
+            ctx.out[ctx.next] = ctx.end;
+        }
+    }
+
     fn markAllViewsDirty(self: *Self) void {
         self._rope.setMetricsGeneration(self.tab_metrics_generation);
         // Increment epoch first so views see the new value when checking caches.

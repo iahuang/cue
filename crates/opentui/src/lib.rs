@@ -34,6 +34,7 @@ mod color;
 mod edit;
 mod error;
 mod renderer;
+mod style;
 mod text;
 mod thread;
 mod tty;
@@ -41,11 +42,12 @@ mod tty;
 pub use buffer::{Buffer, FrameBuffer, OwnedBuffer};
 pub use color::{Attributes, Rgba};
 pub use edit::{
-    EditBuffer, EditorView, LogicalCursor, SelectionBehavior, SelectionColors, Viewport,
+    EditBuffer, EditorView, Highlight, LogicalCursor, SelectionBehavior, SelectionColors, Viewport,
     VisibleLine, VisualCursor,
 };
 pub use error::{Error, Result};
 pub use renderer::{Output, RenderStatus, Renderer};
+pub use style::SyntaxStyle;
 pub use text::{TextBuffer, TextBufferView, WidthMethod, WrapMode};
 
 /// Raw bindings, for functionality this crate does not wrap yet.

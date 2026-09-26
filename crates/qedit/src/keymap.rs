@@ -40,6 +40,14 @@ commands! {
     Save => "file:save", "Save";
     GoToFile => "file:go-to", "Go to File";
     SearchWorkspace => "search:workspace", "Search in Workspace";
+    Find => "find:show", "Find in File";
+    FindReplace => "find:show-replace", "Replace in File";
+    FindNext => "find:next", "Find Next";
+    FindPrevious => "find:previous", "Find Previous";
+    FindSwitchField => "find:switch-field", "Find: Switch Between Find and Replace";
+    FindClose => "find:close", "Close Find";
+    Replace => "find:replace", "Replace";
+    ReplaceAll => "find:replace-all", "Replace All";
     Undo => "editor:undo", "Undo";
     Redo => "editor:redo", "Redo";
     Copy => "editor:copy", "Copy";
@@ -101,17 +109,29 @@ pub enum Context {
     Tree,
     /// The file picker and command palette, while open.
     Picker,
-    /// Workspace search, while open. The picker's keys work there too.
+    /// Workspace search, while open. The picker's keys and the search
+    /// options work there too.
     Search,
+    /// Matching case, whole words, or regexes, in workspace search and in
+    /// finding in the file.
+    SearchOptions,
+    /// The find bar's query, while it has focus. The search options work
+    /// there too.
+    Find,
+    /// The find bar's replacement, while it has focus. The find bar's keys
+    /// work there too.
+    Replace,
 }
 
 impl Context {
-    /// Where to look for a key's binding after this context, before the
-    /// global bindings.
-    fn parent(self) -> Option<Context> {
+    /// Where to look for a key's binding after this context, in order,
+    /// before the global bindings.
+    fn parents(self) -> &'static [Context] {
         match self {
-            Context::Search => Some(Context::Picker),
-            _ => None,
+            Context::Search => &[Context::SearchOptions, Context::Picker],
+            Context::Find => &[Context::SearchOptions],
+            Context::Replace => &[Context::Find, Context::SearchOptions],
+            _ => &[],
         }
     }
 }
@@ -121,14 +141,16 @@ impl Command {
     pub fn context(self) -> Context {
         use Command::*;
         match self {
-            Quit | Palette | Save | GoToFile | SearchWorkspace | ToggleTree | FocusTree
-            | FocusEditor => Context::Global,
+            Quit | Palette | Save | GoToFile | SearchWorkspace | Find | FindReplace | FindNext
+            | FindPrevious | ToggleTree | FocusTree | FocusEditor => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose => {
                 Context::Picker
             }
-            SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::Search,
+            SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
+            FindSwitchField | FindClose => Context::Find,
+            Replace | ReplaceAll => Context::Replace,
             _ => Context::Editor,
         }
     }
@@ -147,7 +169,16 @@ impl Command {
 
 pub struct Keymap {
     /// In priority order: a command's first binding is the one shown for it.
-    bindings: Vec<(Key, Command)>,
+    bindings: Vec<Binding>,
+}
+
+/// A key that runs a command where a context has focus: usually the
+/// command's own context, but a command may have keys in others too.
+#[derive(Debug, Clone, Copy)]
+struct Binding {
+    key: Key,
+    command: Command,
+    context: Context,
 }
 
 impl Default for Keymap {
@@ -163,6 +194,10 @@ impl Default for Keymap {
             shift: true,
             ..Mods::CTRL
         };
+        const SHIFT: Mods = Mods {
+            shift: true,
+            ..Mods::NONE
+        };
         const SUPER: Mods = Mods {
             sup: true,
             ..Mods::NONE
@@ -171,9 +206,10 @@ impl Default for Keymap {
             shift: true,
             ..SUPER
         };
+        const SUPER_ALT: Mods = Mods { alt: true, ..SUPER };
         let key = Key::new;
 
-        let mut bindings = Vec::new();
+        let mut bindings: Vec<(Key, Command)> = Vec::new();
         // Ctrl and Cmd (Super) are interchangeable for shortcuts; Ctrl comes
         // first because every terminal can send it.
         for (c, command) in [
@@ -194,6 +230,9 @@ impl Default for Keymap {
             // `>` in the file picker gets there too.
             ('p', GoToFile),
             ('k', Palette),
+            ('f', Find),
+            // Ctrl+G, as in VS Code on macOS and in browsers.
+            ('g', FindNext),
         ] {
             bindings.push((key(Char(c), Mods::CTRL), command));
             bindings.push((key(Char(c), SUPER), command));
@@ -201,10 +240,17 @@ impl Default for Keymap {
         bindings.push((key(Char('z'), CTRL_SHIFT), Redo));
         bindings.push((key(Char('z'), SUPER_SHIFT), Redo));
         // As in VS Code, Sublime, and Zed. Terminals that only speak the
-        // legacy protocol send it as Ctrl+F, which is kept for finding in
-        // the file; there, the command palette has it.
+        // legacy protocol send it as Ctrl+F, which finds in the file; there,
+        // the command palette has it.
         bindings.push((key(Char('f'), CTRL_SHIFT), SearchWorkspace));
         bindings.push((key(Char('f'), SUPER_SHIFT), SearchWorkspace));
+        bindings.push((key(Char('g'), CTRL_SHIFT), FindPrevious));
+        bindings.push((key(Char('g'), SUPER_SHIFT), FindPrevious));
+        // As in VS Code, Sublime, and Zed; on macOS, VS Code's Cmd+Alt+F.
+        // Legacy terminals send Ctrl+H as Backspace; there, the command
+        // palette has it.
+        bindings.push((key(Char('h'), Mods::CTRL), FindReplace));
+        bindings.push((key(Char('f'), SUPER_ALT), FindReplace));
 
         bindings.extend([
             (key(Esc, Mods::NONE), ClearSelection),
@@ -271,7 +317,30 @@ impl Default for Keymap {
             (key(Char('c'), ALT), SearchToggleCase),
             (key(Char('w'), ALT), SearchToggleWord),
             (key(Char('r'), ALT), SearchToggleRegex),
+            (key(Esc, Mods::NONE), FindClose),
+            (key(Tab, Mods::NONE), FindSwitchField),
+            (key(Enter, Mods::NONE), Replace),
+            (key(Enter, ALT), ReplaceAll),
         ]);
+        let mut bindings: Vec<Binding> = bindings
+            .into_iter()
+            .map(|(key, command)| Binding {
+                key,
+                command,
+                context: command.context(),
+            })
+            .collect();
+        // In the find bar, Enter steps through the matches.
+        for (key, command) in [
+            (key(Enter, Mods::NONE), FindNext),
+            (key(Enter, SHIFT), FindPrevious),
+        ] {
+            bindings.push(Binding {
+                key,
+                command,
+                context: Context::Find,
+            });
+        }
         Keymap { bindings }
     }
 }
@@ -306,20 +375,29 @@ impl Keymap {
     pub fn shortcut(&self, command: Command) -> Option<Key> {
         self.bindings
             .iter()
-            .find(|&&(_, c)| c == command)
-            .map(|&(key, _)| key)
+            .find(|b| b.command == command)
+            .map(|b| b.key)
+    }
+
+    /// The key for `command` where `context` has focus, if it has one there.
+    pub fn shortcut_in(&self, command: Command, context: Context) -> Option<Key> {
+        self.bindings
+            .iter()
+            .find(|b| b.command == command && b.context == context)
+            .map(|b| b.key)
     }
 
     fn find(&self, key: Key, context: Context) -> Option<Command> {
         let bound = |context| {
             self.bindings
                 .iter()
-                .find(|&&(k, command)| k == key && command.context() == context)
-                .map(|&(_, command)| command)
+                .find(|b| b.key == key && b.context == context)
+                .map(|b| b.command)
         };
-        bound(context)
-            .or_else(|| context.parent().and_then(bound))
-            .or_else(|| bound(Context::Global))
+        std::iter::once(context)
+            .chain(context.parents().iter().copied())
+            .chain([Context::Global])
+            .find_map(bound)
     }
 }
 
@@ -416,12 +494,13 @@ mod tests {
     #[test]
     fn keys_are_bound_at_most_once_per_context() {
         let keymap = Keymap::default();
-        for (i, (a, x)) in keymap.bindings.iter().enumerate() {
-            for (b, y) in &keymap.bindings[i + 1..] {
+        for (i, a) in keymap.bindings.iter().enumerate() {
+            for b in &keymap.bindings[i + 1..] {
                 assert!(
-                    a != b || x.context() != y.context(),
-                    "{a} is bound twice in {:?}",
-                    x.context()
+                    a.key != b.key || a.context != b.context,
+                    "{} is bound twice in {:?}",
+                    a.key,
+                    a.context
                 );
             }
         }
@@ -463,6 +542,44 @@ mod tests {
             Some((Command::SearchToggleCase, false))
         );
         assert_eq!(keymap.lookup(alt_c, Context::Picker), None);
+
+        // In the find bar, Enter finds the next match; in the replacement,
+        // it replaces, and the find bar's other keys still work.
+        let enter = Key::new(KeyCode::Enter, Mods::NONE);
+        let shift_enter = Key::new(KeyCode::Enter, mods(true, false, false, false));
+        assert_eq!(
+            keymap.lookup(enter, Context::Find),
+            Some((Command::FindNext, false))
+        );
+        assert_eq!(
+            keymap.lookup(shift_enter, Context::Find),
+            Some((Command::FindPrevious, false))
+        );
+        assert_eq!(
+            keymap.lookup(enter, Context::Replace),
+            Some((Command::Replace, false))
+        );
+        assert_eq!(
+            keymap.lookup(esc, Context::Replace),
+            Some((Command::FindClose, false))
+        );
+        assert_eq!(
+            keymap.lookup(alt_c, Context::Replace),
+            Some((Command::SearchToggleCase, false))
+        );
+        assert_eq!(
+            keymap.lookup(enter, Context::Editor),
+            Some((Command::NewLine, false))
+        );
+        // The shortcut shown for Find Next is the one that works anywhere.
+        assert_eq!(
+            keymap.shortcut(Command::FindNext).unwrap().to_string(),
+            "Ctrl+G"
+        );
+        assert_eq!(
+            keymap.shortcut_in(Command::FindNext, Context::Find),
+            Some(enter)
+        );
     }
 
     #[test]

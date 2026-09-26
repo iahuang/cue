@@ -4,6 +4,7 @@ mod app;
 mod document;
 mod editor;
 mod file_index;
+mod find;
 mod history;
 mod input;
 mod keymap;
