@@ -824,6 +824,7 @@ impl Editor {
         let hints: String = [
             (Command::Save, "save"),
             (Command::FocusTree, "files"),
+            (Command::Palette, "commands"),
             (Command::Quit, "quit"),
         ]
         .iter()

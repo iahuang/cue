@@ -7,6 +7,10 @@
 //! As in VS Code, a file opened with a single click or Space is a preview:
 //! the next preview replaces it, so stepping through files doesn't keep them
 //! all open. Editing it, or opening it with Enter or a double click, keeps it.
+//!
+//! The picker (Ctrl+P for files, Ctrl+K for commands) opens over everything
+//! and has the keyboard until it closes. The workspace's files are listed in
+//! the background from the start, so it can show them right away.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -15,8 +19,10 @@ use opentui::{Attributes, Buffer, Rgba};
 
 use crate::document;
 use crate::editor::{Action, Editor};
-use crate::input::{Key, Mouse, MouseButton, MouseKind, MULTI_CLICK};
+use crate::file_index::FileIndex;
+use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
+use crate::picker::{Choice, Mode, Picker, PickerAction};
 use crate::tree::{FileTree, TreeAction};
 use crate::workspace::Workspace;
 
@@ -26,6 +32,8 @@ const DEFAULT_TREE_WIDTH: u32 = 30;
 const MIN_TREE_WIDTH: u32 = 12;
 /// The tree hides rather than leave the editor narrower than this.
 const MIN_EDITOR_WIDTH: u32 = 40;
+/// How many recently shown files the picker lists first.
+const RECENT_FILES: usize = 50;
 
 /// What the main loop should do after the app handled input.
 pub enum AppAction {
@@ -72,6 +80,11 @@ pub struct App {
     preview: Option<usize>,
     /// The row and time of the last click in the tree, to spot double clicks.
     last_tree_click: Option<(u32, Instant)>,
+    picker: Option<Picker>,
+    /// Every file in the workspace, for the picker.
+    files: FileIndex,
+    /// Files shown in the editor, most recent first.
+    recent: Vec<PathBuf>,
 }
 
 impl App {
@@ -101,6 +114,7 @@ impl App {
             None => reason,
         })?;
         let mut app = App {
+            files: FileIndex::new(&workspace),
             workspace,
             keymap: Keymap::default(),
             tree,
@@ -116,7 +130,10 @@ impl App {
             quit_armed: false,
             preview: None,
             last_tree_click: None,
+            picker: None,
+            recent: Vec::new(),
         };
+        app.note_recent();
         app.layout();
         Ok(app)
     }
@@ -140,6 +157,7 @@ impl App {
             return self.editor_action(action);
         }
         let context = match self.focus {
+            _ if self.picker.is_some() => Context::Picker,
             Focus::Tree => Context::Tree,
             Focus::Editor => Context::Editor,
         };
@@ -148,12 +166,50 @@ impl App {
             self.quit_armed = false;
         }
         match binding {
-            Some((command, select)) => self.run(command, select),
+            Some((command, select)) => {
+                // Other global commands (save, quit, ...) close the picker
+                // and run as usual.
+                if command.context() == Context::Global
+                    && !matches!(command, Command::GoToFile | Command::Palette)
+                {
+                    self.picker = None;
+                }
+                self.run(command, select)
+            }
+            None if self.picker.is_some() => {
+                self.edit_picker_query(key);
+                AppAction::Continue
+            }
             None => {
                 if self.focus == Focus::Editor {
                     self.editor_mut().type_key(key);
                 }
                 AppAction::Continue
+            }
+        }
+    }
+
+    /// A key for the picker's query: typing, or the editor's keys for
+    /// deleting and pasting.
+    fn edit_picker_query(&mut self, key: Key) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        match self.keymap.lookup(key, Context::Editor) {
+            Some((Command::DeleteBackward, _)) => picker.delete_backward(),
+            Some((Command::DeleteWordBackward, _)) => picker.delete_word_backward(),
+            Some((Command::Paste, _)) => {
+                if let Some(text) = &self.clipboard {
+                    picker.insert(text.lines().next().unwrap_or(""));
+                }
+            }
+            Some(_) => {}
+            None => {
+                if let KeyCode::Char(c) = key.code {
+                    if key.mods.is_plain() {
+                        picker.insert(c.encode_utf8(&mut [0; 4]));
+                    }
+                }
             }
         }
     }
@@ -181,6 +237,15 @@ impl App {
                 }
             }
             Command::FocusEditor => self.focus = Focus::Editor,
+            Command::GoToFile => self.show_picker(Mode::Files),
+            Command::Palette => self.show_picker(Mode::Commands),
+            command if command.context() == Context::Picker => {
+                let Some(picker) = &mut self.picker else {
+                    return AppAction::Continue;
+                };
+                let action = picker.run(command);
+                return self.picker_action(action);
+            }
             command if command.context() == Context::Tree => {
                 let action = self.tree.run(command);
                 self.tree_action(action);
@@ -203,7 +268,13 @@ impl App {
         AppAction::Continue
     }
 
-    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) {
+    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> AppAction {
+        if let Some(picker) = &mut self.picker {
+            let action = picker.handle_mouse(mouse);
+            let action = self.picker_action(action);
+            self.keep_if_edited();
+            return action;
+        }
         let tree_width = self.visible_tree_width();
         let at = if tree_width > 0 && mouse.x < tree_width {
             MouseTarget::Tree
@@ -219,7 +290,7 @@ impl App {
             }
             MouseKind::Drag(_) | MouseKind::Release(_) => match self.mouse_target {
                 Some(target) => target,
-                None => return,
+                None => return AppAction::Continue,
             },
             _ => at,
         };
@@ -270,11 +341,16 @@ impl App {
                 self.editor_mut().handle_mouse(local, now);
             }
         }
+        AppAction::Continue
     }
 
     /// Text pasted through the terminal.
     pub fn paste(&mut self, text: &str) {
-        if self.focus == Focus::Editor {
+        if let Some(picker) = &mut self.picker {
+            // Terminals send newlines in pastes as CR.
+            let line = text.split(['\r', '\n']).next().unwrap_or("");
+            picker.insert(line);
+        } else if self.focus == Focus::Editor {
             self.editor_mut().paste(text);
             self.keep_if_edited();
         }
@@ -293,7 +369,80 @@ impl App {
             }
         }
         let cursor = self.editor().draw(frame, &self.keymap, &self.workspace);
+        if let Some(picker) = &self.picker {
+            return picker.draw(frame);
+        }
         (self.focus == Focus::Editor).then_some(cursor)
+    }
+
+    /// Catches up on work in the background: listing the workspace's files.
+    /// Returns whether the screen needs redrawing.
+    pub fn poll(&mut self) -> bool {
+        if !self.files.poll() {
+            return false;
+        }
+        match &mut self.picker {
+            Some(picker) => {
+                picker.set_files(&self.files);
+                true
+            }
+            None => false,
+        }
+    }
+
+    // --- picker -----------------------------------------------------------------
+
+    /// Opens the picker listing `mode`, or switches it to `mode`. Pressed
+    /// again, the same shortcut closes it.
+    fn show_picker(&mut self, mode: Mode) {
+        match &mut self.picker {
+            Some(picker) if picker.mode() == mode => self.picker = None,
+            Some(picker) => picker.set_mode(mode),
+            None => {
+                if mode == Mode::Files {
+                    // Files may have come or gone since the last listing,
+                    // which is shown until this one is done.
+                    self.files.refresh();
+                }
+                // Listed first, most recent first. The file on screen is left
+                // out so that Enter goes back to the previous one.
+                let shown = self.editor().path();
+                let recent = self
+                    .recent
+                    .iter()
+                    .filter(|path| Some(path.as_path()) != shown && path.is_file())
+                    .cloned()
+                    .collect();
+                self.picker = Some(Picker::new(
+                    mode,
+                    &self.workspace,
+                    &self.keymap,
+                    recent,
+                    &self.files,
+                    self.width,
+                    self.height,
+                ));
+            }
+        }
+    }
+
+    fn picker_action(&mut self, action: PickerAction) -> AppAction {
+        match action {
+            PickerAction::Continue => {}
+            PickerAction::Close => self.picker = None,
+            PickerAction::Accept(choice) => {
+                self.picker = None;
+                match choice {
+                    Choice::File(path) => {
+                        if self.open(&path, false) {
+                            self.focus = Focus::Editor;
+                        }
+                    }
+                    Choice::Command(command) => return self.run(command, false),
+                }
+            }
+        }
+        AppAction::Continue
     }
 
     // --- files ------------------------------------------------------------------
@@ -363,6 +512,17 @@ impl App {
         let path = self.editor().path().map(Path::to_path_buf);
         let preview = self.preview == Some(self.current);
         self.tree.set_active(path.as_deref(), preview);
+        self.note_recent();
+    }
+
+    /// Moves the file on screen to the front of the recent files.
+    fn note_recent(&mut self) {
+        let Some(path) = self.editor().path().map(Path::to_path_buf) else {
+            return;
+        };
+        self.recent.retain(|recent| *recent != path);
+        self.recent.insert(0, path);
+        self.recent.truncate(RECENT_FILES);
     }
 
     /// The open editor for the file at `path`, however it was named.
@@ -443,6 +603,7 @@ impl App {
             Action::Saved => {
                 // The file may be new, or saved under a new name.
                 self.tree.refresh();
+                self.files.refresh();
                 self.show_active_in_tree();
                 AppAction::Continue
             }
@@ -479,6 +640,9 @@ impl App {
             self.focus = Focus::Editor;
         }
         self.tree.set_height(self.height);
+        if let Some(picker) = &mut self.picker {
+            picker.set_size(self.width, self.height);
+        }
         let x = self.editor_x();
         let width = self.width.saturating_sub(x).max(1);
         let height = self.height;
@@ -930,5 +1094,134 @@ mod tests {
         click(&mut app, 2, t0 + Duration::from_secs(3));
         assert_eq!(app.preview, Some(1));
         assert_eq!(open_paths(&app), ["a.txt", "b.txt"]);
+    }
+
+    /// Opens the file picker once the files are listed.
+    fn go_to_file(app: &mut App) {
+        wait_for_files(app);
+        ctrl(app, 'p');
+    }
+
+    /// Waits for every listing of the files in progress, and shows the
+    /// result in the picker if it's open.
+    fn wait_for_files(app: &mut App) {
+        app.files.wait();
+        if let Some(picker) = &mut app.picker {
+            picker.set_files(&app.files);
+        }
+    }
+
+    #[test]
+    fn ctrl_p_opens_a_file_by_name_and_goes_back_to_the_previous_one() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "go-to",
+            &[("a.txt", "alpha"), ("src/abracadabra.rs", "magic")],
+        );
+        let mut app = app(&root, Some("a.txt"));
+        go_to_file(&mut app);
+        type_text(&mut app, "abcr");
+        let text = screen(&app);
+        assert!(text.contains("Go to File"), "{text}");
+        assert!(text.contains("src/abracadabra.rs"), "{text}");
+        assert_eq!(
+            app.editor().path(),
+            Some(root.join("a.txt").as_path()),
+            "typing doesn't edit"
+        );
+        assert!(!app.editor().is_modified());
+
+        key(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(screen(&app).contains("magic"));
+
+        // The previous file is listed first, so Ctrl+P, Enter switches back.
+        go_to_file(&mut app);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.editor().path(), Some(root.join("a.txt").as_path()));
+        assert_eq!(app.editors.len(), 2);
+    }
+
+    #[test]
+    fn ctrl_k_runs_a_command_by_name() {
+        let _serial = crate::test_serial();
+        let root = fixture("palette", &[("a.txt", "")]);
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'k');
+        type_text(&mut app, "hide tree");
+        let text = screen(&app);
+        assert!(text.contains("Show or Hide File Tree"), "{text}");
+        assert!(text.contains("Ctrl+B"), "shortcuts are shown: {text}");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none());
+        assert_eq!(app.visible_tree_width(), 0);
+    }
+
+    #[test]
+    fn picker_shortcuts_switch_toggle_and_close_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("picker-keys", &[("a.txt", "")]);
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'p');
+        type_text(&mut app, "wrap");
+        ctrl(&mut app, 'k');
+        assert!(screen(&app).contains(">wrap"), "switching keeps the query");
+        // Backspace past the `>` goes back to files.
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        assert!(screen(&app).contains("Go to File"));
+        ctrl(&mut app, 'p');
+        assert!(
+            app.picker.is_none(),
+            "pressed again, the shortcut closes it"
+        );
+
+        ctrl(&mut app, 'k');
+        key(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none());
+
+        // Other global shortcuts close it and run.
+        type_text(&mut app, "x");
+        ctrl(&mut app, 'k');
+        ctrl(&mut app, 's');
+        assert!(app.picker.is_none());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "x");
+
+        // Pastes go to the query.
+        ctrl(&mut app, 'p');
+        app.paste("a.t\rignored");
+        assert!(screen(&app).contains("a.t "), "{}", screen(&app));
+    }
+
+    #[test]
+    fn the_picker_shows_the_last_listing_while_refreshing_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("stale-list", &[("a.txt", "")]);
+        let mut app = app(&root, None);
+        wait_for_files(&mut app);
+        fs::write(root.join("b.txt"), "").unwrap();
+        ctrl(&mut app, 'p');
+        let text = screen(&app);
+        assert!(
+            text.contains("a.txt") && !text.contains("listing"),
+            "{text}"
+        );
+        assert!(!text.contains("b.txt"), "not listed yet: {text}");
+
+        wait_for_files(&mut app);
+        assert!(screen(&app).contains("b.txt"));
+    }
+
+    #[test]
+    fn clicking_outside_the_picker_closes_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("picker-mouse", &[("a.txt", ""), ("b.txt", "")]);
+        let mut app = app(&root, Some("a.txt"));
+        go_to_file(&mut app);
+        press(&mut app, 0, 9);
+        assert!(app.picker.is_none());
+        assert_eq!(app.editor().path(), Some(root.join("a.txt").as_path()));
     }
 }

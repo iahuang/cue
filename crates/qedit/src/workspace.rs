@@ -1,11 +1,12 @@
-//! The folders qedit is working in. The file tree shows them, and file
-//! search will search them.
+//! The folders qedit is working in. The file tree shows them, and the file
+//! picker lists their files.
 //!
 //! There can be several roots, but the command line only opens one for now.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Workspace {
     /// Absolute, symlink-free paths, in the order they were added.
     roots: Vec<PathBuf>,

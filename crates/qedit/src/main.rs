@@ -3,9 +3,11 @@
 mod app;
 mod document;
 mod editor;
+mod file_index;
 mod history;
 mod input;
 mod keymap;
+mod picker;
 mod terminal;
 mod tree;
 mod words;
@@ -132,23 +134,30 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 parser.feed(&bytes)
             };
-            if !events.is_empty() || terminal::size() != (width, height) {
+            if !events.is_empty() || terminal::size() != (width, height) || app.poll() {
                 break events;
             }
         };
 
         for event in events.drain(..) {
-            match event {
-                Event::Key(key) => match app.handle_key(key) {
-                    AppAction::Quit => return Ok(()),
-                    AppAction::Copy(text) => {
-                        renderer.copy_to_clipboard(&text);
-                    }
-                    AppAction::Continue => {}
-                },
+            let action = match event {
+                Event::Key(key) => app.handle_key(key),
                 Event::Mouse(mouse) => app.handle_mouse(mouse, Instant::now()),
-                Event::Paste(text) => app.paste(&text),
-                Event::Reply(bytes) => renderer.process_capability_response(&bytes),
+                Event::Paste(text) => {
+                    app.paste(&text);
+                    AppAction::Continue
+                }
+                Event::Reply(bytes) => {
+                    renderer.process_capability_response(&bytes);
+                    AppAction::Continue
+                }
+            };
+            match action {
+                AppAction::Quit => return Ok(()),
+                AppAction::Copy(text) => {
+                    renderer.copy_to_clipboard(&text);
+                }
+                AppAction::Continue => {}
             }
         }
 

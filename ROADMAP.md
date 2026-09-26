@@ -10,7 +10,7 @@ tier 0 - required for use at all
   - left-hand file tree navigator; expand and collapse (done)
   - search
     - should ignore .gitignore and .git by default
-    - quick "go to file" ctrl+P
+    - quick "go to file" ctrl+P (done: fuzzy matching with nucleo, skips .gitignored files and .git, recently opened files first so ctrl+P enter goes back to the previous file)
       - supports that thing where u can find, for instance `abracadabra.rs` by searching `abcr` bc those characters exist in order in the filename
     - workspace-wide search; probably use ripgrep for this. i'd make this a popup modal tbh.
 - editor stuff
@@ -18,8 +18,8 @@ tier 0 - required for use at all
     - figure out how themes should work. should qedit bundle themes or should it inherit the terminal's therme?
   - find and replace
   - basic language awareness for features like autoclosing brackets, quotes
-- command pallete (come up with a sensible shortcut for this. claude says cmd+space is taken)
-  - actions such as file save, copy, paste ideally prefixed with like `editor:copy` (done: every shortcut is a named command like `editor:copy`, listed with its shortcut in `qedit --help`; the palette UI itself isn't built yet)
+- command pallete (done): ctrl+K (cmd+K too, though most mac terminals eat it to clear the screen). typing `>` in ctrl+P switches to commands, like sublime/vscode. ctrl+shift+P is awkward to hit, and ctrl+space arrives as a NUL byte that also toggles macOS input sources.
+  - actions such as file save, copy, paste ideally prefixed with like `editor:copy` (done: every shortcut is a named command like `editor:copy`, listed with its shortcut in `qedit --help` and in the palette)
   - philosophy: any action which has a keyboard shortcut should also be findable in the command pallete. and likewise you should be able to see the shortcut there.
 
 ---

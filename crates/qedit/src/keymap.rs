@@ -36,7 +36,9 @@ macro_rules! commands {
 
 commands! {
     Quit => "app:quit", "Quit";
+    Palette => "app:command-palette", "Show Command Palette";
     Save => "file:save", "Save";
+    GoToFile => "file:go-to", "Go to File";
     Undo => "editor:undo", "Undo";
     Redo => "editor:redo", "Redo";
     Copy => "editor:copy", "Copy";
@@ -79,6 +81,12 @@ commands! {
     TreePageUp => "tree:page-up", "File Tree: Page Up";
     TreePageDown => "tree:page-down", "File Tree: Page Down";
     TreeRefresh => "tree:refresh", "File Tree: Refresh";
+    PickerUp => "picker:up", "Picker: Select Previous";
+    PickerDown => "picker:down", "Picker: Select Next";
+    PickerPageUp => "picker:page-up", "Picker: Page Up";
+    PickerPageDown => "picker:page-down", "Picker: Page Down";
+    PickerAccept => "picker:accept", "Picker: Open Selected";
+    PickerClose => "picker:close", "Picker: Close";
 }
 
 /// Where a key binding applies: the focused part of the screen, or anywhere.
@@ -87,6 +95,8 @@ pub enum Context {
     Global,
     Editor,
     Tree,
+    /// The file picker and command palette, while open.
+    Picker,
 }
 
 impl Command {
@@ -94,9 +104,14 @@ impl Command {
     pub fn context(self) -> Context {
         use Command::*;
         match self {
-            Quit | Save | ToggleTree | FocusTree | FocusEditor => Context::Global,
+            Quit | Palette | Save | GoToFile | ToggleTree | FocusTree | FocusEditor => {
+                Context::Global
+            }
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh => Context::Tree,
+            PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose => {
+                Context::Picker
+            }
             _ => Context::Editor,
         }
     }
@@ -158,6 +173,11 @@ impl Default for Keymap {
             // the sidebar, "E" for the explorer.
             ('b', ToggleTree),
             ('e', FocusTree),
+            // Ctrl+P as in VS Code and Sublime. Ctrl+K rather than their
+            // awkward Ctrl+Shift+P, as in Slack, Linear, and Raycast; typing
+            // `>` in the file picker gets there too.
+            ('p', GoToFile),
+            ('k', Palette),
         ] {
             bindings.push((key(Char(c), Mods::CTRL), command));
             bindings.push((key(Char(c), SUPER), command));
@@ -220,6 +240,12 @@ impl Default for Keymap {
             (key(PageDown, Mods::NONE), TreePageDown),
             (key(Char('r'), Mods::CTRL), TreeRefresh),
             (key(Char('r'), SUPER), TreeRefresh),
+            (key(Up, Mods::NONE), PickerUp),
+            (key(Down, Mods::NONE), PickerDown),
+            (key(PageUp, Mods::NONE), PickerPageUp),
+            (key(PageDown, Mods::NONE), PickerPageDown),
+            (key(Enter, Mods::NONE), PickerAccept),
+            (key(Esc, Mods::NONE), PickerClose),
         ]);
         Keymap { bindings }
     }
