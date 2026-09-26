@@ -142,7 +142,7 @@ impl Editor {
         let buffer = doc.buffer.clone();
         let (_, view_w, view_h) = text_area(width, height, buffer.line_count());
         let view = buffer.shared_view(view_w, view_h)?;
-        let wrap = WrapMode::None;
+        let wrap = WrapMode::Word;
         view.set_wrap_mode(wrap);
         let mut editor = Editor {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -309,9 +309,13 @@ impl Editor {
     /// Scrolls line `row`, where the cursor moved, a third of the way down
     /// if it was off screen in `vp`, the viewport before the move.
     fn reveal(&self, vp: Viewport, row: u32) {
-        // Wrapped, lines and rows differ; the view scrolls the cursor into
-        // view by itself.
-        if self.wrap == WrapMode::None && !(vp.y..vp.y + vp.height).contains(&row) {
+        // Wrapped, lines and rows differ: find the cursor's row among the
+        // wrapped ones.
+        let row = match self.wrap {
+            WrapMode::None => row,
+            _ => self.view.visual_cursor().row + self.view.viewport().y,
+        };
+        if !(vp.y..vp.y + vp.height).contains(&row) {
             let max_y = self
                 .view
                 .total_virtual_line_count()
@@ -1404,11 +1408,15 @@ impl Editor {
     }
 
     fn toggle_wrap(&mut self) {
-        self.wrap = match self.wrap {
+        self.set_wrap(match self.wrap {
             WrapMode::None => WrapMode::Word,
             _ => WrapMode::None,
-        };
-        self.view.set_wrap_mode(self.wrap);
+        });
+    }
+
+    fn set_wrap(&mut self, wrap: WrapMode) {
+        self.wrap = wrap;
+        self.view.set_wrap_mode(wrap);
     }
 
     fn page(&self) -> u32 {
@@ -2195,6 +2203,7 @@ mod tests {
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text(&"0123456789".repeat(20));
         let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 6).unwrap();
+        editor.set_wrap(WrapMode::None);
         let now = Instant::now();
         let wheel = |editor: &mut Editor, kind, mods| {
             editor.handle_mouse(
@@ -2228,7 +2237,7 @@ mod tests {
         editor.close_find();
 
         // Wrapping already fits the text to the viewport.
-        editor.toggle_wrap();
+        editor.set_wrap(WrapMode::Word);
         wheel(&mut editor, MouseKind::ScrollRight, Mods::NONE);
         wheel(&mut editor, MouseKind::ScrollDown, Mods::SHIFT);
         assert_eq!(editor.view.viewport().x, 0);
@@ -2253,6 +2262,7 @@ mod tests {
         eb.set_text("one\ntwo two two two two two two\nthree");
         eb.set_cursor(1, 2);
         let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 30, 6).unwrap();
+        editor.set_wrap(WrapMode::None);
         let (lines, cursor) = screen_lines(&editor, 30, 6);
         assert_eq!(
             lines[..3],
@@ -2261,7 +2271,7 @@ mod tests {
         assert_eq!(cursor, (GUTTER + 2, 1), "cursor is right of the numbers");
 
         // Wrapped rows are left unnumbered.
-        editor.toggle_wrap();
+        editor.set_wrap(WrapMode::Word);
         let (lines, _) = screen_lines(&editor, 30, 6);
         assert_eq!(
             lines[..4],
@@ -2274,7 +2284,7 @@ mod tests {
         );
 
         // A tenth line adds a digit, narrowing the text.
-        editor.toggle_wrap();
+        editor.set_wrap(WrapMode::None);
         eb.set_cursor(2, 5);
         for _ in 0..7 {
             key(&mut editor, KeyCode::Enter);
@@ -2319,6 +2329,32 @@ mod tests {
     }
 
     #[test]
+    fn select_in_line_scrolls_a_third_down_past_wrapped_lines() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let lines: Vec<String> = (0..40)
+            .map(|i| format!("{i} {}", "word ".repeat(20)))
+            .collect();
+        eb.set_text(&lines.join("\n"));
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 10).unwrap();
+        let _ = screen_lines(&editor, 40, 10);
+        editor.select_in_line(30, 0..2);
+        assert_eq!(editor.selected_text().as_deref(), Some("30"));
+        let (lines, cursor) = screen_lines(&editor, 40, 10);
+        assert_eq!(cursor.1, 9 / 3, "a third of the way down: {lines:?}");
+        assert!(
+            lines[cursor.1 as usize].contains("31  30 word"),
+            "{lines:?}"
+        );
+
+        // Already on screen: the view stays put.
+        let top = editor.view.viewport().y;
+        editor.select_in_line(31, 0..2);
+        let _ = screen_lines(&editor, 40, 10);
+        assert_eq!(editor.view.viewport().y, top);
+    }
+
+    #[test]
     fn wrapping_drops_the_sideways_scroll_and_keeps_the_top_line() {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
@@ -2331,6 +2367,7 @@ mod tests {
         eb.set_text(&lines.join("\n"));
         eb.set_cursor(30, 0);
         let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 16).unwrap();
+        editor.set_wrap(WrapMode::None);
         // End goes to the end of a line wider than the view.
         key(&mut editor, KeyCode::End);
         assert_eq!(eb.cursor().col, long.len() as u32);
@@ -2364,7 +2401,7 @@ mod tests {
         lines[25] = long;
         eb.set_text(&lines.join("\n"));
         let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 10).unwrap();
-        editor.toggle_wrap();
+        editor.set_wrap(WrapMode::Word);
         let _ = screen_lines(&editor, 40, 10);
         let vp = editor.view.viewport();
         let max_y = editor.view.total_virtual_line_count() - vp.height;

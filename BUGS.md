@@ -1,3 +1,0 @@
-- left, right arrow keys dont work in command pallete/file picker
-- having nonzero horizontal scroll and then turning on word wrap locks ur view at that horizontal offset
-- scrolling with word wrapped turned on when some lines are very long and wrap many times can be finnicky
