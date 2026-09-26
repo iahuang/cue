@@ -8,6 +8,8 @@ mod history;
 mod input;
 mod keymap;
 mod picker;
+mod search;
+mod search_modal;
 mod terminal;
 mod tree;
 mod words;

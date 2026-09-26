@@ -27,12 +27,12 @@ use crate::workspace::Workspace;
 
 /// The terminal's own background, as behind the editor; the border sets
 /// the popup apart.
-const BG: Rgba = Rgba::terminal_default([0, 0, 0]);
-const BORDER: Rgba = Rgba::rgb(88, 91, 112);
-const FG: Rgba = Rgba::rgb(205, 214, 244);
-const DIM: Rgba = Rgba::rgb(147, 153, 178);
-const MATCH_FG: Rgba = Rgba::rgb(137, 180, 250);
-const SELECTED_BG: Rgba = Rgba::rgb(69, 71, 110);
+pub const BG: Rgba = Rgba::terminal_default([0, 0, 0]);
+pub const BORDER: Rgba = Rgba::rgb(88, 91, 112);
+pub const FG: Rgba = Rgba::rgb(205, 214, 244);
+pub const DIM: Rgba = Rgba::rgb(147, 153, 178);
+pub const MATCH_FG: Rgba = Rgba::rgb(137, 180, 250);
+pub const SELECTED_BG: Rgba = Rgba::rgb(69, 71, 110);
 
 /// The widest the popup gets, in columns.
 const MAX_WIDTH: u32 = 90;
@@ -152,8 +152,9 @@ impl Picker {
     ) -> Picker {
         let commands = Command::ALL
             .iter()
-            // Moving through the picker isn't something to pick from it.
-            .filter(|command| command.context() != Context::Picker)
+            // Moving through the picker, or search, isn't something to pick
+            // from it.
+            .filter(|command| !matches!(command.context(), Context::Picker | Context::Search))
             .map(|&command| Item::command(command, keymap))
             .collect();
         let mut picker = Picker {
@@ -257,22 +258,14 @@ impl Picker {
 
     /// Deletes back to the start of the word, or of the query after a `/`.
     pub fn delete_word_backward(&mut self) {
-        let trimmed = self.query.trim_end_matches(char::is_whitespace);
-        let is_word = |c: char| c.is_alphanumeric() || c == '_';
-        let start = match trimmed.chars().next_back() {
-            Some(c) if is_word(c) => trimmed.trim_end_matches(is_word).len(),
-            Some(c) => trimmed.len() - c.len_utf8(),
-            None => 0,
-        };
-        self.query.truncate(start);
+        delete_word_backward(&mut self.query);
         self.query_changed();
     }
 
     /// A click on a result picks it; one outside the popup closes it.
     pub fn handle_mouse(&mut self, mouse: Mouse) -> PickerAction {
         let area = self.area();
-        let inside = (area.x..area.x + area.width).contains(&mouse.x)
-            && (area.y..area.y + area.height).contains(&mouse.y);
+        let inside = area.contains(mouse.x, mouse.y);
         match mouse.kind {
             MouseKind::Press(_) if !inside => PickerAction::Close,
             MouseKind::Press(MouseButton::Left) => {
@@ -453,43 +446,12 @@ impl Picker {
             width,
             height,
         } = area;
-        let right = x + width - 1;
-        frame.fill_rect(x, y, width, height, BG);
-        let rule = "─".repeat(width.saturating_sub(2) as usize);
-        let border = |left: &str, right_end: &str, y: u32| {
-            frame.draw_text(
-                &format!("{left}{rule}{right_end}"),
-                x,
-                y,
-                BORDER,
-                None,
-                Attributes::NONE,
-            );
-        };
-        border("╭", "╮", y);
-        border("├", "┤", y + 2);
-        border("╰", "╯", y + height - 1);
-        for row in y + 1..y + height - 1 {
-            if row != y + 2 {
-                frame.draw_text("│", x, row, BORDER, None, Attributes::NONE);
-                frame.draw_text("│", right, row, BORDER, None, Attributes::NONE);
-            }
-        }
         let (title, noun) = match self.mode() {
-            Mode::Files => (" Go to File ", "files"),
-            Mode::Commands => (" Commands ", "commands"),
+            Mode::Files => ("Go to File", "files"),
+            Mode::Commands => ("Commands", "commands"),
         };
-        frame.draw_text(title, x + 2, y, FG, None, Attributes::BOLD);
-        let status = self.status(noun);
-        let status_x = (x + width).saturating_sub(status.chars().count() as u32 + 2);
-        frame.draw_text(
-            &status,
-            status_x,
-            y + height - 1,
-            DIM,
-            None,
-            Attributes::NONE,
-        );
+        draw_frame(frame, area, title);
+        draw_status(frame, area, &self.status(noun));
 
         // The query, its end kept in view.
         let text_x = x + 2;
@@ -626,12 +588,73 @@ impl Picker {
     }
 }
 
+/// Where a popup is on screen.
 #[derive(Debug, Clone, Copy)]
-struct Area {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
+pub struct Area {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Area {
+    pub fn contains(&self, x: u32, y: u32) -> bool {
+        (self.x..self.x + self.width).contains(&x) && (self.y..self.y + self.height).contains(&y)
+    }
+}
+
+/// Clears `area` and draws a popup's box around it, with `title` in the top
+/// border and a rule under the first row, which holds the query.
+pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
+    let Area {
+        x,
+        y,
+        width,
+        height,
+    } = area;
+    let right = x + width - 1;
+    frame.fill_rect(x, y, width, height, BG);
+    let rule = "─".repeat(width.saturating_sub(2) as usize);
+    let border = |left: &str, right_end: &str, y: u32| {
+        frame.draw_text(
+            &format!("{left}{rule}{right_end}"),
+            x,
+            y,
+            BORDER,
+            None,
+            Attributes::NONE,
+        );
+    };
+    border("╭", "╮", y);
+    border("├", "┤", y + 2);
+    border("╰", "╯", y + height - 1);
+    for row in y + 1..y + height - 1 {
+        if row != y + 2 {
+            frame.draw_text("│", x, row, BORDER, None, Attributes::NONE);
+            frame.draw_text("│", right, row, BORDER, None, Attributes::NONE);
+        }
+    }
+    frame.draw_text(&format!(" {title} "), x + 2, y, FG, None, Attributes::BOLD);
+}
+
+/// Draws `status` into the right of a popup's bottom border.
+pub fn draw_status(frame: &Buffer, area: Area, status: &str) {
+    let x = (area.x + area.width).saturating_sub(status.chars().count() as u32 + 2);
+    let y = area.y + area.height - 1;
+    frame.draw_text(status, x, y, DIM, None, Attributes::NONE);
+}
+
+/// Deletes the end of `query` back to the start of a word, or just one
+/// character of punctuation such as `/`.
+pub fn delete_word_backward(query: &mut String) {
+    let trimmed = query.trim_end_matches(char::is_whitespace);
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let start = match trimmed.chars().next_back() {
+        Some(c) if is_word(c) => trimmed.trim_end_matches(is_word).len(),
+        Some(c) => trimmed.len() - c.len_utf8(),
+        None => 0,
+    };
+    query.truncate(start);
 }
 
 #[cfg(test)]

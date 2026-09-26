@@ -8,10 +8,12 @@
 //! the next preview replaces it, so stepping through files doesn't keep them
 //! all open. Editing it, or opening it with Enter or a double click, keeps it.
 //!
-//! The picker (Ctrl+P for files, Ctrl+K for commands) opens over everything
-//! and has the keyboard until it closes. The workspace's files are listed in
-//! the background from the start, so it can show them right away.
+//! The picker (Ctrl+P for files, Ctrl+K for commands) and workspace search
+//! (Ctrl+Shift+F) open over everything and have the keyboard until they
+//! close. The workspace's files are listed in the background from the
+//! start, so the picker can show them right away.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -23,6 +25,7 @@ use crate::file_index::FileIndex;
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
 use crate::picker::{Choice, Mode, Picker, PickerAction};
+use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::tree::{FileTree, TreeAction};
 use crate::workspace::Workspace;
 
@@ -85,6 +88,41 @@ pub struct App {
     files: FileIndex,
     /// Files shown in the editor, most recent first.
     recent: Vec<PathBuf>,
+    /// Workspace search, while open. Never open with the picker.
+    search: Option<SearchModal>,
+    /// What the last search left behind, for the next one.
+    search_memory: Memory,
+}
+
+/// A popup's query line, which typing and pasting edit.
+trait QueryInput {
+    fn insert(&mut self, text: &str);
+    fn delete_backward(&mut self);
+    fn delete_word_backward(&mut self);
+}
+
+impl QueryInput for Picker {
+    fn insert(&mut self, text: &str) {
+        Picker::insert(self, text);
+    }
+    fn delete_backward(&mut self) {
+        Picker::delete_backward(self);
+    }
+    fn delete_word_backward(&mut self) {
+        Picker::delete_word_backward(self);
+    }
+}
+
+impl QueryInput for SearchModal {
+    fn insert(&mut self, text: &str) {
+        SearchModal::insert(self, text);
+    }
+    fn delete_backward(&mut self) {
+        SearchModal::delete_backward(self);
+    }
+    fn delete_word_backward(&mut self) {
+        SearchModal::delete_word_backward(self);
+    }
 }
 
 impl App {
@@ -132,6 +170,8 @@ impl App {
             last_tree_click: None,
             picker: None,
             recent: Vec::new(),
+            search: None,
+            search_memory: Memory::default(),
         };
         app.note_recent();
         app.layout();
@@ -157,6 +197,7 @@ impl App {
             return self.editor_action(action);
         }
         let context = match self.focus {
+            _ if self.search.is_some() => Context::Search,
             _ if self.picker.is_some() => Context::Picker,
             Focus::Tree => Context::Tree,
             Focus::Editor => Context::Editor,
@@ -168,16 +209,19 @@ impl App {
         match binding {
             Some((command, select)) => {
                 // Other global commands (save, quit, ...) close the picker
-                // and run as usual.
+                // or search and run as usual.
                 if command.context() == Context::Global
-                    && !matches!(command, Command::GoToFile | Command::Palette)
+                    && !matches!(
+                        command,
+                        Command::GoToFile | Command::Palette | Command::SearchWorkspace
+                    )
                 {
-                    self.picker = None;
+                    self.close_popups();
                 }
                 self.run(command, select)
             }
-            None if self.picker.is_some() => {
-                self.edit_picker_query(key);
+            None if self.query_input().is_some() => {
+                self.edit_query(key);
                 AppAction::Continue
             }
             None => {
@@ -189,25 +233,37 @@ impl App {
         }
     }
 
-    /// A key for the picker's query: typing, or the editor's keys for
-    /// deleting and pasting.
-    fn edit_picker_query(&mut self, key: Key) {
-        let Some(picker) = &mut self.picker else {
+    /// The query line of the open popup, if any.
+    fn query_input(&mut self) -> Option<&mut dyn QueryInput> {
+        if let Some(search) = &mut self.search {
+            return Some(search);
+        }
+        self.picker
+            .as_mut()
+            .map(|picker| picker as &mut dyn QueryInput)
+    }
+
+    /// A key for a popup's query: typing, or the editor's keys for deleting
+    /// and pasting.
+    fn edit_query(&mut self, key: Key) {
+        let binding = self.keymap.lookup(key, Context::Editor);
+        let clipboard = self.clipboard.clone();
+        let Some(input) = self.query_input() else {
             return;
         };
-        match self.keymap.lookup(key, Context::Editor) {
-            Some((Command::DeleteBackward, _)) => picker.delete_backward(),
-            Some((Command::DeleteWordBackward, _)) => picker.delete_word_backward(),
+        match binding {
+            Some((Command::DeleteBackward, _)) => input.delete_backward(),
+            Some((Command::DeleteWordBackward, _)) => input.delete_word_backward(),
             Some((Command::Paste, _)) => {
-                if let Some(text) = &self.clipboard {
-                    picker.insert(text.lines().next().unwrap_or(""));
+                if let Some(text) = &clipboard {
+                    input.insert(text.lines().next().unwrap_or(""));
                 }
             }
             Some(_) => {}
             None => {
                 if let KeyCode::Char(c) = key.code {
                     if key.mods.is_plain() {
-                        picker.insert(c.encode_utf8(&mut [0; 4]));
+                        input.insert(c.encode_utf8(&mut [0; 4]));
                     }
                 }
             }
@@ -239,7 +295,12 @@ impl App {
             Command::FocusEditor => self.focus = Focus::Editor,
             Command::GoToFile => self.show_picker(Mode::Files),
             Command::Palette => self.show_picker(Mode::Commands),
-            command if command.context() == Context::Picker => {
+            Command::SearchWorkspace => self.show_search(),
+            command if matches!(command.context(), Context::Picker | Context::Search) => {
+                if let Some(search) = &mut self.search {
+                    let action = search.run(command);
+                    return self.search_action(action);
+                }
                 let Some(picker) = &mut self.picker else {
                     return AppAction::Continue;
                 };
@@ -269,6 +330,12 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> AppAction {
+        if let Some(search) = &mut self.search {
+            let action = search.handle_mouse(mouse);
+            let action = self.search_action(action);
+            self.keep_if_edited();
+            return action;
+        }
         if let Some(picker) = &mut self.picker {
             let action = picker.handle_mouse(mouse);
             let action = self.picker_action(action);
@@ -346,10 +413,10 @@ impl App {
 
     /// Text pasted through the terminal.
     pub fn paste(&mut self, text: &str) {
-        if let Some(picker) = &mut self.picker {
+        if let Some(input) = self.query_input() {
             // Terminals send newlines in pastes as CR.
             let line = text.split(['\r', '\n']).next().unwrap_or("");
-            picker.insert(line);
+            input.insert(line);
         } else if self.focus == Focus::Editor {
             self.editor_mut().paste(text);
             self.keep_if_edited();
@@ -369,24 +436,28 @@ impl App {
             }
         }
         let cursor = self.editor().draw(frame, &self.keymap, &self.workspace);
+        if let Some(search) = &self.search {
+            return search.draw(frame);
+        }
         if let Some(picker) = &self.picker {
             return picker.draw(frame);
         }
         (self.focus == Focus::Editor).then_some(cursor)
     }
 
-    /// Catches up on work in the background: listing the workspace's files.
-    /// Returns whether the screen needs redrawing.
+    /// Catches up on work in the background: listing the workspace's files
+    /// and searching them. Returns whether the screen needs redrawing.
     pub fn poll(&mut self) -> bool {
+        let searched = self.search.as_mut().is_some_and(SearchModal::poll);
         if !self.files.poll() {
-            return false;
+            return searched;
         }
         match &mut self.picker {
             Some(picker) => {
                 picker.set_files(&self.files);
                 true
             }
-            None => false,
+            None => searched,
         }
     }
 
@@ -395,6 +466,7 @@ impl App {
     /// Opens the picker listing `mode`, or switches it to `mode`. Pressed
     /// again, the same shortcut closes it.
     fn show_picker(&mut self, mode: Mode) {
+        self.close_search();
         match &mut self.picker {
             Some(picker) if picker.mode() == mode => self.picker = None,
             Some(picker) => picker.set_mode(mode),
@@ -439,6 +511,66 @@ impl App {
                         }
                     }
                     Choice::Command(command) => return self.run(command, false),
+                }
+            }
+        }
+        AppAction::Continue
+    }
+
+    // --- search -----------------------------------------------------------------
+
+    /// Opens workspace search, or closes it if it's open. A selection in
+    /// the editor on a single line becomes the query; otherwise the last
+    /// query is kept.
+    fn show_search(&mut self) {
+        if self.search.is_some() {
+            self.close_search();
+            return;
+        }
+        self.picker = None;
+        let selected = self
+            .editor()
+            .selected_text()
+            .filter(|text| !text.contains('\n'));
+        // Open files are searched as they are, saved or not.
+        let unsaved: HashMap<PathBuf, String> = self
+            .editors
+            .iter()
+            .filter(|editor| editor.is_modified())
+            .filter_map(|editor| Some((editor.path()?.to_path_buf(), editor.text())))
+            .collect();
+        self.search = Some(SearchModal::new(
+            &self.workspace,
+            &self.keymap,
+            self.search_memory.clone(),
+            selected,
+            unsaved,
+            self.width,
+            self.height,
+        ));
+    }
+
+    /// Closes workspace search, keeping its query for next time.
+    fn close_search(&mut self) {
+        if let Some(search) = self.search.take() {
+            self.search_memory = search.memory();
+        }
+    }
+
+    fn close_popups(&mut self) {
+        self.picker = None;
+        self.close_search();
+    }
+
+    fn search_action(&mut self, action: SearchAction) -> AppAction {
+        match action {
+            SearchAction::Continue => {}
+            SearchAction::Close => self.close_search(),
+            SearchAction::Open { path, line, range } => {
+                self.close_search();
+                if self.open(&path, false) {
+                    self.editor_mut().select_in_line(line, range);
+                    self.focus = Focus::Editor;
                 }
             }
         }
@@ -642,6 +774,9 @@ impl App {
         self.tree.set_height(self.height);
         if let Some(picker) = &mut self.picker {
             picker.set_size(self.width, self.height);
+        }
+        if let Some(search) = &mut self.search {
+            search.set_size(self.width, self.height);
         }
         let x = self.editor_x();
         let width = self.width.saturating_sub(x).max(1);
@@ -1223,5 +1358,98 @@ mod tests {
         press(&mut app, 0, 9);
         assert!(app.picker.is_none());
         assert_eq!(app.editor().path(), Some(root.join("a.txt").as_path()));
+    }
+
+    fn search_workspace(app: &mut App) {
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+    }
+
+    /// Waits for the search in progress to finish.
+    fn wait_for_search(app: &mut App) {
+        let started = Instant::now();
+        while app.screen_contains_searching() {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            app.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    impl App {
+        fn screen_contains_searching(&self) -> bool {
+            let text = screen(self);
+            text.contains("Searching") || text.contains("searching")
+        }
+    }
+
+    #[test]
+    fn workspace_search_opens_the_match_selected() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "search",
+            &[
+                ("a.txt", "alpha"),
+                ("src/b.rs", "fn main() {\n    needle();\n}\n"),
+            ],
+        );
+        let mut app = app(&root, Some("a.txt"));
+        search_workspace(&mut app);
+        type_text(&mut app, "needle");
+        wait_for_search(&mut app);
+        let text = screen(&app);
+        assert!(text.contains("Search"), "{text}");
+        assert!(text.contains("src/b.rs"), "{text}");
+        assert!(text.contains("2  ") && text.contains("needle();"), "{text}");
+        assert!(!app.editor().is_modified(), "typing doesn't edit");
+
+        key(&mut app, KeyCode::Enter);
+        assert!(app.search.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.editor().path(), Some(root.join("src/b.rs").as_path()));
+        assert_eq!(app.editor().selected_text().as_deref(), Some("needle"));
+
+        // Reopened, it keeps the query; the shortcut again closes it.
+        search_workspace(&mut app);
+        assert!(screen(&app).contains("needle"));
+        search_workspace(&mut app);
+        assert!(app.search.is_none());
+
+        // Ctrl+P switches to the file picker; other shortcuts close it.
+        search_workspace(&mut app);
+        ctrl(&mut app, 'p');
+        assert!(app.search.is_none() && app.picker.is_some());
+        search_workspace(&mut app);
+        assert!(app.search.is_some() && app.picker.is_none());
+        ctrl(&mut app, 'b');
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn workspace_search_starts_from_the_selection_and_sees_unsaved_edits() {
+        let _serial = crate::test_serial();
+        let root = fixture("search-unsaved", &[("a.txt", "one\n"), ("b.txt", "two\n")]);
+        let mut app = app(&root, Some("a.txt"));
+        // Unsaved: "two one".
+        type_text(&mut app, "two ");
+        ctrl(&mut app, 'a');
+        app.editor_mut().select_in_line(0, 0..3);
+        search_workspace(&mut app);
+        wait_for_search(&mut app);
+        let text = screen(&app);
+        assert!(text.contains("│ two"), "the selection is the query: {text}");
+        assert!(text.contains("a.txt") && text.contains("b.txt"), "{text}");
+
+        // Typing replaces the query it started with.
+        type_text(&mut app, "one");
+        wait_for_search(&mut app);
+        let text = screen(&app);
+        assert!(text.contains("│ one "), "{text}");
+        assert!(text.contains("1 of 1 in 1 file"), "{text}");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.search.is_none());
+        assert!(app.editor().is_modified(), "the edit is still there");
     }
 }

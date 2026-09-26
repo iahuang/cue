@@ -12,7 +12,7 @@ tier 0 - required for use at all
     - should ignore .gitignore and .git by default
     - quick "go to file" ctrl+P (done: fuzzy matching with nucleo, skips .gitignored files and .git, recently opened files first so ctrl+P enter goes back to the previous file)
       - supports that thing where u can find, for instance `abracadabra.rs` by searching `abcr` bc those characters exist in order in the filename
-    - workspace-wide search; probably use ripgrep for this. i'd make this a popup modal tbh.
+    - workspace-wide search; probably use ripgrep for this. i'd make this a popup modal tbh. (done: ctrl+shift+F opens a large popup that searches as you type with ripgrep's engine, in-process. results are zed-style excerpts (each file's path, then matching lines with 2 lines of context), read-only. up/down step through matches, enter opens the file with the match selected. alt+C/W/R toggle case, whole word, regex. unsaved edits are searched. reopening keeps the query and selected match.)
 - editor stuff
   - basic syntax highlighting
     - figure out how themes should work. should qedit bundle themes or should it inherit the terminal's therme?

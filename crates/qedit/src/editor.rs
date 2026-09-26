@@ -1,6 +1,7 @@
 //! One open file: editing commands on top of OpenTUI's `EditBuffer` and
 //! `EditorView`, which own the text, cursor, selection, and scrolling.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
@@ -196,6 +197,50 @@ impl Editor {
     /// replace.
     pub fn is_blank(&self) -> bool {
         self.file.path.is_none() && !self.buffer.can_undo() && self.buffer.text().is_empty()
+    }
+
+    /// The whole text, with `\n` line breaks.
+    pub fn text(&self) -> String {
+        self.buffer.text()
+    }
+
+    /// The selected text, if anything is selected.
+    pub fn selected_text(&self) -> Option<String> {
+        self.view
+            .selection()
+            .filter(|(s, e)| s != e)
+            .map(|_| self.view.selected_text())
+    }
+
+    /// Selects the bytes `range` of line `row` (0-based), or puts the
+    /// cursor at its start if it's empty. A line off screen is scrolled to
+    /// a third of the way down.
+    pub fn select_in_line(&mut self, row: u32, range: Range<usize>) {
+        self.history.break_group();
+        self.anchor = None;
+        self.view.clear_selection();
+        // Before the cursor moves: the view follows it.
+        let vp = self.view.viewport();
+        let eb = &*self.buffer;
+        let row = row.min(eb.line_count().saturating_sub(1));
+        eb.set_cursor(row, 0);
+        let start = step_bytes(eb, range.start);
+        let end = step_bytes(eb, range.end.saturating_sub(range.start));
+        if start != end {
+            self.anchor = Some(start);
+            self.view.set_selection(start, end, SELECTION);
+        }
+        // Wrapped, lines and rows differ; the view scrolls the cursor into
+        // view by itself.
+        if self.wrap == WrapMode::None && !(vp.y..vp.y + vp.height).contains(&row) {
+            let max_y = self
+                .view
+                .total_virtual_line_count()
+                .saturating_sub(vp.height);
+            let y = row.saturating_sub(vp.height / 3).min(max_y);
+            // Without moving the cursor, the view scrolls sideways to it.
+            self.view.scroll_to(0, y, false);
+        }
     }
 
     /// Shows `text` in the status bar until the next key press.
@@ -906,6 +951,27 @@ impl Editor {
 
     fn page(&self) -> u32 {
         self.text_area().2.saturating_sub(1).max(1)
+    }
+}
+
+/// Moves the cursor right over `bytes` bytes of its line, a grapheme at a
+/// time so that tabs and wide characters are counted as the engine lays
+/// them out, and returns its offset. Stops at the end of the line.
+fn step_bytes(eb: &EditBuffer, bytes: usize) -> u32 {
+    let mut passed = 0;
+    loop {
+        let at = eb.cursor().offset;
+        if passed >= bytes {
+            return at;
+        }
+        eb.move_cursor_right();
+        let next = eb.cursor().offset;
+        let grapheme = eb.text_range(at, next);
+        if next == at || grapheme.contains('\n') {
+            eb.set_cursor_by_offset(at);
+            return at;
+        }
+        passed += grapheme.len();
     }
 }
 
@@ -1708,5 +1774,32 @@ mod tests {
         let (lines, cursor) = screen_lines(&editor, 20, 6);
         assert_eq!(lines[0], "one", "{lines:?}");
         assert_eq!(cursor, (0, 0));
+    }
+
+    #[test]
+    fn select_in_line_selects_bytes_and_scrolls_to_them() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let mut lines: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        // A tab and a wide character before the match, which is in bytes.
+        lines[30] = "\t日x = needle;".to_string();
+        eb.set_text(&lines.join("\n"));
+        let mut editor = Editor::new(eb.clone(), unnamed(), 40, 10).unwrap();
+        let start = lines[30].find("needle").unwrap();
+        editor.select_in_line(30, start..start + 6);
+        assert_eq!(editor.selected_text().as_deref(), Some("needle"));
+        assert_eq!(eb.cursor().row, 30);
+        let (_, cursor) = screen_lines(&editor, 40, 10);
+        let top = editor.view.viewport().y;
+        assert_eq!(top, 30 - 9 / 3, "a third of the way down");
+        assert_eq!(cursor.1, 30 - top);
+
+        // An empty range puts the cursor there; past the end, at the end.
+        editor.select_in_line(2, 5..5);
+        assert_eq!(editor.selected_text(), None);
+        assert_eq!((eb.cursor().row, eb.cursor().col), (2, 5));
+        editor.select_in_line(99, 50..60);
+        assert_eq!(eb.cursor().row, 39);
+        assert_eq!(editor.selected_text(), None);
     }
 }

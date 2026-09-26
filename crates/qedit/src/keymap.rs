@@ -39,6 +39,7 @@ commands! {
     Palette => "app:command-palette", "Show Command Palette";
     Save => "file:save", "Save";
     GoToFile => "file:go-to", "Go to File";
+    SearchWorkspace => "search:workspace", "Search in Workspace";
     Undo => "editor:undo", "Undo";
     Redo => "editor:redo", "Redo";
     Copy => "editor:copy", "Copy";
@@ -87,6 +88,9 @@ commands! {
     PickerPageDown => "picker:page-down", "Picker: Page Down";
     PickerAccept => "picker:accept", "Picker: Open Selected";
     PickerClose => "picker:close", "Picker: Close";
+    SearchToggleCase => "search:toggle-case", "Search: Match Case";
+    SearchToggleWord => "search:toggle-word", "Search: Match Whole Word";
+    SearchToggleRegex => "search:toggle-regex", "Search: Use Regular Expression";
 }
 
 /// Where a key binding applies: the focused part of the screen, or anywhere.
@@ -97,6 +101,19 @@ pub enum Context {
     Tree,
     /// The file picker and command palette, while open.
     Picker,
+    /// Workspace search, while open. The picker's keys work there too.
+    Search,
+}
+
+impl Context {
+    /// Where to look for a key's binding after this context, before the
+    /// global bindings.
+    fn parent(self) -> Option<Context> {
+        match self {
+            Context::Search => Some(Context::Picker),
+            _ => None,
+        }
+    }
 }
 
 impl Command {
@@ -104,14 +121,14 @@ impl Command {
     pub fn context(self) -> Context {
         use Command::*;
         match self {
-            Quit | Palette | Save | GoToFile | ToggleTree | FocusTree | FocusEditor => {
-                Context::Global
-            }
+            Quit | Palette | Save | GoToFile | SearchWorkspace | ToggleTree | FocusTree
+            | FocusEditor => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose => {
                 Context::Picker
             }
+            SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::Search,
             _ => Context::Editor,
         }
     }
@@ -184,6 +201,11 @@ impl Default for Keymap {
         }
         bindings.push((key(Char('z'), CTRL_SHIFT), Redo));
         bindings.push((key(Char('z'), SUPER_SHIFT), Redo));
+        // As in VS Code, Sublime, and Zed. Terminals that only speak the
+        // legacy protocol send it as Ctrl+F, which is kept for finding in
+        // the file; there, the command palette has it.
+        bindings.push((key(Char('f'), CTRL_SHIFT), SearchWorkspace));
+        bindings.push((key(Char('f'), SUPER_SHIFT), SearchWorkspace));
 
         bindings.extend([
             (key(Esc, Mods::NONE), ClearSelection),
@@ -246,6 +268,10 @@ impl Default for Keymap {
             (key(PageDown, Mods::NONE), PickerPageDown),
             (key(Enter, Mods::NONE), PickerAccept),
             (key(Esc, Mods::NONE), PickerClose),
+            // As in VS Code's search.
+            (key(Char('c'), ALT), SearchToggleCase),
+            (key(Char('w'), ALT), SearchToggleWord),
+            (key(Char('r'), ALT), SearchToggleRegex),
         ]);
         Keymap { bindings }
     }
@@ -254,7 +280,7 @@ impl Default for Keymap {
 impl Keymap {
     /// The command bound to `key` where `context` has focus, and whether
     /// Shift should extend the selection. Bindings for the focused context
-    /// win over global ones. A key with Shift held falls back to its
+    /// win over its parent's, which win over global ones. A key with Shift held falls back to its
     /// unshifted binding when it has none of its own: Shift+Left selects,
     /// Shift+Enter still breaks the line.
     pub fn lookup(&self, key: Key, context: Context) -> Option<(Command, bool)> {
@@ -292,7 +318,9 @@ impl Keymap {
                 .find(|&&(k, command)| k == key && command.context() == context)
                 .map(|&(_, command)| command)
         };
-        bound(context).or_else(|| bound(Context::Global))
+        bound(context)
+            .or_else(|| context.parent().and_then(bound))
+            .or_else(|| bound(Context::Global))
     }
 }
 
@@ -422,6 +450,17 @@ mod tests {
         // Editor commands aren't reachable from the tree.
         let ctrl_z = Key::new(KeyCode::Char('z'), Mods::CTRL);
         assert_eq!(keymap.lookup(ctrl_z, Context::Tree), None);
+        // Search has the picker's keys, and its own.
+        assert_eq!(
+            keymap.lookup(up, Context::Search),
+            Some((Command::PickerUp, false))
+        );
+        let alt_c = Key::new(KeyCode::Char('c'), mods(false, true, false, false));
+        assert_eq!(
+            keymap.lookup(alt_c, Context::Search),
+            Some((Command::SearchToggleCase, false))
+        );
+        assert_eq!(keymap.lookup(alt_c, Context::Picker), None);
     }
 
     #[test]

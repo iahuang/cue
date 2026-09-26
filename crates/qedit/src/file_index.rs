@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use ignore::{WalkBuilder, WalkState};
+use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use crate::picker::Item;
 use crate::workspace::Workspace;
@@ -148,17 +148,8 @@ fn list(workspace: &Workspace, progress: bool) -> Receiver<Message> {
 /// Collects the paths the walk finds into items, and sends them.
 fn collect(workspace: &Workspace, progress: bool, sender: &Sender<Message>) {
     let (found, paths) = mpsc::channel();
-    let roots = workspace.roots();
-    let outermost: Vec<PathBuf> = roots
-        .iter()
-        .filter(|root| {
-            !roots
-                .iter()
-                .any(|other| other != *root && root.starts_with(other))
-        })
-        .cloned()
-        .collect();
-    std::thread::spawn(move || walk(&outermost, found));
+    let walker = walker(workspace);
+    std::thread::spawn(move || walk(walker, found));
 
     let mut files = Vec::new();
     let mut sent = 0;
@@ -190,13 +181,19 @@ fn collect(workspace: &Workspace, progress: bool, sender: &Sender<Message>) {
     let _ = sender.send(Message::Done { files, truncated });
 }
 
-/// Walks `roots` in parallel, sending each file's path.
-fn walk(roots: &[PathBuf], found: Sender<PathBuf>) {
-    let Some((first, rest)) = roots.split_first() else {
-        return;
-    };
-    let mut builder = WalkBuilder::new(first);
-    for root in rest {
+/// A walk over the workspace's files, or `None` if it has no roots. It
+/// skips `.git` and what `.gitignore` and `.ignore` files exclude, and lists
+/// folders inside another root once, as part of it. The file picker and
+/// workspace search use the same rules.
+pub fn walker(workspace: &Workspace) -> Option<WalkBuilder> {
+    let roots = workspace.roots();
+    let mut outermost = roots.iter().filter(|root| {
+        !roots
+            .iter()
+            .any(|other| other != *root && root.starts_with(other))
+    });
+    let mut builder = WalkBuilder::new(outermost.next()?);
+    for root in outermost {
         builder.add(root);
     }
     builder
@@ -205,18 +202,30 @@ fn walk(roots: &[PathBuf], found: Sender<PathBuf>) {
         .filter_entry(|entry| entry.file_name() != ".git")
         // Honor .gitignore in folders that aren't git repositories too.
         .require_git(false);
-    builder.build_parallel().run(|| {
+    Some(builder)
+}
+
+/// Whether a walked entry is a file, or a symlink to one.
+pub fn is_file(entry: &DirEntry) -> bool {
+    match entry.file_type() {
+        Some(kind) if kind.is_symlink() => entry.path().is_file(),
+        Some(kind) => kind.is_file(),
+        None => false,
+    }
+}
+
+/// Walks in parallel, sending each file's path.
+fn walk(walker: Option<WalkBuilder>, found: Sender<PathBuf>) {
+    let Some(walker) = walker else {
+        return;
+    };
+    walker.build_parallel().run(|| {
         let found = found.clone();
         Box::new(move |entry| {
             let Ok(entry) = entry else {
                 return WalkState::Continue;
             };
-            let is_file = match entry.file_type() {
-                Some(kind) if kind.is_symlink() => entry.path().is_file(),
-                Some(kind) => kind.is_file(),
-                None => false,
-            };
-            if is_file && found.send(entry.into_path()).is_err() {
+            if is_file(&entry) && found.send(entry.into_path()).is_err() {
                 return WalkState::Quit;
             }
             WalkState::Continue
