@@ -22,6 +22,17 @@
 //! Each editor has its own find bar (Ctrl+F); the app remembers the last
 //! query, so finding in another file starts from it.
 //!
+//! Files are opened, saved under a new name, and created through the file
+//! dialog (Ctrl+O, Ctrl+Shift+S, Ctrl+Alt+N), which opens over everything
+//! like the picker. Ctrl+N opens an untitled file, `Untitled-1` and so on,
+//! which the picker lists until it's saved; saving it asks where.
+//!
+//! Closing a panel (Ctrl+W) closes what it shows, unless another panel
+//! shows it too: a file, which is no longer open, or a terminal, whose
+//! shell is hung up on. Showing something else in a panel instead keeps it
+//! open, for the picker to bring back, and Ctrl+W in the picker closes it
+//! from there. Closing unsaved changes, or a running program, asks first.
+//!
 //! Terminals (Ctrl+Alt+T) are the app's too, like open files: a panel shows
 //! one, and it keeps running when the panel moves on. While one has the
 //! keyboard, keys go to its shell, but for a few (see
@@ -29,6 +40,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -38,6 +50,7 @@ use opentui::{Attributes, Buffer, Rgba};
 
 use crate::document::{self, Document};
 use crate::editor::{Action, Editor};
+use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
 use crate::find;
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
@@ -73,6 +86,18 @@ enum Recent {
     File(PathBuf),
     /// A terminal, by id.
     Terminal(u32),
+    /// An untitled file, by number.
+    Untitled(u32),
+}
+
+/// Something that asked before going ahead, which asking for again, before
+/// doing anything else, goes ahead with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Armed {
+    Quit,
+    /// Closing this, and losing its unsaved changes or stopping what's
+    /// running in it.
+    Close(Recent),
 }
 
 /// What the main loop should do after the app handled input.
@@ -162,8 +187,8 @@ pub struct App {
     height: u32,
     mouse_target: Option<MouseTarget>,
     header_drag: Option<HeaderDrag>,
-    /// Quit was asked for with unsaved changes; asking again quits.
-    quit_armed: bool,
+    /// Quitting or closing something asked first; asking again goes ahead.
+    armed: Option<Armed>,
     /// The file opened as a preview, which the next preview replaces.
     preview: Option<Rc<Document>>,
     /// The row and time of the last click in the tree, to spot double clicks.
@@ -175,6 +200,8 @@ pub struct App {
     recent: Vec<Recent>,
     /// Workspace search, while open. Never open with the picker.
     search: Option<SearchModal>,
+    /// The file dialog, while open. Never open with the picker or search.
+    dialog: Option<FileDialog>,
     /// What the last search left behind, for the next one.
     search_memory: Memory,
     /// The last find bar's query and replacement.
@@ -203,6 +230,12 @@ impl QueryInput for Editor {
 impl QueryInput for SearchModal {
     fn edit(&mut self, edit: Edit) {
         SearchModal::edit(self, edit);
+    }
+}
+
+impl QueryInput for FileDialog {
+    fn edit(&mut self, edit: Edit) {
+        FileDialog::edit(self, edit);
     }
 }
 
@@ -258,15 +291,19 @@ impl App {
             height,
             mouse_target: None,
             header_drag: None,
-            quit_armed: false,
+            armed: None,
             preview: None,
             last_tree_click: None,
             picker: None,
             recent: Vec::new(),
             search: None,
+            dialog: None,
             search_memory: Memory::default(),
             find_memory: find::Memory::default(),
         };
+        if doc.path().is_none() {
+            doc.untitled.set(1);
+        }
         app.layout();
         app.panels[0].show(&doc).map_err(|e| e.to_string())?;
         if let Some(notice) = notice {
@@ -298,9 +335,7 @@ impl App {
             }
             if terminal.borrow().exit().is_none() {
                 let command = self.keymap.lookup_terminal(key);
-                if command != Some(Command::Quit) {
-                    self.quit_armed = false;
-                }
+                self.disarm_unless(command);
                 if prefixed {
                     return self.prefixed_key(&terminal, key);
                 }
@@ -321,15 +356,9 @@ impl App {
                 return AppAction::Continue;
             }
         }
-        if self.editor().is_some_and(Editor::prompt_open) {
-            let action = match self.editor_mut() {
-                Some(editor) => editor.handle_prompt_key(key),
-                None => Action::Continue,
-            };
-            return self.editor_action(action);
-        }
         let context = match self.focus {
             _ if self.search.is_some() => Context::Search,
+            _ if self.dialog.is_some() => Context::Dialog,
             _ if self.picker.is_some() => Context::Picker,
             Focus::Tree => Context::Tree,
             Focus::Editor => self
@@ -338,17 +367,20 @@ impl App {
                 .map_or(Context::Editor, find::Field::context),
         };
         let binding = self.keymap.lookup(key, context);
-        if !matches!(binding, Some((Command::Quit, _))) {
-            self.quit_armed = false;
-        }
+        self.disarm_unless(binding.map(|(command, _)| command));
         match binding {
             Some((command, select)) => {
-                // Other global commands (save, quit, ...) close the picker
-                // or search and run as usual.
+                // Other global commands (save, quit, ...) close the picker,
+                // search, or file dialog and run as usual.
                 if command.context() == Context::Global
                     && !matches!(
                         command,
-                        Command::GoToFile | Command::Palette | Command::SearchWorkspace
+                        Command::GoToFile
+                            | Command::Palette
+                            | Command::SearchWorkspace
+                            | Command::OpenFile
+                            | Command::CreateFile
+                            | Command::SaveAs
                     )
                 {
                     self.close_popups();
@@ -370,6 +402,26 @@ impl App {
         }
     }
 
+    /// Forgets that quitting or closing asked first, unless `command` (from
+    /// a key) asks again, or goes through the picker on the way to asking
+    /// again, as from the command palette.
+    fn disarm_unless(&mut self, command: Option<Command>) {
+        use Command::*;
+        let keep = match command {
+            Some(command) => {
+                matches!(
+                    command,
+                    Quit | ClosePanel | CloseFile | CloseTerminal | Palette | GoToFile
+                ) || command.context() == Context::Picker
+            }
+            // Typing in the picker's query.
+            None => self.picker.is_some(),
+        };
+        if !keep {
+            self.armed = None;
+        }
+    }
+
     /// The query line of the open popup, or the focused find bar field.
     fn query_input(&mut self) -> Option<&mut dyn QueryInput> {
         if self.search.is_some() {
@@ -383,6 +435,12 @@ impl App {
                 .picker
                 .as_mut()
                 .map(|picker| picker as &mut dyn QueryInput);
+        }
+        if self.dialog.is_some() {
+            return self
+                .dialog
+                .as_mut()
+                .map(|dialog| dialog as &mut dyn QueryInput);
         }
         if self.focus != Focus::Editor || self.editor().and_then(Editor::find_field).is_none() {
             return None;
@@ -449,6 +507,10 @@ impl App {
             Command::GoToFile => self.show_picker(Mode::Files),
             Command::Palette => self.show_picker(Mode::Commands),
             Command::SearchWorkspace => self.show_search(),
+            Command::NewFile => self.new_untitled(),
+            Command::OpenFile => self.show_dialog(Purpose::Open),
+            Command::CreateFile => self.show_dialog(Purpose::Create),
+            Command::SaveAs => self.show_dialog(Purpose::SaveAs),
             Command::SplitRight => self.split(Axis::Horizontal),
             Command::SplitDown => self.split(Axis::Vertical),
             Command::ClosePanel => self.close_panel(),
@@ -462,7 +524,22 @@ impl App {
                     terminal.borrow_mut().clear();
                 }
             }
-            Command::CloseTerminal => self.close_terminal(),
+            Command::CloseTerminal => {
+                if self.active_terminal().is_some() {
+                    self.close_shown();
+                }
+            }
+            Command::CloseFile => {
+                if self.editor().is_some() && self.close_shown() {
+                    self.show_active_in_tree();
+                }
+            }
+            // Search and the file dialog have the picker's keys, but
+            // nothing to close; Ctrl+W closes the panel, as without them.
+            Command::PickerCloseItem if self.picker.is_none() => {
+                self.close_popups();
+                return self.run(Command::ClosePanel, false);
+            }
             Command::RenameTerminal => {
                 if let Some(terminal) = self.active_terminal() {
                     terminal.borrow_mut().show_rename();
@@ -503,12 +580,18 @@ impl App {
                 }
             }
             command
-                if matches!(command.context(), Context::Picker | Context::Search)
-                    || (command.context() == Context::SearchOptions && self.search.is_some()) =>
+                if matches!(
+                    command.context(),
+                    Context::Picker | Context::Search | Context::Dialog
+                ) || (command.context() == Context::SearchOptions && self.search.is_some()) =>
             {
                 if let Some(search) = &mut self.search {
                     let action = search.run(command);
                     return self.search_action(action);
+                }
+                if let Some(dialog) = &mut self.dialog {
+                    let action = dialog.run(command);
+                    return self.dialog_action(action);
                 }
                 let Some(picker) = &mut self.picker else {
                     return AppAction::Continue;
@@ -526,11 +609,6 @@ impl App {
                     return AppAction::Continue;
                 };
                 let action = editor.run(command, select, &mut self.clipboard);
-                // Saving an unnamed file from the tree asks for a name in
-                // the editor's status bar.
-                if editor.prompt_open() {
-                    self.focus = Focus::Editor;
-                }
                 self.keep_if_edited();
                 return self.editor_action(action);
             }
@@ -557,6 +635,10 @@ impl App {
             self.keep_if_edited();
             return action;
         }
+        if let Some(dialog) = &mut self.dialog {
+            let action = dialog.handle_mouse(mouse);
+            return self.dialog_action(action);
+        }
         let target = match mouse.kind {
             MouseKind::Press(_) => {
                 // In case the last drag's release never came.
@@ -575,14 +657,11 @@ impl App {
             return AppAction::Continue;
         };
         if let MouseKind::Press(_) = mouse.kind {
-            // Like a key press, a click dismisses messages, the quit
-            // confirmation, the terminal prefix, and prompts.
-            self.quit_armed = false;
+            // Like a key press, a click dismisses messages, the quit and
+            // close confirmations, the terminal prefix, and prompts.
+            self.armed = None;
             self.terminal_prefix = false;
             self.active_panel_mut().clear_message();
-            if let Some(editor) = self.editor_mut() {
-                editor.cancel_prompt();
-            }
             if let Some(terminal) = self.active_terminal() {
                 terminal.borrow_mut().cancel_prompt();
             }
@@ -739,6 +818,7 @@ impl App {
 
     /// Text pasted through the terminal.
     pub fn paste(&mut self, text: &str) {
+        self.armed = None;
         let terminal = self.keyboard_terminal().filter(|terminal| {
             let terminal = terminal.borrow();
             terminal.prompt_open() || terminal.exit().is_none()
@@ -819,6 +899,9 @@ impl App {
         if let Some(picker) = &self.picker {
             return picker.draw(frame);
         }
+        if let Some(dialog) = &self.dialog {
+            return dialog.draw(frame);
+        }
         cursor.filter(|_| self.focus == Focus::Editor)
     }
 
@@ -874,21 +957,13 @@ impl App {
         self.activate(id);
     }
 
-    /// Closes the active panel, giving its room to its neighbor, which
-    /// becomes active. The last panel is emptied instead. Its files stay
-    /// open.
+    /// Closes the active panel and what it shows (see
+    /// [`App::close_shown`]), giving its room to its neighbor, which becomes
+    /// active. The last panel is emptied instead. Files it showed before
+    /// stay open.
     fn close_panel(&mut self) {
-        // With no name, the file couldn't be opened again.
-        if let Some(doc) = self.active_panel().document() {
-            let elsewhere = self
-                .panels
-                .iter()
-                .any(|panel| panel.id != self.active && panel.has(doc));
-            if doc.path().is_none() && doc.is_modified() && !elsewhere {
-                let save = self.shortcut(Command::Save);
-                self.show_message(format!("Save the new file first ({save})."), true);
-                return;
-            }
+        if !self.close_shown() {
+            return;
         }
         match self.layout.remove(self.active) {
             Some(next) => {
@@ -947,6 +1022,7 @@ impl App {
     /// again, the same shortcut closes it.
     fn show_picker(&mut self, mode: Mode) {
         self.close_search();
+        self.dialog = None;
         match &mut self.picker {
             Some(picker) if picker.mode() == mode => self.picker = None,
             Some(picker) => picker.set_mode(mode),
@@ -978,8 +1054,19 @@ impl App {
         match action {
             PickerAction::Continue => {}
             PickerAction::Close => self.picker = None,
+            PickerAction::CloseItem(choice) => {
+                self.close_item(choice);
+                let recent = self.recent_items();
+                if let Some(picker) = &mut self.picker {
+                    picker.set_recent(recent);
+                }
+            }
             PickerAction::Accept(choice) => {
                 self.picker = None;
+                // A command from the palette may ask again to close.
+                if !matches!(choice, Choice::Command(_)) {
+                    self.armed = None;
+                }
                 match choice {
                     Choice::File(path) => {
                         if self.open(&path, false) {
@@ -991,6 +1078,11 @@ impl App {
                         let terminal = self.terminals.iter().find(|t| t.borrow().id() == id);
                         if let Some(terminal) = terminal.cloned() {
                             self.show_terminal(terminal);
+                        }
+                    }
+                    Choice::Untitled(number) => {
+                        if let Some(doc) = self.find_untitled(number) {
+                            self.show_document(&doc);
                         }
                     }
                 }
@@ -1010,6 +1102,7 @@ impl App {
             return;
         }
         self.picker = None;
+        self.dialog = None;
         let selected = self
             .editor()
             .and_then(Editor::selected_text)
@@ -1041,6 +1134,7 @@ impl App {
 
     fn close_popups(&mut self) {
         self.picker = None;
+        self.dialog = None;
         self.close_search();
     }
 
@@ -1146,6 +1240,13 @@ impl App {
         let panels = &self.panels;
         self.documents
             .retain(|doc| !doc.is_blank() || panels.iter().any(|panel| panel.has(doc)));
+        let documents = &self.documents;
+        self.recent.retain(|recent| match recent {
+            Recent::Untitled(number) => documents
+                .iter()
+                .any(|doc| doc.path().is_none() && doc.untitled.get() == *number),
+            Recent::File(_) | Recent::Terminal(_) => true,
+        });
     }
 
     /// Keeps the find bar's query for finding in other files.
@@ -1178,13 +1279,21 @@ impl App {
         self.preview.as_ref().is_some_and(|p| Rc::ptr_eq(p, doc))
     }
 
+    /// What's on screen in the active panel, as the picker lists it.
+    fn shown(&self) -> Option<Recent> {
+        if let Some(terminal) = self.active_terminal() {
+            return Some(Recent::Terminal(terminal.borrow().id()));
+        }
+        self.active_panel()
+            .document()
+            .map(|doc| document_target(doc))
+    }
+
     /// Moves the file or terminal on screen to the front of the recent
     /// ones.
     fn note_recent(&mut self) {
-        let shown = match (self.active_terminal(), self.editor().and_then(Editor::path)) {
-            (Some(terminal), _) => Recent::Terminal(terminal.borrow().id()),
-            (None, Some(path)) => Recent::File(path),
-            (None, None) => return,
+        let Some(shown) = self.shown() else {
+            return;
         };
         self.recent.retain(|recent| *recent != shown);
         self.recent.insert(0, shown);
@@ -1192,14 +1301,11 @@ impl App {
     }
 
     /// What the picker lists first: the files and terminals shown recently,
-    /// most recent first, then any other terminals. What's on screen is
-    /// left out, so that Enter goes back to what was shown before it.
+    /// most recent first, then any other terminals and untitled files.
+    /// What's on screen is left out, so that Enter goes back to what was
+    /// shown before it.
     fn recent_items(&self) -> Vec<Item> {
-        let shown = match (self.active_terminal(), self.editor().and_then(Editor::path)) {
-            (Some(terminal), _) => Some(Recent::Terminal(terminal.borrow().id())),
-            (None, Some(path)) => Some(Recent::File(path)),
-            (None, None) => None,
-        };
+        let shown = self.shown();
         let terminal_item = |terminal: &Rc<RefCell<Terminal>>| {
             let terminal = terminal.borrow();
             let running = match terminal.exit() {
@@ -1221,13 +1327,26 @@ impl App {
                     .iter()
                     .find(|terminal| terminal.borrow().id() == *id)
                     .map(terminal_item),
+                Recent::Untitled(number) => {
+                    self.find_untitled(*number).map(|_| Item::untitled(*number))
+                }
             })
             .collect();
-        for terminal in &self.terminals {
-            let id = terminal.borrow().id();
-            let listed = self.recent.contains(&Recent::Terminal(id));
-            if !listed && shown != Some(Recent::Terminal(id)) {
-                items.push(terminal_item(terminal));
+        let others = self.terminals.iter().map(|terminal| {
+            (
+                Recent::Terminal(terminal.borrow().id()),
+                terminal_item(terminal),
+            )
+        });
+        let untitled = self
+            .documents
+            .iter()
+            .filter(|doc| doc.path().is_none())
+            .map(|doc| doc.untitled.get())
+            .map(|number| (Recent::Untitled(number), Item::untitled(number)));
+        for (recent, item) in others.chain(untitled) {
+            if !self.recent.contains(&recent) && shown.as_ref() != Some(&recent) {
+                items.push(item);
             }
         }
         items
@@ -1238,31 +1357,339 @@ impl App {
         self.documents.iter().find(|doc| doc.is_file(path)).cloned()
     }
 
-    /// Saves the current file to `input` from the "Save as" prompt, relative
-    /// to the workspace's first folder, unless another file open is that one.
-    fn save_as(&mut self, input: &Path) -> AppAction {
-        let base = match self.workspace.roots().first() {
+    // --- closing ----------------------------------------------------------------
+
+    /// Closes what the active panel shows, as closing the panel does,
+    /// leaving it empty: a terminal, or a file, unless another panel shows
+    /// it too. Returns false if it asked first instead (see
+    /// [`App::confirm_close`]).
+    fn close_shown(&mut self) -> bool {
+        if let Some(terminal) = self.active_terminal() {
+            let target = Recent::Terminal(terminal.borrow().id());
+            let losing = self.terminal_losing(&terminal);
+            if !self.confirm_close(target, losing) {
+                return false;
+            }
+            self.destroy_terminal(&terminal);
+            return true;
+        }
+        let Some(doc) = self.active_panel().document().cloned() else {
+            return true;
+        };
+        let active = self.active;
+        if self
+            .panels
+            .iter()
+            .any(|panel| panel.id != active && panel.shows(&doc))
+        {
+            self.active_panel_mut().forget(&doc);
+            return true;
+        }
+        let losing = self.document_losing(&doc, true);
+        if !self.confirm_close(document_target(&doc), losing) {
+            return false;
+        }
+        self.destroy_document(&doc);
+        true
+    }
+
+    /// Closes a recent file, terminal, or untitled file the picker lists,
+    /// wherever it's shown, asking first as closing a panel does. A file
+    /// that isn't open is only no longer listed as recent.
+    fn close_item(&mut self, choice: Choice) {
+        match choice {
+            Choice::File(path) => {
+                if let Some(doc) = self.find_document(&path) {
+                    let losing = self.document_losing(&doc, false);
+                    if !self.confirm_close(Recent::File(path.clone()), losing) {
+                        return;
+                    }
+                    self.destroy_document(&doc);
+                }
+                self.recent
+                    .retain(|recent| *recent != Recent::File(path.clone()));
+            }
+            Choice::Untitled(number) => {
+                if let Some(doc) = self.find_untitled(number) {
+                    let losing = self.document_losing(&doc, false);
+                    if self.confirm_close(Recent::Untitled(number), losing) {
+                        self.destroy_document(&doc);
+                    }
+                }
+            }
+            Choice::Terminal(id) => {
+                let terminal = self.terminals.iter().find(|t| t.borrow().id() == id);
+                if let Some(terminal) = terminal.cloned() {
+                    let losing = self.terminal_losing(&terminal);
+                    if self.confirm_close(Recent::Terminal(id), losing) {
+                        self.destroy_terminal(&terminal);
+                    }
+                }
+            }
+            Choice::Command(_) => {}
+        }
+    }
+
+    /// Whether to go ahead closing `target`, which would lose unsaved
+    /// changes or stop a program if there's `losing`, which says so. The
+    /// first time, it does, and closing it again goes ahead.
+    fn confirm_close(&mut self, target: Recent, losing: Option<String>) -> bool {
+        let armed = Some(Armed::Close(target));
+        let go = losing.is_none() || self.armed == armed;
+        self.armed = if go { None } else { armed };
+        match losing {
+            Some(losing) if !go => {
+                self.show_message(losing, true);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// What closing `doc` would lose, if anything. Saving is suggested if
+    /// it's `on_screen`.
+    fn document_losing(&self, doc: &Document, on_screen: bool) -> Option<String> {
+        if !doc.is_modified() {
+            return None;
+        }
+        let save = match on_screen {
+            true => format!(", or save it ({})", self.shortcut(Command::Save)),
+            false => String::new(),
+        };
+        Some(format!(
+            "{} has unsaved changes. Close it again to discard them{save}.",
+            self.document_name(doc)
+        ))
+    }
+
+    /// What closing `terminal` would stop, if anything.
+    fn terminal_losing(&self, terminal: &Rc<RefCell<Terminal>>) -> Option<String> {
+        let terminal = terminal.borrow();
+        if !terminal.is_busy() {
+            return None;
+        }
+        let program = terminal
+            .program()
+            .unwrap_or_else(|| "A program".to_string());
+        Some(format!(
+            "{program} is running in {}. Close it again to stop it.",
+            terminal.name()
+        ))
+    }
+
+    /// Closes `doc`, wherever it's shown, dropping its unsaved changes.
+    fn destroy_document(&mut self, doc: &Rc<Document>) {
+        for panel in &mut self.panels {
+            panel.forget(doc);
+        }
+        self.documents.retain(|open| !Rc::ptr_eq(open, doc));
+        if self.is_preview(doc) {
+            self.preview = None;
+        }
+        self.prune_documents();
+        self.show_active_in_tree();
+    }
+
+    /// How `doc` is named to the user.
+    fn document_name(&self, doc: &Document) -> String {
+        match doc.path() {
+            Some(path) => self.workspace.display_path(&path),
+            None => doc.untitled_name().unwrap_or_default(),
+        }
+    }
+
+    /// The untitled file numbered `number`, if it's open.
+    fn find_untitled(&self, number: u32) -> Option<Rc<Document>> {
+        self.documents
+            .iter()
+            .find(|doc| doc.path().is_none() && doc.untitled.get() == number)
+            .cloned()
+    }
+
+    /// Shows `doc`, which is open, in the active panel, and gives it the
+    /// keyboard.
+    fn show_document(&mut self, doc: &Rc<Document>) {
+        let had_terminal = self.active_terminal().is_some();
+        if let Some(editor) = self.editor_mut() {
+            editor.blur_find();
+        }
+        if let Err(err) = self.active_panel_mut().show(doc) {
+            self.show_message(format!("Can't show the file: {err}"), true);
+            return;
+        }
+        self.focus = Focus::Editor;
+        self.prune_documents();
+        if had_terminal {
+            self.prune_terminals();
+        }
+        self.show_active_in_tree();
+    }
+
+    /// Opens a new, untitled file in the active panel, numbered after the
+    /// untitled files open. One on screen that was never typed in is kept.
+    fn new_untitled(&mut self) {
+        if self
+            .active_panel()
+            .document()
+            .is_some_and(|doc| doc.is_blank())
+        {
+            self.focus = Focus::Editor;
+            return;
+        }
+        let doc = match Document::open(None, self.theme.clone()) {
+            Ok((doc, _)) => doc,
+            Err(err) => {
+                self.show_message(format!("Can't open a new file: {err}"), true);
+                return;
+            }
+        };
+        let taken: Vec<u32> = self
+            .documents
+            .iter()
+            .filter(|doc| doc.path().is_none())
+            .map(|doc| doc.untitled.get())
+            .collect();
+        let number = (1..).find(|n| !taken.contains(n)).unwrap_or(1);
+        doc.untitled.set(number);
+        self.documents.push(doc.clone());
+        self.show_document(&doc);
+    }
+
+    /// The workspace's first folder, where terminals start.
+    fn workspace_folder(&self) -> PathBuf {
+        match self.workspace.roots().first() {
             Some(root) => root.clone(),
             None => std::env::current_dir().unwrap_or_default(),
-        };
-        let path = document::resolve(&base.join(input));
-        let current = self.active_panel().document();
+        }
+    }
+
+    // --- file dialog ------------------------------------------------------------
+
+    /// Opens the file dialog for `purpose`, or closes it if it's open for
+    /// that. Saving, it suggests the file's name.
+    fn show_dialog(&mut self, purpose: Purpose) {
+        self.close_search();
+        self.picker = None;
         if self
-            .find_document(&path)
-            .is_some_and(|open| !current.is_some_and(|current| Rc::ptr_eq(current, &open)))
+            .dialog
+            .take()
+            .is_some_and(|dialog| dialog.purpose() == purpose)
         {
-            let message = format!(
-                "Can't save: {} is already open.",
-                self.workspace.display_path(&path)
-            );
-            self.show_message(message, true);
-            return AppAction::Continue;
+            return;
+        }
+        let current = match purpose {
+            Purpose::SaveAs => match self.active_panel().document() {
+                Some(doc) => doc.path(),
+                None => {
+                    self.show_message("There's no file here to save.", false);
+                    return;
+                }
+            },
+            Purpose::Open | Purpose::Create => None,
+        };
+        let name = current
+            .as_deref()
+            .and_then(Path::file_name)
+            .map_or(String::new(), |name| name.to_string_lossy().into_owned());
+        self.dialog = Some(FileDialog::new(
+            purpose,
+            &self.dialog_folder(),
+            &name,
+            current,
+            &self.keymap,
+            self.width,
+            self.height,
+        ));
+    }
+
+    /// Where the file dialog starts: in the folder selected in the tree, if
+    /// the tree has the keyboard, or else the active file's folder, or the
+    /// workspace's.
+    fn dialog_folder(&self) -> PathBuf {
+        if self.focus == Focus::Tree {
+            if let Some(folder) = self.tree.selected_folder() {
+                return folder;
+            }
+        }
+        let file = self.active_panel().document().and_then(|doc| doc.path());
+        match file.as_deref().and_then(Path::parent) {
+            Some(folder) if folder.is_dir() => folder.to_path_buf(),
+            _ => self.workspace_folder(),
+        }
+    }
+
+    fn dialog_action(&mut self, action: DialogAction) -> AppAction {
+        match action {
+            DialogAction::Continue => {}
+            DialogAction::Close => self.dialog = None,
+            DialogAction::Accept(path) => {
+                let Some(mut dialog) = self.dialog.take() else {
+                    return AppAction::Continue;
+                };
+                let result = match dialog.purpose() {
+                    Purpose::Open => {
+                        if self.open(&path, false) {
+                            self.focus = Focus::Editor;
+                        }
+                        Ok(AppAction::Continue)
+                    }
+                    Purpose::SaveAs => self.save_as(&path),
+                    Purpose::Create => self.create_file(&path),
+                };
+                match result {
+                    Ok(action) => return action,
+                    // The dialog stays, to choose another path.
+                    Err(error) => {
+                        dialog.show_error(error);
+                        self.dialog = Some(dialog);
+                    }
+                }
+            }
+        }
+        AppAction::Continue
+    }
+
+    /// Saves the active file to `path` from now on, creating its folder if
+    /// need be, unless another file open is that one.
+    fn save_as(&mut self, path: &Path) -> Result<AppAction, String> {
+        let current = self.active_panel().document();
+        let open = self.find_document(&document::resolve(path));
+        if open.is_some_and(|open| !current.is_some_and(|current| Rc::ptr_eq(current, &open))) {
+            return Err(format!("{} is open; close it first.", file_name(path)));
+        }
+        if let Some(folder) = path.parent() {
+            fs::create_dir_all(folder).map_err(|err| format!("Can't create its folder: {err}"))?;
         }
         let action = match self.editor_mut() {
-            Some(editor) => editor.save_as(path),
+            Some(editor) => editor.save_as(document::resolve(path)),
             None => Action::Continue,
         };
-        self.editor_action(action)
+        self.focus = Focus::Editor;
+        Ok(self.editor_action(action))
+    }
+
+    /// Creates an empty file at `path`, and its folder if need be, and
+    /// opens it.
+    fn create_file(&mut self, path: &Path) -> Result<AppAction, String> {
+        let created = (|| {
+            if let Some(folder) = path.parent() {
+                fs::create_dir_all(folder)?;
+            }
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map(drop)
+        })();
+        created.map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
+        self.tree.refresh();
+        self.files.refresh();
+        let path = document::resolve(path);
+        if self.open(&path, false) {
+            self.tree.reveal(&path);
+            self.focus = Focus::Editor;
+        }
+        Ok(AppAction::Continue)
     }
 
     fn quit(&mut self) -> AppAction {
@@ -1270,10 +1697,7 @@ impl App {
             .documents
             .iter()
             .filter(|doc| doc.is_modified())
-            .map(|doc| match doc.path() {
-                Some(path) => self.workspace.display_path(&path),
-                None => "[new file]".to_string(),
-            })
+            .map(|doc| self.document_name(doc))
             .collect();
         let running: Vec<String> = self
             .terminals
@@ -1286,10 +1710,10 @@ impl App {
                     .unwrap_or_else(|| "A program".to_string())
             })
             .collect();
-        if (unsaved.is_empty() && running.is_empty()) || self.quit_armed {
+        if (unsaved.is_empty() && running.is_empty()) || self.armed == Some(Armed::Quit) {
             return AppAction::Quit;
         }
-        self.quit_armed = true;
+        self.armed = Some(Armed::Quit);
         let mut reasons = Vec::new();
         if !unsaved.is_empty() {
             reasons.push(format!("Unsaved changes in {}.", unsaved.join(", ")));
@@ -1339,7 +1763,11 @@ impl App {
                 self.show_active_in_tree();
                 AppAction::Continue
             }
-            Action::SaveAs(input) => self.save_as(&input),
+            // It has no name yet.
+            Action::SaveAs => {
+                self.show_dialog(Purpose::SaveAs);
+                AppAction::Continue
+            }
         }
     }
 
@@ -1347,10 +1775,7 @@ impl App {
 
     /// Starts a shell in the workspace's first folder, in the active panel.
     fn new_terminal(&mut self) {
-        let cwd = match self.workspace.roots().first() {
-            Some(root) => root.clone(),
-            None => std::env::current_dir().unwrap_or_default(),
-        };
+        let cwd = self.workspace_folder();
         let body = self.active_panel().body();
         let id = self.next_terminal;
         match Terminal::new(id, &cwd, body) {
@@ -1382,14 +1807,18 @@ impl App {
         self.show_active_in_tree();
     }
 
-    /// Closes the terminal in the active panel, hanging up on its shell and
-    /// whatever it's running. The panel is left empty.
-    fn close_terminal(&mut self) {
-        let Some(terminal) = self.active_terminal() else {
-            return;
-        };
-        self.active_panel_mut().hide_terminal();
-        self.terminals.retain(|t| !Rc::ptr_eq(t, &terminal));
+    /// Closes `terminal`, hanging up on its shell and whatever it's
+    /// running. A panel showing it is left empty.
+    fn destroy_terminal(&mut self, terminal: &Rc<RefCell<Terminal>>) {
+        for panel in &mut self.panels {
+            if panel
+                .terminal()
+                .is_some_and(|shown| Rc::ptr_eq(shown, terminal))
+            {
+                panel.hide_terminal();
+            }
+        }
+        self.terminals.retain(|t| !Rc::ptr_eq(t, terminal));
         self.prune_terminals();
     }
 
@@ -1400,7 +1829,7 @@ impl App {
 
     /// The terminal keys go to, if one has the keyboard.
     fn keyboard_terminal(&self) -> Option<Rc<RefCell<Terminal>>> {
-        let popup = self.picker.is_some() || self.search.is_some();
+        let popup = self.picker.is_some() || self.search.is_some() || self.dialog.is_some();
         if self.focus != Focus::Editor || popup {
             return None;
         }
@@ -1483,7 +1912,7 @@ impl App {
         });
         let terminals = &self.terminals;
         self.recent.retain(|recent| match recent {
-            Recent::File(_) => true,
+            Recent::File(_) | Recent::Untitled(_) => true,
             Recent::Terminal(id) => terminals.iter().any(|t| t.borrow().id() == *id),
         });
     }
@@ -1534,6 +1963,9 @@ impl App {
         if let Some(search) = &mut self.search {
             search.set_size(self.width, self.height);
         }
+        if let Some(dialog) = &mut self.dialog {
+            dialog.set_size(self.width, self.height);
+        }
         for (id, area) in self.layout.panels(self.main_area()) {
             if let Some(panel) = self.panels.iter_mut().find(|panel| panel.id == id) {
                 panel.set_area(area);
@@ -1580,6 +2012,21 @@ impl App {
             None => command.id().to_string(),
         }
     }
+}
+
+/// `doc`, as the picker lists it.
+fn document_target(doc: &Document) -> Recent {
+    match doc.path() {
+        Some(path) => Recent::File(path),
+        None => Recent::Untitled(doc.untitled.get()),
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 #[cfg(test)]
@@ -1811,8 +2258,9 @@ mod tests {
         // A program running keeps quitting from being immediate.
         type_text(&mut app, "sleep 30");
         key(&mut app, KeyCode::Enter);
+        // Not only busy: the login shell may be running its own startup.
         wait_until(&mut app, "sleep to run", |app| {
-            app.terminals[0].borrow().is_busy()
+            app.terminals[0].borrow().program().as_deref() == Some("sleep")
         });
         let quit = Key::new(KeyCode::Char('q'), ctrl_shift);
         assert!(matches!(app.handle_key(quit), AppAction::Continue));
@@ -1918,16 +2366,20 @@ mod tests {
             status_bar(&app)
         );
 
-        // Closing it hangs up on what it's running, and leaves the panel
-        // empty.
+        // Closing it asks first, then hangs up on what it's running, and
+        // leaves the panel empty.
         type_text(&mut app, "sleep 30");
         key(&mut app, KeyCode::Enter);
+        // Not only busy: the login shell may be running its own startup.
         wait_until(&mut app, "sleep to run", |app| {
-            app.terminals[0].borrow().is_busy()
+            app.terminals[0].borrow().program().as_deref() == Some("sleep")
         });
-        app.handle_key(Key::new(KeyCode::Char('k'), ctrl_shift));
-        type_text(&mut app, "close terminal");
-        key(&mut app, KeyCode::Enter);
+        for _ in 0..2 {
+            assert!(app.active_terminal().is_some());
+            app.handle_key(Key::new(KeyCode::Char('k'), ctrl_shift));
+            type_text(&mut app, "close terminal");
+            key(&mut app, KeyCode::Enter);
+        }
         assert!(app.active_terminal().is_none());
         assert!(app.editor().is_none());
         assert!(app.terminals.is_empty());
@@ -2005,10 +2457,14 @@ mod tests {
         app.focus = Focus::Editor;
         type_text(&mut app, "hi");
         ctrl(&mut app, 's');
-        assert!(app.ed().prompt_open());
+        assert_eq!(
+            app.dialog.as_ref().map(FileDialog::purpose),
+            Some(Purpose::SaveAs)
+        );
         let path = root.join("new.txt");
-        type_text(&mut app, path.to_str().unwrap());
+        type_text(&mut app, "new.txt");
         key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none());
         assert_eq!(fs::read_to_string(&path).unwrap(), "hi");
         assert!(screen(&app).contains("new.txt"));
         app.tree.run(Command::TreeLast);
@@ -2034,17 +2490,136 @@ mod tests {
     }
 
     #[test]
-    fn saving_an_unnamed_file_from_the_tree_focuses_the_prompt() {
+    fn saving_an_unnamed_file_from_the_tree_asks_where_in_its_folder() {
         let _serial = crate::test_serial();
-        let root = fixture("prompt-focus", &[("a.txt", "")]);
+        let root = fixture("save-from-tree", &[("dir/a.txt", "")]);
         let mut app = app(&root, None);
         assert_eq!(app.focus, Focus::Tree);
+        key(&mut app, KeyCode::Down);
         ctrl(&mut app, 's');
-        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.dialog.is_some());
         type_text(&mut app, "named.txt");
         key(&mut app, KeyCode::Enter);
-        assert!(root.join("named.txt").exists(), "relative to the workspace");
+        assert!(
+            root.join("dir/named.txt").exists(),
+            "in the folder selected"
+        );
+        assert_eq!(app.focus, Focus::Editor);
         assert_eq!(app.documents.len(), 1);
+    }
+
+    #[test]
+    fn save_as_asks_before_replacing_and_refuses_open_files() {
+        let _serial = crate::test_serial();
+        let root = fixture("save-as-other", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.open(&root.join("b.txt"), false);
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        with_mods(&mut app, KeyCode::Char('s'), ctrl_shift);
+        assert!(screen(&app).contains("Save As"));
+        // The name is suggested, and typing replaces it.
+        type_text(&mut app, "a.txt");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_some());
+        assert!(screen(&app).contains("a.txt is open; close it first."));
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "alpha");
+
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "c.txt");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none());
+        assert_eq!(fs::read_to_string(root.join("c.txt")).unwrap(), "beta");
+        assert_eq!(open_paths(&app), ["a.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn the_file_dialog_opens_and_creates_files() {
+        let _serial = crate::test_serial();
+        let root = fixture("dialog", &[("a.txt", "alpha"), ("dir/b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'o');
+        assert!(screen(&app).contains("Open File"));
+        // Pressed again, it closes.
+        ctrl(&mut app, 'o');
+        assert!(app.dialog.is_none());
+        ctrl(&mut app, 'o');
+        type_text(&mut app, "dir/b");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.ed().text(), "beta");
+
+        // It starts in the active file's folder; new folders are created.
+        with_mods(&mut app, KeyCode::Char('n'), CTRL_ALT);
+        assert!(screen(&app).contains("New File"));
+        type_text(&mut app, "b.txt");
+        key(&mut app, KeyCode::Enter);
+        assert!(screen(&app).contains("b.txt already exists."));
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "sub/new.rs");
+        key(&mut app, KeyCode::Enter);
+        let new = root.join("dir/sub/new.rs");
+        assert_eq!(fs::read_to_string(&new).unwrap(), "");
+        assert_eq!(app.ed().path(), Some(new));
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(screen(&app).contains("new.rs"), "revealed in the tree");
+    }
+
+    #[test]
+    fn ctrl_n_opens_untitled_files_the_picker_lists() {
+        let _serial = crate::test_serial();
+        let root = fixture("untitled", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'n');
+        assert!(screen(&app).contains("Untitled-1"));
+        type_text(&mut app, "one");
+        ctrl(&mut app, 'n');
+        assert!(screen(&app).contains("Untitled-2"));
+        // A blank one on screen is kept rather than stacked.
+        ctrl(&mut app, 'n');
+        assert_eq!(app.documents.len(), 3);
+        type_text(&mut app, "two");
+
+        go_to_file(&mut app);
+        let text = screen(&app);
+        assert!(text.contains("Untitled-1"), "{text}");
+        key(&mut app, KeyCode::Esc);
+
+        // Something else shown in its place, it stays open.
+        assert!(app.open(&root.join("a.txt"), false));
+        go_to_file(&mut app);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.ed().text(), "two");
+
+        // Ctrl+W in the picker closes one, asking first.
+        go_to_file(&mut app);
+        key(&mut app, KeyCode::Down);
+        ctrl(&mut app, 'w');
+        assert!(screen(&app).contains("Untitled-1 has unsaved changes."));
+        assert_eq!(app.documents.len(), 3);
+        ctrl(&mut app, 'w');
+        assert!(app.picker.is_some());
+        assert_eq!(app.documents.len(), 2);
+        assert!(!screen(&app).contains("Untitled-1"));
+        key(&mut app, KeyCode::Esc);
+
+        // Saved, it's a file.
+        ctrl(&mut app, 's');
+        type_text(&mut app, "two.txt");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(fs::read_to_string(root.join("two.txt")).unwrap(), "two");
+        ctrl(&mut app, 'n');
+        assert!(
+            screen(&app).contains("Untitled-1"),
+            "the number is free again"
+        );
     }
 
     #[cfg(unix)]
@@ -2081,9 +2656,11 @@ mod tests {
         type_text(&mut app, "other");
         ctrl(&mut app, 's');
         type_text(&mut app, "a.txt");
+        // Once to confirm replacing it.
+        key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Enter);
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "original");
-        assert!(screen(&app).contains("Can't save: a.txt is already open."));
+        assert!(screen(&app).contains("a.txt is open; close it first."));
     }
 
     #[test]
@@ -2722,6 +3299,10 @@ mod tests {
         ctrl(&mut app, '\\');
         assert!(app.open(&root.join("b.txt"), false));
         type_text(&mut app, "edited ");
+        // Its file goes with it, after asking about the edits.
+        ctrl(&mut app, 'w');
+        assert_eq!(app.panels.len(), 2);
+        assert!(screen(&app).contains("b.txt has unsaved changes."));
         ctrl(&mut app, 'w');
         assert_eq!(app.panels.len(), 1);
         assert_eq!(
@@ -2729,19 +3310,25 @@ mod tests {
             Some(root.join("a.txt").as_path())
         );
         assert_eq!(app.active_panel().area().width, 80);
-        assert_eq!(open_paths(&app), ["a.txt", "b.txt"], "files stay open");
+        assert_eq!(open_paths(&app), ["a.txt"]);
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "beta");
 
-        // Ctrl+P goes back to b.txt, edits and all.
-        go_to_file(&mut app);
-        key(&mut app, KeyCode::Enter);
-        assert!(app.ed().text().starts_with("edited beta"));
+        // A file another panel shows stays open.
+        ctrl(&mut app, '\\');
+        assert!(app.open(&root.join("a.txt"), false));
+        ctrl(&mut app, 'w');
+        assert_eq!(app.panels.len(), 1);
+        assert_eq!(open_paths(&app), ["a.txt"]);
 
-        // The last panel empties instead.
+        // Files shown there before stay open; the last panel empties.
+        assert!(app.open(&root.join("b.txt"), false));
+        type_text(&mut app, "edited ");
+        assert!(app.open(&root.join("a.txt"), false));
         ctrl(&mut app, 'w');
         assert_eq!(app.panels.len(), 1);
         assert!(app.editor().is_none());
         assert!(screen(&app).contains("No file"));
-        assert_eq!(open_paths(&app), ["a.txt", "b.txt"]);
+        assert_eq!(open_paths(&app), ["b.txt"]);
         assert!(
             matches!(ctrl(&mut app, 'q'), AppAction::Continue),
             "b.txt is unsaved"
@@ -2749,17 +3336,37 @@ mod tests {
     }
 
     #[test]
-    fn a_panel_with_an_unsaved_new_file_stays_open() {
+    fn closing_a_busy_terminal_asks_first() {
+        let _serial = crate::test_serial();
+        let root = fixture("close-terminal", &[]);
+        let mut app = app(&root, None);
+        let ctrl_alt_t = Key::new(KeyCode::Char('t'), CTRL_ALT);
+        let ctrl_shift_w = Key::new(
+            KeyCode::Char('w'),
+            Mods {
+                shift: true,
+                ..Mods::CTRL
+            },
+        );
+        app.handle_key(ctrl_alt_t);
+        type_text(&mut app, "sleep 30");
+        key(&mut app, KeyCode::Enter);
+        // Not only busy: the login shell may be running its own startup.
+        wait_until(&mut app, "sleep to run", |app| {
+            app.terminals[0].borrow().program().as_deref() == Some("sleep")
+        });
+        app.handle_key(ctrl_shift_w);
+        assert_eq!(app.terminals.len(), 1);
+        assert!(screen(&app).contains("sleep is running in Terminal 1."));
+        app.handle_key(ctrl_shift_w);
+        assert!(app.terminals.is_empty());
+        assert!(app.active_terminal().is_none());
+    }
+
+    #[test]
+    fn a_blank_untitled_file_goes_away_with_its_panel() {
         let _serial = crate::test_serial();
         let root = fixture("close-new", &[]);
-        let mut app = app(&root, None);
-        key(&mut app, KeyCode::Esc);
-        type_text(&mut app, "draft");
-        ctrl(&mut app, 'w');
-        assert!(app.editor().is_some());
-        assert!(screen(&app).contains("Save the new file first (Ctrl+S)."));
-
-        // A blank one goes away with its panel.
         let mut app = self::app(&root, None);
         ctrl(&mut app, '\\');
         with_mods(&mut app, KeyCode::Left, CTRL_ALT);

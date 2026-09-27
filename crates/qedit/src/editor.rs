@@ -30,7 +30,7 @@ use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::Edit;
 use crate::search::Toggle;
-use crate::status::{Prompt, PromptKey, Status};
+use crate::status::Status;
 #[cfg(test)]
 use crate::theme::Theme;
 use crate::words;
@@ -65,9 +65,9 @@ pub enum Action {
     Copy(String),
     /// The file was written, possibly to a new path.
     Saved,
-    /// The "Save as" prompt was answered with this path, as typed. The app
-    /// resolves it and calls [`Editor::save_as`].
-    SaveAs(PathBuf),
+    /// The file has no name yet: the app asks where to save it, and calls
+    /// [`Editor::save_as`].
+    SaveAs,
 }
 
 struct Message {
@@ -113,7 +113,6 @@ pub struct Editor {
     width: u32,
     height: u32,
     message: Option<Message>,
-    prompt: Option<Prompt>,
     find: Option<FindBar>,
 }
 
@@ -153,7 +152,6 @@ impl Editor {
             width,
             height,
             message: None,
-            prompt: None,
             find: None,
         };
         editor.attach();
@@ -333,15 +331,6 @@ impl Editor {
         self.message = None;
     }
 
-    /// The "Save as" prompt has the keyboard.
-    pub fn prompt_open(&self) -> bool {
-        self.prompt.is_some()
-    }
-
-    pub fn cancel_prompt(&mut self) {
-        self.prompt = None;
-    }
-
     /// Types a key bound to no command. Keys with Ctrl/Alt/Cmd held never
     /// type.
     pub fn type_key(&mut self, key: Key) {
@@ -450,9 +439,6 @@ impl Editor {
     }
 
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) {
-        if self.prompt.is_some() {
-            return;
-        }
         let (text_x, text_w, text_h) = self.text_area();
         // A drag that started in the text stays with it.
         let pressed = matches!(mouse.kind, MouseKind::Press(_));
@@ -570,14 +556,8 @@ impl Editor {
     pub fn paste(&mut self, text: &str) {
         // Terminals send newlines in pastes as CR.
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        match &mut self.prompt {
-            // Only the first line makes sense in a file name.
-            Some(prompt) => prompt.paste(&text),
-            None => {
-                self.edit(EditKind::Other, |eb| eb.insert_text(&text));
-                self.sync_find();
-            }
-        }
+        self.edit(EditKind::Other, |eb| eb.insert_text(&text));
+        self.sync_find();
     }
 
     /// Draws the editor in its area and returns the terminal cursor
@@ -1304,9 +1284,6 @@ impl Editor {
 
     /// What the status bar shows while this editor is active.
     pub fn status(&self) -> Status {
-        if let Some(prompt) = &self.prompt {
-            return prompt.status();
-        }
         if let Some(message) = &self.message {
             return Status::Message {
                 text: message.text.clone(),
@@ -1352,8 +1329,7 @@ impl Editor {
     /// Writes the file, or asks for a name if it has none.
     fn save(&mut self) -> Action {
         let Some(path) = self.path() else {
-            self.prompt = Some(Prompt::new("Save as", ""));
-            return Action::Continue;
+            return Action::SaveAs;
         };
         let text = self.buffer.text();
         let line_ending = self.doc.file.borrow().line_ending;
@@ -1374,24 +1350,6 @@ impl Editor {
                 Action::Continue
             }
         }
-    }
-
-    /// A key for the "Save as" prompt, while it is open.
-    pub fn handle_prompt_key(&mut self, key: Key) -> Action {
-        let Some(prompt) = self.prompt.as_mut() else {
-            return Action::Continue;
-        };
-        match prompt.handle_key(key) {
-            PromptKey::Continue => {}
-            PromptKey::Cancel => self.prompt = None,
-            PromptKey::Submit(input) => {
-                self.prompt = None;
-                if !input.is_empty() {
-                    return Action::SaveAs(PathBuf::from(input));
-                }
-            }
-        }
-        Action::Continue
     }
 
     fn toggle_wrap(&mut self) {
@@ -1493,12 +1451,6 @@ mod tests {
     impl HandleKey for Editor {
         fn handle_key(&mut self, key: Key) -> Action {
             self.clear_message();
-            if self.prompt_open() {
-                return match self.handle_prompt_key(key) {
-                    Action::SaveAs(path) => self.save_as(path),
-                    action => action,
-                };
-            }
             match Keymap::default().lookup(key, Context::Editor) {
                 Some((command, select)) => CLIPBOARD
                     .with(|clipboard| self.run(command, select, &mut clipboard.borrow_mut())),
@@ -1603,25 +1555,19 @@ mod tests {
     }
 
     #[test]
-    fn save_as_prompt_names_a_new_file() {
+    fn saving_an_unnamed_file_asks_where() {
         let _serial = serial();
-        let path = temp_path("prompted.txt");
+        let path = temp_path("named.txt");
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
         press(&mut editor, "hi");
-        ctrl(&mut editor, 's');
-        assert!(status(&editor).starts_with(" Save as:"));
+        assert!(matches!(ctrl(&mut editor, 's'), Action::SaveAs));
+        assert!(editor.is_modified());
 
-        // Typing goes to the prompt, not the buffer; Esc cancels.
-        press(&mut editor, "zzz");
-        key(&mut editor, KeyCode::Esc);
-        assert_eq!(eb.text(), "hi");
-
-        ctrl(&mut editor, 's');
-        editor.paste(path.to_str().unwrap());
-        key(&mut editor, KeyCode::Enter);
+        assert!(matches!(editor.save_as(path.clone()), Action::Saved));
         assert_eq!(fs::read_to_string(&path).unwrap(), "hi");
         assert!(status(&editor).starts_with(" Wrote "));
+        assert_eq!(editor.path(), Some(path));
     }
 
     #[test]

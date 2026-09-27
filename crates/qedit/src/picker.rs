@@ -1,6 +1,6 @@
 //! The picker: a popup list that narrows as you type. It lists the
-//! workspace's files (Ctrl+P), after what was shown recently, terminals
-//! included, or, when the query starts with `>`, every command with its
+//! workspace's files (Ctrl+P), after what was shown recently, terminals and
+//! untitled files included, or, when the query starts with `>`, every command with its
 //! shortcut (Ctrl+K), as in Sublime and VS Code.
 //!
 //! Matching is fuzzy: the query's characters must appear in order, so `abcr`
@@ -9,6 +9,9 @@
 //!
 //! The files come from the app's [`FileIndex`], which lists them in the
 //! background.
+//!
+//! Ctrl+W closes the recent file, terminal, or untitled file selected, as
+//! closing a panel closes what it shows.
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
@@ -57,6 +60,8 @@ pub enum Choice {
     Command(Command),
     /// A terminal, by its id.
     Terminal(u32),
+    /// An untitled file, by its number.
+    Untitled(u32),
 }
 
 /// What the app should do after the picker handled input.
@@ -65,6 +70,8 @@ pub enum PickerAction {
     Continue,
     Close,
     Accept(Choice),
+    /// Close this recent file, terminal, or untitled file.
+    CloseItem(Choice),
 }
 
 /// A row the picker can list.
@@ -110,6 +117,16 @@ impl Item {
         }
     }
 
+    /// Untitled file `number`, not yet saved.
+    pub fn untitled(number: u32) -> Item {
+        Item {
+            text: crate::document::untitled_name(number),
+            dim: 0..0,
+            detail: "unsaved".to_string(),
+            choice: Choice::Untitled(number),
+        }
+    }
+
     fn command(command: Command, keymap: &Keymap) -> Item {
         let title = command.title();
         let text = format!("{title} {}", command.id());
@@ -127,7 +144,7 @@ impl Item {
     fn path(&self) -> Option<&Path> {
         match &self.choice {
             Choice::File(path) => Some(path),
-            Choice::Command(_) | Choice::Terminal(_) => None,
+            Choice::Command(_) | Choice::Terminal(_) | Choice::Untitled(_) => None,
         }
     }
 }
@@ -147,6 +164,8 @@ pub struct Picker {
     listing: bool,
     /// Whether some files went unlisted.
     truncated: bool,
+    /// The bottom border's hint for closing what was shown recently.
+    close_hint: String,
     commands: Vec<Item>,
     pattern: Pattern,
     matcher: RefCell<Matcher>,
@@ -177,11 +196,15 @@ impl Picker {
         let commands = Command::ALL
             .iter()
             // Moving through the picker, search options, and the find bar's
-            // own keys aren't something to pick from it.
+            // and file dialog's own keys aren't something to pick from it.
             .filter(|command| {
                 !matches!(
                     command.context(),
-                    Context::Picker | Context::Search | Context::SearchOptions | Context::Find
+                    Context::Picker
+                        | Context::Search
+                        | Context::SearchOptions
+                        | Context::Find
+                        | Context::Dialog
                 )
             })
             .filter(|&&command| available(command))
@@ -195,6 +218,9 @@ impl Picker {
             duplicates: Vec::new(),
             listing: false,
             truncated: false,
+            close_hint: keymap
+                .shortcut(Command::PickerCloseItem)
+                .map_or(String::new(), |key| format!(" {key:#} close ")),
             commands,
             pattern: Pattern::default(),
             matcher: RefCell::new(Matcher::new(Config::DEFAULT.match_paths())),
@@ -245,10 +271,25 @@ impl Picker {
         }
     }
 
+    /// Lists `recent` first from now on, as after one was closed, keeping
+    /// the selection where it was.
+    pub fn set_recent(&mut self, recent: Vec<Item>) {
+        self.recent = recent;
+        self.find_duplicates();
+        let (selected, scroll) = (self.selected, self.scroll);
+        self.refilter(None);
+        self.scroll = scroll;
+        self.select(selected);
+    }
+
     fn take_files(&mut self, index: &FileIndex) {
         self.files = index.files();
         self.listing = index.listing();
         self.truncated = index.truncated();
+        self.find_duplicates();
+    }
+
+    fn find_duplicates(&mut self) {
         let recent: HashSet<&Path> = self.recent.iter().filter_map(Item::path).collect();
         self.duplicates = self
             .files
@@ -269,6 +310,17 @@ impl Picker {
             Command::PickerPageDown => self.select(self.selected + page),
             Command::PickerAccept => return self.accept(),
             Command::PickerClose => return PickerAction::Close,
+            Command::PickerCloseItem => {
+                // Only what was shown recently is open to close.
+                let recent = self.mode() == Mode::Files
+                    && self
+                        .matches
+                        .get(self.selected)
+                        .is_some_and(|&i| i < self.recent.len());
+                if let Some(item) = self.selected_item().filter(|_| recent) {
+                    return PickerAction::CloseItem(item.choice.clone());
+                }
+            }
             _ => {}
         }
         PickerAction::Continue
@@ -470,7 +522,14 @@ impl Picker {
             Mode::Commands => ("Commands", "commands"),
         };
         draw_frame(frame, area, title);
-        draw_status(frame, area, &self.status(noun));
+        let status = self.status(noun);
+        draw_status(frame, area, &status);
+        let room = width.saturating_sub(status.chars().count() as u32 + 6) as usize;
+        let closable = self.mode() == Mode::Files && !self.recent.is_empty();
+        if closable && self.close_hint.chars().count() <= room {
+            let bottom = y + height - 1;
+            frame.draw_text(&self.close_hint, x + 2, bottom, DIM, None, Attributes::NONE);
+        }
 
         // The query, the cursor kept in view.
         let text_x = x + 2;

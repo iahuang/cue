@@ -55,6 +55,8 @@ pub struct Document {
     pub syntax: RefCell<Option<Highlighter>>,
     pub history: RefCell<History>,
     pub theme: Rc<Theme>,
+    /// Tells documents not yet saved apart: 1 for `Untitled-1`, and so on.
+    pub untitled: Cell<u32>,
     /// The editor whose cursor the buffer holds, if any.
     pub cursor_owner: Cell<Option<u64>>,
     /// The other editors' cursors, by editor, while they wait for it.
@@ -123,6 +125,7 @@ impl Document {
             syntax: RefCell::new(syntax),
             history: RefCell::new(History::new()),
             theme,
+            untitled: Cell::new(0),
             cursor_owner: Cell::new(None),
             parked: RefCell::default(),
             parked_text: RefCell::default(),
@@ -212,6 +215,15 @@ impl Document {
         self.file.borrow().path.clone()
     }
 
+    /// The file's name as shown, if it has none yet: `Untitled-1`.
+    pub fn untitled_name(&self) -> Option<String> {
+        self.file
+            .borrow()
+            .path
+            .is_none()
+            .then(|| untitled_name(self.untitled.get()))
+    }
+
     /// Whether the document is the file at `path`, however it's named.
     pub fn is_file(&self, path: &Path) -> bool {
         self.file
@@ -249,6 +261,11 @@ impl Document {
             *self.syntax.borrow_mut() = highlighter;
         }
     }
+}
+
+/// What untitled file `number` is called.
+pub fn untitled_name(number: u32) -> String {
+    format!("Untitled-{number}")
 }
 
 /// The length in bytes of what `a` and `b` start with alike, ending on a

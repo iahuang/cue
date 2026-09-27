@@ -135,6 +135,15 @@ impl FileTree {
         self.active_preview = preview;
     }
 
+    /// The selected folder, or the folder of the selected file.
+    pub fn selected_folder(&self) -> Option<PathBuf> {
+        let row = self.rows.get(self.selected)?;
+        match row.is_dir {
+            true => Some(row.path.clone()),
+            false => row.path.parent().map(Path::to_path_buf),
+        }
+    }
+
     #[cfg(test)]
     pub fn active_is_preview(&self) -> bool {
         self.active_preview

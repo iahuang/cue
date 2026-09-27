@@ -1,7 +1,7 @@
 //! The status bar along the bottom of the screen. It's the active panel's:
 //! where its cursor is and what its file is written in, a message after a
-//! key press, or a prompt, such as "Save as". Shortcut hints fill the
-//! right.
+//! key press, or a prompt, such as a terminal's new name. Shortcut hints
+//! fill the right.
 
 use opentui::{Attributes, Buffer};
 
@@ -34,7 +34,7 @@ impl Status {
     }
 }
 
-/// A line of text asked for in the status bar, such as a file name.
+/// A line of text asked for in the status bar, such as a terminal's name.
 pub struct Prompt {
     label: &'static str,
     input: String,
@@ -50,7 +50,8 @@ pub enum PromptKey {
 }
 
 impl Prompt {
-    /// A prompt labeled `label` ("Save as"), starting with `input` typed.
+    /// A prompt labeled `label` ("Rename terminal"), starting with `input`
+    /// typed.
     pub fn new(label: &'static str, input: &str) -> Prompt {
         Prompt {
             label,

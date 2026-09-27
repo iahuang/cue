@@ -4,8 +4,8 @@
 //! Panels have no tabs. Opening a file in a panel replaces what it shows,
 //! but the panel keeps an editor for each file it has shown, so going back
 //! to one finds the cursor and scroll position where they were. Files and
-//! terminals stay open when a panel moves on from them or closes; the app
-//! owns them.
+//! terminals stay open when a panel moves on from them; the app owns them,
+//! and closing a panel closes only what it shows.
 //!
 //! A header across the top names the file or terminal, brighter on the
 //! active panel. An empty panel, as a new split starts, lists how to open
@@ -30,6 +30,8 @@ use crate::workspace::Workspace;
 /// What an empty panel suggests.
 const SUGGESTIONS: &[Command] = &[
     Command::GoToFile,
+    Command::OpenFile,
+    Command::NewFile,
     Command::SearchWorkspace,
     Command::NewTerminal,
     Command::Palette,
@@ -171,7 +173,8 @@ impl Panel {
         Ok(())
     }
 
-    /// Drops the editor of `doc`, which must not be on screen.
+    /// Drops the editor of `doc`. If it was on screen, the panel is left
+    /// empty.
     pub fn forget(&mut self, doc: &Rc<Document>) {
         let Some(index) = self
             .editors
@@ -180,11 +183,12 @@ impl Panel {
         else {
             return;
         };
-        debug_assert_ne!(self.current, Some(index));
         self.editors.remove(index);
-        if let Some(current) = self.current.filter(|&current| current > index) {
-            self.current = Some(current - 1);
-        }
+        self.current = match self.current {
+            Some(current) if current == index => None,
+            Some(current) if current > index => Some(current - 1),
+            current => current,
+        };
     }
 
     /// Empties the panel, dropping its editors.
@@ -341,7 +345,7 @@ impl Panel {
                     .unwrap_or_default();
                 (name, folder)
             }
-            None => ("[new file]".to_string(), String::new()),
+            None => (doc.untitled_name().unwrap_or_default(), String::new()),
         };
         let dirty = if doc.is_modified() { " [+]" } else { "" };
         let room = area.width.saturating_sub(1) as usize;

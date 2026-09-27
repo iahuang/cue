@@ -3,6 +3,7 @@
 mod app;
 mod document;
 mod editor;
+mod file_dialog;
 mod file_index;
 mod find;
 mod history;

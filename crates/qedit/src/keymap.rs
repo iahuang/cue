@@ -38,6 +38,11 @@ commands! {
     Quit => "app:quit", "Quit";
     Palette => "app:command-palette", "Show Command Palette";
     Save => "file:save", "Save";
+    SaveAs => "file:save-as", "Save As…";
+    NewFile => "file:new", "New Untitled File";
+    CreateFile => "file:create", "New File…";
+    OpenFile => "file:open", "Open File…";
+    CloseFile => "file:close", "Close File";
     GoToFile => "file:go-to", "Go to File";
     SearchWorkspace => "search:workspace", "Search in Workspace";
     Find => "find:show", "Find in File";
@@ -108,9 +113,12 @@ commands! {
     PickerPageDown => "picker:page-down", "Picker: Page Down";
     PickerAccept => "picker:accept", "Picker: Open Selected";
     PickerClose => "picker:close", "Picker: Close";
+    PickerCloseItem => "picker:close-item", "Picker: Close Selected File or Terminal";
     SearchToggleCase => "search:toggle-case", "Search: Match Case";
     SearchToggleWord => "search:toggle-word", "Search: Match Whole Word";
     SearchToggleRegex => "search:toggle-regex", "Search: Use Regular Expression";
+    DialogParent => "dialog:parent", "File Dialog: Parent Folder";
+    DialogComplete => "dialog:complete", "File Dialog: Complete Name";
 }
 
 /// Where a key binding applies: the focused part of the screen, or anywhere.
@@ -124,6 +132,8 @@ pub enum Context {
     /// Workspace search, while open. The picker's keys and the search
     /// options work there too.
     Search,
+    /// The file dialog, while open. The picker's keys work there too.
+    Dialog,
     /// Matching case, whole words, or regexes, in workspace search and in
     /// finding in the file.
     SearchOptions,
@@ -144,6 +154,7 @@ impl Context {
     fn parents(self) -> &'static [Context] {
         match self {
             Context::Search => &[Context::SearchOptions, Context::Picker],
+            Context::Dialog => &[Context::Picker],
             Context::Find => &[Context::SearchOptions],
             Context::Replace => &[Context::Find, Context::SearchOptions],
             _ => &[],
@@ -156,16 +167,16 @@ impl Command {
     pub fn context(self) -> Context {
         use Command::*;
         match self {
-            Quit | Palette | Save | GoToFile | SearchWorkspace | Find | FindReplace | FindNext
-            | FindPrevious | ToggleTree | FocusTree | FocusEditor | SplitRight | SplitDown
-            | ClosePanel | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown
-            | NewTerminal => Context::Global,
+            Quit | Palette | Save | SaveAs | NewFile | CreateFile | OpenFile | GoToFile
+            | SearchWorkspace | Find | FindReplace | FindNext | FindPrevious | ToggleTree
+            | FocusTree | FocusEditor | SplitRight | SplitDown | ClosePanel | FocusPanelLeft
+            | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh => Context::Tree,
-            PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose => {
-                Context::Picker
-            }
+            PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
+            | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
+            DialogParent | DialogComplete => Context::Dialog,
             FindSwitchField | FindClose => Context::Find,
             ClearTerminal | CloseTerminal | RenameTerminal | TerminalPrefix => Context::Terminal,
             Replace | ReplaceAll => Context::Replace,
@@ -233,6 +244,9 @@ impl Default for Keymap {
         for (c, command) in [
             ('q', Quit),
             ('s', Save),
+            // As in VS Code, where Ctrl+N is a new untitled file too.
+            ('n', NewFile),
+            ('o', OpenFile),
             ('z', Undo),
             ('y', Redo),
             ('c', Copy),
@@ -260,6 +274,10 @@ impl Default for Keymap {
         }
         bindings.push((key(Char('z'), CTRL_SHIFT), Redo));
         bindings.push((key(Char('z'), SUPER_SHIFT), Redo));
+        // Legacy terminals send it as Ctrl+S, which saves; there, the
+        // command palette has it.
+        bindings.push((key(Char('s'), CTRL_SHIFT), SaveAs));
+        bindings.push((key(Char('s'), SUPER_SHIFT), SaveAs));
         // As in VS Code, Sublime, and Zed. Terminals that only speak the
         // legacy protocol send it as Ctrl+F, which finds in the file; there,
         // the command palette has it.
@@ -290,6 +308,8 @@ impl Default for Keymap {
             (Up, FocusPanelUp),
             (Down, FocusPanelDown),
             (Char('t'), NewTerminal),
+            // VS Code's New File… is Ctrl+Alt+Super+N.
+            (Char('n'), CreateFile),
         ] {
             bindings.push((key(code, CTRL_ALT), command));
             bindings.push((key(code, SUPER_ALT), command));
@@ -356,6 +376,10 @@ impl Default for Keymap {
             (key(PageDown, Mods::NONE), PickerPageDown),
             (key(Enter, Mods::NONE), PickerAccept),
             (key(Esc, Mods::NONE), PickerClose),
+            // Closing a panel closes what it shows; in the picker, what's
+            // selected.
+            (key(Char('w'), Mods::CTRL), PickerCloseItem),
+            (key(Char('w'), SUPER), PickerCloseItem),
             // As in VS Code's search.
             (key(Char('c'), ALT), SearchToggleCase),
             (key(Char('w'), ALT), SearchToggleWord),
@@ -364,6 +388,10 @@ impl Default for Keymap {
             (key(Tab, Mods::NONE), FindSwitchField),
             (key(Enter, Mods::NONE), Replace),
             (key(Enter, ALT), ReplaceAll),
+            // As in the Finder and macOS's file dialogs.
+            (key(Up, ALT), DialogParent),
+            (key(Up, SUPER), DialogParent),
+            (key(Tab, Mods::NONE), DialogComplete),
         ]);
         let mut bindings: Vec<Binding> = bindings
             .into_iter()
@@ -589,6 +617,7 @@ mod tests {
         // Reached only from the command palette.
         const UNBOUND: &[Command] = &[
             Command::ToggleWrap,
+            Command::CloseFile,
             Command::ClearTerminal,
             Command::CloseTerminal,
             Command::RenameTerminal,
@@ -797,6 +826,10 @@ mod tests {
             (key('\\', true, false, true, false), Command::SplitDown),
             (key('p', false, false, false, true), Command::GoToFile),
             (key('t', false, true, true, false), Command::NewTerminal),
+            (key('n', false, true, true, false), Command::CreateFile),
+            (key('o', true, false, true, false), Command::OpenFile),
+            (key('n', true, false, true, false), Command::NewFile),
+            (key('s', true, false, true, false), Command::SaveAs),
             (
                 Key::new(KeyCode::Left, mods(false, true, true, false)),
                 Command::FocusPanelLeft,
