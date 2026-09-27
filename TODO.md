@@ -24,9 +24,6 @@
 
 - file ops
   - rename, move, copy, delete in file tree
-  - new file (create)
-  - new file (unsaved buffer)
-  - file picker dialog for open, save emulating the native OS one
 
 - dim gitignored files, folders in the file tree and also exclude them from the search + file picker
 - support for nerdfonts

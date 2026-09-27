@@ -28,11 +28,7 @@ use crate::terminal::{self, Terminal};
 use crate::workspace::Workspace;
 
 /// What an empty panel suggests.
-const SUGGESTIONS: &[Command] = &[
-    Command::GoToFile,
-    Command::NewFile,
-    Command::NewTerminal,
-];
+const SUGGESTIONS: &[Command] = &[Command::GoToFile, Command::NewFile, Command::NewTerminal];
 
 pub struct Panel {
     pub id: PanelId,

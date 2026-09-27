@@ -197,14 +197,20 @@ pub fn walker(workspace: &Workspace) -> Option<WalkBuilder> {
     for root in outermost {
         builder.add(root);
     }
+    skip_ignored(&mut builder);
+    Some(builder)
+}
+
+/// Makes `builder` skip `.git`, `.DS_Store`, and what `.gitignore` and
+/// `.ignore` files exclude. The tree dims what these rules skip.
+pub fn skip_ignored(builder: &mut WalkBuilder) -> &mut WalkBuilder {
     builder
         // Dotfiles such as .env are shown, as in the tree; .git and
         // .DS_Store never are.
         .hidden(false)
         .filter_entry(|entry| !tree::is_hidden(entry.file_name()))
         // Honor .gitignore in folders that aren't git repositories too.
-        .require_git(false);
-    Some(builder)
+        .require_git(false)
 }
 
 /// Whether a walked entry is a file, or a symlink to one.

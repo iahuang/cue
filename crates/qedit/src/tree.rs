@@ -4,13 +4,17 @@
 //! Folders are read when they are expanded and re-read on refresh; nothing
 //! watches the file system yet. Which folders are expanded is remembered by
 //! path, so collapsing a folder and expanding it again restores its subfolders.
+//! What `.gitignore` and `.ignore` files exclude is shown dimmed, and left
+//! out of the file picker and workspace search.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ignore::WalkBuilder;
 use opentui::{Attributes, Buffer, Rgba};
 
+use crate::file_index;
 use crate::keymap::Command;
 use crate::workspace::{deepest_root, root_name};
 
@@ -18,6 +22,8 @@ const FG: Rgba = Rgba::rgb(186, 194, 222);
 const ROOT_FG: Rgba = Rgba::rgb(205, 214, 244);
 const ACTIVE_FG: Rgba = Rgba::rgb(137, 180, 250);
 const ARROW_FG: Rgba = Rgba::rgb(108, 112, 134);
+/// Ignored entries.
+const IGNORED_FG: Rgba = Rgba::rgb(108, 112, 134);
 const SELECTED_BG: Rgba = Rgba::rgb(69, 71, 110);
 /// The selection while the editor has focus.
 const SELECTED_BG_UNFOCUSED: Rgba = Rgba::rgb(49, 50, 68);
@@ -40,6 +46,8 @@ struct Row {
     /// 0 for workspace roots.
     depth: usize,
     is_dir: bool,
+    /// Excluded by an ignore file, or inside a folder that is.
+    ignored: bool,
 }
 
 /// What the app should do after the tree handled input.
@@ -110,9 +118,10 @@ impl FileTree {
                 name: root_name(root),
                 depth: 0,
                 is_dir: true,
+                ignored: false,
             });
             if self.expanded.contains(root) {
-                self.push_children(&mut rows, root, 1);
+                self.push_children(&mut rows, root, 1, false);
             }
         }
         self.rows = rows;
@@ -242,6 +251,8 @@ impl FileTree {
                 (ACTIVE_FG, Attributes::BOLD | Attributes::ITALIC)
             } else if self.active.as_ref() == Some(&row.path) {
                 (ACTIVE_FG, Attributes::BOLD)
+            } else if row.ignored {
+                (IGNORED_FG, Attributes::NONE)
             } else {
                 (FG, Attributes::NONE)
             };
@@ -327,10 +338,10 @@ impl FileTree {
 
     fn expand(&mut self, index: usize) {
         let row = &self.rows[index];
-        let (path, depth) = (row.path.clone(), row.depth);
+        let (path, depth, ignored) = (row.path.clone(), row.depth, row.ignored);
         self.expanded.insert(path.clone());
         let mut children = Vec::new();
-        self.push_children(&mut children, &path, depth + 1);
+        self.push_children(&mut children, &path, depth + 1, ignored);
         self.rows.splice(index + 1..index + 1, children);
     }
 
@@ -354,24 +365,31 @@ impl FileTree {
         self.rows.iter().position(|row| row.path == path)
     }
 
-    /// Appends the entries of `dir`, and of its expanded subfolders.
-    fn push_children(&self, rows: &mut Vec<Row>, dir: &Path, depth: usize) {
-        for row in read_dir(dir, depth) {
+    /// Appends the entries of `dir`, and of its expanded subfolders. Those
+    /// of an `ignored` folder are all ignored.
+    fn push_children(&self, rows: &mut Vec<Row>, dir: &Path, depth: usize, ignored: bool) {
+        for row in read_dir(dir, depth, ignored) {
             let expand = row.is_dir && self.expanded.contains(&row.path);
-            let path = row.path.clone();
+            let (path, ignored) = (row.path.clone(), row.ignored);
             rows.push(row);
             if expand {
-                self.push_children(rows, &path, depth + 1);
+                self.push_children(rows, &path, depth + 1, ignored);
             }
         }
     }
 }
 
 /// The entries of `dir`, folders first, each group by name ignoring case.
-/// An unreadable folder shows as empty.
-fn read_dir(dir: &Path, depth: usize) -> Vec<Row> {
+/// An unreadable folder shows as empty. The entries of an `ignored` folder
+/// are all ignored.
+fn read_dir(dir: &Path, depth: usize, ignored: bool) -> Vec<Row> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
+    };
+    let kept = if ignored {
+        HashSet::new()
+    } else {
+        not_ignored(dir)
     };
     let mut rows: Vec<Row> = entries
         .filter_map(Result::ok)
@@ -387,6 +405,7 @@ fn read_dir(dir: &Path, depth: usize) -> Vec<Row> {
             };
             Row {
                 name: entry.file_name().to_string_lossy().into_owned(),
+                ignored: !kept.contains(&path),
                 path,
                 depth,
                 is_dir,
@@ -401,6 +420,19 @@ fn read_dir(dir: &Path, depth: usize) -> Vec<Row> {
         ))
     });
     rows
+}
+
+/// The entries of `dir` that the file picker and workspace search would
+/// list: those no ignore file excludes, in `dir` or the folders above it.
+fn not_ignored(dir: &Path) -> HashSet<PathBuf> {
+    let mut builder = WalkBuilder::new(dir);
+    file_index::skip_ignored(&mut builder).max_depth(Some(1));
+    builder
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.depth() == 1)
+        .map(|entry| entry.into_path())
+        .collect()
 }
 
 /// `s` cut to `max` characters, ending in an ellipsis if cut.
@@ -478,6 +510,33 @@ mod tests {
             listing(&tree),
             ["order/", "  docs/", "  src/", "  .env", "  A.txt", "  b.txt"]
         );
+    }
+
+    #[test]
+    fn marks_ignored_entries_and_their_contents() {
+        let root = fixture(
+            "ignored",
+            &[
+                ".gitignore",
+                "target/debug/out",
+                "src/main.rs",
+                "src/gen.rs",
+                "src/.gitignore",
+                "app.log",
+            ],
+        );
+        fs::write(root.join(".gitignore"), "target/\n*.log\n").unwrap();
+        fs::write(root.join("src/.gitignore"), "gen.rs\n").unwrap();
+        let mut tree = tree(std::slice::from_ref(&root));
+        tree.reveal(&root.join("target/debug/out"));
+        tree.reveal(&root.join("src/main.rs"));
+        let ignored: Vec<String> = tree
+            .rows
+            .iter()
+            .filter(|row| row.ignored)
+            .map(|row| row.name.clone())
+            .collect();
+        assert_eq!(ignored, ["gen.rs", "target", "debug", "out", "app.log"]);
     }
 
     #[test]
