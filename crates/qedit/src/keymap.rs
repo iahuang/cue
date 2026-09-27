@@ -39,7 +39,7 @@ commands! {
     Palette => "app:command-palette", "Show Command Palette";
     Save => "file:save", "Save";
     SaveAs => "file:save-as", "Save As…";
-    NewFile => "file:new", "New Untitled File";
+    NewFile => "file:new", "New File";
     CreateFile => "file:create", "New File…";
     OpenFile => "file:open", "Open File…";
     CloseFile => "file:close", "Close File";

@@ -30,12 +30,8 @@ use crate::workspace::Workspace;
 /// What an empty panel suggests.
 const SUGGESTIONS: &[Command] = &[
     Command::GoToFile,
-    Command::OpenFile,
     Command::NewFile,
-    Command::SearchWorkspace,
     Command::NewTerminal,
-    Command::Palette,
-    Command::ClosePanel,
 ];
 
 pub struct Panel {
