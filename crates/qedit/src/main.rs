@@ -1,6 +1,7 @@
 //! qedit: a terminal text editor on OpenTUI's native core.
 
 mod app;
+mod context_menu;
 mod document;
 mod editor;
 mod file_dialog;

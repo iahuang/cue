@@ -63,6 +63,15 @@ pub enum TreeAction {
     },
 }
 
+/// An entry in the tree, as the file commands see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    /// A workspace root, which isn't renamed, moved, or deleted from here.
+    pub is_root: bool,
+}
+
 pub struct FileTree {
     roots: Vec<PathBuf>,
     expanded: HashSet<PathBuf>,
@@ -151,6 +160,58 @@ impl FileTree {
             true => Some(row.path.clone()),
             false => row.path.parent().map(Path::to_path_buf),
         }
+    }
+
+    /// The selected entry, if there are any.
+    pub fn selected(&self) -> Option<Entry> {
+        self.rows.get(self.selected).map(|row| Entry {
+            path: row.path.clone(),
+            is_dir: row.is_dir,
+            is_root: row.depth == 0,
+        })
+    }
+
+    /// The first workspace root.
+    pub fn root(&self) -> Option<Entry> {
+        self.roots.first().map(|root| Entry {
+            path: root.clone(),
+            is_dir: true,
+            is_root: true,
+        })
+    }
+
+    /// Where the selected entry's name is on screen: the column, from the
+    /// tree's left edge, and the row. `None` if it's scrolled out of view.
+    pub fn selected_position(&self) -> Option<(u32, u32)> {
+        let row = self.rows.get(self.selected)?;
+        let y = self.selected.checked_sub(self.scroll)?;
+        (y < self.height).then_some((3 + 2 * row.depth as u32, y as u32))
+    }
+
+    /// Selects the entry on screen row `y`, as a right click does, without
+    /// opening it. Returns false if there's none there.
+    pub fn select_at(&mut self, y: u32) -> bool {
+        let index = self.scroll + y as usize;
+        if index >= self.rows.len() {
+            return false;
+        }
+        self.select(index);
+        true
+    }
+
+    /// Follows `from`, and what's in it, to `to`: folders expanded there
+    /// stay expanded. Refreshes and selects `to`.
+    pub fn moved(&mut self, from: &Path, to: &Path) {
+        let expanded = std::mem::take(&mut self.expanded);
+        self.expanded = expanded
+            .into_iter()
+            .map(|path| match path.strip_prefix(from) {
+                Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
+                Ok(rest) => to.join(rest),
+                Err(_) => path,
+            })
+            .collect();
+        self.reveal(to);
     }
 
     #[cfg(test)]

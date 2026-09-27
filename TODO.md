@@ -19,11 +19,7 @@
 
 # feat
 
-- context menus
-
-- file ops
-  - rename, move, copy, delete in file tree
-
+- maybe: make proper move rather than unix style unified move-rename verb
 - dim gitignored files, folders in the file tree and also exclude them from the search + file picker
 - support for nerdfonts
 

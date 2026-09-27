@@ -107,6 +107,17 @@ commands! {
     TreePageUp => "tree:page-up", "File Tree: Page Up";
     TreePageDown => "tree:page-down", "File Tree: Page Down";
     TreeRefresh => "tree:refresh", "File Tree: Refresh";
+    TreeContextMenu => "tree:context-menu", "File Tree: Show Context Menu";
+    TreeOpenToSide => "tree:open-to-side", "File Tree: Open to the Side";
+    TreeNewFile => "tree:new-file", "File Tree: New File…";
+    TreeNewFolder => "tree:new-folder", "File Tree: New Folder…";
+    TreeRename => "tree:rename", "File Tree: Rename or Move…";
+    TreeDuplicate => "tree:duplicate", "File Tree: Duplicate…";
+    TreeTrash => "tree:trash", "File Tree: Move to Trash";
+    TreeCopyPath => "tree:copy-path", "File Tree: Copy Path";
+    TreeCopyRelativePath => "tree:copy-relative-path", "File Tree: Copy Relative Path";
+    TreeReveal => "tree:reveal", "File Tree: Reveal in File Manager";
+    TreeOpenInTerminal => "tree:open-in-terminal", "File Tree: Open in Terminal";
     PickerUp => "picker:up", "Picker: Select Previous";
     PickerDown => "picker:down", "Picker: Select Next";
     PickerPageUp => "picker:page-up", "Picker: Page Up";
@@ -172,7 +183,9 @@ impl Command {
             | FocusTree | FocusEditor | SplitRight | SplitDown | ClosePanel | FocusPanelLeft
             | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
-            | TreeLast | TreePageUp | TreePageDown | TreeRefresh => Context::Tree,
+            | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu | TreeOpenToSide
+            | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate | TreeTrash | TreeCopyPath
+            | TreeCopyRelativePath | TreeReveal | TreeOpenInTerminal => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
@@ -370,6 +383,15 @@ impl Default for Keymap {
             (key(PageDown, Mods::NONE), TreePageDown),
             (key(Char('r'), Mods::CTRL), TreeRefresh),
             (key(Char('r'), SUPER), TreeRefresh),
+            // As in VS Code.
+            (key(Enter, Mods::CTRL), TreeOpenToSide),
+            (key(Enter, SUPER), TreeOpenToSide),
+            // As in Windows and GTK; F2 renames there, and in VS Code.
+            (key(F(10), SHIFT), TreeContextMenu),
+            (key(F(2), Mods::NONE), TreeRename),
+            // Cmd+Backspace as in the Finder.
+            (key(Delete, Mods::NONE), TreeTrash),
+            (key(Backspace, SUPER), TreeTrash),
             (key(Up, Mods::NONE), PickerUp),
             (key(Down, Mods::NONE), PickerDown),
             (key(PageUp, Mods::NONE), PickerPageUp),
@@ -614,13 +636,20 @@ mod tests {
 
     #[test]
     fn every_command_has_a_shortcut() {
-        // Reached only from the command palette.
+        // Reached only from the command palette, or the tree's context menu.
         const UNBOUND: &[Command] = &[
             Command::ToggleWrap,
             Command::CloseFile,
             Command::ClearTerminal,
             Command::CloseTerminal,
             Command::RenameTerminal,
+            Command::TreeNewFile,
+            Command::TreeNewFolder,
+            Command::TreeDuplicate,
+            Command::TreeCopyPath,
+            Command::TreeCopyRelativePath,
+            Command::TreeReveal,
+            Command::TreeOpenInTerminal,
         ];
         let keymap = Keymap::default();
         for &command in Command::ALL {

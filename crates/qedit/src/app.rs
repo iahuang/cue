@@ -33,6 +33,11 @@
 //! open, for the picker to bring back, and Ctrl+W in the picker closes it
 //! from there. Closing unsaved changes, or a running program, asks first.
 //!
+//! Right-clicking the file tree, or Shift+F10 there, opens a context menu
+//! of file commands: renaming, moving, duplicating, and trashing files and
+//! folders, and so on. They have keys and palette entries too, and act on
+//! the tree's selection, or from elsewhere, on the file on screen.
+//!
 //! Terminals (Ctrl+Alt+T) are the app's too, like open files: a panel shows
 //! one, and it keeps running when the panel moves on. While one has the
 //! keyboard, keys go to its shell, but for a few (see
@@ -41,6 +46,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -48,6 +54,7 @@ use std::time::Instant;
 
 use opentui::{Attributes, Buffer, Rgba};
 
+use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
 use crate::document::{self, Document};
 use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
@@ -63,7 +70,7 @@ use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::status;
 use crate::terminal::Terminal;
 use crate::theme::Theme;
-use crate::tree::{FileTree, TreeAction};
+use crate::tree::{Entry, FileTree, TreeAction};
 use crate::workspace::Workspace;
 
 const DIVIDER: Rgba = Rgba::rgb(69, 71, 90);
@@ -98,6 +105,8 @@ enum Armed {
     /// Closing this, and losing its unsaved changes or stopping what's
     /// running in it.
     Close(Recent),
+    /// Moving this to the Trash.
+    Trash(PathBuf),
 }
 
 /// What the main loop should do after the app handled input.
@@ -202,6 +211,9 @@ pub struct App {
     search: Option<SearchModal>,
     /// The file dialog, while open. Never open with the picker or search.
     dialog: Option<FileDialog>,
+    /// A context menu, while open, and what its commands act on. Never
+    /// open with another popup.
+    menu: Option<(ContextMenu, Entry)>,
     /// What the last search left behind, for the next one.
     search_memory: Memory,
     /// The last find bar's query and replacement.
@@ -298,6 +310,7 @@ impl App {
             recent: Vec::new(),
             search: None,
             dialog: None,
+            menu: None,
             search_memory: Memory::default(),
             find_memory: find::Memory::default(),
         };
@@ -357,6 +370,8 @@ impl App {
             }
         }
         let context = match self.focus {
+            // Its keys are the picker's.
+            _ if self.menu.is_some() => Context::Picker,
             _ if self.search.is_some() => Context::Search,
             _ if self.dialog.is_some() => Context::Dialog,
             _ if self.picker.is_some() => Context::Picker,
@@ -387,6 +402,7 @@ impl App {
                 }
                 self.run(command, select)
             }
+            None if self.menu.is_some() => AppAction::Continue,
             None if self.query_input().is_some() => {
                 self.edit_query(key);
                 AppAction::Continue
@@ -411,7 +427,7 @@ impl App {
             Some(command) => {
                 matches!(
                     command,
-                    Quit | ClosePanel | CloseFile | CloseTerminal | Palette | GoToFile
+                    Quit | ClosePanel | CloseFile | CloseTerminal | TreeTrash | Palette | GoToFile
                 ) || command.context() == Context::Picker
             }
             // Typing in the picker's query.
@@ -585,6 +601,10 @@ impl App {
                     Context::Picker | Context::Search | Context::Dialog
                 ) || (command.context() == Context::SearchOptions && self.search.is_some()) =>
             {
+                if let Some((menu, _)) = &mut self.menu {
+                    let action = menu.run(command);
+                    return self.menu_action(action);
+                }
                 if let Some(search) = &mut self.search {
                     let action = search.run(command);
                     return self.search_action(action);
@@ -598,6 +618,20 @@ impl App {
                 };
                 let action = picker.run(command);
                 return self.picker_action(action);
+            }
+            Command::TreeContextMenu => self.show_tree_menu(),
+            Command::TreeOpenToSide
+            | Command::TreeNewFile
+            | Command::TreeNewFolder
+            | Command::TreeRename
+            | Command::TreeDuplicate
+            | Command::TreeTrash
+            | Command::TreeCopyPath
+            | Command::TreeCopyRelativePath
+            | Command::TreeReveal
+            | Command::TreeOpenInTerminal => {
+                let target = self.file_target();
+                return self.file_command(command, target, false);
             }
             command if command.context() == Context::Tree => {
                 let action = self.tree.run(command);
@@ -623,6 +657,15 @@ impl App {
     }
 
     fn dispatch_mouse(&mut self, mouse: Mouse, now: Instant) -> AppAction {
+        if let Some((menu, _)) = &mut self.menu {
+            let action = menu.handle_mouse(mouse);
+            if action != MenuAction::CloseAndPass {
+                // Nor does the rest of a click on it go anywhere else.
+                self.mouse_target = None;
+                return self.menu_action(action);
+            }
+            self.menu = None;
+        }
         if let Some(search) = &mut self.search {
             let action = search.handle_mouse(mouse);
             let action = self.search_action(action);
@@ -669,6 +712,21 @@ impl App {
 
         match target {
             MouseTarget::Tree => match mouse.kind {
+                // Ctrl+click, as on macOS.
+                MouseKind::Press(button)
+                    if button == MouseButton::Right
+                        || (button == MouseButton::Left && mouse.mods.ctrl) =>
+                {
+                    self.focus = Focus::Tree;
+                    // Below the entries, it's for the workspace's folder.
+                    let target = match self.tree.select_at(mouse.y) {
+                        true => self.tree.selected(),
+                        false => self.tree.root(),
+                    };
+                    if let Some(target) = target {
+                        self.open_menu(target, Some((mouse.x, mouse.y)));
+                    }
+                }
                 MouseKind::Press(MouseButton::Left) => {
                     self.focus = Focus::Tree;
                     let double = self.last_tree_click.is_some_and(|(y, time)| {
@@ -893,6 +951,10 @@ impl App {
             let rect = drop.rect;
             frame.fill_rect(rect.x, rect.y, rect.width, rect.height, DROP_TINT);
         }
+        if let Some((menu, _)) = &self.menu {
+            menu.draw(frame);
+            return None;
+        }
         if let Some(search) = &self.search {
             return search.draw(frame);
         }
@@ -1021,6 +1083,7 @@ impl App {
     /// Opens the picker listing `mode`, or switches it to `mode`. Pressed
     /// again, the same shortcut closes it.
     fn show_picker(&mut self, mode: Mode) {
+        self.menu = None;
         self.close_search();
         self.dialog = None;
         match &mut self.picker {
@@ -1101,6 +1164,7 @@ impl App {
             self.close_search();
             return;
         }
+        self.menu = None;
         self.picker = None;
         self.dialog = None;
         let selected = self
@@ -1133,6 +1197,7 @@ impl App {
     }
 
     fn close_popups(&mut self) {
+        self.menu = None;
         self.picker = None;
         self.dialog = None;
         self.close_search();
@@ -1585,16 +1650,23 @@ impl App {
                     return;
                 }
             },
-            Purpose::Open | Purpose::Create => None,
+            _ => None,
         };
         let name = current
             .as_deref()
             .and_then(Path::file_name)
             .map_or(String::new(), |name| name.to_string_lossy().into_owned());
+        self.open_dialog(purpose, &self.dialog_folder(), &name, current);
+    }
+
+    /// Opens the file dialog for `purpose` in `dir`, with `name` suggested,
+    /// for `current` (see [`FileDialog::new`]).
+    fn open_dialog(&mut self, purpose: Purpose, dir: &Path, name: &str, current: Option<PathBuf>) {
+        self.close_popups();
         self.dialog = Some(FileDialog::new(
             purpose,
-            &self.dialog_folder(),
-            &name,
+            dir,
+            name,
             current,
             &self.keymap,
             self.width,
@@ -1635,6 +1707,17 @@ impl App {
                     }
                     Purpose::SaveAs => self.save_as(&path),
                     Purpose::Create => self.create_file(&path),
+                    Purpose::CreateFolder => self.create_folder(&path),
+                    Purpose::Move | Purpose::Duplicate => match dialog.current() {
+                        Some(from) => {
+                            let from = from.to_path_buf();
+                            match dialog.purpose() {
+                                Purpose::Move => self.move_entry(&from, &path),
+                                _ => self.duplicate(&from, &path),
+                            }
+                        }
+                        None => Ok(AppAction::Continue),
+                    },
                 };
                 match result {
                     Ok(action) => return action,
@@ -1771,14 +1854,327 @@ impl App {
         }
     }
 
+    // --- file commands ----------------------------------------------------------
+
+    /// What the file commands act on: the entry selected in the tree, if it
+    /// has the keyboard, or else the file on screen, or the workspace's
+    /// folder.
+    fn file_target(&self) -> Entry {
+        if self.focus == Focus::Tree {
+            if let Some(entry) = self.tree.selected() {
+                return entry;
+            }
+        }
+        if let Some(path) = self.active_panel().document().and_then(|doc| doc.path()) {
+            return Entry {
+                path,
+                is_dir: false,
+                is_root: false,
+            };
+        }
+        Entry {
+            path: self.workspace_folder(),
+            is_dir: true,
+            is_root: true,
+        }
+    }
+
+    /// Shift+F10, or from the palette: the context menu of the tree's
+    /// selection, next to it. From elsewhere, the tree shows the file on
+    /// screen first.
+    fn show_tree_menu(&mut self) {
+        if self.focus != Focus::Tree {
+            let file = self.active_panel().document().and_then(|doc| doc.path());
+            self.run(Command::FocusTree, false);
+            if let Some(file) = file {
+                self.tree.reveal(&file);
+            }
+        }
+        if self.focus != Focus::Tree {
+            return;
+        }
+        if let Some(target) = self.tree.selected() {
+            self.open_menu(target, None);
+        }
+    }
+
+    /// Opens the context menu of the file or folder `target`, at the cell
+    /// right-clicked, or from the keyboard, next to the tree's selection.
+    fn open_menu(&mut self, target: Entry, at: Option<(u32, u32)>) {
+        use Command::*;
+        let item = |command, label: &str| MenuItem::Command(command, label.to_string());
+        let mut items = Vec::new();
+        if !target.is_dir {
+            items.extend([
+                item(TreeOpen, "Open"),
+                item(TreeOpenToSide, "Open to the Side"),
+                MenuItem::Separator,
+            ]);
+        }
+        items.extend([
+            item(TreeNewFile, "New File…"),
+            item(TreeNewFolder, "New Folder…"),
+        ]);
+        if target.is_dir {
+            items.push(item(TreeOpenInTerminal, "Open in Terminal"));
+        }
+        if !target.is_root {
+            items.extend([
+                MenuItem::Separator,
+                item(TreeRename, "Rename…"),
+                item(TreeDuplicate, "Duplicate…"),
+                item(TreeTrash, "Move to Trash"),
+            ]);
+        }
+        let reveal = match cfg!(target_os = "macos") {
+            true => "Reveal in Finder",
+            false => "Open Containing Folder",
+        };
+        items.extend([
+            MenuItem::Separator,
+            item(TreeCopyPath, "Copy Path"),
+            item(TreeCopyRelativePath, "Copy Relative Path"),
+            item(TreeReveal, reveal),
+        ]);
+        let (x, y) = at
+            .or_else(|| self.tree.selected_position())
+            .unwrap_or((0, 0));
+        let menu = ContextMenu::new(
+            items,
+            &self.keymap,
+            x,
+            y,
+            at.is_some(),
+            self.width,
+            self.height,
+        );
+        self.close_popups();
+        self.menu = Some((menu, target));
+    }
+
+    fn menu_action(&mut self, action: MenuAction) -> AppAction {
+        match action {
+            MenuAction::Continue => AppAction::Continue,
+            MenuAction::Close | MenuAction::CloseAndPass => {
+                self.menu = None;
+                AppAction::Continue
+            }
+            MenuAction::Accept(command) => match self.menu.take() {
+                Some((_, target)) => self.file_command(command, target, true),
+                None => AppAction::Continue,
+            },
+        }
+    }
+
+    /// Runs the file command `command` on `target`. Trashing asks first,
+    /// unless it was chosen from a context menu.
+    fn file_command(&mut self, command: Command, target: Entry, from_menu: bool) -> AppAction {
+        let parent = match target.path.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => self.workspace_folder(),
+        };
+        let folder = match target.is_dir {
+            true => target.path.clone(),
+            false => parent.clone(),
+        };
+        let name = file_name(&target.path);
+        match command {
+            Command::TreeOpen if !target.is_dir => {
+                if self.open(&target.path, false) {
+                    self.focus = Focus::Editor;
+                }
+            }
+            Command::TreeOpenToSide if !target.is_dir => {
+                let panels = self.panels.len();
+                self.split(Axis::Horizontal);
+                if self.panels.len() > panels && self.open(&target.path, false) {
+                    self.focus = Focus::Editor;
+                }
+            }
+            Command::TreeNewFile => self.open_dialog(Purpose::Create, &folder, "", None),
+            Command::TreeNewFolder => self.open_dialog(Purpose::CreateFolder, &folder, "", None),
+            Command::TreeOpenInTerminal => self.new_terminal_in(&folder),
+            Command::TreeRename | Command::TreeDuplicate | Command::TreeTrash if target.is_root => {
+                self.show_message(format!("{name} is a workspace folder."), false);
+            }
+            Command::TreeRename => {
+                self.open_dialog(Purpose::Move, &parent, &name, Some(target.path));
+            }
+            Command::TreeDuplicate => {
+                let copy = copy_name(&target.path);
+                self.open_dialog(Purpose::Duplicate, &parent, &copy, Some(target.path));
+            }
+            Command::TreeTrash => self.trash(&target.path, from_menu),
+            Command::TreeCopyPath => {
+                return self.copy_path(target.path.display().to_string());
+            }
+            Command::TreeCopyRelativePath => {
+                let relative = match self.workspace.root_of(&target.path) {
+                    Some(root) => target.path.strip_prefix(root).unwrap_or(&target.path),
+                    None => &target.path,
+                };
+                let relative = match relative.as_os_str().is_empty() {
+                    true => ".".to_string(),
+                    false => relative.display().to_string(),
+                };
+                return self.copy_path(relative);
+            }
+            Command::TreeReveal => self.reveal(&target.path),
+            _ => {}
+        }
+        AppAction::Continue
+    }
+
+    /// Puts the path `text` on the clipboard.
+    fn copy_path(&mut self, text: String) -> AppAction {
+        self.show_message(format!("Copied {text}"), false);
+        self.clipboard = Some(text.clone());
+        AppAction::Copy(text)
+    }
+
+    /// Creates the folder `path`, and those it's in if need be.
+    fn create_folder(&mut self, path: &Path) -> Result<AppAction, String> {
+        fs::create_dir_all(path).map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
+        self.tree.refresh();
+        self.tree.reveal(path);
+        Ok(AppAction::Continue)
+    }
+
+    /// Renames or moves the file or folder `from` to `to`, creating the
+    /// folder it goes in if need be. Open files go with it.
+    fn move_entry(&mut self, from: &Path, to: &Path) -> Result<AppAction, String> {
+        if to.starts_with(from) && to != from {
+            return Err("Can't move a folder into itself.".to_string());
+        }
+        if let Some(folder) = to.parent() {
+            fs::create_dir_all(folder).map_err(|err| format!("Can't create its folder: {err}"))?;
+        }
+        fs::rename(from, to).map_err(|err| format!("Can't move {}: {err}", file_name(from)))?;
+        // Open files have their paths resolved.
+        let (resolved_from, resolved_to) = (document::resolve(from), document::resolve(to));
+        let moved = |path: &Path| {
+            let rest = path.strip_prefix(&resolved_from).ok()?;
+            Some(match rest.as_os_str().is_empty() {
+                true => resolved_to.clone(),
+                false => resolved_to.join(rest),
+            })
+        };
+        for doc in &self.documents {
+            if let Some(path) = doc.path().and_then(|path| moved(&path)) {
+                doc.rename(path);
+            }
+        }
+        for recent in &mut self.recent {
+            if let Recent::File(path) = recent {
+                if let Some(moved) = moved(path) {
+                    *path = moved;
+                }
+            }
+        }
+        self.tree.moved(from, to);
+        self.files.refresh();
+        self.show_active_in_tree();
+        let message = match from.parent() == to.parent() {
+            true => format!("Renamed {} to {}.", file_name(from), file_name(to)),
+            false => format!(
+                "Moved {} to {}.",
+                file_name(from),
+                self.workspace.display_path(to)
+            ),
+        };
+        self.show_message(message, false);
+        Ok(AppAction::Continue)
+    }
+
+    /// Copies the file or folder `from` to `to`, creating the folder it goes
+    /// in if need be.
+    fn duplicate(&mut self, from: &Path, to: &Path) -> Result<AppAction, String> {
+        if to.starts_with(from) {
+            return Err("Can't copy a folder into itself.".to_string());
+        }
+        if let Some(folder) = to.parent() {
+            fs::create_dir_all(folder).map_err(|err| format!("Can't create its folder: {err}"))?;
+        }
+        copy_all(from, to).map_err(|err| format!("Can't copy {}: {err}", file_name(from)))?;
+        self.tree.refresh();
+        self.tree.reveal(to);
+        self.files.refresh();
+        Ok(AppAction::Continue)
+    }
+
+    /// Moves the file or folder at `path` to the Trash, after asking, unless
+    /// `confirmed`. Open files that were in it close, unless they have
+    /// unsaved changes, which saving puts back.
+    fn trash(&mut self, path: &Path, confirmed: bool) {
+        let name = file_name(path);
+        let armed = Some(Armed::Trash(path.to_path_buf()));
+        if !confirmed && self.armed != armed {
+            self.armed = armed;
+            let again = self.shortcut(Command::TreeTrash);
+            self.show_message(format!("{again} again moves {name} to the Trash."), true);
+            return;
+        }
+        self.armed = None;
+        let resolved = document::resolve(path);
+        if let Err(err) = move_to_trash(path) {
+            self.show_message(format!("Can't move {name} to the Trash: {err}"), true);
+            return;
+        }
+        let closing: Vec<Rc<Document>> = self
+            .documents
+            .iter()
+            .filter(|doc| !doc.is_modified())
+            .filter(|doc| doc.path().is_some_and(|open| open.starts_with(&resolved)))
+            .cloned()
+            .collect();
+        for doc in closing {
+            self.destroy_document(&doc);
+        }
+        self.recent
+            .retain(|recent| !matches!(recent, Recent::File(open) if open.starts_with(&resolved)));
+        self.tree.refresh();
+        self.files.refresh();
+        self.show_message(format!("Moved {name} to the Trash."), false);
+    }
+
+    /// Shows `path` in the Finder, or elsewhere, opens its folder.
+    fn reveal(&mut self, path: &Path) {
+        let mut command = match cfg!(target_os = "macos") {
+            true => {
+                let mut command = std::process::Command::new("open");
+                command.arg("-R").arg(path);
+                command
+            }
+            false => {
+                let mut command = std::process::Command::new("xdg-open");
+                command.arg(path.parent().unwrap_or(path));
+                command
+            }
+        };
+        let spawned = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            // Waited for, so it doesn't linger as a zombie.
+            Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+            Err(err) => self.show_message(format!("Can't show {}: {err}", file_name(path)), true),
+        }
+    }
+
     // --- terminals --------------------------------------------------------------
 
     /// Starts a shell in the workspace's first folder, in the active panel.
     fn new_terminal(&mut self) {
-        let cwd = self.workspace_folder();
+        self.new_terminal_in(&self.workspace_folder());
+    }
+
+    /// Starts a shell in `cwd`, in the active panel.
+    fn new_terminal_in(&mut self, cwd: &Path) {
         let body = self.active_panel().body();
         let id = self.next_terminal;
-        match Terminal::new(id, &cwd, body) {
+        match Terminal::new(id, cwd, body) {
             Ok(terminal) => {
                 self.next_terminal += 1;
                 let terminal = Rc::new(RefCell::new(terminal));
@@ -1829,7 +2225,10 @@ impl App {
 
     /// The terminal keys go to, if one has the keyboard.
     fn keyboard_terminal(&self) -> Option<Rc<RefCell<Terminal>>> {
-        let popup = self.picker.is_some() || self.search.is_some() || self.dialog.is_some();
+        let popup = self.picker.is_some()
+            || self.search.is_some()
+            || self.dialog.is_some()
+            || self.menu.is_some();
         if self.focus != Focus::Editor || popup {
             return None;
         }
@@ -1966,6 +2365,9 @@ impl App {
         if let Some(dialog) = &mut self.dialog {
             dialog.set_size(self.width, self.height);
         }
+        if let Some((menu, _)) = &mut self.menu {
+            menu.set_size(self.width, self.height);
+        }
         for (id, area) in self.layout.panels(self.main_area()) {
             if let Some(panel) = self.panels.iter_mut().find(|panel| panel.id == id) {
                 panel.set_area(area);
@@ -2020,6 +2422,71 @@ fn document_target(doc: &Document) -> Recent {
         Some(path) => Recent::File(path),
         None => Recent::Untitled(doc.untitled.get()),
     }
+}
+
+/// A name for a copy of `path` next to it, as the Finder names them:
+/// `a copy.txt`, then `a copy 2.txt`, and so on.
+fn copy_name(path: &Path) -> String {
+    let name = file_name(path);
+    let (stem, extension) = match path.extension() {
+        Some(extension) if !path.is_dir() => (
+            name.strip_suffix(&format!(".{}", extension.to_string_lossy()))
+                .unwrap_or(&name),
+            format!(".{}", extension.to_string_lossy()),
+        ),
+        _ => (name.as_str(), String::new()),
+    };
+    (1..)
+        .map(|n| match n {
+            1 => format!("{stem} copy{extension}"),
+            n => format!("{stem} copy {n}{extension}"),
+        })
+        .find(|copy| fs::symlink_metadata(path.with_file_name(copy)).is_err())
+        .unwrap_or_default()
+}
+
+/// Copies the file, folder, or symlink `from` to `to`, which doesn't exist.
+fn copy_all(from: &Path, to: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(from)?;
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(from)?, to)
+    } else if meta.is_dir() {
+        fs::create_dir(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            copy_all(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        fs::copy(from, to).map(drop)
+    }
+}
+
+/// Moves `path` to the Trash.
+#[cfg(not(test))]
+fn move_to_trash(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let trashed = {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut context = trash::TrashContext::default();
+        // The default, the Finder's AppleScript, asks for permission to
+        // control the Finder, and plays its sound.
+        context.set_delete_method(DeleteMethod::NsFileManager);
+        context.delete(path)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let trashed = trash::delete(path);
+    trashed.map_err(|err| err.to_string())
+}
+
+/// Tests delete instead, to leave the Trash alone.
+#[cfg(test)]
+fn move_to_trash(path: &Path) -> Result<(), String> {
+    let removed = match path.is_dir() {
+        true => fs::remove_dir_all(path),
+        false => fs::remove_file(path),
+    };
+    removed.map_err(|err| err.to_string())
 }
 
 fn file_name(path: &Path) -> String {
@@ -3652,5 +4119,282 @@ mod tests {
             }
         }
         assert!(screen(&app).contains("│"));
+    }
+
+    // --- context menu and file commands ----------------------------------------
+
+    /// An app over a screen tall enough for the tree's context menu.
+    fn tall_app(root: &Path, file: Option<&str>) -> App {
+        let workspace = Workspace::new([root.to_path_buf()]).unwrap();
+        App::new(workspace, file.map(|f| root.join(f)), 80, 24).unwrap()
+    }
+
+    fn tall_screen(app: &App) -> String {
+        let frame = OwnedBuffer::new(80, 24, false, WidthMethod::Unicode, "test").unwrap();
+        app.draw(&frame);
+        frame.to_text(true)
+    }
+
+    fn mouse_at(app: &mut App, kind: MouseKind, x: u32, y: u32) {
+        let mouse = Mouse {
+            kind,
+            x,
+            y,
+            mods: Mods::NONE,
+        };
+        app.handle_mouse(mouse, Instant::now());
+    }
+
+    fn right_click(app: &mut App, x: u32, y: u32) {
+        mouse_at(app, MouseKind::Press(MouseButton::Right), x, y);
+        mouse_at(app, MouseKind::Release(MouseButton::Right), x, y);
+    }
+
+    /// Clicks the menu item labeled `label`.
+    fn click_item(app: &mut App, label: &str) {
+        let text = tall_screen(app);
+        let (y, line) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(&format!("│ {label}")))
+            .unwrap_or_else(|| panic!("no {label} in\n{text}"));
+        let x = line.chars().position(|c| c == '│').unwrap() as u32;
+        // Past the tree's divider, if the menu is right of it.
+        let x = line.chars().skip(x as usize + 1).position(|c| c == '│').map_or(x, |_| x);
+        left_click(app, x + 2, y as u32);
+    }
+
+    #[test]
+    fn right_clicking_a_file_in_the_tree_renames_it_from_the_menu() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-rename", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = tall_app(&root, Some("a.txt"));
+        type_text(&mut app, "1");
+
+        // The root is on row 0, a.txt on row 1.
+        right_click(&mut app, 4, 1);
+        assert!(app.menu.is_some(), "the release left it open");
+        assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(app.tree.selected().unwrap().path, root.join("a.txt"));
+        let text = tall_screen(&app);
+        assert!(text.contains("Rename…"), "{text}");
+        assert!(!text.contains("Open in Terminal"), "that's for folders");
+
+        click_item(&mut app, "Rename…");
+        assert!(app.menu.is_none());
+        assert_eq!(app.dialog.as_ref().map(|d| d.purpose()), Some(Purpose::Move));
+        type_text(&mut app, "c.txt");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none(), "{}", tall_screen(&app));
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(fs::read_to_string(root.join("c.txt")).unwrap(), "alpha");
+        assert_eq!(
+            app.ed().path().as_deref(),
+            Some(root.join("c.txt").as_path()),
+            "the open file went with it"
+        );
+        assert!(tall_screen(&app).contains("1alpha"), "keeping its edit");
+        assert_eq!(app.tree.selected().unwrap().path, root.join("c.txt"));
+    }
+
+    #[test]
+    fn renaming_to_an_existing_name_is_refused() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-exists", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = tall_app(&root, None);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::F(2));
+        type_text(&mut app, "b.txt");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_some());
+        assert!(tall_screen(&app).contains("b.txt already exists."));
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "beta");
+
+        // Enter on the name it has leaves it be.
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "a.txt");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none());
+        assert!(root.join("a.txt").exists());
+    }
+
+    #[test]
+    fn moving_a_folder_takes_its_open_files_and_expanded_folders() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "menu-move",
+            &[("src/deep/x.rs", "fn x() {}"), ("dest/keep.txt", "")],
+        );
+        let mut app = tall_app(&root, Some("src/deep/x.rs"));
+        app.focus = Focus::Tree;
+        app.tree.reveal(&root.join("src"));
+        app.run(Command::TreeRename, false);
+        // Replace the whole path.
+        app.paste(&format!("{}/dest/src", root.display()));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none(), "{}", tall_screen(&app));
+        let moved = root.join("dest/src/deep/x.rs");
+        assert!(moved.is_file());
+        assert_eq!(app.ed().path().as_deref(), Some(moved.as_path()));
+        assert!(tall_screen(&app).contains("x.rs"), "still expanded to it");
+    }
+
+    #[test]
+    fn a_folder_cant_move_into_itself() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-into", &[("src/a.rs", "")]);
+        let mut app = tall_app(&root, None);
+        key(&mut app, KeyCode::Down);
+        app.run(Command::TreeRename, false);
+        app.paste(&format!("{}/src/inner/src", root.display()));
+        key(&mut app, KeyCode::Enter);
+        assert!(tall_screen(&app).contains("Can't move a folder into itself."));
+        assert!(root.join("src/a.rs").is_file());
+    }
+
+    #[test]
+    fn duplicating_names_copies_as_the_finder_does() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "menu-duplicate",
+            &[("a.txt", "alpha"), ("a copy.txt", ""), ("dir/b.txt", "beta")],
+        );
+        let mut app = tall_app(&root, None);
+        // dir, then a copy.txt, then a.txt.
+        for _ in 0..3 {
+            key(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.tree.selected().unwrap().path, root.join("a.txt"));
+        app.run(Command::TreeDuplicate, false);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(fs::read_to_string(root.join("a copy 2.txt")).unwrap(), "alpha");
+
+        app.tree.reveal(&root.join("dir"));
+        app.run(Command::TreeDuplicate, false);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(fs::read_to_string(root.join("dir copy/b.txt")).unwrap(), "beta");
+        assert_eq!(app.tree.selected().unwrap().path, root.join("dir copy"));
+    }
+
+    #[test]
+    fn delete_asks_before_trashing_but_the_menu_doesnt() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-trash", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = tall_app(&root, Some("a.txt"));
+        app.focus = Focus::Tree;
+        app.tree.reveal(&root.join("a.txt"));
+        key(&mut app, KeyCode::Delete);
+        assert!(root.join("a.txt").exists());
+        assert!(tall_screen(&app).contains("Delete again moves a.txt to the Trash."));
+        key(&mut app, KeyCode::Delete);
+        assert!(!root.join("a.txt").exists());
+        assert!(!app.ed_is_shown(), "its unedited file closed");
+
+        // b.txt is on row 1 now.
+        right_click(&mut app, 4, 1);
+        click_item(&mut app, "Move to Trash");
+        assert!(!root.join("b.txt").exists());
+    }
+
+    #[test]
+    fn roots_arent_renamed_or_trashed() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-root", &[("a.txt", "")]);
+        let mut app = tall_app(&root, None);
+        right_click(&mut app, 2, 0);
+        let text = tall_screen(&app);
+        assert!(text.contains("Open in Terminal"), "{text}");
+        assert!(!text.contains("Rename"), "{text}");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.menu.is_none());
+        key(&mut app, KeyCode::Delete);
+        key(&mut app, KeyCode::Delete);
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn new_folder_from_the_menu_goes_in_the_folder_clicked() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-folder", &[("dir/a.txt", "")]);
+        let mut app = tall_app(&root, None);
+        // Below the entries, the menu is the workspace folder's.
+        right_click(&mut app, 4, 15);
+        click_item(&mut app, "New Folder…");
+        assert_eq!(
+            app.dialog.as_ref().map(|d| d.purpose()),
+            Some(Purpose::CreateFolder)
+        );
+        type_text(&mut app, "made");
+        key(&mut app, KeyCode::Enter);
+        assert!(root.join("made").is_dir());
+        assert_eq!(app.tree.selected().unwrap().path, root.join("made"));
+    }
+
+    #[test]
+    fn shift_f10_opens_the_menu_from_the_keyboard() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-keys", &[("a.txt", "alpha")]);
+        let mut app = tall_app(&root, None);
+        key(&mut app, KeyCode::Down);
+        let shift = Mods {
+            shift: true,
+            ..Mods::NONE
+        };
+        app.handle_key(Key::new(KeyCode::F(10), shift));
+        assert!(app.menu.is_some());
+        type_text(&mut app, "x");
+        assert!(app.menu.is_some(), "typing does nothing");
+        // Open is first.
+        key(&mut app, KeyCode::Enter);
+        assert!(app.menu.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(tall_screen(&app).contains("alpha"));
+    }
+
+    #[test]
+    fn a_left_click_outside_closes_the_menu_and_a_right_click_moves_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-outside", &[("a.txt", ""), ("b.txt", "")]);
+        let mut app = tall_app(&root, None);
+        right_click(&mut app, 4, 1);
+        // Left of the menu, which is over the row.
+        right_click(&mut app, 1, 2);
+        assert!(app.menu.is_some());
+        assert_eq!(app.tree.selected().unwrap().path, root.join("b.txt"));
+        left_click(&mut app, 60, 20);
+        assert!(app.menu.is_none());
+        assert_eq!(app.focus, Focus::Tree, "that click only closed it");
+    }
+
+    #[test]
+    fn copy_relative_path_copies_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-copy", &[("dir/a.txt", "")]);
+        let mut app = tall_app(&root, Some("dir/a.txt"));
+        // From the editor, it's the file on screen's.
+        match app.run(Command::TreeCopyRelativePath, false) {
+            AppAction::Copy(text) => assert_eq!(text, "dir/a.txt"),
+            _ => panic!("nothing copied"),
+        }
+        assert_eq!(app.clipboard.as_deref(), Some("dir/a.txt"));
+    }
+
+    #[test]
+    fn the_menu_survives_tiny_screens() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-tiny", &[("a.txt", "")]);
+        let mut app = tall_app(&root, None);
+        right_click(&mut app, 4, 1);
+        for (width, height) in [(30, 5), (3, 2), (1, 1), (0, 0), (80, 24)] {
+            app.resize(width, height);
+            let frame =
+                OwnedBuffer::new(width.max(1), height.max(1), false, WidthMethod::Unicode, "t")
+                    .unwrap();
+            app.draw(&frame);
+            mouse_at(&mut app, MouseKind::Drag(MouseButton::Right), width / 2, height / 2);
+        }
+        assert!(app.menu.is_some());
     }
 }

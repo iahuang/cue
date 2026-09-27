@@ -15,6 +15,10 @@
 //!
 //! Saving and creating take a path that doesn't exist yet, folders
 //! included, which the app creates. Saving over another file asks first.
+//!
+//! From the file tree, it also names a new folder, where to rename or move
+//! a file or folder, and where to duplicate one. None of those replace
+//! anything already there.
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
@@ -51,6 +55,12 @@ pub enum Purpose {
     SaveAs,
     /// A file that doesn't exist yet, to create.
     Create,
+    /// A folder that doesn't exist yet, to create.
+    CreateFolder,
+    /// Where to rename or move the dialog's current file or folder.
+    Move,
+    /// Where to copy the dialog's current file or folder.
+    Duplicate,
 }
 
 impl Purpose {
@@ -59,6 +69,9 @@ impl Purpose {
             Purpose::Open => "Open File",
             Purpose::SaveAs => "Save As",
             Purpose::Create => "New File",
+            Purpose::CreateFolder => "New Folder",
+            Purpose::Move => "Rename or Move",
+            Purpose::Duplicate => "Duplicate",
         }
     }
 
@@ -110,7 +123,8 @@ pub struct FileDialog {
     caret: Caret,
     /// What relative paths are relative to: the folder it opened in.
     base: PathBuf,
-    /// The file being saved, which saving over again doesn't ask about.
+    /// The file being saved, which saving over again doesn't ask about, or
+    /// the file or folder being moved or duplicated.
     current: Option<PathBuf>,
     /// The name in the path is the one suggested, and selected: typing
     /// replaces it, and the whole folder is listed rather than narrowed to
@@ -182,6 +196,11 @@ impl FileDialog {
 
     pub fn purpose(&self) -> Purpose {
         self.purpose
+    }
+
+    /// The file being saved, moved, or duplicated.
+    pub fn current(&self) -> Option<&Path> {
+        self.current.as_deref()
     }
 
     pub fn set_size(&mut self, width: u32, height: u32) {
@@ -465,6 +484,10 @@ impl FileDialog {
             None => {}
         }
         let path = self.resolve(&self.text);
+        if self.purpose == Purpose::Move && self.current.as_ref() == Some(&path) {
+            // Left where it is.
+            return DialogAction::Close;
+        }
         if path.is_dir() {
             // `..` typed, or a folder the list didn't narrow to.
             self.navigate(&path, false);
@@ -491,6 +514,22 @@ impl FileDialog {
                 DialogAction::Continue
             }
             Purpose::Create => DialogAction::Accept(path),
+            // A new name for the same file, as when only its case changes.
+            Purpose::Move
+                if self
+                    .current
+                    .as_deref()
+                    .is_some_and(|current| document::same_file(current, &path)) =>
+            {
+                DialogAction::Accept(path)
+            }
+            Purpose::CreateFolder | Purpose::Move | Purpose::Duplicate if exists => {
+                self.show_error(format!("{name} already exists."));
+                DialogAction::Continue
+            }
+            Purpose::CreateFolder | Purpose::Move | Purpose::Duplicate => {
+                DialogAction::Accept(path)
+            }
             Purpose::SaveAs => {
                 let current = self
                     .current
@@ -552,7 +591,7 @@ impl FileDialog {
         self.rows = rows;
         self.selected = match self.purpose {
             Purpose::Open => self.rows.iter().position(|&row| row != Row::Parent),
-            Purpose::SaveAs | Purpose::Create => None,
+            _ => None,
         };
         self.scroll = 0;
         self.scroll_into_view();
@@ -683,7 +722,9 @@ impl FileDialog {
             _ if self.filter().is_empty() => "An empty folder.".to_string(),
             Purpose::Open => "No matching files.".to_string(),
             Purpose::SaveAs => format!("Enter saves as {}.", self.name()),
-            Purpose::Create => format!("Enter creates {}.", self.name()),
+            Purpose::Create | Purpose::CreateFolder => format!("Enter creates {}.", self.name()),
+            Purpose::Move => format!("Enter moves it to {}.", self.name()),
+            Purpose::Duplicate => format!("Enter copies it to {}.", self.name()),
         };
         Some((text, DIM))
     }
