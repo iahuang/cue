@@ -5,12 +5,17 @@
 //! language's highlight query. After an edit it reparses only what changed,
 //! which it finds by comparing the text before and after, so typing, undo,
 //! and replacing all go the same way.
+//!
+//! An [`ExcerptHighlighter`] colors a few lines of a file at a time, for
+//! search results, on any thread, and remembers them for the next search.
 
-use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::{ControlFlow, Range};
-use std::rc::Rc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use opentui::{EditBuffer, Highlight};
@@ -19,7 +24,7 @@ use tree_sitter::{
 };
 
 use crate::language::Language;
-use crate::theme::Theme;
+use crate::theme::{SyntaxColor, Theme};
 
 /// Tags syntax highlights.
 pub const HIGHLIGHTS: u16 = 2;
@@ -34,41 +39,330 @@ const MAX_CAPTURES: usize = 20_000;
 /// How many stretches of lines stay highlighted at once: one per panel
 /// showing the text, so panels don't take turns repainting.
 const MAX_PAINTED: usize = 4;
+/// Larger files' excerpts are left plain: search results come from many
+/// files, and each is parsed whole.
+pub const MAX_EXCERPT_BYTES: usize = 2 << 20;
+/// The excerpt cache forgets the files used longest ago past this many
+/// spans, about 24 bytes each.
+const MAX_CACHED_SPANS: usize = 1 << 20;
 
 /// A language's grammar and compiled highlight query.
 struct Grammar {
     language: tree_sitter::Language,
     query: Query,
+    /// Colors by capture index; `None` for captures left uncolored.
+    colors: Vec<Option<SyntaxColor>>,
 }
 
-thread_local! {
-    /// By language name, compiled on first use: a big query takes a while.
-    static GRAMMARS: RefCell<HashMap<&'static str, Option<Rc<Grammar>>>> =
-        RefCell::default();
-}
+/// Grammars by language name; `None` for one whose query doesn't compile.
+type Grammars = HashMap<&'static str, Option<Arc<Grammar>>>;
 
-fn grammar(language: &'static Language) -> Option<Rc<Grammar>> {
+/// Compiled on first use: a big query takes a while. Shared by every thread.
+static GRAMMARS: LazyLock<Mutex<Grammars>> = LazyLock::new(Default::default);
+
+fn grammar(language: &'static Language) -> Option<Arc<Grammar>> {
     let syntax = language.syntax.as_ref()?;
-    GRAMMARS.with_borrow_mut(|grammars| {
-        grammars
-            .entry(language.name)
-            .or_insert_with(|| {
-                let grammar = (syntax.grammar)();
-                // Neovim's `#lua-match?` takes Lua patterns, which the
-                // queries only use where they read the same as regexes.
-                let source = syntax.highlights.concat().replace("#lua-match?", "#match?");
-                let query = Query::new(&grammar, &source).ok()?;
-                Some(Rc::new(Grammar {
-                    language: grammar,
-                    query,
-                }))
-            })
-            .clone()
-    })
+    let mut grammars = GRAMMARS.lock().unwrap_or_else(|e| e.into_inner());
+    grammars
+        .entry(language.name)
+        .or_insert_with(|| {
+            let grammar = (syntax.grammar)();
+            // Neovim's `#lua-match?` takes Lua patterns, which the queries
+            // only use where they read the same as regexes.
+            let source = syntax.highlights.concat().replace("#lua-match?", "#match?");
+            let query = Query::new(&grammar, &source).ok()?;
+            let colors = query
+                .capture_names()
+                .iter()
+                .map(|name| SyntaxColor::of(name))
+                .collect();
+            Some(Arc::new(Grammar {
+                language: grammar,
+                query,
+                colors,
+            }))
+        })
+        .clone()
+}
+
+/// Parses `text` with `parser`, reusing `old`, the tree of the text before,
+/// for what didn't change. Gives up after `budget`, if any, or once `stop`
+/// is set.
+fn parse(
+    parser: &mut Parser,
+    text: &str,
+    old: Option<&Tree>,
+    budget: Option<Duration>,
+    stop: &AtomicBool,
+) -> Option<Tree> {
+    // Small texts are parsed before the first check of progress.
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    let deadline = budget.map(|budget| Instant::now() + budget);
+    let mut progress = |_: &ParseState| {
+        let late = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if !late && !stop.load(Ordering::Relaxed) {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    };
+    let bytes = text.as_bytes();
+    parser.parse_with_options(
+        &mut |at, _| &bytes[at.min(bytes.len())..],
+        old,
+        Some(ParseOptions::new().progress_callback(&mut progress)),
+    )
+}
+
+/// The styled spans of `bytes` of `text`, which `tree` is the tree of, with
+/// each capture's style from `styles`.
+fn query_spans<S: Copy>(
+    grammar: &Grammar,
+    cursor: &mut QueryCursor,
+    tree: &Tree,
+    text: &str,
+    bytes: Range<usize>,
+    styles: &[Option<S>],
+) -> Vec<Span<S>> {
+    cursor.set_byte_range(bytes.clone());
+    let mut captures = cursor.captures(&grammar.query, tree.root_node(), text.as_bytes());
+    let mut found = Vec::new();
+    while let Some((m, i)) = captures.next() {
+        let capture = m.captures()[*i];
+        found.push(Capture {
+            bytes: capture.node.byte_range(),
+            node: capture.node.id(),
+            style: styles[capture.index as usize],
+            pattern: m.pattern_index,
+        });
+        if found.len() == MAX_CAPTURES {
+            break;
+        }
+    }
+    flatten(found, bytes)
+}
+
+/// A line's syntax colors, as byte ranges in it, in order.
+pub type LineColors = Vec<(Range<usize>, SyntaxColor)>;
+
+/// Highlights a few lines of a file at a time, for search results: the
+/// file's parsed whole, so lines inside a block comment or a long string
+/// come out right. Runs on any thread.
+pub struct ExcerptHighlighter {
+    parser: Parser,
+    cursor: QueryCursor,
+}
+
+impl ExcerptHighlighter {
+    pub fn new() -> ExcerptHighlighter {
+        ExcerptHighlighter {
+            parser: Parser::new(),
+            cursor: QueryCursor::new(),
+        }
+    }
+
+    /// The colors of each of `lines` of `text`, the file at `path` in
+    /// `language`. `lines` are byte ranges of `text`, in order, each within
+    /// one line. `None` if qedit can't highlight the language, the text is
+    /// too big, or parsing was stopped by `stop`. There's no time limit: how
+    /// long is too long depends on the machine and the build.
+    ///
+    /// Lines colored before, of the same text, are remembered, so only
+    /// files with lines not seen yet are parsed.
+    pub fn highlight(
+        &mut self,
+        path: &Path,
+        language: &'static Language,
+        text: &str,
+        lines: &[Range<usize>],
+        stop: &AtomicBool,
+    ) -> Option<Vec<LineColors>> {
+        if text.len() > MAX_EXCERPT_BYTES {
+            return None;
+        }
+        let hash = hash(text);
+        let mut colors = EXCERPT_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path, hash, lines);
+        let missing: Vec<Range<usize>> = lines
+            .iter()
+            .zip(&colors)
+            .filter(|(_, colors)| colors.is_none())
+            .map(|(line, _)| line.clone())
+            .collect();
+        if missing.is_empty() {
+            return colors.into_iter().collect();
+        }
+        let found = self.parse_and_color(language, text, &missing, stop)?;
+        EXCERPT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).put(
+            path,
+            hash,
+            missing.iter().cloned().zip(found.iter().cloned()),
+        );
+        let mut found = found.into_iter();
+        for colors in &mut colors {
+            if colors.is_none() {
+                *colors = found.next();
+            }
+        }
+        colors.into_iter().collect()
+    }
+
+    /// Parses `text` and colors `lines` of it, as [`Self::highlight`].
+    fn parse_and_color(
+        &mut self,
+        language: &'static Language,
+        text: &str,
+        lines: &[Range<usize>],
+        stop: &AtomicBool,
+    ) -> Option<Vec<LineColors>> {
+        let grammar = grammar(language)?;
+        self.parser.set_language(&grammar.language).ok()?;
+        let tree = parse(&mut self.parser, text, None, None, stop)?;
+        let mut colors = Vec::with_capacity(lines.len());
+        // Lines that follow each other are queried together: one query
+        // per excerpt, not per line.
+        for group in lines.chunk_by(|a, b| b.start <= a.end + 2) {
+            let bytes = group[0].start..group[group.len() - 1].end;
+            let spans = query_spans(
+                &grammar,
+                &mut self.cursor,
+                &tree,
+                text,
+                bytes,
+                &grammar.colors,
+            );
+            let mut first = 0;
+            for line in group {
+                // Spans are in order and don't overlap; one can run on into
+                // the next line.
+                while spans.get(first).is_some_and(|s| s.bytes.end <= line.start) {
+                    first += 1;
+                }
+                let line_colors = spans[first..]
+                    .iter()
+                    .take_while(|s| s.bytes.start < line.end)
+                    .map(|s| {
+                        let start = s.bytes.start.max(line.start) - line.start;
+                        let end = s.bytes.end.min(line.end) - line.start;
+                        (start..end, s.style)
+                    })
+                    .collect();
+                colors.push(line_colors);
+            }
+        }
+        Some(colors)
+    }
+}
+
+fn hash(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Excerpts' colors from earlier searches, so typing a longer query, which
+/// finds the same lines or fewer, parses nothing again. Keeping the trees
+/// would save parsing for any line, but they take ~35 times the text's size.
+static EXCERPT_CACHE: LazyLock<Mutex<ExcerptCache>> = LazyLock::new(Default::default);
+
+#[derive(Default)]
+struct ExcerptCache {
+    files: HashMap<PathBuf, CachedFile>,
+    /// Spans in all files.
+    spans: usize,
+    /// Counts up with each use, for forgetting the files used longest ago.
+    clock: u64,
+}
+
+struct CachedFile {
+    /// Of the text the colors are for.
+    hash: u64,
+    used: u64,
+    /// By the line's byte range.
+    lines: HashMap<Range<usize>, LineColors>,
+    spans: usize,
+}
+
+impl ExcerptCache {
+    /// The colors of each of `lines` known for the text with `hash` of the
+    /// file at `path`.
+    fn get(&mut self, path: &Path, hash: u64, lines: &[Range<usize>]) -> Vec<Option<LineColors>> {
+        self.clock += 1;
+        let Some(file) = self.files.get_mut(path).filter(|file| file.hash == hash) else {
+            return vec![None; lines.len()];
+        };
+        file.used = self.clock;
+        lines
+            .iter()
+            .map(|line| file.lines.get(line).cloned())
+            .collect()
+    }
+
+    /// Remembers the colors of `lines` of the text with `hash`.
+    fn put(
+        &mut self,
+        path: &Path,
+        hash: u64,
+        lines: impl Iterator<Item = (Range<usize>, LineColors)>,
+    ) {
+        let file = self.file(path, hash);
+        let mut added = 0;
+        for (line, colors) in lines {
+            added += colors.len().max(1);
+            if let Some(old) = file.lines.insert(line, colors) {
+                added -= old.len().max(1);
+            }
+        }
+        file.spans += added;
+        self.spans += added;
+        self.forget_old();
+    }
+
+    /// The entry for the text with `hash` of the file at `path`, emptied if
+    /// it was for another text.
+    fn file(&mut self, path: &Path, hash: u64) -> &mut CachedFile {
+        self.clock += 1;
+        let file = self.files.entry(path.to_path_buf()).or_insert(CachedFile {
+            hash,
+            used: 0,
+            lines: HashMap::new(),
+            spans: 0,
+        });
+        if file.hash != hash {
+            self.spans -= file.spans;
+            *file = CachedFile {
+                hash,
+                used: 0,
+                lines: HashMap::new(),
+                spans: 0,
+            };
+        }
+        file.used = self.clock;
+        file
+    }
+
+    fn forget_old(&mut self) {
+        while self.spans > MAX_CACHED_SPANS {
+            let Some(oldest) = self
+                .files
+                .iter()
+                .min_by_key(|(_, file)| file.used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            let file = self.files.remove(&oldest).unwrap();
+            self.spans -= file.spans;
+        }
+    }
 }
 
 pub struct Highlighter {
-    grammar: Rc<Grammar>,
+    grammar: Arc<Grammar>,
     /// Style ids by capture index; `None` for captures left uncolored.
     styles: Vec<Option<u32>>,
     parser: Parser,
@@ -178,21 +472,14 @@ impl Highlighter {
                 None => return true,
             }
         }
-        let deadline = Instant::now() + PARSE_BUDGET;
-        let mut progress = |_: &ParseState| {
-            if Instant::now() < deadline {
-                ControlFlow::Continue(())
-            } else {
-                ControlFlow::Break(())
-            }
-        };
-        let bytes = text.as_bytes();
-        let tree = self.parser.parse_with_options(
-            &mut |at, _| &bytes[at.min(bytes.len())..],
+        let never = AtomicBool::new(false);
+        self.tree = parse(
+            &mut self.parser,
+            &text,
             self.tree.as_ref(),
-            Some(ParseOptions::new().progress_callback(&mut progress)),
+            Some(PARSE_BUDGET),
+            &never,
         );
-        self.tree = tree;
         self.text = text;
         self.line_starts = line_starts;
         self.tree.is_some()
@@ -206,28 +493,18 @@ impl Highlighter {
     }
 
     /// The styled spans of `bytes` of the text.
-    fn spans(&mut self, bytes: Range<usize>) -> Vec<Span> {
+    fn spans(&mut self, bytes: Range<usize>) -> Vec<Span<u32>> {
         let Some(tree) = &self.tree else {
             return Vec::new();
         };
-        self.cursor.set_byte_range(bytes.clone());
-        let mut captures =
-            self.cursor
-                .captures(&self.grammar.query, tree.root_node(), self.text.as_bytes());
-        let mut found = Vec::new();
-        while let Some((m, i)) = captures.next() {
-            let capture = m.captures()[*i];
-            found.push(Capture {
-                bytes: capture.node.byte_range(),
-                node: capture.node.id(),
-                style: self.styles[capture.index as usize],
-                pattern: m.pattern_index,
-            });
-            if found.len() == MAX_CAPTURES {
-                break;
-            }
-        }
-        flatten(found, bytes)
+        query_spans(
+            &self.grammar,
+            &mut self.cursor,
+            tree,
+            &self.text,
+            bytes,
+            &self.styles,
+        )
     }
 
     /// The highlights for lines `lines`.
@@ -262,21 +539,21 @@ impl Highlighter {
     }
 }
 
-/// A node a query captured, and the style it gets.
-struct Capture {
+/// A node a query captured, and the style `S` it gets.
+struct Capture<S> {
     bytes: Range<usize>,
     /// Which node, as [`tree_sitter::Node::id`].
     node: usize,
     /// `None` for captures the theme leaves uncolored.
-    style: Option<u32>,
+    style: Option<S>,
     /// The pattern that captured it, in the query's order.
     pattern: usize,
 }
 
 #[derive(Debug, PartialEq)]
-struct Span {
+struct Span<S> {
     bytes: Range<usize>,
-    style: u32,
+    style: S,
 }
 
 /// Captures as spans that don't overlap, in order, clipped to `within`.
@@ -284,7 +561,7 @@ struct Span {
 /// capture the same node, the last one's does, as in tree-sitter's own
 /// highlighter: queries go from general patterns to specific ones. That
 /// holds even when the theme leaves the last one uncolored.
-fn flatten(mut captures: Vec<Capture>, within: Range<usize>) -> Vec<Span> {
+fn flatten<S: Copy>(mut captures: Vec<Capture<S>>, within: Range<usize>) -> Vec<Span<S>> {
     // Nodes with the same text, like a node and its only child, come in no
     // particular order.
     captures.sort_by_key(|c| (c.bytes.start, Reverse(c.bytes.end), c.node, c.pattern));
@@ -299,14 +576,14 @@ fn flatten(mut captures: Vec<Capture>, within: Range<usize>) -> Vec<Span> {
         .into_iter()
         .filter_map(|c| Some((c.bytes, c.style?)));
     let mut spans = Vec::new();
-    let mut push = |start: usize, end: usize, style: u32| {
+    let mut push = |start: usize, end: usize, style: S| {
         let bytes = start.max(within.start)..end.min(within.end);
         if !bytes.is_empty() {
             spans.push(Span { bytes, style });
         }
     };
     // The captures around `at`, innermost last, as (end, style).
-    let mut open: Vec<(usize, u32)> = Vec::new();
+    let mut open: Vec<(usize, S)> = Vec::new();
     let mut at = 0;
     for (bytes, style) in captures {
         while let Some(&(end, outer)) = open.last() {
@@ -610,7 +887,7 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    fn capture(bytes: Range<usize>, style: Option<u32>, pattern: usize) -> Capture {
+    fn capture(bytes: Range<usize>, style: Option<u32>, pattern: usize) -> Capture<u32> {
         Capture {
             node: bytes.start << 16 | bytes.end,
             bytes,
@@ -619,7 +896,7 @@ mod tests {
         }
     }
 
-    fn spans(captures: Vec<Capture>, within: Range<usize>) -> Vec<(Range<usize>, u32)> {
+    fn spans(captures: Vec<Capture<u32>>, within: Range<usize>) -> Vec<(Range<usize>, u32)> {
         flatten(captures, within)
             .into_iter()
             .map(|s| (s.bytes, s.style))
@@ -745,6 +1022,86 @@ mod tests {
         }
         assert_eq!(highlighter.painted.len(), MAX_PAINTED);
         assert!(!highlighter.painted.contains(&(190..220)));
+    }
+
+    #[test]
+    fn excerpts_are_highlighted_from_the_whole_file() {
+        let text = "fn a() {}\n/* one\ntwo\nthree */\nlet s = \"x\";\nfn b() {}\n";
+        let line = |n: usize| {
+            let start = line_starts(text)[n];
+            start..start + text[start..].find('\n').unwrap()
+        };
+        // Lines 2 and 3 are one excerpt, 5 another.
+        let lines = [line(2), line(3), line(5)];
+        let never = AtomicBool::new(false);
+        let path = Path::new("/excerpts/whole_file.rs");
+        let colors = ExcerptHighlighter::new()
+            .highlight(path, rust(), text, &lines, &never)
+            .unwrap();
+        let comment = SyntaxColor::of("comment");
+        let keyword = SyntaxColor::of("keyword");
+        // Inside the comment, though the excerpt doesn't show where it
+        // starts; clipped to each line.
+        assert_eq!(colors[0], [(0..3, comment.unwrap())]);
+        assert_eq!(colors[1], [(0..8, comment.unwrap())]);
+        assert_eq!(colors[2].first(), Some(&(0..2, keyword.unwrap())));
+
+        let stopped = AtomicBool::new(true);
+        let path = Path::new("/excerpts/stopped.rs");
+        let colors = ExcerptHighlighter::new().highlight(path, rust(), text, &lines, &stopped);
+        assert!(colors.is_none());
+    }
+
+    #[test]
+    fn excerpts_are_remembered_for_the_same_text() {
+        let text = "/* a\nb */\nfn c() {}\nfn d() {}\n";
+        let line = |n: usize| {
+            let start = line_starts(text)[n];
+            start..start + text[start..].find('\n').unwrap()
+        };
+        let path = Path::new("/excerpts/remembered.rs");
+        let mut highlighter = ExcerptHighlighter::new();
+        let never = AtomicBool::new(false);
+        let first = highlighter
+            .highlight(path, rust(), text, &[line(1), line(2)], &never)
+            .unwrap();
+        // Stopped, so nothing can be parsed: only what's remembered comes back.
+        let stopped = AtomicBool::new(true);
+        let mut again = |lines: &[Range<usize>], text: &str| {
+            highlighter.highlight(path, rust(), text, lines, &stopped)
+        };
+        assert_eq!(again(&[line(1), line(2)], text).as_ref(), Some(&first));
+        assert_eq!(again(&[line(2)], text).as_deref(), Some(&first[1..]));
+        assert!(again(&[line(3)], text).is_none(), "not seen yet");
+        let changed = text.replace("fn c", "fn e");
+        assert!(again(&[line(1)], &changed).is_none(), "another text");
+
+        // Parsing the new lines keeps the ones seen before.
+        let both = highlighter
+            .highlight(path, rust(), text, &[line(2), line(3)], &never)
+            .unwrap();
+        assert_eq!(both[0], first[1]);
+        assert_eq!(both[1].first().map(|c| c.1), SyntaxColor::of("keyword"));
+    }
+
+    #[test]
+    fn the_excerpt_cache_forgets_what_was_used_longest_ago() {
+        let mut cache = ExcerptCache::default();
+        let color = SyntaxColor::of("comment").unwrap();
+        let spans = |n: usize| vec![(0..1, color); n];
+        let (a, b, c) = (Path::new("a"), Path::new("b"), Path::new("c"));
+        cache.put(a, 1, [(0..1, spans(MAX_CACHED_SPANS / 2))].into_iter());
+        cache.put(b, 1, [(0..1, spans(MAX_CACHED_SPANS / 2))].into_iter());
+        cache.get(a, 1, std::slice::from_ref(&(0..1)));
+        cache.put(c, 1, [(0..1, spans(10))].into_iter());
+        assert!(cache.files.contains_key(a) && cache.files.contains_key(c));
+        assert!(!cache.files.contains_key(b));
+        assert_eq!(cache.spans, MAX_CACHED_SPANS / 2 + 10);
+
+        // Another text replaces a file's colors.
+        cache.put(c, 2, [(5..6, spans(3))].into_iter());
+        assert_eq!(cache.get(c, 2, &[0..1, 5..6]), [None, Some(spans(3))]);
+        assert_eq!(cache.spans, MAX_CACHED_SPANS / 2 + 3);
     }
 
     #[test]

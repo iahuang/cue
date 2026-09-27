@@ -7,7 +7,6 @@
 # qol
 
 - display number of index/n_matches in within-file and workspace search
-- syntax highlighting in workspace search (possibly nontrivial)
 
 - indentation guides in editor
 - that thing where when scrolling thru the file explorer, the directory descendants stay sticked at the top so you always know where u are

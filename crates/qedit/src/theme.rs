@@ -42,12 +42,40 @@ const SYNTAX: &[(&str, u8, Attributes)] = &[
     ("variable.builtin", 5, Attributes::NONE),
 ];
 
+/// A syntax color: one of [`SYNTAX`]'s styles. Unlike a style id, it can be
+/// worked out on any thread, and drawn without a `SyntaxStyle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntaxColor(u8);
+
+impl SyntaxColor {
+    /// The color for text a highlight query captured as `capture`: its own,
+    /// or that of the nearest capture it refines (`function.method` is a
+    /// `function`), or none.
+    pub fn of(capture: &str) -> Option<SyntaxColor> {
+        let mut name = capture;
+        loop {
+            if let Some(i) = SYNTAX.iter().position(|&(c, _, _)| c == name) {
+                return Some(SyntaxColor(i as u8));
+            }
+            name = &name[..name.rfind('.')?];
+        }
+    }
+
+    pub fn fg(self) -> Rgba {
+        Rgba::indexed(SYNTAX[self.0 as usize].1)
+    }
+
+    pub fn attributes(self) -> Attributes {
+        SYNTAX[self.0 as usize].2
+    }
+}
+
 pub struct Theme {
     style: Rc<SyntaxStyle>,
     /// The find bar's matches: a background alone, so text keeps its color.
     pub find_match: u32,
-    /// Style ids for [`SYNTAX`]'s captures.
-    syntax: Vec<(&'static str, u32)>,
+    /// Style ids for [`SYNTAX`]'s captures, in order.
+    syntax: Vec<u32>,
 }
 
 impl Theme {
@@ -58,7 +86,7 @@ impl Theme {
             .iter()
             .map(|&(capture, slot, attributes)| {
                 let fg = Some(Rgba::indexed(slot));
-                (capture, style.register(capture, fg, None, attributes))
+                style.register(capture, fg, None, attributes)
             })
             .collect();
         Ok(Theme {
@@ -68,17 +96,10 @@ impl Theme {
         })
     }
 
-    /// The style for text a highlight query captured as `capture`: its own,
-    /// or that of the nearest capture it refines (`function.method` is a
-    /// `function`), or none.
+    /// The style for text a highlight query captured as `capture`, as
+    /// [`SyntaxColor::of`] picks it.
     pub fn capture_style(&self, capture: &str) -> Option<u32> {
-        let mut name = capture;
-        loop {
-            if let Some(&(_, id)) = self.syntax.iter().find(|(c, _)| *c == name) {
-                return Some(id);
-            }
-            name = &name[..name.rfind('.')?];
-        }
+        SyntaxColor::of(capture).map(|color| self.syntax[color.0 as usize])
     }
 
     /// The style to give buffers.

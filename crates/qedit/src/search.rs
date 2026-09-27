@@ -6,15 +6,17 @@
 //! the lines around them, for showing excerpts. Open files with unsaved
 //! changes are searched as they are in the editor, not as saved.
 //!
-//! Results arrive a file at a time, in no particular order. Dropping the
-//! [`Search`] stops it.
+//! Results arrive a file at a time, in no particular order. Each file's
+//! syntax colors come after it, once the file is parsed, so highlighting
+//! never holds up results. Dropping the [`Search`] stops it.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -23,6 +25,8 @@ use ignore::WalkState;
 
 use crate::file_index;
 use crate::keymap::Command;
+use crate::language::{self, Language};
+use crate::syntax::{ExcerptHighlighter, LineColors, MAX_EXCERPT_BYTES};
 use crate::workspace::Workspace;
 
 /// Lines shown before and after each matching line.
@@ -150,6 +154,11 @@ pub struct Line {
     pub cut: bool,
     /// The matches, as byte ranges in the whole line. Empty for context.
     pub matches: Vec<Range<usize>>,
+    /// Syntax colors, as byte ranges in `text`, in order. Empty until they
+    /// come in, or if the file's language isn't highlighted.
+    pub syntax: LineColors,
+    /// Where the whole line starts in the file, in bytes.
+    offset: usize,
 }
 
 impl Line {
@@ -163,15 +172,39 @@ impl Line {
     }
 }
 
-enum Message {
+impl FileMatches {
+    /// Colors the lines, with a list of colors for each.
+    pub fn set_colors(&mut self, colors: Vec<LineColors>) {
+        for (line, colors) in self.lines.iter_mut().zip(colors) {
+            line.syntax = colors;
+        }
+    }
+}
+
+/// What a search found.
+pub enum Found {
+    /// A file with matches, not colored yet.
     File(FileMatches),
+    /// The syntax colors of a file found before, for
+    /// [`FileMatches::set_colors`].
+    Colors {
+        path: PathBuf,
+        /// As in [`FileMatches::display`].
+        display: String,
+        colors: Vec<LineColors>,
+    },
+}
+
+enum Message {
+    Found(Found),
     Done,
 }
 
 /// A search in progress, or done.
 pub struct Search {
     receiver: Receiver<Message>,
-    stop: Arc<AtomicBool>,
+    /// Stops the search, and coloring what it found.
+    dropped: Arc<AtomicBool>,
     /// Matches found so far, across all threads.
     found: Arc<AtomicUsize>,
     done: bool,
@@ -188,28 +221,29 @@ impl Search {
     ) -> Result<Search, String> {
         let matcher = query.matcher()?;
         let (sender, receiver) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
         let found = Arc::new(AtomicUsize::new(0));
         let search = Search {
             receiver,
-            stop: Arc::clone(&stop),
+            dropped: Arc::clone(&dropped),
             found: Arc::clone(&found),
             done: false,
         };
         let workspace = workspace.clone();
         std::thread::spawn(move || {
-            run(&workspace, matcher, open, &stop, &found, &sender);
+            run(&workspace, matcher, open, &dropped, &found, &sender);
             let _ = sender.send(Message::Done);
         });
         Ok(search)
     }
 
-    /// The files with matches found since the last call.
-    pub fn poll(&mut self) -> Vec<FileMatches> {
-        let mut files = Vec::new();
+    /// What was found since the last call, in order: a file's colors come
+    /// after the file.
+    pub fn poll(&mut self) -> Vec<Found> {
+        let mut found = Vec::new();
         loop {
             match self.receiver.try_recv() {
-                Ok(Message::File(file)) => files.push(file),
+                Ok(Message::Found(f)) => found.push(f),
                 Ok(Message::Done) | Err(TryRecvError::Disconnected) => {
                     self.done = true;
                     break;
@@ -217,7 +251,7 @@ impl Search {
                 Err(TryRecvError::Empty) => break,
             }
         }
-        files
+        found
     }
 
     /// Whether the search finished, and every file it found was polled.
@@ -230,12 +264,20 @@ impl Search {
         self.found.load(Ordering::Relaxed) >= MAX_MATCHES
     }
 
-    /// Waits for the search to finish, for tests.
+    /// Waits for the search to finish, for tests: the files, colored.
     #[cfg(test)]
     pub fn wait(&mut self) -> Vec<FileMatches> {
-        let mut files = Vec::new();
+        let mut files: Vec<FileMatches> = Vec::new();
         while !self.done {
-            files.extend(self.poll());
+            for found in self.poll() {
+                match found {
+                    Found::File(file) => files.push(file),
+                    Found::Colors { path, colors, .. } => {
+                        let file = files.iter_mut().find(|file| file.path == path);
+                        file.unwrap().set_colors(colors);
+                    }
+                }
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         files
@@ -244,62 +286,129 @@ impl Search {
 
 impl Drop for Search {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.dropped.store(true, Ordering::Relaxed);
     }
 }
 
-/// Searches every file in the workspace, sending those with matches.
+/// Searches every file in the workspace, sending those with matches, and
+/// then their colors: files are colored on threads of their own, so
+/// searching goes on at full speed.
 fn run(
     workspace: &Workspace,
     matcher: RegexMatcher,
     open: HashMap<PathBuf, String>,
-    stop: &AtomicBool,
+    dropped: &AtomicBool,
     found: &AtomicUsize,
     sender: &Sender<Message>,
 ) {
     let Some(walker) = file_index::walker(workspace) else {
         return;
     };
-    walker.build_parallel().run(|| {
-        let matcher = matcher.clone();
-        let open = &open;
-        let sender = sender.clone();
-        let mut searcher = SearcherBuilder::new()
-            .line_number(true)
-            .before_context(CONTEXT_LINES)
-            .after_context(CONTEXT_LINES)
-            .binary_detection(BinaryDetection::quit(0))
-            .build();
-        Box::new(move |entry| {
-            if stop.load(Ordering::Relaxed) {
-                return WalkState::Quit;
-            }
-            let Ok(entry) = entry else {
-                return WalkState::Continue;
-            };
-            if !file_index::is_file(&entry) {
-                return WalkState::Continue;
-            }
-            let path = entry.path();
-            let Some(lines) = search_file(&mut searcher, &matcher, path, open.get(path)) else {
-                return WalkState::Continue;
-            };
-            let match_count = lines.iter().map(|line| line.matches.len()).sum();
-            if found.fetch_add(match_count, Ordering::Relaxed) + match_count >= MAX_MATCHES {
-                stop.store(true, Ordering::Relaxed);
-            }
-            let file = FileMatches {
-                path: path.to_path_buf(),
-                display: workspace.display_path(path),
-                lines,
-                match_count,
-            };
-            if sender.send(Message::File(file)).is_err() {
-                return WalkState::Quit;
-            }
-            WalkState::Continue
-        })
+    // Set once there are enough matches, which stops searching but not
+    // coloring the files found.
+    let full = AtomicBool::new(false);
+    let full = &full;
+    let open = &open;
+    let (jobs, queue) = mpsc::channel::<Job>();
+    let queue = Mutex::new(queue);
+    std::thread::scope(|scope| {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        for _ in 0..threads {
+            let queue = &queue;
+            let sender = sender.clone();
+            scope.spawn(move || {
+                let mut highlighter = ExcerptHighlighter::new();
+                loop {
+                    let job = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok(job) = job else {
+                        return;
+                    };
+                    let Some(colors) = job.color(&mut highlighter, dropped) else {
+                        continue;
+                    };
+                    if sender.send(Message::Found(colors)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        walker.build_parallel().run(|| {
+            let matcher = matcher.clone();
+            let sender = sender.clone();
+            let jobs = jobs.clone();
+            let mut searcher = SearcherBuilder::new()
+                .line_number(true)
+                .before_context(CONTEXT_LINES)
+                .after_context(CONTEXT_LINES)
+                .binary_detection(BinaryDetection::quit(0))
+                .build();
+            Box::new(move |entry| {
+                if dropped.load(Ordering::Relaxed) || full.load(Ordering::Relaxed) {
+                    return WalkState::Quit;
+                }
+                let Ok(entry) = entry else {
+                    return WalkState::Continue;
+                };
+                if !file_index::is_file(&entry) {
+                    return WalkState::Continue;
+                }
+                let path = entry.path();
+                let unsaved = open.get(path);
+                let Some(lines) = search_file(&mut searcher, &matcher, path, unsaved) else {
+                    return WalkState::Continue;
+                };
+                let excerpts = excerpts(path, unsaved, &lines);
+                let match_count = lines.iter().map(|line| line.matches.len()).sum();
+                if found.fetch_add(match_count, Ordering::Relaxed) + match_count >= MAX_MATCHES {
+                    full.store(true, Ordering::Relaxed);
+                }
+                let file = FileMatches {
+                    path: path.to_path_buf(),
+                    display: workspace.display_path(path),
+                    lines,
+                    match_count,
+                };
+                // Queued after the file is sent, so its colors come after it.
+                let job = excerpts.map(|excerpts| Job {
+                    path: file.path.clone(),
+                    display: file.display.clone(),
+                    excerpts,
+                });
+                if sender.send(Message::Found(Found::File(file))).is_err() {
+                    return WalkState::Quit;
+                }
+                if let Some(job) = job {
+                    let _ = jobs.send(job);
+                }
+                WalkState::Continue
+            })
+        });
+        // Searching's done: the coloring threads finish what's queued.
+        drop(jobs);
     });
+}
+
+/// A file to color.
+struct Job<'t> {
+    path: PathBuf,
+    display: String,
+    excerpts: Excerpts<'t>,
+}
+
+impl Job<'_> {
+    fn color(self, highlighter: &mut ExcerptHighlighter, dropped: &AtomicBool) -> Option<Found> {
+        let Excerpts {
+            language,
+            text,
+            lines,
+        } = self.excerpts;
+        let colors = highlighter.highlight(&self.path, language, &text, &lines, dropped)?;
+        Some(Found::Colors {
+            path: self.path,
+            display: self.display,
+            colors,
+        })
+    }
 }
 
 /// The matching lines in the file at `path`, or in `text` if given, with
@@ -324,6 +433,55 @@ fn search_file(
     (result.is_ok() && !sink.skip && has_match).then_some(sink.lines)
 }
 
+/// What coloring a file's lines takes.
+struct Excerpts<'t> {
+    language: &'static Language,
+    text: Cow<'t, str>,
+    /// The lines' byte ranges in `text`.
+    lines: Vec<Range<usize>>,
+}
+
+/// What coloring `lines` of the file at `path`, or of `unsaved` if given,
+/// takes. `None` if qedit doesn't highlight its language, or it's too big, or
+/// changed since it was searched.
+fn excerpts<'t>(path: &Path, unsaved: Option<&'t String>, lines: &[Line]) -> Option<Excerpts<'t>> {
+    let read = || -> Option<Cow<'t, str>> {
+        if let Some(text) = unsaved {
+            return Some(Cow::Borrowed(text));
+        }
+        let size = std::fs::metadata(path).ok()?.len();
+        if size > MAX_EXCERPT_BYTES as u64 {
+            return None;
+        }
+        std::fs::read_to_string(path).ok().map(Cow::Owned)
+    };
+    // Only read to find a `#!` line if the name doesn't tell.
+    let mut text = None;
+    let language = language::detect(Some(path), || {
+        text = read();
+        let first = text.as_deref().and_then(|text| text.lines().next());
+        first.unwrap_or_default().to_string()
+    })?;
+    language.syntax.as_ref()?;
+    let text = text.or_else(read)?;
+    let ranges: Vec<Range<usize>> = lines
+        .iter()
+        .map(|line| {
+            let start = line.offset + line.start;
+            start..start + line.text.len()
+        })
+        .collect();
+    let unchanged = lines
+        .iter()
+        .zip(&ranges)
+        .all(|(line, range)| text.get(range.clone()) == Some(line.text.as_str()));
+    unchanged.then_some(Excerpts {
+        language,
+        text,
+        lines: ranges,
+    })
+}
+
 /// Collects a file's lines from the searcher.
 struct Collect<'m> {
     matcher: &'m RegexMatcher,
@@ -334,7 +492,7 @@ struct Collect<'m> {
 
 impl Collect<'_> {
     /// Adds a line, returning whether to go on.
-    fn push(&mut self, number: Option<u64>, bytes: &[u8], is_match: bool) -> bool {
+    fn push(&mut self, number: Option<u64>, offset: u64, bytes: &[u8], is_match: bool) -> bool {
         let bytes = strip_line_break(bytes);
         let Ok(text) = std::str::from_utf8(bytes) else {
             self.skip = true;
@@ -367,6 +525,8 @@ impl Collect<'_> {
             start,
             cut: end < text.len(),
             matches,
+            syntax: Vec::new(),
+            offset: offset as usize,
         });
         true
     }
@@ -376,11 +536,13 @@ impl Sink for Collect<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
-        Ok(self.push(mat.line_number(), mat.bytes(), true))
+        let offset = mat.absolute_byte_offset();
+        Ok(self.push(mat.line_number(), offset, mat.bytes(), true))
     }
 
     fn context(&mut self, _: &Searcher, context: &SinkContext<'_>) -> Result<bool, std::io::Error> {
-        Ok(self.push(context.line_number(), context.bytes(), false))
+        let offset = context.absolute_byte_offset();
+        Ok(self.push(context.line_number(), offset, context.bytes(), false))
     }
 
     fn binary_data(&mut self, _: &Searcher, _: u64) -> Result<bool, std::io::Error> {
@@ -406,6 +568,7 @@ fn floor_char_boundary(text: &str, at: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::SyntaxColor;
     use std::fs;
 
     /// A fresh workspace folder with `files` (name, contents).
@@ -549,6 +712,43 @@ mod tests {
         assert_eq!(&line.text[m], "needle");
         assert_eq!(line.matches[0].start, 600, "bytes in the whole line");
         assert_eq!(files[0].lines[1].text, "short", "no \\r");
+    }
+
+    /// The syntax color of the first `needle` in `line`.
+    fn color_of(line: &Line, needle: &str) -> Option<SyntaxColor> {
+        let at = line.text.find(needle).unwrap();
+        let span = line.syntax.iter().find(|(bytes, _)| bytes.contains(&at));
+        span.map(|&(_, color)| color)
+    }
+
+    #[test]
+    fn excerpts_are_syntax_highlighted() {
+        let rust = "/* a block\ncomment */\nfn main() {\n    let s = \"hit\";\n}\n";
+        let root = fixture(
+            "syntax",
+            &[
+                ("a.rs", rust),
+                ("b.txt", "fn hit\n"),
+                ("script", "#!/bin/sh\necho \"hit\"\n"),
+                ("unsaved.rs", "// hit\n"),
+            ],
+        );
+        let open = HashMap::from([(root.join("unsaved.rs"), "fn hit() {}\n".to_string())]);
+        let files = search(&root, &query("hit"), open);
+        let [a, b, script, unsaved] = &files[..] else {
+            panic!("{files:?}");
+        };
+        let comment = SyntaxColor::of("comment");
+        let keyword = SyntaxColor::of("keyword");
+        let string = SyntaxColor::of("string");
+        // The whole file is parsed: line 1 is inside a comment.
+        assert_eq!(a.lines[0].number, 1);
+        assert_eq!(color_of(&a.lines[0], "comment"), comment);
+        assert_eq!(color_of(&a.lines[1], "fn"), keyword);
+        assert_eq!(color_of(&a.lines[2], "hit"), string);
+        assert!(b.lines[0].syntax.is_empty(), "no language");
+        assert_eq!(color_of(&script.lines[1], "hit"), string, "by #! line");
+        assert_eq!(color_of(&unsaved.lines[0], "fn"), keyword, "as edited");
     }
 
     #[test]

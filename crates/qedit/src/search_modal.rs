@@ -1,8 +1,8 @@
 //! Workspace search (Ctrl+Shift+F): a large popup that searches every file
 //! in the workspace as you type. As in Zed, matches are listed as excerpts:
 //! each file's path, then its matching lines with a couple of lines around
-//! them. Up and Down step through the matches, and Enter opens the file
-//! with the match selected. The excerpts are only for reading.
+//! them, syntax highlighted. Up and Down step through the matches, and Enter
+//! opens the file with the match selected. The excerpts are only for reading.
 //!
 //! Closing the popup keeps the query and the selected match, so reopening
 //! it searches again and picks up where it left off.
@@ -17,7 +17,7 @@ use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::{Caret, Edit};
 use crate::picker::{self, Area, DIM, FG, MATCH_FG, SELECTED_BG};
-use crate::search::{FileMatches, Line, Query, Search, Toggle, CONTEXT_LINES};
+use crate::search::{FileMatches, Found, Line, Query, Search, Toggle, CONTEXT_LINES};
 use crate::workspace::Workspace;
 
 const LINE_NUMBER: Rgba = Rgba::rgb(108, 112, 134);
@@ -254,8 +254,8 @@ impl SearchModal {
         }
     }
 
-    /// Takes in what the search found since the last call. Returns whether
-    /// the results changed.
+    /// Takes in what the search found since the last call: files, and their
+    /// colors. Returns whether the results changed.
     pub fn poll(&mut self) -> bool {
         let Some(search) = &mut self.search else {
             return false;
@@ -276,8 +276,23 @@ impl SearchModal {
             self.scroll = 0;
         }
         let mut reveal = false;
-        for file in found {
-            reveal |= self.add_file(file);
+        for found in found {
+            match found {
+                Found::File(file) => reveal |= self.add_file(file),
+                Found::Colors {
+                    path,
+                    display,
+                    colors,
+                } => {
+                    let key = sort_key(&display);
+                    let at = self
+                        .files
+                        .partition_point(|other| sort_key(&other.display) < key);
+                    if let Some(file) = self.files.get_mut(at).filter(|file| file.path == path) {
+                        file.set_colors(colors);
+                    }
+                }
+            }
         }
         if done {
             // Its file didn't match this time.
@@ -708,9 +723,9 @@ impl SearchModal {
         frame.draw_text(&name, name_x, y, FG, None, Attributes::BOLD);
     }
 
-    /// A line of a file: its number, then its text with matches highlighted,
-    /// the `selected` one most. A match past the right edge is scrolled into
-    /// view.
+    /// A line of a file: its number, then its text in its syntax colors with
+    /// matches highlighted, the `selected` one most. A match past the right
+    /// edge is scrolled into view.
     #[allow(clippy::too_many_arguments)]
     fn draw_line(
         &self,
@@ -736,14 +751,23 @@ impl SearchModal {
         }
 
         let matches: Vec<Range<usize>> = line.matches_in_text().collect();
-        let style = |byte: usize| -> Style {
+        // The syntax color around the byte last asked about: bytes are asked
+        // about in order.
+        let mut syntax = line.syntax.iter().peekable();
+        let mut style = |byte: usize| -> Style {
+            while syntax.next_if(|(bytes, _)| bytes.end <= byte).is_some() {}
             let hit = matches.iter().position(|m| m.contains(&byte));
             match hit {
                 Some(index) if Some(index) == selected => {
                     (BG_TEXT, Some(MATCH_FG), Attributes::BOLD)
                 }
                 Some(_) => (MATCH_FG, Some(MATCH_BG), Attributes::BOLD),
-                None => (FG, None, Attributes::NONE),
+                None => match syntax.peek() {
+                    Some((bytes, color)) if bytes.start <= byte => {
+                        (color.fg(), None, color.attributes())
+                    }
+                    _ => (FG, None, Attributes::NONE),
+                },
             }
         };
         let mut cells: Vec<(char, Style)> = Vec::new();
@@ -1041,6 +1065,30 @@ mod tests {
             click(&mut modal, area.y + area.height + 1),
             SearchAction::Close
         );
+    }
+
+    #[test]
+    fn colors_come_in_after_the_files() {
+        let root = fixture(
+            "colors",
+            &[
+                ("b.rs", "// find\nfn find() {}\n"),
+                ("a.txt", "find\n"),
+                ("C.rs", "let find = 1;\n"),
+            ],
+        );
+        let mut modal = modal(&root, Memory::default(), None, 20);
+        modal.edit(Edit::Insert("find"));
+        wait(&mut modal);
+        let names: Vec<&str> = modal.files.iter().map(|f| f.display.as_str()).collect();
+        assert_eq!(names, ["a.txt", "b.rs", "C.rs"]);
+        let colors = |file: usize| -> Vec<usize> {
+            let lines = &modal.files[file].lines;
+            lines.iter().map(|line| line.syntax.len()).collect()
+        };
+        assert_eq!(colors(0), [0], "plain text");
+        assert!(colors(1).iter().all(|&n| n > 0), "{:?}", colors(1));
+        assert!(colors(2).iter().all(|&n| n > 0), "{:?}", colors(2));
     }
 
     #[test]
