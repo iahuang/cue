@@ -143,6 +143,11 @@ impl Terminal {
         }
     }
 
+    /// Whether it was given a name.
+    pub fn is_renamed(&self) -> bool {
+        self.name.is_some()
+    }
+
     /// Asks for a new name in the status bar, starting from the one it
     /// was given, if any.
     pub fn show_rename(&mut self) {

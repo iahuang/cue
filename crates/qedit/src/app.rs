@@ -42,6 +42,12 @@
 //! one, and it keeps running when the panel moves on. While one has the
 //! keyboard, keys go to its shell, but for a few (see
 //! [`Keymap::lookup_terminal`]).
+//!
+//! Tabs (see [`crate::tab`]) are whole layouts of panels, one on screen at a
+//! time; Ctrl+T opens one. Files and terminals aren't any tab's: a file
+//! can be shown in panels in several, and a terminal, in one panel anywhere,
+//! moves to the tab it's shown in. Closing a tab closes what its panels
+//! show, as closing each of them would.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -67,7 +73,8 @@ use crate::line_edit::Edit;
 use crate::panel::Panel;
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::search_modal::{Memory, SearchAction, SearchModal};
-use crate::status;
+use crate::status::{self, Prompt, PromptKey};
+use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
 use crate::theme::Theme;
 use crate::tree::{Entry, FileTree, TreeAction};
@@ -107,6 +114,9 @@ enum Armed {
     Close(Recent),
     /// Moving this to the Trash.
     Trash(PathBuf),
+    /// Closing this tab, and losing unsaved changes or stopping programs in
+    /// its panels.
+    CloseTab(TabId),
 }
 
 /// What the main loop should do after the app handled input.
@@ -135,6 +145,10 @@ enum MouseTarget {
     /// A panel's header, which drags the panel (see [`HeaderDrag`]).
     Header(PanelId),
     Panel(PanelId),
+    /// A tab in the tab bar, which drags along it.
+    Tab(TabId),
+    /// The tab bar's button for a new tab.
+    NewTab,
 }
 
 /// A panel's header being dragged. A header with a panel above it is also
@@ -179,13 +193,16 @@ pub struct App {
     terminal_prefix: bool,
     /// The terminal last told it has the keyboard.
     focused_terminal: Option<Rc<RefCell<Terminal>>>,
-    layout: Layout,
-    /// The panels in the layout, in no particular order. Never empty.
-    panels: Vec<Panel>,
-    /// The panel keys go to, unless the tree has focus.
-    active: PanelId,
-    /// The id for the next new panel.
+    /// The tabs, in the order the bar lists them. Never empty.
+    tabs: Vec<Tab>,
+    /// The index of the tab on screen.
+    tab: usize,
+    /// The id for the next new tab.
+    next_tab: TabId,
+    /// The id for the next new panel, in any tab.
     next_panel: PanelId,
+    /// The prompt for the tab's new name, while it's open.
+    tab_prompt: Option<Prompt>,
     /// Text from the last copy or cut, shared by all editors.
     clipboard: Option<String>,
     focus: Focus,
@@ -202,6 +219,8 @@ pub struct App {
     preview: Option<Rc<Document>>,
     /// The row and time of the last click in the tree, to spot double clicks.
     last_tree_click: Option<(u32, Instant)>,
+    /// The tab and time of the last click on the tab bar.
+    last_tab_click: Option<(TabId, Instant)>,
     picker: Option<Picker>,
     /// Every file in the workspace, for the picker.
     files: FileIndex,
@@ -290,10 +309,11 @@ impl App {
             next_terminal: 1,
             terminal_prefix: false,
             focused_terminal: None,
-            layout: Layout::Panel(0),
-            panels: vec![Panel::new(0)],
-            active: 0,
+            tabs: vec![Tab::new(0, 0)],
+            tab: 0,
+            next_tab: 1,
             next_panel: 1,
+            tab_prompt: None,
             clipboard: None,
             focus,
             tree_visible: true,
@@ -305,6 +325,7 @@ impl App {
             armed: None,
             preview: None,
             last_tree_click: None,
+            last_tab_click: None,
             picker: None,
             recent: Vec::new(),
             search: None,
@@ -317,9 +338,11 @@ impl App {
             doc.untitled.set(1);
         }
         app.layout();
-        app.panels[0].show(&doc).map_err(|e| e.to_string())?;
+        app.active_panel_mut()
+            .show(&doc)
+            .map_err(|e| e.to_string())?;
         if let Some(notice) = notice {
-            app.panels[0].show_message(notice, false);
+            app.show_message(notice, false);
         }
         app.note_recent();
         Ok(app)
@@ -339,6 +362,18 @@ impl App {
 
     fn dispatch_key(&mut self, key: Key) -> AppAction {
         self.active_panel_mut().clear_message();
+        if let Some(prompt) = &mut self.tab_prompt {
+            match prompt.handle_key(key) {
+                PromptKey::Continue => {}
+                PromptKey::Cancel => self.tab_prompt = None,
+                // An empty name goes back to naming it for what it shows.
+                PromptKey::Submit(name) => {
+                    self.tab_prompt = None;
+                    self.tab_mut().name = (!name.is_empty()).then_some(name);
+                }
+            }
+            return AppAction::Continue;
+        }
         let prefixed = std::mem::take(&mut self.terminal_prefix);
         if let Some(terminal) = self.keyboard_terminal() {
             if terminal.borrow().prompt_open() {
@@ -427,6 +462,7 @@ impl App {
                 matches!(
                     command,
                     Quit | ClosePanel
+                        | CloseTab
                         | CloseFile
                         | CloseTerminal
                         | TreeTrash
@@ -540,6 +576,34 @@ impl App {
             Command::FocusPanelRight => self.focus_panel(Direction::Right),
             Command::FocusPanelUp => self.focus_panel(Direction::Up),
             Command::FocusPanelDown => self.focus_panel(Direction::Down),
+            Command::NewTab => self.new_tab(),
+            Command::CloseTab => self.close_tab(self.tab),
+            Command::NextTab | Command::PreviousTab if self.tabs.len() == 1 => {
+                let message = format!(
+                    "There's only this tab; {} opens another.",
+                    self.shortcut(Command::NewTab)
+                );
+                self.show_message(message, false);
+            }
+            Command::NextTab => self.switch_tab((self.tab + 1) % self.tabs.len()),
+            Command::PreviousTab => {
+                self.switch_tab((self.tab + self.tabs.len() - 1) % self.tabs.len())
+            }
+            Command::MoveTabLeft => self.move_tab(self.tab, self.tab.saturating_sub(1)),
+            Command::MoveTabRight => self.move_tab(self.tab, self.tab + 1),
+            command if command.tab_index().is_some() => {
+                let index = command.tab_index().unwrap_or(0);
+                if index < self.tabs.len() {
+                    self.switch_tab(index);
+                } else {
+                    let message = format!("There's no tab {}.", index + 1);
+                    self.show_message(message, false);
+                }
+            }
+            Command::RenameTab => {
+                let name = self.tab().name.clone().unwrap_or_default();
+                self.tab_prompt = Some(Prompt::new("Rename tab", &name));
+            }
             Command::NewTerminal => self.new_terminal(),
             Command::ClearTerminal => {
                 if let Some(terminal) = self.active_terminal() {
@@ -644,8 +708,7 @@ impl App {
                 self.tree_action(action);
             }
             command => {
-                let active = self.active_index();
-                let Some(editor) = self.panels[active].editor_mut() else {
+                let Some(editor) = self.tabs[self.tab].active_panel_mut().editor_mut() else {
                     return AppAction::Continue;
                 };
                 let action = editor.run(command, select, &mut self.clipboard);
@@ -705,11 +768,17 @@ impl App {
         let Some(target) = target else {
             return AppAction::Continue;
         };
-        if let MouseKind::Press(_) = mouse.kind {
+        if let MouseKind::Press(button) = mouse.kind {
             // Like a key press, a click dismisses messages, the quit and
-            // close confirmations, the terminal prefix, and prompts.
-            self.armed = None;
+            // close confirmations, the terminal prefix, and prompts. But
+            // closing a tab with the middle button asks first, and doing it
+            // again goes ahead.
+            let armed = self.armed.take();
+            if button == MouseButton::Middle && matches!(target, MouseTarget::Tab(_)) {
+                self.armed = armed;
+            }
             self.terminal_prefix = false;
+            self.tab_prompt = None;
             self.active_panel_mut().clear_message();
             if let Some(terminal) = self.active_terminal() {
                 terminal.borrow_mut().cancel_prompt();
@@ -757,7 +826,7 @@ impl App {
             MouseTarget::Handle(path) => {
                 if let MouseKind::Drag(MouseButton::Left) = mouse.kind {
                     let area = self.main_area();
-                    self.layout.drag(&path, area, mouse.x, mouse.y);
+                    self.tab_mut().layout.drag(&path, area, mouse.x, mouse.y);
                     self.layout();
                 }
             }
@@ -767,10 +836,16 @@ impl App {
                     self.activate(id);
                 }
                 // The wheel scrolls any panel; the rest goes to the active one.
-                if let Some(panel) = self.panels.iter_mut().find(|panel| panel.id == id) {
+                if let Some(panel) = self.tab_mut().panel_mut(id) {
                     panel.handle_mouse(mouse, now);
                 }
                 self.note_find_memory();
+            }
+            MouseTarget::Tab(id) => self.tab_mouse(id, mouse, now),
+            MouseTarget::NewTab => {
+                if let MouseKind::Press(MouseButton::Left) = mouse.kind {
+                    self.new_tab();
+                }
             }
         }
         AppAction::Continue
@@ -790,16 +865,24 @@ impl App {
         if tree_width > 0 && x == tree_width {
             return Some(MouseTarget::Divider);
         }
-        if let Some(handle) = self
-            .layout
+        if y < area.y {
+            let (item, ..) = tab::bar(&self.tabs, self.bar_area())
+                .into_iter()
+                .find(|(_, rect, _)| rect.contains(x, y))?;
+            return Some(match item {
+                BarItem::Tab(index) => MouseTarget::Tab(self.tabs[index].id),
+                BarItem::New => MouseTarget::NewTab,
+            });
+        }
+        let layout = &self.tab().layout;
+        if let Some(handle) = layout
             .handles(area)
             .into_iter()
             .find(|handle| handle.axis == Axis::Horizontal && handle.rect.contains(x, y))
         {
             return Some(MouseTarget::Handle(handle.path));
         }
-        let (id, rect) = self
-            .layout
+        let (id, rect) = layout
             .panels(area)
             .into_iter()
             .find(|(_, rect)| rect.contains(x, y))?;
@@ -815,10 +898,12 @@ impl App {
     /// or moves the panel (see [`HeaderDrag`]).
     fn drag_header(&mut self, id: PanelId, mouse: Mouse, now: Instant) {
         let area = self.main_area();
+        let tab = self.tab;
         match mouse.kind {
             MouseKind::Press(MouseButton::Left) => {
                 self.activate(id);
                 let handle = self
+                    .tab()
                     .layout
                     .handles(area)
                     .into_iter()
@@ -828,7 +913,7 @@ impl App {
                     handle,
                     x: mouse.x,
                     y: mouse.y,
-                    before: self.layout.clone(),
+                    before: self.tab().layout.clone(),
                     resizing: false,
                     moving: false,
                     drop: None,
@@ -838,8 +923,9 @@ impl App {
                 let Some(drag) = &mut self.header_drag else {
                     return;
                 };
+                let layout = &mut self.tabs[tab].layout;
                 if !drag.moving {
-                    let columns = self.layout.panels(area).into_iter().find(|&(p, _)| p == id);
+                    let columns = layout.panels(area).into_iter().find(|&(p, _)| p == id);
                     let within = columns
                         .is_some_and(|(_, rect)| (rect.x..rect.x + rect.width).contains(&mouse.x));
                     let (dx, dy) = (mouse.x.abs_diff(drag.x), mouse.y.abs_diff(drag.y));
@@ -848,15 +934,15 @@ impl App {
                     let sideways = !drag.resizing && dx >= MOVE_THRESHOLD && dx > 3 * dy;
                     if drag.handle.is_none() || sideways || !within {
                         drag.moving = true;
-                        self.layout = drag.before.clone();
+                        *layout = drag.before.clone();
                     } else if dy > 0 {
                         drag.resizing = true;
                     }
                 }
                 match (&drag.handle, drag.moving) {
-                    (_, true) => drag.drop = self.layout.drop_at(area, id, mouse.x, mouse.y),
+                    (_, true) => drag.drop = layout.drop_at(area, id, mouse.x, mouse.y),
                     (Some(path), false) if drag.resizing => {
-                        self.layout.drag(path, area, mouse.x, mouse.y)
+                        layout.drag(path, area, mouse.x, mouse.y)
                     }
                     _ => {}
                 }
@@ -867,13 +953,54 @@ impl App {
                     return;
                 };
                 if let Some(drop) = drag.drop.filter(|_| drag.moving) {
-                    self.layout.drop_panel(id, drop);
+                    self.tab_mut().layout.drop_panel(id, drop);
                     self.layout();
                 }
             }
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
-                if let Some(panel) = self.panels.iter_mut().find(|panel| panel.id == id) {
+                if let Some(panel) = self.tab_mut().panel_mut(id) {
                     panel.handle_mouse(mouse, now);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A mouse event on tab `id` in the tab bar, or dragged from it: a
+    /// click switches to it, a double click renames it, the middle button
+    /// closes it, and dragging moves it along the bar.
+    fn tab_mouse(&mut self, id: TabId, mouse: Mouse, now: Instant) {
+        let Some(index) = self.tab_index(id) else {
+            return;
+        };
+        match mouse.kind {
+            MouseKind::Press(MouseButton::Left) => {
+                let double = self
+                    .last_tab_click
+                    .is_some_and(|(tab, time)| tab == id && now.duration_since(time) < MULTI_CLICK);
+                self.last_tab_click = (!double).then_some((id, now));
+                self.switch_tab(index);
+                if double {
+                    self.run(Command::RenameTab, false);
+                }
+            }
+            MouseKind::Press(MouseButton::Middle) => self.close_tab(index),
+            MouseKind::Drag(MouseButton::Left) => {
+                let over = |app: &App| {
+                    tab::bar(&app.tabs, app.bar_area())
+                        .into_iter()
+                        .find(|(_, rect, _)| (rect.x..rect.x + rect.width).contains(&mouse.x))
+                        .map(|(item, ..)| item)
+                };
+                let Some(BarItem::Tab(to)) = over(self) else {
+                    return;
+                };
+                self.move_tab(index, to);
+                // Tabs are as wide as their names: moved past a wider one,
+                // it may not be under the mouse, and would move right back
+                // on the next motion.
+                if over(self) != Some(BarItem::Tab(to)) {
+                    self.move_tab(to, index);
                 }
             }
             _ => {}
@@ -883,6 +1010,10 @@ impl App {
     /// Text pasted through the terminal.
     pub fn paste(&mut self, text: &str) {
         self.armed = None;
+        if let Some(prompt) = &mut self.tab_prompt {
+            prompt.paste(text);
+            return;
+        }
         let terminal = self.keyboard_terminal().filter(|terminal| {
             let terminal = terminal.borrow();
             terminal.prompt_open() || terminal.exit().is_none()
@@ -925,13 +1056,17 @@ impl App {
         if tree_width > 0 {
             self.tree
                 .draw(frame, 0, tree_width, self.focus == Focus::Tree);
-            for y in 0..main.height {
+            for y in 0..self.height.saturating_sub(1) {
                 frame.draw_text("│", tree_width, y, DIVIDER, None, Attributes::NONE);
             }
         }
+        if self.bar_height() > 0 {
+            tab::draw_bar(frame, &self.tabs, self.tab, self.bar_area());
+        }
         let mut cursor = None;
-        for panel in &self.panels {
-            let active = panel.id == self.active;
+        let tab = self.tab();
+        for panel in &tab.panels {
+            let active = panel.id == tab.active;
             let preview = panel.document().is_some_and(|doc| self.is_preview(doc));
             let at = panel.draw(frame, &self.keymap, &self.workspace, active, preview);
             if active {
@@ -939,13 +1074,16 @@ impl App {
             }
         }
         if self.height > 1 {
-            let status = self.active_panel().status();
+            let status = match &self.tab_prompt {
+                Some(prompt) => prompt.status(),
+                None => self.active_panel().status(),
+            };
             let y = self.height - 1;
             if let Some(prompt) = status::draw(frame, &status, y, self.width, &self.keymap) {
                 cursor = Some(prompt);
             }
         }
-        for handle in self.layout.handles(main) {
+        for handle in tab.layout.handles(main) {
             if handle.axis == Axis::Horizontal {
                 let rect = handle.rect;
                 for y in rect.y..rect.y + rect.height {
@@ -1019,24 +1157,32 @@ impl App {
         }
         let id = self.next_panel;
         self.next_panel += 1;
-        self.layout.split(self.active, id, axis);
-        self.panels.push(Panel::new(id));
+        let tab = self.tab_mut();
+        tab.layout.split(tab.active, id, axis);
+        tab.panels.push(Panel::new(id));
         self.layout();
         self.activate(id);
     }
 
     /// Closes the active panel and what it shows (see
     /// [`App::close_shown`]), giving its room to its neighbor, which becomes
-    /// active. The last panel is emptied instead. Files it showed before
+    /// active. The tab's last panel is emptied instead, and once empty,
+    /// closes the tab, unless it's the only one. Files it showed before
     /// stay open.
     fn close_panel(&mut self) {
+        let tab = self.tab();
+        if tab.panels.len() == 1 && tab.active_panel().is_empty() && self.tabs.len() > 1 {
+            self.close_tab(self.tab);
+            return;
+        }
         if !self.close_shown() {
             return;
         }
-        match self.layout.remove(self.active) {
+        let tab = self.tab_mut();
+        match tab.layout.remove(tab.active) {
             Some(next) => {
-                let closed = self.active;
-                self.panels.retain(|panel| panel.id != closed);
+                let closed = tab.active;
+                tab.panels.retain(|panel| panel.id != closed);
                 self.layout();
                 self.activate(next);
             }
@@ -1058,10 +1204,8 @@ impl App {
             }
             return;
         }
-        match self
-            .layout
-            .neighbor(self.main_area(), self.active, direction)
-        {
+        let tab = self.tab();
+        match tab.layout.neighbor(self.main_area(), tab.active, direction) {
             Some(id) => self.activate(id),
             None if direction == Direction::Left => {
                 self.run(Command::FocusTree, false);
@@ -1074,14 +1218,128 @@ impl App {
     /// last panel's message goes.
     fn activate(&mut self, id: PanelId) {
         self.focus = Focus::Editor;
-        if self.active != id {
+        let tab = self.tab_mut();
+        if tab.active != id {
             // It may have just closed.
-            if let Some(panel) = self.panels.iter_mut().find(|p| p.id == self.active) {
+            let active = tab.active;
+            if let Some(panel) = tab.panel_mut(active) {
                 panel.clear_message();
             }
-            self.active = id;
+            tab.active = id;
             self.show_active_in_tree();
         }
+    }
+
+    // --- tabs -------------------------------------------------------------------
+
+    /// Opens a new tab after the one on screen, with one empty panel, and
+    /// switches to it.
+    fn new_tab(&mut self) {
+        let tab = Tab::new(self.next_tab, self.next_panel);
+        self.next_tab += 1;
+        self.next_panel += 1;
+        self.tabs.insert(self.tab + 1, tab);
+        self.switch_tab(self.tab + 1);
+    }
+
+    /// Puts the tab at `index` on screen, and gives the keyboard to its
+    /// active panel. The status bar is that panel's now, so the last one's
+    /// message goes.
+    fn switch_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.active_panel_mut().clear_message();
+        self.tab_prompt = None;
+        self.tab = index;
+        self.focus = Focus::Editor;
+        // The screen may have changed size while it was away.
+        self.layout();
+        self.show_active_in_tree();
+    }
+
+    /// Moves the tab at `from` to `to` in the bar.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let current = self.tab().id;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.tab = self.tab_index(current).unwrap_or(0);
+    }
+
+    fn tab_index(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// Closes the tab at `index`, and what its panels show, as closing each
+    /// of them would (see [`App::close_shown`]). If that loses unsaved
+    /// changes or stops a program, it asks first, and closing it again goes
+    /// ahead. The tab after it takes its place on screen, or the one before
+    /// it. The only tab is emptied instead, down to one empty panel.
+    fn close_tab(&mut self, index: usize) {
+        let Some(closing) = self.tabs.get(index) else {
+            return;
+        };
+        // What its panels show, except files panels in other tabs show too.
+        let elsewhere = |doc: &Rc<Document>| {
+            self.tabs
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != index)
+                .flat_map(|(_, tab)| &tab.panels)
+                .any(|panel| panel.shows(doc))
+        };
+        let mut documents: Vec<Rc<Document>> = Vec::new();
+        for doc in closing.panels.iter().filter_map(Panel::document) {
+            if !elsewhere(doc) && !documents.iter().any(|d| Rc::ptr_eq(d, doc)) {
+                documents.push(doc.clone());
+            }
+        }
+        let terminals: Vec<Rc<RefCell<Terminal>>> = closing
+            .panels
+            .iter()
+            .filter_map(Panel::terminal)
+            .cloned()
+            .collect();
+        let unsaved: Vec<String> = documents
+            .iter()
+            .filter(|doc| doc.is_modified())
+            .map(|doc| self.document_name(doc))
+            .collect();
+        let running = running_programs(&terminals);
+        let armed = Some(Armed::CloseTab(closing.id));
+        if (!unsaved.is_empty() || !running.is_empty()) && self.armed != armed {
+            self.armed = armed;
+            let message = format!(
+                "{} {} again to close the tab anyway.",
+                losing_reasons(&unsaved, &running),
+                self.shortcut(Command::CloseTab)
+            );
+            self.show_message(message, true);
+            return;
+        }
+        self.armed = None;
+        self.tab_prompt = None;
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.tabs.push(Tab::new(self.next_tab, self.next_panel));
+            self.next_tab += 1;
+            self.next_panel += 1;
+        }
+        if index < self.tab || self.tab >= self.tabs.len() {
+            self.tab -= 1;
+        }
+        for terminal in &terminals {
+            self.destroy_terminal(terminal);
+        }
+        for doc in &documents {
+            self.destroy_document(doc);
+        }
+        self.layout();
+        self.prune_documents();
+        self.show_active_in_tree();
     }
 
     // --- picker -----------------------------------------------------------------
@@ -1236,14 +1494,13 @@ impl App {
     /// file can't be opened.
     fn open(&mut self, path: &Path, preview: bool) -> bool {
         let path = document::resolve(path);
-        let active = self.active_index();
-        self.panels[active].clear_message();
+        self.active_panel_mut().clear_message();
         // Coming back to a file, the keyboard is for its text.
-        if let Some(editor) = self.panels[active].editor_mut() {
+        if let Some(editor) = self.editor_mut() {
             editor.blur_find();
         }
         let existing = self.find_document(&path);
-        let had_terminal = self.panels[active].terminal().is_some();
+        let had_terminal = self.active_terminal().is_some();
         let (doc, notice) = match &existing {
             Some(doc) => (doc.clone(), None),
             None => match Document::open(Some(path.clone()), self.theme.clone()) {
@@ -1254,8 +1511,8 @@ impl App {
                 }
             },
         };
-        let left = self.panels[active].document().cloned();
-        if let Err(err) = self.panels[active].show(&doc) {
+        let left = self.active_panel().document().cloned();
+        if let Err(err) = self.active_panel_mut().show(&doc) {
             self.cant_open(&err.to_string(), &path);
             return false;
         }
@@ -1266,14 +1523,14 @@ impl App {
                 _ => None,
             };
             let replaced = replaced
-                .filter(|old| !self.panels.iter().any(|panel| panel.shows(old)))
+                .filter(|old| !tab::all_panels(&self.tabs).any(|panel| panel.shows(old)))
                 .and_then(|old| {
                     let index = self.documents.iter().position(|d| Rc::ptr_eq(d, &old))?;
                     Some((index, old))
                 });
             match replaced {
                 Some((index, old)) => {
-                    for panel in &mut self.panels {
+                    for panel in tab::all_panels_mut(&mut self.tabs) {
                         panel.forget(&old);
                     }
                     self.documents[index] = doc.clone();
@@ -1306,11 +1563,12 @@ impl App {
         self.show_message(message, true);
     }
 
-    /// Closes unnamed files that were never typed in and no panel has.
+    /// Closes unnamed files that were never typed in and no panel has, in
+    /// any tab.
     fn prune_documents(&mut self) {
-        let panels = &self.panels;
+        let tabs = &self.tabs;
         self.documents
-            .retain(|doc| !doc.is_blank() || panels.iter().any(|panel| panel.has(doc)));
+            .retain(|doc| !doc.is_blank() || tab::all_panels(tabs).any(|panel| panel.has(doc)));
         let documents = &self.documents;
         self.recent.retain(|recent| match recent {
             Recent::Untitled(number) => documents
@@ -1431,8 +1689,8 @@ impl App {
     // --- closing ----------------------------------------------------------------
 
     /// Closes what the active panel shows, as closing the panel does,
-    /// leaving it empty: a terminal, or a file, unless another panel shows
-    /// it too. Returns false if it asked first instead (see
+    /// leaving it empty: a terminal, or a file, unless another panel, in
+    /// any tab, shows it too. Returns false if it asked first instead (see
     /// [`App::confirm_close`]).
     fn close_shown(&mut self) -> bool {
         if let Some(terminal) = self.active_terminal() {
@@ -1447,12 +1705,8 @@ impl App {
         let Some(doc) = self.active_panel().document().cloned() else {
             return true;
         };
-        let active = self.active;
-        if self
-            .panels
-            .iter()
-            .any(|panel| panel.id != active && panel.shows(&doc))
-        {
+        let active = self.tab().active;
+        if tab::all_panels(&self.tabs).any(|panel| panel.id != active && panel.shows(&doc)) {
             self.active_panel_mut().forget(&doc);
             return true;
         }
@@ -1550,7 +1804,7 @@ impl App {
 
     /// Closes `doc`, wherever it's shown, dropping its unsaved changes.
     fn destroy_document(&mut self, doc: &Rc<Document>) {
-        for panel in &mut self.panels {
+        for panel in tab::all_panels_mut(&mut self.tabs) {
             panel.forget(doc);
         }
         self.documents.retain(|open| !Rc::ptr_eq(open, doc));
@@ -1788,39 +2042,18 @@ impl App {
             .filter(|doc| doc.is_modified())
             .map(|doc| self.document_name(doc))
             .collect();
-        let running: Vec<String> = self
-            .terminals
-            .iter()
-            .map(|terminal| terminal.borrow())
-            .filter(|terminal| terminal.is_busy())
-            .map(|terminal| {
-                terminal
-                    .program()
-                    .unwrap_or_else(|| "A program".to_string())
-            })
-            .collect();
+        let running = running_programs(&self.terminals);
         if (unsaved.is_empty() && running.is_empty()) || self.armed == Some(Armed::Quit) {
             return AppAction::Quit;
         }
         self.armed = Some(Armed::Quit);
-        let mut reasons = Vec::new();
-        if !unsaved.is_empty() {
-            reasons.push(format!("Unsaved changes in {}.", unsaved.join(", ")));
-        }
-        match running.as_slice() {
-            [] => {}
-            [program] => reasons.push(format!("{program} is running in a terminal.")),
-            programs => reasons.push(format!("{} are running in terminals.", programs.join(", "))),
-        }
+        let reasons = losing_reasons(&unsaved, &running);
         let quit = self.shortcut(Command::Quit);
         let message = if unsaved.is_empty() {
-            format!("{} {quit} again to quit.", reasons.join(" "))
+            format!("{reasons} {quit} again to quit.")
         } else {
             let save = self.shortcut(Command::Save);
-            format!(
-                "{} {quit} again to quit, {save} to save.",
-                reasons.join(" ")
-            )
+            format!("{reasons} {quit} again to quit, {save} to save.")
         };
         self.show_message(message, true);
         AppAction::Continue
@@ -1991,9 +2224,9 @@ impl App {
                 }
             }
             Command::TreeOpenToSide if !target.is_dir => {
-                let panels = self.panels.len();
+                let panels = self.tab().panels.len();
                 self.split(Axis::Horizontal);
-                if self.panels.len() > panels && self.open(&target.path, false) {
+                if self.tab().panels.len() > panels && self.open(&target.path, false) {
                     self.focus = Focus::Editor;
                 }
             }
@@ -2193,9 +2426,10 @@ impl App {
     }
 
     /// Shows `terminal` in the active panel, and gives it the keyboard. It
-    /// leaves any other panel showing it, since its pty has one size.
+    /// leaves any other panel showing it, in any tab, since its pty has one
+    /// size.
     fn show_terminal(&mut self, terminal: Rc<RefCell<Terminal>>) {
-        for panel in &mut self.panels {
+        for panel in tab::all_panels_mut(&mut self.tabs) {
             if panel
                 .terminal()
                 .is_some_and(|shown| Rc::ptr_eq(shown, &terminal))
@@ -2213,7 +2447,7 @@ impl App {
     /// Closes `terminal`, hanging up on its shell and whatever it's
     /// running. A panel showing it is left empty.
     fn destroy_terminal(&mut self, terminal: &Rc<RefCell<Terminal>>) {
-        for panel in &mut self.panels {
+        for panel in tab::all_panels_mut(&mut self.tabs) {
             if panel
                 .terminal()
                 .is_some_and(|shown| Rc::ptr_eq(shown, terminal))
@@ -2235,7 +2469,8 @@ impl App {
         let popup = self.picker.is_some()
             || self.search.is_some()
             || self.dialog.is_some()
-            || self.menu.is_some();
+            || self.menu.is_some()
+            || self.tab_prompt.is_some();
         if self.focus != Focus::Editor || popup {
             return None;
         }
@@ -2309,12 +2544,13 @@ impl App {
         self.focused_terminal = focused;
     }
 
-    /// Closes terminals whose shell exited and that no panel shows.
+    /// Closes terminals whose shell exited and that no panel shows, in any
+    /// tab.
     fn prune_terminals(&mut self) {
-        let panels = &self.panels;
+        let tabs = &self.tabs;
         self.terminals.retain(|terminal| {
             terminal.borrow().exit().is_none()
-                || panels.iter().any(|panel| {
+                || tab::all_panels(tabs).any(|panel| {
                     panel
                         .terminal()
                         .is_some_and(|shown| Rc::ptr_eq(shown, terminal))
@@ -2351,14 +2587,31 @@ impl App {
         }
     }
 
-    /// Where the panels go: right of the tree, above the status bar.
+    /// Where the panels go: right of the tree, below the tab bar, above the
+    /// status bar.
     fn main_area(&self) -> Rect {
         let x = self.editor_x();
+        let bar = self.bar_height();
         Rect {
             x,
-            y: 0,
+            y: bar,
             width: self.width.saturating_sub(x).max(1),
-            height: self.height.saturating_sub(1),
+            height: self.height.saturating_sub(1 + bar),
+        }
+    }
+
+    /// The tab bar's height: a row with more than one tab, if that leaves
+    /// room for a panel below it.
+    fn bar_height(&self) -> u32 {
+        u32::from(self.tabs.len() > 1 && self.height >= layout::MIN_HEIGHT + 2)
+    }
+
+    /// The tab bar, across the top of the panels.
+    fn bar_area(&self) -> Rect {
+        Rect {
+            height: self.bar_height(),
+            y: 0,
+            ..self.main_area()
         }
     }
 
@@ -2366,7 +2619,8 @@ impl App {
         if self.visible_tree_width() == 0 && self.focus == Focus::Tree {
             self.focus = Focus::Editor;
         }
-        self.tree.set_height(self.main_area().height);
+        // The tree is as tall as the tab bar and panels together.
+        self.tree.set_height(self.height.saturating_sub(1));
         if let Some(picker) = &mut self.picker {
             picker.set_size(self.width, self.height);
         }
@@ -2379,27 +2633,26 @@ impl App {
         if let Some((menu, _)) = &mut self.menu {
             menu.set_size(self.width, self.height);
         }
-        for (id, area) in self.layout.panels(self.main_area()) {
-            if let Some(panel) = self.panels.iter_mut().find(|panel| panel.id == id) {
-                panel.set_area(area);
-            }
-        }
+        // Tabs off screen are laid out when they come back.
+        let area = self.main_area();
+        self.tab_mut().set_area(area);
     }
 
-    fn active_index(&self) -> usize {
-        self.panels
-            .iter()
-            .position(|panel| panel.id == self.active)
-            .expect("the active panel is open")
+    /// The tab on screen.
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.tab]
+    }
+
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.tab]
     }
 
     fn active_panel(&self) -> &Panel {
-        &self.panels[self.active_index()]
+        self.tab().active_panel()
     }
 
     fn active_panel_mut(&mut self) -> &mut Panel {
-        let index = self.active_index();
-        &mut self.panels[index]
+        self.tab_mut().active_panel_mut()
     }
 
     /// The active panel's editor, if it isn't empty.
@@ -2425,6 +2678,35 @@ impl App {
             None => command.id().to_string(),
         }
     }
+}
+
+/// What's running in `terminals`, by name, of those busy running something.
+fn running_programs(terminals: &[Rc<RefCell<Terminal>>]) -> Vec<String> {
+    terminals
+        .iter()
+        .map(|terminal| terminal.borrow())
+        .filter(|terminal| terminal.is_busy())
+        .map(|terminal| {
+            terminal
+                .program()
+                .unwrap_or_else(|| "A program".to_string())
+        })
+        .collect()
+}
+
+/// Why going ahead would lose something: the files with `unsaved` changes,
+/// and the programs `running` in terminals.
+fn losing_reasons(unsaved: &[String], running: &[String]) -> String {
+    let mut reasons = Vec::new();
+    if !unsaved.is_empty() {
+        reasons.push(format!("Unsaved changes in {}.", unsaved.join(", ")));
+    }
+    match running {
+        [] => {}
+        [program] => reasons.push(format!("{program} is running in a terminal.")),
+        programs => reasons.push(format!("{} are running in terminals.", programs.join(", "))),
+    }
+    reasons.join(" ")
 }
 
 /// `doc`, as the picker lists it.
@@ -3629,7 +3911,12 @@ mod tests {
 
     /// What the status bar would show with panel `id` active.
     fn status_of(app: &App, id: PanelId) -> String {
-        let panel = app.panels.iter().find(|panel| panel.id == id).unwrap();
+        let panel = app
+            .tab()
+            .panels
+            .iter()
+            .find(|panel| panel.id == id)
+            .unwrap();
         match panel.status() {
             crate::status::Status::Info(info) => info,
             other => panic!("{other:?}"),
@@ -3647,7 +3934,7 @@ mod tests {
         let mut app = app(&root, Some("a.txt"));
         ctrl(&mut app, 'b');
         ctrl(&mut app, '\\');
-        assert_eq!(app.panels.len(), 2);
+        assert_eq!(app.tab().panels.len(), 2);
         assert!(app.editor().is_none(), "the new panel is active, and empty");
         let text = screen(&app);
         assert!(
@@ -3690,7 +3977,7 @@ mod tests {
                 ..Mods::CTRL
             },
         );
-        assert_eq!(app.panels.len(), 3);
+        assert_eq!(app.tab().panels.len(), 3);
         assert_eq!(
             app.active_panel().area(),
             Rect {
@@ -3732,7 +4019,7 @@ mod tests {
 
         // Back left, typing goes where its cursor was.
         with_mods(&mut app, KeyCode::Left, CTRL_ALT);
-        assert_eq!(app.active, 0);
+        assert_eq!(app.tab().active, 0);
         type_text(&mut app, "Y");
         assert!(app.ed().text().starts_with("Yline 1\n"));
         assert!(
@@ -3770,10 +4057,10 @@ mod tests {
         type_text(&mut app, "edited ");
         // Its file goes with it, after asking about the edits.
         ctrl(&mut app, 'w');
-        assert_eq!(app.panels.len(), 2);
+        assert_eq!(app.tab().panels.len(), 2);
         assert!(screen(&app).contains("b.txt has unsaved changes."));
         ctrl(&mut app, 'w');
-        assert_eq!(app.panels.len(), 1);
+        assert_eq!(app.tab().panels.len(), 1);
         assert_eq!(
             app.ed().path().as_deref(),
             Some(root.join("a.txt").as_path())
@@ -3786,7 +4073,7 @@ mod tests {
         ctrl(&mut app, '\\');
         assert!(app.open(&root.join("a.txt"), false));
         ctrl(&mut app, 'w');
-        assert_eq!(app.panels.len(), 1);
+        assert_eq!(app.tab().panels.len(), 1);
         assert_eq!(open_paths(&app), ["a.txt"]);
 
         // Files shown there before stay open; the last panel empties.
@@ -3794,7 +4081,7 @@ mod tests {
         type_text(&mut app, "edited ");
         assert!(app.open(&root.join("a.txt"), false));
         ctrl(&mut app, 'w');
-        assert_eq!(app.panels.len(), 1);
+        assert_eq!(app.tab().panels.len(), 1);
         assert!(app.editor().is_none());
         assert!(screen(&app).contains("No file"));
         assert_eq!(open_paths(&app), ["b.txt"]);
@@ -3837,7 +4124,7 @@ mod tests {
         with_mods(&mut app, KeyCode::Left, CTRL_ALT);
         assert!(app.ed().is_blank());
         ctrl(&mut app, 'w');
-        assert_eq!(app.panels.len(), 1);
+        assert_eq!(app.tab().panels.len(), 1);
         assert!(app.documents.is_empty(), "{}", app.documents.len());
     }
 
@@ -3855,16 +4142,16 @@ mod tests {
 
         // On the line numbers: the start of the line.
         left_click(&mut app, 1, 1);
-        assert_eq!(app.active, 0);
+        assert_eq!(app.tab().active, 0);
         assert_eq!(
             app.ed().path().as_deref(),
             Some(root.join("a.txt").as_path())
         );
         // A header gives its panel the keyboard, and leaves the cursor.
         left_click(&mut app, 60, 0);
-        assert_eq!(app.active, 1);
+        assert_eq!(app.tab().active, 1);
         left_click(&mut app, 30, 0);
-        assert_eq!(app.active, 0);
+        assert_eq!(app.tab().active, 0);
 
         // The wheel scrolls the other panel without taking the keyboard.
         let wheel = |app: &mut App| {
@@ -3880,7 +4167,7 @@ mod tests {
         };
         wheel(&mut app);
         wheel(&mut app);
-        assert_eq!(app.active, 0);
+        assert_eq!(app.tab().active, 0);
         assert!(
             !cells(&app, 1, 41..80).contains("line 1 "),
             "{}",
@@ -3904,9 +4191,9 @@ mod tests {
         drag(&mut app, MouseKind::Press(MouseButton::Left), 40, 3);
         drag(&mut app, MouseKind::Drag(MouseButton::Left), 30, 3);
         drag(&mut app, MouseKind::Release(MouseButton::Left), 30, 3);
-        assert_eq!(app.panels[0].area().width, 30);
+        assert_eq!(app.tab().panels[0].area().width, 30);
         assert_eq!(cells(&app, 0, 30..31), "│");
-        assert_eq!(app.active, 0, "dragging doesn't move the keyboard");
+        assert_eq!(app.tab().active, 0, "dragging doesn't move the keyboard");
 
         // Stacked panels: the lower one's header drags.
         ctrl(&mut app, '|');
@@ -3960,7 +4247,7 @@ mod tests {
                 Instant::now(),
             );
         };
-        let area = |app: &App, id| app.panels.iter().find(|p| p.id == id).unwrap().area();
+        let area = |app: &App, id| app.tab().panels.iter().find(|p| p.id == id).unwrap().area();
         let tinted = |app: &App, x, y| {
             let frame = OwnedBuffer::new(80, 10, false, WidthMethod::Unicode, "t").unwrap();
             app.draw(&frame);
@@ -3970,7 +4257,11 @@ mod tests {
         // Dropped in the middle of the other panel, they swap. Over itself,
         // it would stay.
         mouse(&mut app, MouseKind::Press(MouseButton::Left), 10, 0);
-        assert_eq!(app.active, 0, "grabbing a header gives it the keyboard");
+        assert_eq!(
+            app.tab().active,
+            0,
+            "grabbing a header gives it the keyboard"
+        );
         mouse(&mut app, MouseKind::Drag(MouseButton::Left), 20, 0);
         assert!(app.header_drag.as_ref().unwrap().drop.is_none());
         mouse(&mut app, MouseKind::Drag(MouseButton::Left), 60, 4);
@@ -4041,21 +4332,21 @@ mod tests {
         let root = fixture("panel-keys", &[("a.txt", "")]);
         let mut app = app(&root, Some("a.txt"));
         ctrl(&mut app, '\\');
-        let right = app.active;
+        let right = app.tab().active;
         with_mods(&mut app, KeyCode::Left, CTRL_ALT);
-        assert_eq!((app.active, app.focus), (0, Focus::Editor));
+        assert_eq!((app.tab().active, app.focus), (0, Focus::Editor));
         with_mods(&mut app, KeyCode::Left, CTRL_ALT);
         assert_eq!(app.focus, Focus::Tree, "left of the panels is the tree");
         with_mods(&mut app, KeyCode::Right, CTRL_ALT);
-        assert_eq!((app.active, app.focus), (0, Focus::Editor));
+        assert_eq!((app.tab().active, app.focus), (0, Focus::Editor));
         with_mods(&mut app, KeyCode::Right, CTRL_ALT);
-        assert_eq!(app.active, right);
+        assert_eq!(app.tab().active, right);
         with_mods(&mut app, KeyCode::Right, CTRL_ALT);
-        assert_eq!(app.active, right, "nothing further right");
+        assert_eq!(app.tab().active, right, "nothing further right");
 
         // Too small to split again.
         ctrl(&mut app, '\\');
-        assert_eq!(app.panels.len(), 2);
+        assert_eq!(app.tab().panels.len(), 2);
         assert!(
             screen(&app).contains("No room to split"),
             "{}",
@@ -4096,6 +4387,9 @@ mod tests {
                 ..Mods::CTRL
             },
         );
+        // A second tab, for the tab bar.
+        ctrl(&mut app, 't');
+        assert!(app.open(&root.join("a.txt"), false));
         for (width, height) in [(30, 5), (3, 2), (1, 1), (0, 0), (200, 60), (80, 10)] {
             app.resize(width, height);
             let frame = OwnedBuffer::new(
@@ -4117,6 +4411,218 @@ mod tests {
             }
         }
         assert!(screen(&app).contains("│"));
+    }
+
+    // --- tabs -------------------------------------------------------------------
+
+    /// The tab bar's text, row 0, with the tree hidden.
+    fn tab_bar(app: &App) -> String {
+        cells(app, 0, 0..80).trim_end().to_string()
+    }
+
+    #[test]
+    fn tabs_switch_the_whole_layout() {
+        let _serial = crate::test_serial();
+        let root = fixture("tabs", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'b');
+        ctrl(&mut app, '\\');
+        assert!(app.open(&root.join("b.txt"), false));
+        assert!(
+            cells(&app, 0, 0..80).contains("a.txt"),
+            "no bar with one tab"
+        );
+
+        // A new tab has one empty panel, below a bar naming the tabs for
+        // their active panels.
+        ctrl(&mut app, 't');
+        assert_eq!((app.tabs.len(), app.tab), (2, 1));
+        assert_eq!(app.tab().panels.len(), 1);
+        assert!(app.editor().is_none());
+        assert_eq!(tab_bar(&app), " 1 b.txt  2 Empty  +");
+        assert!(
+            cells(&app, 1, 0..80).contains("No file"),
+            "{}",
+            screen(&app)
+        );
+        assert_eq!(app.active_panel().area().y, 1);
+
+        // A file can be in both.
+        assert!(app.open(&root.join("a.txt"), false));
+        assert_eq!(open_paths(&app), ["a.txt", "b.txt"]);
+        assert_eq!(tab_bar(&app), " 1 b.txt  2 a.txt  +");
+
+        // Back to the first, as it was.
+        with_mods(&mut app, KeyCode::Char('['), CTRL_ALT);
+        assert_eq!(app.tab, 0);
+        assert_eq!(app.tab().panels.len(), 2);
+        assert!(cells(&app, 2, 0..40).contains("alpha"), "{}", screen(&app));
+        assert!(cells(&app, 2, 41..80).contains("beta"));
+        assert_eq!(
+            app.ed().path().as_deref(),
+            Some(root.join("b.txt").as_path())
+        );
+        app.handle_key(Key::new(KeyCode::PageDown, Mods::CTRL));
+        assert_eq!(app.tab, 1);
+        with_mods(&mut app, KeyCode::Char(']'), CTRL_ALT);
+        assert_eq!(app.tab, 0, "wrapping around");
+        ctrl(&mut app, '2');
+        assert_eq!(app.tab, 1);
+        ctrl(&mut app, '3');
+        assert_eq!(app.tab, 1);
+        assert!(screen(&app).contains("There's no tab 3."));
+        ctrl(&mut app, '1');
+        assert_eq!(app.tab, 0);
+
+        // Moving it right, then closing the other: a.txt stays open, since
+        // the tab left shows it too, and that tab fills the screen again.
+        with_mods(
+            &mut app,
+            KeyCode::PageDown,
+            Mods {
+                shift: true,
+                ..Mods::CTRL
+            },
+        );
+        assert_eq!(tab_bar(&app), " 1 a.txt  2 b.txt  +");
+        assert_eq!(app.tab, 1);
+        with_mods(&mut app, KeyCode::Char('['), CTRL_ALT);
+        with_mods(&mut app, KeyCode::Char('w'), CTRL_ALT);
+        assert_eq!((app.tabs.len(), app.tab), (1, 0));
+        assert_eq!(open_paths(&app), ["a.txt", "b.txt"]);
+        assert_eq!(app.tab().panels.len(), 2);
+        assert_eq!(app.active_panel().area().y, 0);
+        assert!(cells(&app, 0, 0..40).contains("a.txt"), "{}", screen(&app));
+        assert!(cells(&app, 0, 41..80).contains("b.txt"));
+    }
+
+    #[test]
+    fn closing_a_tab_asks_before_losing_edits() {
+        let _serial = crate::test_serial();
+        let root = fixture("close-tab", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        with_mods(&mut app, KeyCode::Char(']'), CTRL_ALT);
+        assert!(screen(&app).contains("There's only this tab; Ctrl+T opens another."));
+
+        ctrl(&mut app, 't');
+        assert!(app.open(&root.join("b.txt"), false));
+        type_text(&mut app, "edited ");
+        with_mods(&mut app, KeyCode::Char('w'), CTRL_ALT);
+        assert_eq!(app.tabs.len(), 2);
+        assert!(
+            screen(&app).contains("Unsaved changes in b.txt. Ctrl+Alt+W again"),
+            "{}",
+            screen(&app)
+        );
+        with_mods(&mut app, KeyCode::Char('w'), CTRL_ALT);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(open_paths(&app), ["a.txt"]);
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "beta");
+
+        // Closing a tab's last panel once it's empty closes the tab, but
+        // not the only one.
+        ctrl(&mut app, 't');
+        assert_eq!(app.tabs.len(), 2);
+        ctrl(&mut app, 'w');
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.ed_is_shown(), "back to a.txt");
+        ctrl(&mut app, 'w');
+        ctrl(&mut app, 'w');
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.active_panel().is_empty());
+
+        // Closing the only tab empties it.
+        assert!(app.open(&root.join("a.txt"), false));
+        ctrl(&mut app, '\\');
+        with_mods(&mut app, KeyCode::Char('w'), CTRL_ALT);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tab().panels.len(), 1);
+        assert!(app.active_panel().is_empty());
+        assert!(app.documents.is_empty());
+    }
+
+    #[test]
+    fn a_terminal_moves_to_the_tab_it_is_shown_in() {
+        let _serial = crate::test_serial();
+        let root = fixture("tab-terminal", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('n'), ctrl_shift));
+        let terminal = app.active_terminal().expect("a terminal");
+        // Ctrl+T is the shell's; after the prefix, it's qedit's.
+        ctrl(&mut app, 't');
+        assert_eq!(app.tabs.len(), 1);
+        prefixed_ctrl(&mut app, 't');
+        assert_eq!(app.tabs.len(), 2);
+        assert!(app.active_terminal().is_none());
+
+        app.show_terminal(terminal.clone());
+        assert!(app.active_terminal().is_some());
+        assert!(
+            app.tabs[0].active_panel().is_empty(),
+            "a terminal is in one panel at a time"
+        );
+        with_mods(&mut app, KeyCode::Char('['), CTRL_ALT);
+        assert!(app.active_terminal().is_none());
+
+        // Closing its tab hangs up on it. Ctrl+2 gets there from a
+        // terminal too.
+        ctrl(&mut app, '2');
+        assert_eq!(app.tab, 1);
+        with_mods(&mut app, KeyCode::Char('w'), CTRL_ALT);
+        if app.tabs.len() == 2 {
+            // The login shell was still starting up: it asked first.
+            with_mods(&mut app, KeyCode::Char('w'), CTRL_ALT);
+        }
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.terminals.is_empty());
+    }
+
+    #[test]
+    fn the_mouse_switches_opens_closes_moves_and_renames_tabs() {
+        let _serial = crate::test_serial();
+        let root = fixture("tab-mouse", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'b');
+        ctrl(&mut app, 't');
+        assert!(app.open(&root.join("b.txt"), false));
+        assert_eq!(tab_bar(&app), " 1 a.txt  2 b.txt  +");
+
+        left_click(&mut app, 2, 0);
+        assert_eq!(app.tab, 0);
+        // The + opens one after the tab on screen.
+        left_click(&mut app, 19, 0);
+        assert_eq!(tab_bar(&app), " 1 a.txt  2 Empty  3 b.txt  +");
+        assert_eq!(app.tab, 1);
+        mouse_at(&mut app, MouseKind::Press(MouseButton::Middle), 12, 0);
+        assert_eq!(tab_bar(&app), " 1 a.txt  2 b.txt  +");
+        assert_eq!(app.tab, 1, "b.txt, after the closed tab");
+
+        // Dragged along the bar, a tab moves.
+        mouse_at(&mut app, MouseKind::Press(MouseButton::Left), 2, 0);
+        mouse_at(&mut app, MouseKind::Drag(MouseButton::Left), 12, 0);
+        mouse_at(&mut app, MouseKind::Drag(MouseButton::Left), 14, 0);
+        mouse_at(&mut app, MouseKind::Release(MouseButton::Left), 14, 0);
+        assert_eq!(tab_bar(&app), " 1 b.txt  2 a.txt  +");
+        assert_eq!(app.tab, 1, "a.txt stays on screen");
+
+        // A double click renames it; no name names it for its file again.
+        left_click(&mut app, 12, 0);
+        left_click(&mut app, 12, 0);
+        type_text(&mut app, "notes");
+        assert!(cells(&app, 9, 0..80).starts_with(" Rename tab: notes"));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(tab_bar(&app), " 1 b.txt  2 notes  +");
+        assert!(!app.ed().is_modified(), "the prompt took the keys");
+        app.run(Command::RenameTab, false);
+        for _ in 0.."notes".len() {
+            key(&mut app, KeyCode::Backspace);
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(tab_bar(&app), " 1 b.txt  2 a.txt  +");
     }
 
     // --- context menu and file commands ----------------------------------------

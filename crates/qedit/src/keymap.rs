@@ -91,6 +91,22 @@ commands! {
     FocusPanelRight => "panel:focus-right", "Focus Panel Right";
     FocusPanelUp => "panel:focus-up", "Focus Panel Above";
     FocusPanelDown => "panel:focus-down", "Focus Panel Below";
+    NewTab => "tab:new", "New Tab";
+    CloseTab => "tab:close", "Close Tab";
+    NextTab => "tab:next", "Next Tab";
+    PreviousTab => "tab:previous", "Previous Tab";
+    MoveTabLeft => "tab:move-left", "Move Tab Left";
+    MoveTabRight => "tab:move-right", "Move Tab Right";
+    RenameTab => "tab:rename", "Rename Tab";
+    GoToTab1 => "tab:go-to-1", "Go to Tab 1";
+    GoToTab2 => "tab:go-to-2", "Go to Tab 2";
+    GoToTab3 => "tab:go-to-3", "Go to Tab 3";
+    GoToTab4 => "tab:go-to-4", "Go to Tab 4";
+    GoToTab5 => "tab:go-to-5", "Go to Tab 5";
+    GoToTab6 => "tab:go-to-6", "Go to Tab 6";
+    GoToTab7 => "tab:go-to-7", "Go to Tab 7";
+    GoToTab8 => "tab:go-to-8", "Go to Tab 8";
+    GoToTab9 => "tab:go-to-9", "Go to Tab 9";
     NewTerminal => "terminal:new", "New Terminal";
     ClearTerminal => "terminal:clear", "Clear Terminal";
     CloseTerminal => "terminal:close", "Close Terminal";
@@ -181,7 +197,10 @@ impl Command {
             Quit | Palette | Save | SaveAs | NewFile | CreateFile | OpenFile | GoToFile
             | SearchWorkspace | Find | FindReplace | FindNext | FindPrevious | ToggleTree
             | FocusTree | FocusEditor | SplitRight | SplitDown | ClosePanel | FocusPanelLeft
-            | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal => Context::Global,
+            | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal | NewTab | CloseTab
+            | NextTab | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1
+            | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8
+            | GoToTab9 => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu
             | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate
@@ -197,6 +216,26 @@ impl Command {
             Replace | ReplaceAll => Context::Replace,
             _ => Context::Editor,
         }
+    }
+
+    /// The Go to Tab commands, in order.
+    const GO_TO_TAB: [Command; 9] = [
+        Command::GoToTab1,
+        Command::GoToTab2,
+        Command::GoToTab3,
+        Command::GoToTab4,
+        Command::GoToTab5,
+        Command::GoToTab6,
+        Command::GoToTab7,
+        Command::GoToTab8,
+        Command::GoToTab9,
+    ];
+
+    /// For Go to Tab N, the tab's index, N - 1.
+    pub fn tab_index(self) -> Option<usize> {
+        Command::GO_TO_TAB
+            .iter()
+            .position(|&command| command == self)
     }
 
     /// Cursor movements: with Shift held they extend the selection.
@@ -283,6 +322,8 @@ impl Default for Keymap {
             // Ctrl+\ as in VS Code; Ctrl+W as closing a tab does.
             ('\\', SplitRight),
             ('w', ClosePanel),
+            // As in browsers.
+            ('t', NewTab),
         ] {
             bindings.push((key(Char(c), Mods::CTRL), command));
             bindings.push((key(Char(c), SUPER), command));
@@ -332,9 +373,26 @@ impl Default for Keymap {
             (Down, FocusPanelDown),
             // VS Code's New File… is Ctrl+Alt+Super+N.
             (Char('n'), CreateFile),
+            // Tabs are a level above panels: Ctrl+Alt as for moving between
+            // panels, W as closing a panel, and brackets as macOS's
+            // Cmd+Shift+[ and ].
+            (Char('w'), CloseTab),
+            (Char(']'), NextTab),
+            (Char('['), PreviousTab),
         ] {
             bindings.push((key(code, CTRL_ALT), command));
             bindings.push((key(code, SUPER_ALT), command));
+        }
+        // As in VS Code and browsers. In a terminal, the shell has them.
+        bindings.push((key(PageDown, Mods::CTRL), NextTab));
+        bindings.push((key(PageUp, Mods::CTRL), PreviousTab));
+        bindings.push((key(PageDown, CTRL_SHIFT), MoveTabRight));
+        bindings.push((key(PageUp, CTRL_SHIFT), MoveTabLeft));
+        // As in browsers, but tab 9 is the ninth, not the last. Legacy
+        // terminals can't send these; the kitty protocol can.
+        for (n, command) in ('1'..='9').zip(Command::GO_TO_TAB) {
+            bindings.push((key(Char(n), Mods::CTRL), command));
+            bindings.push((key(Char(n), SUPER), command));
         }
 
         bindings.extend([
@@ -447,14 +505,18 @@ impl Default for Keymap {
         // terminals, Ctrl+Shift copies and pastes. Ctrl+` makes the next
         // shortcut qedit's, as in tmux (VS Code's terminal toggle; shells
         // don't use it). Terminals without the kitty keyboard protocol send
-        // it as Ctrl+Space.
-        for (key, command) in [
+        // it as Ctrl+Space. Ctrl+1 to 9 go to tabs, from terminals too:
+        // shells don't use them either.
+        let go_to_tab = ('1'..='9')
+            .zip(Command::GO_TO_TAB)
+            .map(|(n, command)| (key(Char(n), Mods::CTRL), command));
+        for (key, command) in go_to_tab.chain([
             (key(Char('`'), Mods::CTRL), TerminalPrefix),
             (key(Char('c'), CTRL_SHIFT), Copy),
             (key(Char('c'), SUPER), Copy),
             (key(Char('v'), CTRL_SHIFT), Paste),
             (key(Char('v'), SUPER), Paste),
-        ] {
+        ]) {
             bindings.push(Binding {
                 key,
                 command,
@@ -640,6 +702,7 @@ mod tests {
             Command::ClearTerminal,
             Command::CloseTerminal,
             Command::RenameTerminal,
+            Command::RenameTab,
             Command::TreeNewFile,
             Command::TreeNewFolder,
             Command::TreeDuplicate,
@@ -841,6 +904,8 @@ mod tests {
             key('b', false, true, false, false),
             Key::new(KeyCode::Esc, Mods::NONE),
             Key::new(KeyCode::Left, Mods::CTRL),
+            Key::new(KeyCode::PageDown, Mods::CTRL),
+            key('t', false, false, true, false),
         ] {
             assert_eq!(lookup(key), None, "{key}");
         }
@@ -858,6 +923,17 @@ mod tests {
             (
                 Key::new(KeyCode::Left, mods(false, true, true, false)),
                 Command::FocusPanelLeft,
+            ),
+            (key('t', false, false, false, true), Command::NewTab),
+            (key('1', false, false, true, false), Command::GoToTab1),
+            (key('9', false, false, true, false), Command::GoToTab9),
+            (key('9', false, false, false, true), Command::GoToTab9),
+            (key('w', false, true, true, false), Command::CloseTab),
+            (key(']', false, true, true, false), Command::NextTab),
+            (key('[', false, true, true, false), Command::PreviousTab),
+            (
+                Key::new(KeyCode::PageDown, mods(true, false, true, false)),
+                Command::MoveTabRight,
             ),
             (key('c', true, false, true, false), Command::Copy),
             (key('c', false, false, false, true), Command::Copy),

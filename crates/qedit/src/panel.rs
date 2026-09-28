@@ -121,6 +121,33 @@ impl Panel {
         self.editor().map(Editor::document)
     }
 
+    /// Whether the panel shows nothing.
+    pub fn is_empty(&self) -> bool {
+        self.current.is_none() && self.terminal.is_none()
+    }
+
+    /// What's on screen, briefly, as the tab bar names it: the file's name,
+    /// or the name the terminal was given, or else the program running in
+    /// it, as tmux names windows. (Shells set titles such as `user@host:~`.)
+    /// `None` while empty.
+    pub fn title(&self) -> Option<String> {
+        if let Some(terminal) = &self.terminal {
+            let terminal = terminal.borrow();
+            return Some(match terminal.program() {
+                Some(program) if !terminal.is_renamed() => program,
+                _ => terminal.name(),
+            });
+        }
+        let doc = self.document()?;
+        Some(match doc.path() {
+            Some(path) => path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            ),
+            None => doc.untitled_name().unwrap_or_default(),
+        })
+    }
+
     /// Whether `doc` is on screen here.
     pub fn shows(&self, doc: &Rc<Document>) -> bool {
         self.document().is_some_and(|shown| Rc::ptr_eq(shown, doc))

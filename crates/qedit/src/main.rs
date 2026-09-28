@@ -20,6 +20,7 @@ mod search;
 mod search_modal;
 mod status;
 mod syntax;
+mod tab;
 mod terminal;
 mod theme;
 mod tree;
@@ -83,11 +84,20 @@ fn help() -> String {
     let mut help = format!(
         "{USAGE}\n\nOpens FOLDER, or the current folder with FILE (or a new, unnamed buffer) open.\nShift+movement or the mouse selects.\n\n"
     );
-    for &command in Command::ALL {
-        let key = keymap
+    let key = |command| {
+        keymap
             .shortcut(command)
-            .map_or(String::new(), |key| key.to_string());
-        help += &format!("  {key:<16}{:<30}{}\n", command.id(), command.title());
+            .map_or(String::new(), |key| key.to_string())
+    };
+    let width = Command::ALL
+        .iter()
+        .map(|&c| key(c).len())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    for &command in Command::ALL {
+        let key = key(command);
+        help += &format!("  {key:<width$}{:<30}{}\n", command.id(), command.title());
     }
     help
 }
