@@ -183,9 +183,11 @@ impl Command {
             | FocusTree | FocusEditor | SplitRight | SplitDown | ClosePanel | FocusPanelLeft
             | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
-            | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu | TreeOpenToSide
-            | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate | TreeTrash | TreeCopyPath
-            | TreeCopyRelativePath | TreeReveal | TreeOpenInTerminal => Context::Tree,
+            | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu
+            | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate
+            | TreeTrash | TreeCopyPath | TreeCopyRelativePath | TreeReveal | TreeOpenInTerminal => {
+                Context::Tree
+            }
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
@@ -309,6 +311,14 @@ impl Default for Keymap {
         bindings.push((key(Char('\\'), SUPER_SHIFT), SplitDown));
         bindings.push((key(Char('|'), CTRL_SHIFT), SplitDown));
         bindings.push((key(Char('|'), SUPER_SHIFT), SplitDown));
+        // Legacy terminals send it as Ctrl+N, a new file; there, the command
+        // palette has it.
+        bindings.push((key(Char('n'), CTRL_SHIFT), NewTerminal));
+        bindings.push((key(Char('n'), SUPER_SHIFT), NewTerminal));
+        // As in VS Code; Ctrl+` alone is the terminal's prefix. Some
+        // terminals report the shifted key, `~`.
+        bindings.push((key(Char('`'), CTRL_SHIFT), NewTerminal));
+        bindings.push((key(Char('~'), CTRL_SHIFT), NewTerminal));
         // Ctrl+Alt rather than Ctrl alone, which macOS keeps for switching
         // desktops.
         const CTRL_ALT: Mods = Mods {
@@ -320,7 +330,6 @@ impl Default for Keymap {
             (Right, FocusPanelRight),
             (Up, FocusPanelUp),
             (Down, FocusPanelDown),
-            (Char('t'), NewTerminal),
             // VS Code's New File… is Ctrl+Alt+Super+N.
             (Char('n'), CreateFile),
         ] {
@@ -486,10 +495,9 @@ impl Keymap {
     /// there is none. The shell has the keys a terminal would send it:
     /// qedit keeps only its terminal bindings, and global shortcuts with
     /// Cmd (Super), Ctrl+Alt, or Ctrl+Shift, which shells don't use.
-    /// Ctrl+Shift+key runs the global command of Ctrl+key (Ctrl+Shift+P
-    /// goes to a file), since the shell keeps Ctrl+key. Terminals without
-    /// the kitty keyboard protocol send Ctrl+Shift+key as Ctrl+key, so
-    /// there the shell gets it.
+    /// Ctrl+Shift+key doesn't stand in for Ctrl+key, which is the shell's;
+    /// Ctrl+Shift is kept for shortcuts of its own. The prefix, Ctrl+`,
+    /// reaches the rest.
     pub fn lookup_terminal(&self, key: Key) -> Option<Command> {
         let key = normalize(key);
         let bound = |key, context| {
@@ -510,18 +518,7 @@ impl Keymap {
         if !(sup || (ctrl && (alt || shift))) {
             return None;
         }
-        bound(key, Context::Global).or_else(|| {
-            let unshifted = Key::new(
-                key.code,
-                Mods {
-                    shift: false,
-                    ..key.mods
-                },
-            );
-            (ctrl && shift && !alt && !sup)
-                .then(|| bound(unshifted, Context::Global))
-                .flatten()
-        })
+        bound(key, Context::Global)
     }
 
     /// The key shown for `command`, if it has one.
@@ -830,8 +827,12 @@ mod tests {
         let key =
             |c, shift, alt, ctrl, sup| Key::new(KeyCode::Char(c), mods(shift, alt, ctrl, sup));
         let lookup = |key| keymap.lookup_terminal(key);
-        // The shell's: Ctrl+key, Alt+key, Esc, arrows.
+        // The shell's: Ctrl+key, Alt+key, Esc, arrows. Ctrl+Shift+key isn't
+        // Ctrl+key's shortcut.
         for key in [
+            key('p', true, false, true, false),
+            key('P', false, false, true, false),
+            key('w', true, false, true, false),
             key('p', false, false, true, false),
             key('w', false, false, true, false),
             key('c', false, false, true, false),
@@ -843,21 +844,16 @@ mod tests {
         ] {
             assert_eq!(lookup(key), None, "{key}");
         }
-        // qedit's: Ctrl+Shift runs Ctrl's global command, and Cmd, Ctrl+Alt,
-        // and explicit Ctrl+Shift bindings are kept.
+        // qedit's: Cmd, Ctrl+Alt, and Ctrl+Shift bindings.
         for (key, command) in [
-            (key('p', true, false, true, false), Command::GoToFile),
-            (key('P', false, false, true, false), Command::GoToFile),
-            (key('k', true, false, true, false), Command::Palette),
-            (key('w', true, false, true, false), Command::ClosePanel),
-            (key('q', true, false, true, false), Command::Quit),
             (key('f', true, false, true, false), Command::SearchWorkspace),
             (key('\\', true, false, true, false), Command::SplitDown),
             (key('p', false, false, false, true), Command::GoToFile),
-            (key('t', false, true, true, false), Command::NewTerminal),
+            (key('n', true, false, true, false), Command::NewTerminal),
+            (key('N', false, false, true, false), Command::NewTerminal),
+            (key('`', true, false, true, false), Command::NewTerminal),
+            (key('~', true, false, true, false), Command::NewTerminal),
             (key('n', false, true, true, false), Command::CreateFile),
-            (key('o', true, false, true, false), Command::OpenFile),
-            (key('n', true, false, true, false), Command::NewFile),
             (key('s', true, false, true, false), Command::SaveAs),
             (
                 Key::new(KeyCode::Left, mods(false, true, true, false)),

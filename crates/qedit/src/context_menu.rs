@@ -255,7 +255,8 @@ impl ContextMenu {
         frame.fill_rect(x, y, width, height, BG);
         let inner = width.saturating_sub(2) as usize;
         let rule = "─".repeat(inner);
-        let text = |s: &str, x: u32, y: u32, fg| frame.draw_text(s, x, y, fg, None, Attributes::NONE);
+        let text =
+            |s: &str, x: u32, y: u32, fg| frame.draw_text(s, x, y, fg, None, Attributes::NONE);
         text(&format!("╭{rule}╮"), x, y, BORDER);
         text(&format!("╰{rule}╯"), x, y + height - 1, BORDER);
         let rows = self.items.iter().zip(&self.shortcuts).enumerate();

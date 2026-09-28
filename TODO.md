@@ -15,8 +15,6 @@
 
 - allow scrolling past the end of the file
 
-- make sure currently focused file is automatically revealed in the file tree
-
 # feat
 
 - maybe: make proper move rather than unix style unified move-rename verb

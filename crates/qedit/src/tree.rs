@@ -147,8 +147,11 @@ impl FileTree {
     }
 
     /// Highlights `path` as the file in the editor, in italics if it is a
-    /// preview.
+    /// preview. A file that wasn't already the active one is revealed.
     pub fn set_active(&mut self, path: Option<&Path>, preview: bool) {
+        if let Some(path) = path.filter(|&path| self.active.as_deref() != Some(path)) {
+            self.reveal(path);
+        }
         self.active = path.map(Path::to_path_buf);
         self.active_preview = preview;
     }
@@ -211,6 +214,7 @@ impl FileTree {
                 Err(_) => path,
             })
             .collect();
+        self.refresh();
         self.reveal(to);
     }
 
@@ -220,7 +224,8 @@ impl FileTree {
     }
 
     /// Expands the folders down to `path` and selects it, if it is in the
-    /// workspace.
+    /// workspace. Re-reads the tree only if it had to expand a folder or
+    /// doesn't list `path` yet.
     pub fn reveal(&mut self, path: &Path) {
         let Some(root) = deepest_root(&self.roots, path) else {
             return;
@@ -231,8 +236,11 @@ impl FileTree {
             .take_while(|dir| dir.starts_with(root))
             .map(Path::to_path_buf)
             .collect();
+        let collapsed = folders.iter().any(|dir| !self.expanded.contains(dir));
         self.expanded.extend(folders);
-        self.refresh();
+        if collapsed || self.index_of(path).is_none() {
+            self.refresh();
+        }
         if let Some(index) = self.index_of(path) {
             self.select(index);
         }
@@ -702,6 +710,25 @@ mod tests {
         tree.refresh();
         assert_eq!(selected(&tree), "c.rs");
         assert!(listing(&tree).contains(&"      new.rs".to_string()));
+    }
+
+    #[test]
+    fn a_new_active_file_is_revealed() {
+        let root = fixture("active", &["a/b/c.rs", "a/d.rs", "e.rs"]);
+        let mut tree = tree(std::slice::from_ref(&root));
+        tree.set_active(Some(&root.join("a/b/c.rs")), true);
+        assert_eq!(selected(&tree), "c.rs");
+
+        // The same file again leaves the tree as the user left it.
+        tree.run(Command::TreeFirst);
+        tree.run(Command::TreeDown);
+        tree.run(Command::TreeCollapse);
+        tree.set_active(Some(&root.join("a/b/c.rs")), false);
+        assert_eq!(listing(&tree), ["active/", "  a/", "  e.rs"]);
+
+        tree.set_active(None, false);
+        tree.set_active(Some(&root.join("a/b/c.rs")), false);
+        assert_eq!(selected(&tree), "c.rs");
     }
 
     #[test]

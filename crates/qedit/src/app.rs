@@ -38,7 +38,7 @@
 //! folders, and so on. They have keys and palette entries too, and act on
 //! the tree's selection, or from elsewhere, on the file on screen.
 //!
-//! Terminals (Ctrl+Alt+T) are the app's too, like open files: a panel shows
+//! Terminals (Ctrl+Shift+N) are the app's too, like open files: a panel shows
 //! one, and it keeps running when the panel moves on. While one has the
 //! keyboard, keys go to its shell, but for a few (see
 //! [`Keymap::lookup_terminal`]).
@@ -266,7 +266,6 @@ impl App {
         // The status bar is below it.
         tree.set_height(height.saturating_sub(1));
         if let Some(file) = &file {
-            tree.reveal(file);
             tree.set_active(Some(file), false);
         }
         let focus = if file.is_some() {
@@ -347,11 +346,11 @@ impl App {
                 return AppAction::Continue;
             }
             if terminal.borrow().exit().is_none() {
-                let command = self.keymap.lookup_terminal(key);
-                self.disarm_unless(command);
                 if prefixed {
                     return self.prefixed_key(&terminal, key);
                 }
+                let command = self.keymap.lookup_terminal(key);
+                self.disarm_unless(command);
                 return match command {
                     Some(command) => self.run(command, false),
                     None => {
@@ -427,7 +426,14 @@ impl App {
             Some(command) => {
                 matches!(
                     command,
-                    Quit | ClosePanel | CloseFile | CloseTerminal | TreeTrash | Palette | GoToFile
+                    Quit | ClosePanel
+                        | CloseFile
+                        | CloseTerminal
+                        | TreeTrash
+                        | Palette
+                        | GoToFile
+                        // What follows it decides.
+                        | TerminalPrefix
                 ) || command.context() == Context::Picker
             }
             // Typing in the picker's query.
@@ -2034,7 +2040,8 @@ impl App {
 
     /// Creates the folder `path`, and those it's in if need be.
     fn create_folder(&mut self, path: &Path) -> Result<AppAction, String> {
-        fs::create_dir_all(path).map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
+        fs::create_dir_all(path)
+            .map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
         self.tree.refresh();
         self.tree.reveal(path);
         Ok(AppAction::Continue)
@@ -2239,14 +2246,18 @@ impl App {
     /// had the keyboard. The prefix again goes to the shell, and Esc
     /// cancels.
     fn prefixed_key(&mut self, terminal: &Rc<RefCell<Terminal>>, key: Key) -> AppAction {
+        let command = self.keymap.lookup(key, Context::Editor);
+        self.disarm_unless(command.map(|(command, _)| command));
         if self.keymap.lookup_terminal(key) == Some(Command::TerminalPrefix) {
+            self.armed = None;
             terminal.borrow_mut().send_key(key);
             return AppAction::Continue;
         }
         if key == Key::new(KeyCode::Esc, Mods::NONE) {
+            self.armed = None;
             return AppAction::Continue;
         }
-        match self.keymap.lookup(key, Context::Editor) {
+        match command {
             Some((command, select)) => self.run(command, select),
             None => {
                 self.show_message(format!("{key} isn't a qedit shortcut."), false);
@@ -2548,6 +2559,12 @@ mod tests {
         app.handle_key(Key::new(KeyCode::Char(c), Mods::CTRL))
     }
 
+    /// Ctrl+`c` from a terminal, after the prefix that makes it qedit's.
+    fn prefixed_ctrl(app: &mut App, c: char) -> AppAction {
+        app.handle_key(Key::new(KeyCode::Char('`'), Mods::CTRL));
+        ctrl(app, c)
+    }
+
     fn type_text(app: &mut App, text: &str) {
         for c in text.chars() {
             key(app, KeyCode::Char(c));
@@ -2677,15 +2694,11 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("terminal", &[("a.txt", "alpha")]);
         let mut app = app(&root, Some("a.txt"));
-        let ctrl_alt = Mods {
-            alt: true,
-            ..Mods::CTRL
-        };
         let ctrl_shift = Mods {
             shift: true,
             ..Mods::CTRL
         };
-        app.handle_key(Key::new(KeyCode::Char('t'), ctrl_alt));
+        app.handle_key(Key::new(KeyCode::Char('n'), ctrl_shift));
         assert!(app.active_terminal().is_some());
         assert!(app.editor().is_none());
         assert_eq!(app.focus, Focus::Editor);
@@ -2699,13 +2712,8 @@ mod tests {
         });
         assert!(!app.ed_is_shown(), "typing went to the shell");
 
-        // Ctrl+Shift+P is qedit's; Ctrl+P would be the shell's.
-        app.handle_key(Key::new(KeyCode::Char('p'), ctrl_shift));
-        assert!(app.picker.is_some());
-        key(&mut app, KeyCode::Esc);
-        assert!(app.picker.is_none());
-
-        // So is Ctrl+P after the prefix, Ctrl+`, which the status bar hints.
+        // Ctrl+P is the shell's, and qedit's after the prefix, Ctrl+`, which
+        // the status bar hints.
         assert!(screen(&app).contains("^` qedit keys"), "{}", screen(&app));
         let prefix = Key::new(KeyCode::Char('`'), Mods::CTRL);
         app.handle_key(prefix);
@@ -2729,8 +2737,7 @@ mod tests {
         wait_until(&mut app, "sleep to run", |app| {
             app.terminals[0].borrow().program().as_deref() == Some("sleep")
         });
-        let quit = Key::new(KeyCode::Char('q'), ctrl_shift);
-        assert!(matches!(app.handle_key(quit), AppAction::Continue));
+        assert!(matches!(prefixed_ctrl(&mut app, 'q'), AppAction::Continue));
         assert!(
             screen(&app).contains("sleep is running in a terminal."),
             "{}",
@@ -2754,7 +2761,7 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert!(app.active_terminal().is_some());
         // And from there, back to the file.
-        app.handle_key(Key::new(KeyCode::Char('p'), ctrl_shift));
+        prefixed_ctrl(&mut app, 'p');
         key(&mut app, KeyCode::Enter);
         assert!(app.ed().path().is_some_and(|path| path.ends_with("a.txt")));
     }
@@ -2764,10 +2771,6 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("terminal-commands", &[("a.txt", "alpha")]);
         let mut app = app(&root, Some("a.txt"));
-        let ctrl_shift = Mods {
-            shift: true,
-            ..Mods::CTRL
-        };
         let palette = |app: &mut App| {
             app.run(Command::Palette, false);
             type_text(app, "terminal");
@@ -2843,7 +2846,7 @@ mod tests {
         });
         for _ in 0..2 {
             assert!(app.active_terminal().is_some());
-            app.handle_key(Key::new(KeyCode::Char('k'), ctrl_shift));
+            prefixed_ctrl(&mut app, 'k');
             type_text(&mut app, "close terminal");
             key(&mut app, KeyCode::Enter);
         }
@@ -2852,8 +2855,7 @@ mod tests {
         assert!(app.terminals.is_empty());
         assert!(!app.recent.contains(&Recent::Terminal(1)));
         // Nothing to quit over.
-        let quit = Key::new(KeyCode::Char('q'), ctrl_shift);
-        assert!(matches!(app.handle_key(quit), AppAction::Quit));
+        assert!(matches!(ctrl(&mut app, 'q'), AppAction::Quit));
     }
 
     #[test]
@@ -3807,25 +3809,21 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("close-terminal", &[]);
         let mut app = app(&root, None);
-        let ctrl_alt_t = Key::new(KeyCode::Char('t'), CTRL_ALT);
-        let ctrl_shift_w = Key::new(
-            KeyCode::Char('w'),
-            Mods {
-                shift: true,
-                ..Mods::CTRL
-            },
-        );
-        app.handle_key(ctrl_alt_t);
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('`'), ctrl_shift));
         type_text(&mut app, "sleep 30");
         key(&mut app, KeyCode::Enter);
         // Not only busy: the login shell may be running its own startup.
         wait_until(&mut app, "sleep to run", |app| {
             app.terminals[0].borrow().program().as_deref() == Some("sleep")
         });
-        app.handle_key(ctrl_shift_w);
+        prefixed_ctrl(&mut app, 'w');
         assert_eq!(app.terminals.len(), 1);
         assert!(screen(&app).contains("sleep is running in Terminal 1."));
-        app.handle_key(ctrl_shift_w);
+        prefixed_ctrl(&mut app, 'w');
         assert!(app.terminals.is_empty());
         assert!(app.active_terminal().is_none());
     }
@@ -4160,7 +4158,11 @@ mod tests {
             .unwrap_or_else(|| panic!("no {label} in\n{text}"));
         let x = line.chars().position(|c| c == '│').unwrap() as u32;
         // Past the tree's divider, if the menu is right of it.
-        let x = line.chars().skip(x as usize + 1).position(|c| c == '│').map_or(x, |_| x);
+        let x = line
+            .chars()
+            .skip(x as usize + 1)
+            .position(|c| c == '│')
+            .map_or(x, |_| x);
         left_click(app, x + 2, y as u32);
     }
 
@@ -4182,7 +4184,10 @@ mod tests {
 
         click_item(&mut app, "Rename…");
         assert!(app.menu.is_none());
-        assert_eq!(app.dialog.as_ref().map(|d| d.purpose()), Some(Purpose::Move));
+        assert_eq!(
+            app.dialog.as_ref().map(|d| d.purpose()),
+            Some(Purpose::Move)
+        );
         type_text(&mut app, "c.txt");
         key(&mut app, KeyCode::Enter);
         assert!(app.dialog.is_none(), "{}", tall_screen(&app));
@@ -4259,7 +4264,11 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture(
             "menu-duplicate",
-            &[("a.txt", "alpha"), ("a copy.txt", ""), ("dir/b.txt", "beta")],
+            &[
+                ("a.txt", "alpha"),
+                ("a copy.txt", ""),
+                ("dir/b.txt", "beta"),
+            ],
         );
         let mut app = tall_app(&root, None);
         // dir, then a copy.txt, then a.txt.
@@ -4269,12 +4278,18 @@ mod tests {
         assert_eq!(app.tree.selected().unwrap().path, root.join("a.txt"));
         app.run(Command::TreeDuplicate, false);
         key(&mut app, KeyCode::Enter);
-        assert_eq!(fs::read_to_string(root.join("a copy 2.txt")).unwrap(), "alpha");
+        assert_eq!(
+            fs::read_to_string(root.join("a copy 2.txt")).unwrap(),
+            "alpha"
+        );
 
         app.tree.reveal(&root.join("dir"));
         app.run(Command::TreeDuplicate, false);
         key(&mut app, KeyCode::Enter);
-        assert_eq!(fs::read_to_string(root.join("dir copy/b.txt")).unwrap(), "beta");
+        assert_eq!(
+            fs::read_to_string(root.join("dir copy/b.txt")).unwrap(),
+            "beta"
+        );
         assert_eq!(app.tree.selected().unwrap().path, root.join("dir copy"));
     }
 
@@ -4389,11 +4404,21 @@ mod tests {
         right_click(&mut app, 4, 1);
         for (width, height) in [(30, 5), (3, 2), (1, 1), (0, 0), (80, 24)] {
             app.resize(width, height);
-            let frame =
-                OwnedBuffer::new(width.max(1), height.max(1), false, WidthMethod::Unicode, "t")
-                    .unwrap();
+            let frame = OwnedBuffer::new(
+                width.max(1),
+                height.max(1),
+                false,
+                WidthMethod::Unicode,
+                "t",
+            )
+            .unwrap();
             app.draw(&frame);
-            mouse_at(&mut app, MouseKind::Drag(MouseButton::Right), width / 2, height / 2);
+            mouse_at(
+                &mut app,
+                MouseKind::Drag(MouseButton::Right),
+                width / 2,
+                height / 2,
+            );
         }
         assert!(app.menu.is_some());
     }
