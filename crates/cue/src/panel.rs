@@ -1,5 +1,5 @@
-//! A panel: one area of the layout, showing an open file, a terminal, or
-//! nothing yet.
+//! A panel: one area of the layout, showing an open file, an image, a
+//! terminal, or nothing yet.
 //!
 //! Panels have no tabs. Opening a file in a panel replaces what it shows,
 //! but the panel keeps an editor for each file it has shown, so going back
@@ -25,6 +25,7 @@ use opentui::{Attributes, Buffer, Rgba};
 use crate::document::{Disk, Document};
 use crate::editor::{Editor, INACTIVE_STATUS_BG, STATUS_BG, STATUS_DIM, STATUS_FG};
 use crate::icons::{self, Icon};
+use crate::image::ImageView;
 use crate::input::{Mouse, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::layout::{PanelId, Rect};
@@ -65,6 +66,8 @@ pub enum Visit {
     File(Weak<Document>, Option<PathBuf>),
     /// A terminal, by id.
     Terminal(u32),
+    /// An image file.
+    Image(PathBuf),
 }
 
 impl Visit {
@@ -74,6 +77,7 @@ impl Visit {
                 a.ptr_eq(b) || (a_path.is_some() && a_path == b_path)
             }
             (Visit::Terminal(a), Visit::Terminal(b)) => a == b,
+            (Visit::Image(a), Visit::Image(b)) => a == b,
             _ => false,
         }
     }
@@ -91,10 +95,14 @@ pub struct Panel {
     pub id: PanelId,
     /// An editor for each file shown, most recently opened last.
     editors: Vec<Editor>,
-    /// The editor on screen; `None` while empty or showing a terminal.
+    /// The editor on screen; `None` while empty or showing a terminal or
+    /// an image.
     current: Option<usize>,
     /// The terminal on screen, if any.
     terminal: Option<Rc<RefCell<Terminal>>>,
+    /// The image on screen, if any. Unlike files and terminals, the panel
+    /// owns it: it's gone once the panel moves on.
+    image: Option<ImageView>,
     /// While empty, a message for the status bar until the next key press.
     message: Option<(String, bool)>,
     area: Rect,
@@ -108,6 +116,7 @@ impl Panel {
             editors: Vec::new(),
             current: None,
             terminal: None,
+            image: None,
             message: None,
             area: Rect::default(),
             history: History::default(),
@@ -166,6 +175,39 @@ impl Panel {
         }
         terminal.borrow_mut().set_area(self.body());
         self.terminal = Some(terminal);
+        self.image = None;
+        self.leave_editor();
+    }
+
+    /// The image on screen, if any.
+    pub fn image(&self) -> Option<&ImageView> {
+        self.image.as_ref()
+    }
+
+    pub fn image_mut(&mut self) -> Option<&mut ImageView> {
+        self.image.as_mut()
+    }
+
+    /// Shows `image`. An unnamed document left behind that was never typed
+    /// in is dropped.
+    pub fn show_image(&mut self, image: ImageView) {
+        if !matches!(self.visit(), Some(Visit::Image(shown)) if shown == image.path()) {
+            self.leave();
+        }
+        self.image = Some(image);
+        self.terminal = None;
+        self.leave_editor();
+    }
+
+    /// Stops showing an image, leaving the panel empty.
+    pub fn hide_image(&mut self) {
+        self.leave();
+        self.image = None;
+    }
+
+    /// Takes the editor off screen, for a terminal or an image, dropping it
+    /// if it's of an unnamed document that was never typed in.
+    fn leave_editor(&mut self) {
         self.message = None;
         if let Some(left) = self.current.take() {
             if self.editors[left].is_blank() {
@@ -187,7 +229,7 @@ impl Panel {
 
     /// Whether the panel shows nothing.
     pub fn is_empty(&self) -> bool {
-        self.current.is_none() && self.terminal.is_none()
+        self.current.is_none() && self.terminal.is_none() && self.image.is_none()
     }
 
     /// What's on screen, briefly, as the tab bar names it: the file's name,
@@ -202,14 +244,26 @@ impl Panel {
                 _ => terminal.name(),
             });
         }
-        let doc = self.document()?;
-        Some(match doc.path() {
-            Some(path) => path.file_name().map_or_else(
-                || path.display().to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            ),
-            None => doc.untitled_name().unwrap_or_default(),
-        })
+        let path = match (&self.image, self.document()) {
+            (Some(image), _) => image.path().to_path_buf(),
+            (None, Some(doc)) => match doc.path() {
+                Some(path) => path,
+                None => return Some(doc.untitled_name().unwrap_or_default()),
+            },
+            (None, None) => return None,
+        };
+        Some(path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        ))
+    }
+
+    /// The path of the file or image on screen, if any.
+    pub fn path(&self) -> Option<PathBuf> {
+        match &self.image {
+            Some(image) => Some(image.path().to_path_buf()),
+            None => self.document()?.path(),
+        }
     }
 
     /// Whether `doc` is on screen here.
@@ -246,6 +300,7 @@ impl Panel {
         };
         let left = self.current.replace(index);
         self.terminal = None;
+        self.image = None;
         self.message = None;
         if let Some(left) = left.filter(|&left| left != index && self.editors[left].is_blank()) {
             self.editors.remove(left);
@@ -286,6 +341,7 @@ impl Panel {
         self.editors.clear();
         self.current = None;
         self.terminal = None;
+        self.image = None;
         self.message = None;
     }
 
@@ -296,6 +352,9 @@ impl Panel {
     fn visit(&self) -> Option<Visit> {
         if let Some(terminal) = &self.terminal {
             return Some(Visit::Terminal(terminal.borrow().id()));
+        }
+        if let Some(image) = &self.image {
+            return Some(Visit::Image(image.path().to_path_buf()));
         }
         let doc = self.document().filter(|doc| !doc.is_blank())?;
         Some(Visit::File(Rc::downgrade(doc), doc.path()))
@@ -382,6 +441,9 @@ impl Panel {
         if let (Some(terminal), None) = (&self.terminal, &self.message) {
             return terminal.borrow().status();
         }
+        if let (Some(image), None) = (&self.image, &self.message) {
+            return image.status(self.body());
+        }
         match (self.editor(), &self.message) {
             (Some(editor), _) => editor.status(),
             (None, Some((text, error))) => Status::Message {
@@ -401,6 +463,10 @@ impl Panel {
         }
         if let Some(terminal) = &self.terminal {
             terminal.borrow_mut().handle_mouse(mouse);
+            return;
+        }
+        if let Some(image) = &mut self.image {
+            image.handle_mouse(mouse, body);
             return;
         }
         let local = Mouse {
@@ -436,6 +502,13 @@ impl Panel {
             }
             self.draw_header(frame, workspace, active, preview);
             self.draw_buttons(frame, active);
+            if let Some(image) = &self.image {
+                let body = self.body();
+                frame.with_clip(body.x, body.y, body.width, body.height, || {
+                    image.draw(frame, body)
+                });
+                return None;
+            }
             match self.editor() {
                 Some(editor) => Some(editor.draw(frame, keymap)),
                 None => {
@@ -519,7 +592,7 @@ impl Panel {
 
     /// The file's name, with [+] if it has unsaved changes and a note if
     /// it changed on disk meanwhile or is gone, then dimmed, the folder
-    /// it's in.
+    /// it's in. Images have only the name and folder.
     fn draw_header(&self, frame: &Buffer, workspace: &Workspace, active: bool, preview: bool) {
         let area = self.area;
         let (bg, fg) = if active {
@@ -529,18 +602,30 @@ impl Panel {
         };
         frame.fill_rect(area.x, area.y, area.width, 1, bg);
         let width = self.title_width();
-        let Some(doc) = self.document() else {
-            frame.draw_text(
-                " No file",
-                area.x,
-                area.y,
-                STATUS_DIM,
-                None,
-                Attributes::NONE,
-            );
-            return;
+        let (path, untitled, notes) = match (&self.image, self.document()) {
+            (Some(image), _) => (Some(image.path().to_path_buf()), None, String::new()),
+            (None, Some(doc)) => {
+                let dirty = if doc.is_modified() { " [+]" } else { "" };
+                let disk = match doc.disk() {
+                    Disk::Same => "",
+                    Disk::Changed => " [changed on disk]",
+                    Disk::Deleted => " [deleted]",
+                };
+                (doc.path(), doc.untitled_name(), format!("{dirty}{disk}"))
+            }
+            (None, None) => {
+                frame.draw_text(
+                    " No file",
+                    area.x,
+                    area.y,
+                    STATUS_DIM,
+                    None,
+                    Attributes::NONE,
+                );
+                return;
+            }
         };
-        let (name, folder) = match doc.path() {
+        let (name, folder) = match path {
             Some(path) => {
                 let shown = workspace.display_path(&path);
                 let shown = Path::new(&shown);
@@ -554,17 +639,11 @@ impl Panel {
                     .unwrap_or_default();
                 (name, folder)
             }
-            None => (doc.untitled_name().unwrap_or_default(), String::new()),
+            None => (untitled.unwrap_or_default(), String::new()),
         };
         let icon = header_icon(frame, icons::file(&name), area, active);
-        let dirty = if doc.is_modified() { " [+]" } else { "" };
-        let disk = match doc.disk() {
-            Disk::Same => "",
-            Disk::Changed => " [changed on disk]",
-            Disk::Deleted => " [deleted]",
-        };
         let room = width.saturating_sub(2 + icon) as usize;
-        let name = truncate_left(&format!("{name}{dirty}{disk}"), room);
+        let name = truncate_left(&format!("{name}{notes}"), room);
         let mut attributes = Attributes::BOLD;
         if preview {
             attributes |= Attributes::ITALIC;

@@ -10,6 +10,7 @@ mod file_index;
 mod find;
 mod history;
 mod icons;
+mod image;
 mod indent;
 mod input;
 mod keymap;
@@ -147,6 +148,9 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut renderer = Renderer::new(width, height, Output::Stdout)?;
     renderer.setup_terminal(true);
+    // Zooming into a large image sends it whole: tens of megabytes as
+    // base64 through the terminal otherwise.
+    renderer.use_kitty_image_files();
     // Clicks, drags, and the wheel; plain motion isn't needed.
     renderer.enable_mouse(false);
     let mut parser = Parser::new();
@@ -186,6 +190,7 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                 Vec::new()
             };
             changed |= app.poll();
+            changed |= renderer.poll_kitty_image_transport();
             let resized = tty::size() != (width, height);
             if !events.is_empty() || resized || (changed && drawn.elapsed() >= FRAME) {
                 break events;
@@ -201,7 +206,9 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                     AppAction::Continue
                 }
                 Event::Reply(bytes) => {
-                    renderer.process_capability_response(&bytes);
+                    if !renderer.process_kitty_image_reply(&bytes) {
+                        renderer.process_capability_response(&bytes);
+                    }
                     AppAction::Continue
                 }
             };

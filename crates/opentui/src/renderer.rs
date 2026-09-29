@@ -105,6 +105,38 @@ impl Renderer {
         unsafe { sys::processCapabilityResponse(self.handle, bytes.as_ptr(), len) }
     }
 
+    /// Sends Kitty graphics images to the terminal as files it reads,
+    /// instead of as base64 through the terminal, once a probe shows it
+    /// can (it may take a moment, and never happens over SSH or in a
+    /// multiplexer). Until then, and if it can't, they go through the
+    /// terminal as before. Call after
+    /// [`setup_terminal`](Renderer::setup_terminal), then pass the
+    /// terminal's replies to
+    /// [`process_kitty_image_reply`](Renderer::process_kitty_image_reply)
+    /// and call
+    /// [`poll_kitty_image_transport`](Renderer::poll_kitty_image_transport)
+    /// now and then.
+    pub fn use_kitty_image_files(&mut self) {
+        // `kitty_transport.Mode.file`.
+        unsafe { sys::setKittyImageTransport(self.handle, 2) };
+    }
+
+    /// Takes a terminal reply to a Kitty graphics file transfer or probe.
+    /// Returns false if it's not one, for
+    /// [`process_capability_response`](Renderer::process_capability_response)
+    /// instead.
+    pub fn process_kitty_image_reply(&mut self, bytes: &[u8]) -> bool {
+        let len = ffi_len(bytes.len(), "response");
+        unsafe { sys::processKittyImageReply(self.handle, bytes.as_ptr(), len) != 0 }
+    }
+
+    /// Gives up on Kitty graphics files the terminal hasn't answered for,
+    /// going back to sending images through it. Returns true if images
+    /// need drawing again, as the next render does.
+    pub fn poll_kitty_image_transport(&mut self) -> bool {
+        unsafe { sys::pollKittyImageTransport(self.handle) != 0 }
+    }
+
     /// Reads everything buffered on stdin without blocking and feeds it to
     /// [`process_capability_response`](Renderer::process_capability_response).
     /// This consumes keyboard input too, so use it only when nothing else

@@ -1,12 +1,19 @@
+a post-agentic terminal code editor
+
 ```
 curl -fsSL https://s3.ianhuang.dev/cue/install.sh | bash
 ```
-
-a post-agentic terminal code editor
 
 **guiding principles**
 
 - people don't write code anymore: navigation first; editing second.
 - native mouse support; muscle memory optional.
-- single binary; minimal setup tax.
-- clean, responsive, minimalistic, functional.
+- single binary; works out of the box.
+- minimalistic and functional.
+
+**features**
+
+- multi panel editing
+- `ripgrep` search
+- terminal buffers
+- image viewer (kitty graphics protocol)

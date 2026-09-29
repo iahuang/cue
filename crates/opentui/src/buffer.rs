@@ -8,7 +8,7 @@ use crate::edit::EditorView;
 use crate::renderer::Renderer;
 use crate::text::{TextBufferView, WidthMethod};
 use crate::thread::Claim;
-use crate::{ffi_len, read_native_string, Attributes, Error, Result, Rgba};
+use crate::{ffi_len, read_native_string, Attributes, Error, Image, Result, Rgba};
 
 /// A grid of styled cells (`OptimizedBuffer`).
 ///
@@ -92,6 +92,41 @@ impl Buffer {
     /// Draws an editor view's visible lines with the top-left cell at (`x`, `y`).
     pub fn draw_editor_view(&self, view: &EditorView<'_>, x: i32, y: i32) {
         unsafe { sys::bufferDrawEditorView(self.handle, view.raw_handle(), x, y) }
+    }
+
+    /// Draws `image`, stretched over the `width` x `height` cells at (`x`,
+    /// `y`) and clipped to the buffer and the current clip. The renderer
+    /// sends it with the Kitty graphics protocol or Sixel if the terminal
+    /// has either, or else as half-block characters. `pixel_width` x
+    /// `pixel_height` is the size the cells cover on screen, if known (0
+    /// if not): larger images are sent scaled down to it, and Sixel needs
+    /// it. Returns false if nothing was drawn.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_image(
+        &self,
+        image: &Image,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> bool {
+        let options = sys::ExternalImageDrawOptions {
+            x,
+            y,
+            width,
+            height,
+            pixel_width,
+            pixel_height,
+            source_x: 0,
+            source_y: 0,
+            source_width: image.width(),
+            source_height: image.height(),
+            // `RenderProtocol.auto`: whatever the terminal supports.
+            protocol: 0,
+        };
+        unsafe { sys::bufferDrawImage(self.handle, image.raw_handle(), &options) != 0 }
     }
 
     /// Runs `draw` with drawing clipped to the `width` x `height` rectangle

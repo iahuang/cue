@@ -3,8 +3,8 @@
 use std::sync::{Mutex, MutexGuard};
 
 use opentui::{
-    Attributes, Error, Output, OwnedBuffer, RenderStatus, Renderer, Rgba, TextBuffer, WidthMethod,
-    WrapMode,
+    Attributes, Error, Image, Output, OwnedBuffer, RenderStatus, Renderer, Rgba, TextBuffer,
+    WidthMethod, WrapMode,
 };
 
 /// The native core is single-threaded (see `Error::WrongThread`) and the test
@@ -36,6 +36,36 @@ fn draws_text_into_the_frame() {
             " hello ✓"
         );
     }
+    assert_eq!(renderer.render(true), RenderStatus::Rendered);
+}
+
+/// A 4x2 opaque red PNG.
+const RED_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 4, 0, 0, 0, 2, 8, 6, 0,
+    0, 0, 127, 168, 125, 99, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240, 31, 25,
+    51, 160, 11, 0, 0, 15, 33, 15, 241, 4, 55, 198, 159, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+    130,
+];
+
+#[test]
+fn decodes_and_draws_images() {
+    let _serial = serial();
+    let image = Image::decode(RED_PNG).unwrap();
+    assert_eq!((image.width(), image.height()), (4, 2));
+    assert_eq!(image.format(), Some("PNG"));
+    assert!(matches!(Image::decode(b"not an image"), Err(Error::Image(_))));
+
+    let mut renderer = Renderer::new(12, 4, Output::Memory).unwrap();
+    {
+        let frame = renderer.next_buffer().unwrap();
+        frame.clear(Rgba::BLACK);
+        assert!(frame.draw_image(&image, 1, 1, 4, 2, 0, 0));
+        // Entirely outside the clip: nothing to draw.
+        let drawn = frame.with_clip(8, 0, 4, 4, || frame.draw_image(&image, 1, 1, 4, 2, 0, 0));
+        assert!(!drawn);
+    }
+    // Dropping the image while the frame still has it is fine.
+    drop(image);
     assert_eq!(renderer.render(true), RenderStatus::Rendered);
 }
 

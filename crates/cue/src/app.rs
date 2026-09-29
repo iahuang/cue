@@ -67,6 +67,7 @@ use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
 use crate::find;
+use crate::image::{self, ImageView};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
 use crate::layout::{self, Axis, Direction, Layout, PanelId, Rect};
@@ -325,6 +326,15 @@ impl App {
             Focus::Tree
         };
         let theme = Rc::new(Theme::new().map_err(|e| e.to_string())?);
+        // An image is shown over the unnamed buffer, which then goes.
+        let (file, image) = match file {
+            Some(file) if image::is_image(&file) => {
+                let image = ImageView::open(&file)
+                    .map_err(|reason| format!("{}: {reason}", file.display()))?;
+                (None, Some(image))
+            }
+            file => (file, None),
+        };
         let (doc, notice) =
             Document::open(file.clone(), theme.clone()).map_err(|reason| match &file {
                 Some(file) => format!("{}: {reason}", file.display()),
@@ -378,6 +388,9 @@ impl App {
             .map_err(|e| e.to_string())?;
         if let Some(notice) = notice {
             app.show_message(notice, false);
+        }
+        if let Some(image) = image {
+            app.show_image(image);
         }
         app.note_recent();
         app.watch_folders();
@@ -626,7 +639,8 @@ impl App {
                 }
             }
             Command::CloseFile => {
-                if self.editor().is_some() && self.close_shown(Redo::Run(Command::CloseFile)) {
+                let file = self.editor().is_some() || self.active_panel().image().is_some();
+                if file && self.close_shown(Redo::Run(Command::CloseFile)) {
                     self.show_active_in_tree();
                 }
             }
@@ -1363,6 +1377,7 @@ impl App {
             Visit::Terminal(id) => {
                 !elsewhere.contains(id) && terminals.iter().any(|t| t.borrow().id() == *id)
             }
+            Visit::Image(path) => path.is_file(),
         };
         let Some(visit) = self.tabs[self.tab]
             .active_panel_mut()
@@ -1395,6 +1410,11 @@ impl App {
                 let terminal = self.terminals.iter().find(|t| t.borrow().id() == id);
                 if let Some(terminal) = terminal.cloned() {
                     self.show_terminal(terminal);
+                }
+            }
+            Visit::Image(path) => {
+                if self.open_image(&path) {
+                    self.focus = Focus::Editor;
                 }
             }
         }
@@ -1694,6 +1714,9 @@ impl App {
         if let Some(editor) = self.editor_mut() {
             editor.blur_find();
         }
+        if image::is_image(&path) {
+            return self.open_image(&path);
+        }
         let existing = self.find_document(&path);
         let had_terminal = self.active_terminal().is_some();
         let (doc, notice) = match &existing {
@@ -1749,6 +1772,43 @@ impl App {
         true
     }
 
+    /// Shows the image at `path` in the active panel, unless it's on
+    /// screen there already. Returns false, with a message, if it can't
+    /// be opened.
+    fn open_image(&mut self, path: &Path) -> bool {
+        let shown = self.active_panel().image().is_some_and(|image| image.path() == path);
+        if !shown {
+            match ImageView::open(path) {
+                Ok(image) => self.show_image(image),
+                Err(reason) => {
+                    self.cant_open(&reason, path);
+                    return false;
+                }
+            }
+        }
+        self.show_active_in_tree();
+        true
+    }
+
+    fn show_image(&mut self, image: ImageView) {
+        let had_terminal = self.active_terminal().is_some();
+        self.active_panel_mut().show_image(image);
+        self.prune_documents();
+        if had_terminal {
+            self.prune_terminals();
+        }
+    }
+
+    /// Stops showing images of `path`, or of files in it if it's a folder,
+    /// in every panel.
+    fn close_images(&mut self, path: &Path) {
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            if panel.image().is_some_and(|image| image.path().starts_with(path)) {
+                panel.hide_image();
+            }
+        }
+    }
+
     fn cant_open(&mut self, reason: &str, path: &Path) {
         // Reason first: the status bar clips long paths on the right.
         let message = format!(
@@ -1792,8 +1852,8 @@ impl App {
 
     /// Marks the active panel's file in the tree.
     fn show_active_in_tree(&mut self) {
+        let path = self.active_panel().path();
         let doc = self.active_panel().document();
-        let path = doc.and_then(|doc| doc.path());
         let preview = doc.is_some_and(|doc| self.is_preview(doc));
         self.tree.set_active(path.as_deref(), preview);
         self.note_recent();
@@ -1807,6 +1867,9 @@ impl App {
     fn shown(&self) -> Option<Recent> {
         if let Some(terminal) = self.active_terminal() {
             return Some(Recent::Terminal(terminal.borrow().id()));
+        }
+        if let Some(image) = self.active_panel().image() {
+            return Some(Recent::File(image.path().to_path_buf()));
         }
         self.active_panel()
             .document()
@@ -1897,6 +1960,10 @@ impl App {
             self.destroy_terminal(&terminal);
             return true;
         }
+        if self.active_panel().image().is_some() {
+            self.active_panel_mut().hide_image();
+            return true;
+        }
         let Some(doc) = self.active_panel().document().cloned() else {
             return true;
         };
@@ -1925,6 +1992,7 @@ impl App {
                     }
                     self.destroy_document(&doc);
                 }
+                self.close_images(&path);
                 self.recent
                     .retain(|recent| *recent != Recent::File(path.clone()));
             }
@@ -2259,7 +2327,7 @@ impl App {
                 return folder;
             }
         }
-        let file = self.active_panel().document().and_then(|doc| doc.path());
+        let file = self.active_panel().path();
         match file.as_deref().and_then(Path::parent) {
             Some(folder) if folder.is_dir() => folder.to_path_buf(),
             _ => self.workspace_folder(),
@@ -2417,7 +2485,7 @@ impl App {
                 return entry;
             }
         }
-        if let Some(path) = self.active_panel().document().and_then(|doc| doc.path()) {
+        if let Some(path) = self.active_panel().path() {
             return Entry {
                 path,
                 is_dir: false,
@@ -2436,7 +2504,7 @@ impl App {
     /// screen first.
     fn show_tree_menu(&mut self) {
         if self.focus != Focus::Tree {
-            let file = self.active_panel().document().and_then(|doc| doc.path());
+            let file = self.active_panel().path();
             self.run(Command::FocusTree, false);
             if let Some(file) = file {
                 self.tree.reveal(&file);
@@ -2617,6 +2685,13 @@ impl App {
                 doc.rename(path);
             }
         }
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            if let Some(image) = panel.image_mut() {
+                if let Some(path) = moved(image.path()) {
+                    image.rename(path);
+                }
+            }
+        }
         for recent in &mut self.recent {
             if let Recent::File(path) = recent {
                 if let Some(moved) = moved(path) {
@@ -2686,6 +2761,7 @@ impl App {
         for doc in closing {
             self.destroy_document(&doc);
         }
+        self.close_images(&resolved);
         self.recent
             .retain(|recent| !matches!(recent, Recent::File(open) if open.starts_with(&resolved)));
         self.tree.refresh();
@@ -4044,6 +4120,68 @@ mod tests {
             text.contains("Can't open: not valid UTF-8 (bin.dat)"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn images_open_in_panels_and_go_in_the_history() {
+        let _serial = crate::test_serial();
+        let root = fixture("images", &[("a.txt", "a"), ("broken.png", "not a png")]);
+        fs::write(root.join("red.png"), image::TEST_PNG).unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        assert!(app.open(&root.join("red.png"), false));
+        assert!(!app.ed_is_shown());
+        let text = screen(&app);
+        assert!(text.contains("red.png"), "{text}");
+        assert!(text.contains("4 × 2  PNG  75 B"), "{text}");
+        assert_eq!(app.tab().title(), "red.png");
+        assert!(matches!(app.shown(), Some(Recent::File(path)) if path == root.join("red.png")));
+
+        // The wheel zooms it, and back out to its own size.
+        let body = app.active_panel().body();
+        let (x, y) = (body.x + body.width / 2, body.y + body.height / 2);
+        mouse_at(&mut app, MouseKind::ScrollUp, x, y);
+        assert!(screen(&app).contains("75 B  110%"), "{}", screen(&app));
+        mouse_at(&mut app, MouseKind::ScrollDown, x, y);
+        assert!(!screen(&app).contains('%'), "{}", screen(&app));
+
+        // Back to the file, and forward to the image again.
+        ctrl(&mut app, '-');
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        let forward = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('-'), forward));
+        assert!(app.active_panel().image().is_some());
+
+        // It follows the file when it's renamed.
+        app.move_entry(&root.join("red.png"), &root.join("blue.png"))
+            .unwrap();
+        assert_eq!(app.tab().title(), "blue.png");
+
+        // Closing it empties the panel.
+        app.run(Command::CloseFile, false);
+        assert!(app.active_panel().is_empty());
+
+        // An image that doesn't decode says why.
+        assert!(!app.open(&root.join("broken.png"), false));
+        let text = screen(&app);
+        assert!(text.contains("Can't open: "), "{text}");
+        assert!(text.contains("(broken.png)"), "{text}");
+    }
+
+    #[test]
+    fn an_image_opens_from_the_command_line() {
+        let _serial = crate::test_serial();
+        let root = fixture("image-arg", &[]);
+        fs::write(root.join("red.png"), image::TEST_PNG).unwrap();
+        let app = app(&root, Some("red.png"));
+        assert!(app.active_panel().image().is_some());
+        assert!(app.documents.is_empty());
+        assert_eq!(app.focus, Focus::Editor);
+        let workspace = Workspace::new([root.clone()]).unwrap();
+        let bad = App::new(workspace, Some(root.join("missing.png")), 80, 10);
+        assert!(bad.is_err());
     }
 
     #[test]

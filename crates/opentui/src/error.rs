@@ -9,6 +9,8 @@ pub enum Error {
     CallFailed(&'static str),
     /// OpenTUI objects are alive on another thread; see the crate docs.
     WrongThread,
+    /// An image couldn't be decoded, for the reason given.
+    Image(&'static str),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -19,6 +21,7 @@ impl fmt::Display for Error {
             Error::CreateFailed(what) => write!(f, "OpenTUI failed to create {what}"),
             Error::CallFailed(what) => write!(f, "OpenTUI {what} failed"),
             Error::WrongThread => f.write_str("OpenTUI objects are in use on another thread"),
+            Error::Image(reason) => f.write_str(reason),
         }
     }
 }

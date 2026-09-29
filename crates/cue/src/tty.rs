@@ -16,6 +16,20 @@ pub fn size() -> (u32, u32) {
     }
 }
 
+/// The width and height of a cell in pixels, if the terminal on stdout
+/// says (Ghostty, kitty, and iTerm2 do).
+pub fn cell_pixels() -> Option<(u32, u32)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
+    let known = ok && ws.ws_col > 0 && ws.ws_row > 0 && ws.ws_xpixel > 0 && ws.ws_ypixel > 0;
+    known.then(|| {
+        (
+            (ws.ws_xpixel / ws.ws_col) as u32,
+            (ws.ws_ypixel / ws.ws_row) as u32,
+        )
+    })
+}
+
 /// Waits up to `timeout` for input, or for one of the `watched` file
 /// descriptors (fd, and whether to wait for it to take writes too) to be
 /// ready, and returns the input that's available (empty if none).

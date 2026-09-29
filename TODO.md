@@ -12,7 +12,6 @@
 # feat
 
 - maybe: make proper move rather than unix style unified move-rename verb
-- dim gitignored files, folders in the file tree and also exclude them from the search + file picker
 
 - save workspace layouts
 	- maybe do this in like a "sessions" format, similar to claude code and others?
@@ -38,8 +37,6 @@
 	- git log
 	- see edit history for any given file
 	- git worktree support
-
-- image viewer thru kitty graphics protocol
 
 - proper config; rebinding, settings
 
