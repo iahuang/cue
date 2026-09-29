@@ -1,0 +1,111 @@
+# Builds cue for aarch64 macOS and x86_64 Linux (static musl) and publishes
+# them to R2 for deployment/install.sh.
+#
+# Release: bump `version` in crates/cue/Cargo.toml, commit, then push a
+# matching tag (`git tag v0.2.0 && git push origin v0.2.0`). Running the
+# workflow by hand builds and uploads the archives as workflow artifacts but
+# publishes nothing.
+#
+# Needs repository secrets R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/cue/Cargo.toml | head -n1)
+          if [[ $GITHUB_REF == refs/tags/v* && ${GITHUB_REF_NAME#v} != "$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match crates/cue version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - platform: darwin-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+          - platform: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    env:
+      BIN: target/${{ matrix.target }}/dist/cue
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.91
+        with:
+          targets: ${{ matrix.target }}
+      # opentui-sys builds the vendored OpenTUI core with it.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # On Linux, Zig is also the C compiler and linker. Its bundled musl is
+      # new enough for Zig's std (statx, musl 1.2.5); distro musl-tools is not.
+      - if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo ${{ runner.os == 'Linux' && 'zigbuild' || 'build' }} --locked --profile dist -p cue --target ${{ matrix.target }}
+
+      - if: runner.os == 'macOS'
+        # Apple Silicon refuses to run unsigned code. The linker signs ad hoc,
+        # but stripping can invalidate that, so sign again.
+        run: |
+          codesign --force --sign - "$BIN"
+          codesign --verify "$BIN"
+      - if: runner.os == 'Linux'
+        run: file "$BIN" | tee /dev/stderr | grep -q static
+      - run: '"$BIN" --help > /dev/null'
+
+      - run: deployment/package.sh ${{ matrix.platform }} "$BIN" dist
+      # Tarballs, because artifacts do not keep the executable bit.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cue-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    concurrency: publish
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: sudo apt-get update && sudo apt-get install -y rclone
+      - run: deployment/publish.sh "${{ needs.version.outputs.version }}" dist
+        env:
+          PUBLIC_URL: https://s3.ianhuang.dev/cue
+          R2_BUCKET: public
+          R2_PREFIX: cue
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

@@ -5,3 +5,10 @@ members = ["crates/opentui-sys", "crates/opentui", "crates/cue"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
+
+# Distributed binaries (deployment/release.sh); plain `release` stays fast to build.
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true

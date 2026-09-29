@@ -31,3 +31,7 @@ tree-sitter-typescript = "0.23"
 tree-sitter-yaml = "0.7"
 tree-sitter-zig = "1.1"
 trash = "5"
+
+# musl's allocator is slow under contention (parallel search, file indexing).
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"

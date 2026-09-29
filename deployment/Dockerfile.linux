@@ -1,0 +1,26 @@
+# Cross-compiles x86_64-unknown-linux-musl binaries (fully static). Used by
+# release.sh.
+#
+# The image runs natively on the Mac's architecture: under Rosetta, Zig's
+# self-compiled tools (translate-c) crash and cargo hangs. Zig is the C
+# compiler and linker for the target (via cargo-zigbuild), and x86_64 binutils
+# prelink libopentui (see crates/opentui-sys/build/main.rs).
+FROM rust:1.91-bookworm
+
+ARG ZIG_VERSION=0.16.0
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends binutils-x86-64-linux-gnu file xz-utils \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" \
+    | tar -xJ -C /opt \
+ && ln -s "/opt/zig-$(uname -m)-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig \
+ && rustup target add x86_64-unknown-linux-musl \
+ && cargo install --locked cargo-zigbuild \
+ && rm -rf /usr/local/cargo/registry
+
+ENV OPENTUI_LD=x86_64-linux-gnu-ld \
+    OPENTUI_OBJCOPY=x86_64-linux-gnu-objcopy \
+    OPENTUI_AR=x86_64-linux-gnu-ar
+
+WORKDIR /src

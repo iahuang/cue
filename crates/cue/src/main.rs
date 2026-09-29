@@ -35,6 +35,10 @@ use std::time::{Duration, Instant};
 
 use opentui::{Output, Renderer};
 
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use app::{App, AppAction};
 use input::{Event, Parser};
 use keymap::{Command, Keymap};
