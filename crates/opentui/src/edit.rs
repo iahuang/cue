@@ -53,6 +53,57 @@ fn local_selection_flags(move_cursor: bool, behavior: SelectionBehavior) -> u8 {
     u8::from(move_cursor) | behavior << 2
 }
 
+/// Where `old` and `new` differ, in bytes: the start, the same in both,
+/// then the end in each, after which they're the same again. The ends are
+/// next to line breaks, so never inside a grapheme: the start is a line's,
+/// and the text after the ends starts a line in both or with a line break.
+fn changed_lines(old: &str, new: &str) -> (usize, usize, usize) {
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let start = a[..prefix]
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .map_or(0, |i| i + 1);
+    let most = a.len().min(b.len()) - start;
+    let suffix = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take(most)
+        .take_while(|(x, y)| x == y)
+        .count();
+    let starts_line = |s: &[u8], end: usize| end == 0 || s[end - 1] == b'\n';
+    let suffix = if starts_line(a, a.len() - suffix) && starts_line(b, b.len() - suffix) {
+        suffix
+    } else {
+        // From the first line break in it, if any.
+        let tail = &a[a.len() - suffix..];
+        tail.iter().position(|&c| c == b'\n').map_or(0, |i| suffix - i)
+    };
+    (start, a.len() - suffix, b.len() - suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::changed_lines;
+
+    #[test]
+    fn changed_lines_are_whole_lines_or_line_breaks() {
+        // Appending a line only inserts it.
+        assert_eq!(changed_lines("a\nb\n", "a\nb\nc\n"), (4, 4, 6));
+        // Removing or adding a line in the middle only touches that line.
+        assert_eq!(changed_lines("a\nb\nc\n", "a\nc\n"), (2, 4, 2));
+        assert_eq!(changed_lines("a\nc\n", "a\nb\nc\n"), (2, 2, 4));
+        // A change within a line replaces the line up to its break.
+        assert_eq!(changed_lines("a\nbxb\nc", "a\nbyb\nc"), (2, 5, 5));
+        // Never inside a grapheme: "e" plus an accent differs from "e".
+        assert_eq!(changed_lines("xe\u{301}", "xe"), (0, 4, 2));
+        assert_eq!(changed_lines("same", "same"), (0, 0, 0));
+        assert_eq!(changed_lines("", "new"), (0, 0, 3));
+        assert_eq!(changed_lines("old", ""), (0, 3, 0));
+    }
+}
+
 /// A cursor position in the underlying text: `row` is the line and `col` the
 /// display column within it. `offset` is in the native cursor-offset units
 /// accepted by [`EditorView::set_cursor_by_offset`].
@@ -156,12 +207,34 @@ impl EditBuffer {
     }
 
     /// Replaces the whole text as one undoable edit, moving the cursor to
-    /// the start. Returns the undo snapshots recorded.
+    /// the start. Returns the undo snapshots recorded: none if it failed.
+    ///
+    /// Each call keeps a copy of the text for undo in one of the buffer's
+    /// 255 memory slots, which are never freed; after about 250 calls it
+    /// fails. [`replace_changed_lines`](Self::replace_changed_lines) doesn't.
     pub fn replace_text(&self, text: &str) -> u32 {
-        unsafe {
+        let replaced = unsafe {
             sys::editBufferReplaceText(self.handle, text.as_ptr(), ffi_len(text.len(), "text"))
+        };
+        u32::from(replaced)
+    }
+
+    /// Replaces the text with `text` by replacing only the lines that
+    /// differ, as a deletion then an insertion, so that undo keeps just the
+    /// change. Leaves the cursor after the insertion. Returns the undo
+    /// snapshots recorded.
+    pub fn replace_changed_lines(&self, text: &str) -> u32 {
+        let old = self.text();
+        let (start, old_end, new_end) = changed_lines(&old, text);
+        if start == old_end && start == new_end {
+            return 0;
         }
-        1
+        let ends = self.bytes_to_cursors(&[start as u32, old_end as u32]);
+        let (from, to) = (ends[0], ends[1]);
+        let mut steps = self.delete_range((from.row, from.col), (to.row, to.col));
+        self.set_cursor(from.row, from.col);
+        steps += self.insert_text(&text[start..new_end]);
+        steps
     }
 
     /// A number that changes whenever the text does.

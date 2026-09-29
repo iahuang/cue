@@ -7,7 +7,7 @@
 //! What `.gitignore` and `.ignore` files exclude is shown dimmed, and left
 //! out of the file picker and workspace search.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +37,11 @@ const HIDDEN: &[&str] = &[".git", ".DS_Store"];
 /// Whether an entry named `name` is never shown.
 pub fn is_hidden(name: &std::ffi::OsStr) -> bool {
     HIDDEN.iter().any(|&hidden| name == hidden)
+}
+
+/// Whether a file named `name` says which entries are ignored.
+fn is_ignore_file(name: &std::ffi::OsStr) -> bool {
+    name == ".gitignore" || name == ".ignore"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +82,8 @@ pub struct FileTree {
     expanded: HashSet<PathBuf>,
     /// Every visible entry, top to bottom.
     rows: Vec<Row>,
+    /// Counts changes to `rows`, to tell when the open folders may have.
+    listing: u64,
     selected: usize,
     /// The first row on screen.
     scroll: usize,
@@ -95,6 +102,7 @@ impl FileTree {
             roots: Vec::new(),
             expanded: HashSet::new(),
             rows: Vec::new(),
+            listing: 0,
             selected: 0,
             scroll: 0,
             height: 1,
@@ -134,11 +142,49 @@ impl FileTree {
             }
         }
         self.rows = rows;
+        self.listing += 1;
         if let Some(index) = selected.and_then(|path| self.index_of(&path)) {
             self.selected = index;
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         self.scroll_into_view();
+    }
+
+    /// A number that changes whenever what's listed does.
+    pub fn listing(&self) -> u64 {
+        self.listing
+    }
+
+    /// Whether changes to `paths` change what's listed: an entry of an open
+    /// folder came, went, or became a folder or stopped being one, or an
+    /// ignore file there changed. Told by looking, not by what the changes
+    /// were said to be, which isn't to be trusted (see [`Changes`](crate::watch::Changes)).
+    pub fn is_changed_by<'a>(&self, paths: impl IntoIterator<Item = &'a PathBuf>) -> bool {
+        let open: HashSet<&Path> = self.open_folders().map(PathBuf::as_path).collect();
+        let listed: HashMap<&Path, bool> = self
+            .rows
+            .iter()
+            .map(|row| (row.path.as_path(), row.is_dir))
+            .collect();
+        paths.into_iter().any(|path| {
+            let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+                return false;
+            };
+            if !open.contains(folder) || is_hidden(name) {
+                return false;
+            }
+            // Whether it's a folder, as `read_dir` tells, if it's there.
+            let now = fs::symlink_metadata(path).ok().map(|_| path.is_dir());
+            is_ignore_file(name) || now != listed.get(path.as_path()).copied()
+        })
+    }
+
+    /// The folders listed with their contents showing.
+    pub fn open_folders(&self) -> impl Iterator<Item = &PathBuf> {
+        self.rows
+            .iter()
+            .filter(|row| row.is_dir && self.expanded.contains(&row.path))
+            .map(|row| &row.path)
     }
 
     pub fn set_height(&mut self, height: u32) {
@@ -412,6 +458,7 @@ impl FileTree {
         let mut children = Vec::new();
         self.push_children(&mut children, &path, depth + 1, ignored);
         self.rows.splice(index + 1..index + 1, children);
+        self.listing += 1;
     }
 
     fn collapse(&mut self, index: usize) {
@@ -422,6 +469,7 @@ impl FileTree {
             .position(|row| row.depth <= depth)
             .map_or(self.rows.len(), |n| index + 1 + n);
         self.rows.drain(index + 1..end);
+        self.listing += 1;
         if self.selected >= end {
             self.selected -= end - (index + 1);
         } else if self.selected > index {
@@ -559,6 +607,27 @@ mod tests {
 
     fn selected(tree: &FileTree) -> &str {
         &tree.rows[tree.selected].name
+    }
+
+    #[test]
+    fn tells_which_changes_change_the_listing() {
+        let root = fixture("changed-by", &["a.txt", "shut/b.txt"]);
+        let tree = tree(std::slice::from_ref(&root));
+        let changed = |path: &PathBuf| tree.is_changed_by([path]);
+        let a = root.join("a.txt");
+        assert!(!changed(&a), "there, and listed: changed within");
+        fs::write(root.join("new.txt"), "").unwrap();
+        assert!(changed(&root.join("new.txt")), "came");
+        assert!(!changed(&root.join("gone.txt")), "came and went");
+        fs::remove_file(&a).unwrap();
+        assert!(changed(&a), "went");
+        fs::create_dir(&a).unwrap();
+        assert!(changed(&a), "became a folder");
+        fs::write(root.join("shut/c.txt"), "").unwrap();
+        assert!(!changed(&root.join("shut/c.txt")), "in a closed folder");
+        fs::write(root.join(".DS_Store"), "").unwrap();
+        assert!(!changed(&root.join(".DS_Store")), "never listed");
+        assert!(changed(&root.join(".gitignore")), "may ignore others");
     }
 
     #[test]

@@ -637,7 +637,11 @@ pub const EditBuffer = struct {
     /// Replace text while preserving undo history (creates an undo point)
     pub fn replaceText(self: *EditBuffer, text: []const u8) !void {
         const owned_text = try self.allocator.dupe(u8, text);
-        const mem_id = try self.tb.registerMemBuffer(owned_text, true);
+        // Once registered, the registry owns it.
+        const mem_id = self.tb.registerMemBuffer(owned_text, true) catch |err| {
+            self.allocator.free(owned_text);
+            return err;
+        };
         try self.replaceTextFromMemId(mem_id);
     }
 

@@ -50,7 +50,7 @@
 //! show, as closing each of them would.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::os::fd::RawFd;
@@ -62,7 +62,7 @@ use opentui::{Attributes, Buffer, Rgba};
 
 use crate::alert::{Alert, AlertAction, Button};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
-use crate::document::{self, Document};
+use crate::document::{self, Disk, DiskChange, Document};
 use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
@@ -79,6 +79,7 @@ use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
 use crate::theme::Theme;
 use crate::tree::{Entry, FileTree, TreeAction};
+use crate::watch::{Changes, Watcher};
 use crate::workspace::Workspace;
 
 const DIVIDER: Rgba = Rgba::rgb(69, 71, 90);
@@ -125,6 +126,20 @@ enum Answer {
     Go(Redo),
     /// Save these files, then go ahead.
     Save(Vec<Rc<Document>>, Redo),
+    /// Save this file over the one on disk, which changed since, then
+    /// carry on saving, if it was.
+    Overwrite(Rc<Document>, Option<Saving>),
+    /// Take the file's text from disk, dropping unsaved changes, then
+    /// carry on saving, if it was.
+    Revert(Rc<Document>, Option<Saving>),
+}
+
+/// What's left of saving files and then going ahead, while one that
+/// changed on disk is asked about.
+#[derive(Clone)]
+struct Saving {
+    docs: Vec<Rc<Document>>,
+    redo: Redo,
 }
 
 /// What the main loop should do after the app handled input.
@@ -235,6 +250,12 @@ pub struct App {
     picker: Option<Picker>,
     /// Every file in the workspace, for the picker.
     files: FileIndex,
+    /// Hears of files other programs change, in the tree's open folders
+    /// and those of open files.
+    watcher: Watcher,
+    /// The tree's listing and open files' folders the watcher last took,
+    /// to tell when to update it.
+    watching: Option<(u64, BTreeSet<PathBuf>)>,
     /// Files and terminals shown in the active panel, most recent first.
     recent: Vec<Recent>,
     /// Workspace search, while open. Never open with the picker.
@@ -311,6 +332,8 @@ impl App {
             })?;
         let mut app = App {
             files: FileIndex::new(&workspace),
+            watcher: Watcher::new(),
+            watching: None,
             workspace,
             keymap: Keymap::default(),
             tree,
@@ -357,6 +380,7 @@ impl App {
             app.show_message(notice, false);
         }
         app.note_recent();
+        app.watch_folders();
         Ok(app)
     }
 
@@ -1021,8 +1045,9 @@ impl App {
     }
 
     /// Catches up after input: keeps an edited preview, remembers the find
-    /// bar's query, and puts the active editor's cursor back in the buffer
-    /// it shares with other panels, which input to another may have taken.
+    /// bar's query, puts the active editor's cursor back in the buffer it
+    /// shares with other panels, which input to another may have taken,
+    /// and watches the folders shown or with files open.
     fn after_input(&mut self) {
         self.keep_if_edited();
         self.note_find_memory();
@@ -1031,6 +1056,7 @@ impl App {
         }
         self.editor_mut();
         self.note_terminal_focus();
+        self.watch_folders();
     }
 
     /// Draws the frame and returns where the terminal cursor goes (0-based
@@ -1111,9 +1137,9 @@ impl App {
         cursor.filter(|_| self.focus == Focus::Editor)
     }
 
-    /// Catches up on work in the background: output from terminals, and
-    /// listing the workspace's files and searching them. Returns whether the
-    /// screen needs redrawing.
+    /// Catches up on work in the background: output from terminals,
+    /// listing the workspace's files and searching them, and files other
+    /// programs changed. Returns whether the screen needs redrawing.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         for terminal in &self.terminals {
@@ -1128,6 +1154,82 @@ impl App {
                 picker.set_files(&self.files);
                 changed = true;
             }
+        }
+        if let Some(changes) = self.watcher.poll() {
+            changed |= self.disk_changed(changes);
+            // Folders may have come back for open files, and the tree may
+            // list others.
+            self.watching = None;
+            self.watch_folders();
+        }
+        changed
+    }
+
+    /// Watches the folders open in the tree, and those of open files, if
+    /// they changed since last time.
+    fn watch_folders(&mut self) {
+        let files: BTreeSet<PathBuf> = self
+            .documents
+            .iter()
+            .filter_map(|doc| doc.path()?.parent().map(Path::to_path_buf))
+            .collect();
+        let watching = (self.tree.listing(), files);
+        if self.watching.as_ref() == Some(&watching) {
+            return;
+        }
+        let mut folders: BTreeSet<PathBuf> = self.tree.open_folders().cloned().collect();
+        for folder in &watching.1 {
+            // An open file's folder may be gone; the tree's were just listed.
+            if !folders.contains(folder) && folder.is_dir() {
+                folders.insert(folder.clone());
+            }
+        }
+        self.watcher.watch(folders);
+        self.watching = Some(watching);
+    }
+
+    /// Catches up with `changes` to files: the tree lists what's in its
+    /// open folders now, and open files take changes to them, or, with
+    /// unsaved changes, note them for saving to ask about. Returns whether
+    /// anything did.
+    fn disk_changed(&mut self, changes: Changes) -> bool {
+        let listed = changes.rescan || self.tree.is_changed_by(&changes.paths);
+        if listed {
+            self.tree.refresh();
+        }
+        // Those changed, or in a folder that moved or went.
+        let touched = |doc: &Rc<Document>| {
+            doc.path().is_some_and(|path| {
+                changes.rescan
+                    || changes
+                        .paths
+                        .iter()
+                        .any(|changed| path.starts_with(changed))
+            })
+        };
+        let touched: Vec<Rc<Document>> = self
+            .documents
+            .iter()
+            .filter(|doc| touched(doc))
+            .cloned()
+            .collect();
+        let mut changed = listed;
+        for doc in touched {
+            let Some(change) = doc.check_disk() else {
+                continue;
+            };
+            changed = true;
+            if change == DiskChange::Conflict {
+                let message = format!(
+                    "{} changed on disk; saving will ask whether to overwrite it.",
+                    self.document_name(&doc)
+                );
+                self.show_message(message, false);
+            }
+        }
+        if changed {
+            // Back into the buffer, for the cursor a reload parked.
+            self.editor_mut();
         }
         changed
     }
@@ -1794,6 +1896,44 @@ impl App {
         false
     }
 
+    /// Asks whether saving `doc` should overwrite the file, which changed
+    /// on disk since, or take its text instead, then carry on `saving`.
+    fn ask_overwrite(&mut self, doc: Rc<Document>, saving: Option<Saving>) {
+        let name = self.document_name(&doc);
+        let message = format!(
+            "{name} changed on disk since it was opened or last saved. Overwrite it \
+             with your changes, or revert to the file on disk and lose them?"
+        );
+        let buttons = vec![
+            Button::new(
+                "&Overwrite",
+                Answer::Overwrite(doc.clone(), saving.clone()),
+            )
+            .danger(),
+            Button::new("&Revert", Answer::Revert(doc, saving)).danger(),
+        ];
+        let title = format!("Save {name}?");
+        self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
+    }
+
+    /// Saves `doc` over its file, whatever is there.
+    fn overwrite(&mut self, doc: &Rc<Document>) -> AppAction {
+        let Some(path) = doc.path() else {
+            return AppAction::Continue;
+        };
+        let action = match self.editor_mut() {
+            Some(editor) if Rc::ptr_eq(editor.document(), doc) => editor.write(path),
+            _ => match doc.save(&path) {
+                Ok(()) => Action::Saved,
+                Err(err) => {
+                    self.show_message(format!("Can't save: {err} ({})", path.display()), true);
+                    Action::Continue
+                }
+            },
+        };
+        self.editor_action(action)
+    }
+
     fn alert_action(&mut self, action: AlertAction<Answer>) -> AppAction {
         let answer = match action {
             AlertAction::Continue => return AppAction::Continue,
@@ -1804,20 +1944,57 @@ impl App {
             AlertAction::Answer(answer) => answer,
         };
         self.alert = None;
-        let redo = match answer {
-            Answer::Go(redo) => redo,
-            Answer::Save(docs, redo) => {
-                for doc in &docs {
-                    let Some(path) = doc.path() else { continue };
-                    if let Err(err) = doc.save(&path) {
-                        let message = format!("Can't save: {err} ({})", path.display());
-                        self.show_message(message, true);
-                        return AppAction::Continue;
-                    }
+        let saving = match answer {
+            Answer::Go(redo) => return self.go(redo),
+            Answer::Save(docs, redo) => Saving { docs, redo },
+            Answer::Overwrite(doc, saving) => {
+                let action = self.overwrite(&doc);
+                match saving {
+                    Some(saving) if !doc.is_modified() => saving,
+                    _ => return action,
                 }
-                redo
+            }
+            Answer::Revert(doc, saving) => {
+                let name = self.document_name(&doc);
+                if let Err(err) = doc.revert() {
+                    self.show_message(format!("Can't revert {name}: {err}"), true);
+                    return AppAction::Continue;
+                }
+                self.show_message(format!("Reverted {name} to the file on disk."), false);
+                match saving {
+                    Some(saving) => saving,
+                    None => return AppAction::Continue,
+                }
             }
         };
+        self.save_then_go(saving)
+    }
+
+    /// Saves `saving`'s files, then goes ahead. A file that changed on disk
+    /// since stops it to ask whether to overwrite the file, then it carries
+    /// on; one that can't be saved stops it.
+    fn save_then_go(&mut self, saving: Saving) -> AppAction {
+        let Saving { mut docs, redo } = saving;
+        while !docs.is_empty() {
+            let doc = docs.remove(0);
+            let Some(path) = doc.path() else { continue };
+            // It may have changed since the alert was put up.
+            doc.check_disk();
+            if doc.disk() == Disk::Changed {
+                self.ask_overwrite(doc, Some(Saving { docs, redo }));
+                return AppAction::Continue;
+            }
+            if let Err(err) = doc.save(&path) {
+                let message = format!("Can't save: {err} ({})", path.display());
+                self.show_message(message, true);
+                return AppAction::Continue;
+            }
+        }
+        self.go(redo)
+    }
+
+    /// Goes ahead with `redo`, which the user confirmed.
+    fn go(&mut self, redo: Redo) -> AppAction {
         self.confirmed = true;
         let action = match redo {
             Redo::Run(command) => self.run(command, false),
@@ -2114,6 +2291,12 @@ impl App {
             // It has no name yet.
             Action::SaveAs => {
                 self.show_dialog(Purpose::SaveAs);
+                AppAction::Continue
+            }
+            Action::Conflict => {
+                if let Some(doc) = self.active_panel().document().cloned() {
+                    self.ask_overwrite(doc, None);
+                }
                 AppAction::Continue
             }
         }
@@ -3032,6 +3215,123 @@ mod tests {
             app.poll();
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn files_changed_on_disk_reload_or_ask_before_overwriting() {
+        let _serial = crate::test_serial();
+        let root = fixture("disk", &[("a.txt", "alpha\n"), ("sub/b.txt", "")]);
+        let mut app = app(&root, Some("a.txt"));
+        let file = root.join("a.txt");
+        // Let the watcher start.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Another program changes it, and it's taken, without listing the
+        // folder again.
+        let listing = app.tree.listing();
+        fs::write(&file, "alpha\nbeta\n").unwrap();
+        wait_until(&mut app, "the change", |app| {
+            app.ed().text() == "alpha\nbeta\n"
+        });
+        assert!(!app.ed().is_modified());
+        assert_eq!(app.tree.listing(), listing);
+        fs::write(root.join("new.txt"), "").unwrap();
+        wait_until(&mut app, "the new file", |app| {
+            screen(app).contains("new.txt")
+        });
+        // A folder expanded is watched from then on.
+        ctrl(&mut app, 'e');
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Right);
+        assert!(screen(&app).contains("b.txt"), "{}", screen(&app));
+        fs::write(root.join("sub/c.txt"), "").unwrap();
+        wait_until(&mut app, "the file in the folder", |app| {
+            screen(app).contains("c.txt")
+        });
+        key(&mut app, KeyCode::Esc);
+
+        // With unsaved changes, it keeps them, and saving asks first.
+        type_text(&mut app, "x");
+        fs::write(&file, "gamma\n").unwrap();
+        wait_until(&mut app, "the conflict", |app| {
+            app.ed().document().disk() == Disk::Changed
+        });
+        assert!(
+            screen(&app).contains("a.txt [+] [changed on disk]"),
+            "{}",
+            screen(&app)
+        );
+        assert_eq!(app.ed().text(), "xalpha\nbeta\n");
+        ctrl(&mut app, 's');
+        assert!(screen(&app).contains("Save a.txt?"), "{}", screen(&app));
+        key(&mut app, KeyCode::Char('o'));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "xalpha\nbeta\n");
+        assert!(!app.ed().is_modified());
+        assert_eq!(app.ed().document().disk(), Disk::Same);
+
+        // Or it takes the file's text, which undo takes back.
+        type_text(&mut app, "y");
+        fs::write(&file, "delta\n").unwrap();
+        wait_until(&mut app, "the conflict", |app| {
+            app.ed().document().disk() == Disk::Changed
+        });
+        ctrl(&mut app, 's');
+        key(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.ed().text(), "delta\n");
+        assert!(!app.ed().is_modified());
+        ctrl(&mut app, 'z');
+        assert_eq!(app.ed().text(), "xyalpha\nbeta\n");
+
+        // Deleted, it stays open, and saving writes it again.
+        fs::remove_file(&file).unwrap();
+        wait_until(&mut app, "the deletion", |app| {
+            app.ed().document().disk() == Disk::Deleted
+        });
+        assert!(
+            screen(&app).contains("a.txt [+] [deleted]"),
+            "{}",
+            screen(&app)
+        );
+        ctrl(&mut app, 's');
+        assert!(app.alert.is_none());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "xyalpha\nbeta\n");
+    }
+
+    #[test]
+    fn saving_all_asks_about_files_changed_on_disk_then_carries_on() {
+        let _serial = crate::test_serial();
+        let root = fixture("save-all-disk", &[("a.txt", "a\n"), ("b.txt", "b\n")]);
+        let mut app = app(&root, Some("a.txt"));
+        // Let the watcher start.
+        std::thread::sleep(Duration::from_millis(200));
+        type_text(&mut app, "x");
+        assert!(app.open(&root.join("b.txt"), false));
+        type_text(&mut app, "y");
+
+        // a.txt changes before quitting, and it's heard of; b.txt changes
+        // while the alert is up.
+        fs::write(root.join("a.txt"), "A\n").unwrap();
+        wait_until(&mut app, "the conflict", |app| {
+            app.documents.iter().any(|doc| doc.disk() == Disk::Changed)
+        });
+        ctrl(&mut app, 'q');
+        assert!(screen(&app).contains(" Save All "), "{}", screen(&app));
+        fs::write(root.join("b.txt"), "B\n").unwrap();
+
+        // Each is asked about in turn, then it quits.
+        key(&mut app, KeyCode::Enter);
+        assert!(screen(&app).contains("Save a.txt?"), "{}", screen(&app));
+        assert!(matches!(
+            key(&mut app, KeyCode::Char('o')),
+            AppAction::Continue
+        ));
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "xa\n");
+        assert!(screen(&app).contains("Save b.txt?"), "{}", screen(&app));
+        assert!(matches!(
+            key(&mut app, KeyCode::Char('r')),
+            AppAction::Quit
+        ));
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "B\n");
     }
 
     #[test]

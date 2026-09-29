@@ -2832,10 +2832,13 @@ export fn editBufferSetTextFromMem(edit_handle: NativeHandle, mem_id: u8) void {
     object_ptr.setTextFromMemId(mem_id) catch {};
 }
 
-export fn editBufferReplaceText(edit_handle: NativeHandle, textPtr: ?[*]const u8, textLen: u32) void {
-    const object_ptr = acquireEditBuffer(edit_handle) orelse return;
+/// Returns false if the text couldn't be replaced, e.g. once the buffer's
+/// memory registry is full.
+export fn editBufferReplaceText(edit_handle: NativeHandle, textPtr: ?[*]const u8, textLen: u32) bool {
+    const object_ptr = acquireEditBuffer(edit_handle) orelse return false;
     const text = sliceFromPtrLen(textPtr, textLen);
-    object_ptr.replaceText(text) catch {};
+    object_ptr.replaceText(text) catch return false;
+    return true;
 }
 
 export fn editBufferReplaceTextFromMem(edit_handle: NativeHandle, mem_id: u8) void {

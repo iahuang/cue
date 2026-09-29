@@ -7,17 +7,22 @@
 //! The native edit buffer splits lines on `\n`, `\r\n`, and `\r`, and returns
 //! text joined with `\n`. A file's line ending is detected on load and
 //! restored on save, so CRLF files stay CRLF.
+//!
+//! A document remembers the file as it last loaded or saved it, to tell
+//! when something else changes it (see [`Document::check_disk`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use opentui::{EditBuffer, WidthMethod};
 
-use crate::history::History;
+use crate::history::{EditKind, History};
 use crate::language::{self, Language};
 use crate::syntax::Highlighter;
 use crate::theme::{self, Theme};
@@ -45,6 +50,68 @@ pub struct File {
     pub line_ending: LineEnding,
 }
 
+/// The file on disk as last read or written, to tell whether it changed
+/// since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    /// Of the contents, for when only the time changed, or it changed to
+    /// what it was.
+    hash: u64,
+}
+
+impl Stamp {
+    fn new(meta: &fs::Metadata, bytes: &[u8]) -> Stamp {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Stamp {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            hash: hasher.finish(),
+        }
+    }
+
+    /// Whether a file with `meta` is surely this one, without reading it.
+    fn matches(&self, meta: &fs::Metadata) -> bool {
+        self.modified.is_some() && self.modified == meta.modified().ok() && self.len == meta.len()
+    }
+}
+
+/// How the file on disk compares with the document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Disk {
+    /// As the document last loaded or saved it.
+    #[default]
+    Same,
+    /// Changed since, while the document had unsaved changes: saving asks
+    /// whether to overwrite it.
+    Changed,
+    /// Gone since; saving writes it again.
+    Deleted,
+}
+
+/// What [`Document::check_disk`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskChange {
+    /// The file changed, and the document, with nothing unsaved, took the
+    /// change.
+    Reloaded,
+    /// The file changed, but the document has unsaved changes.
+    Conflict,
+    Deleted,
+    /// The file is back as the document last had it.
+    Restored,
+}
+
+/// The file as the document last loaded or saved it, and how it compares.
+#[derive(Default)]
+struct OnDisk {
+    /// `None` if there was no file.
+    stamp: Option<Stamp>,
+    disk: Disk,
+}
+
 /// An open file, shared by the editors showing it.
 pub struct Document {
     pub buffer: Rc<EditBuffer>,
@@ -63,6 +130,7 @@ pub struct Document {
     parked: RefCell<HashMap<u64, Parked>>,
     /// The text the parked cursors point into, and its content epoch.
     parked_text: RefCell<(u64, String)>,
+    on_disk: RefCell<OnDisk>,
 }
 
 /// An editor's cursor while another editor of the same document has the
@@ -98,7 +166,9 @@ impl Document {
             line_ending: Default::default(),
         };
         let mut notice = None;
+        let mut stamp = None;
         if let Some(loaded) = loaded {
+            stamp = loaded.stamp;
             buffer.set_text(&loaded.text);
             buffer.set_cursor(0, 0);
             file.line_ending = loaded.line_ending;
@@ -109,7 +179,9 @@ impl Document {
                 ));
             }
         }
-        Ok((Rc::new(Document::new(buffer, file, theme)), notice))
+        let doc = Document::new(buffer, file, theme);
+        doc.on_disk.borrow_mut().stamp = stamp;
+        Ok((Rc::new(doc), notice))
     }
 
     /// A document of `buffer`'s text, saved to `file`.
@@ -129,6 +201,7 @@ impl Document {
             cursor_owner: Cell::new(None),
             parked: RefCell::default(),
             parked_text: RefCell::default(),
+            on_disk: RefCell::default(),
         }
     }
 
@@ -254,9 +327,112 @@ impl Document {
     /// it saved.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let line_ending = self.file.borrow().line_ending;
-        save(path, &self.buffer.text(), line_ending)?;
+        let stamp = save(path, &self.buffer.text(), line_ending)?;
         self.history.borrow_mut().mark_saved();
+        *self.on_disk.borrow_mut() = OnDisk {
+            stamp: Some(stamp),
+            disk: Disk::Same,
+        };
         Ok(())
+    }
+
+    /// How the file on disk compared with the document when last checked.
+    pub fn disk(&self) -> Disk {
+        self.on_disk.borrow().disk
+    }
+
+    /// Catches up with the file on disk, which something else may have
+    /// changed. With no unsaved changes, the document takes the change, as
+    /// one undo step; with some, it keeps them, and saving asks first. A
+    /// file that can't be read is left for later.
+    pub fn check_disk(&self) -> Option<DiskChange> {
+        let path = self.path()?;
+        let OnDisk { stamp, disk } = *self.on_disk.borrow();
+        let meta = match fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if stamp.is_none() || disk == Disk::Deleted {
+                    return None;
+                }
+                self.on_disk.borrow_mut().disk = Disk::Deleted;
+                return Some(DiskChange::Deleted);
+            }
+            Err(_) => return None,
+        };
+        if stamp.is_some_and(|stamp| stamp.matches(&meta)) {
+            return self.restored();
+        }
+        let loaded = load(&path).ok()?;
+        if loaded.stamp.map(|s| s.hash) == stamp.map(|s| s.hash) {
+            // Touched, or changed back.
+            self.on_disk.borrow_mut().stamp = loaded.stamp;
+            return self.restored();
+        }
+        if !self.is_modified() {
+            if self.reload(loaded, true) {
+                return Some(DiskChange::Reloaded);
+            }
+            // Only partly taken, so not the file.
+            return Some(DiskChange::Conflict);
+        }
+        if disk == Disk::Changed {
+            return None;
+        }
+        self.on_disk.borrow_mut().disk = Disk::Changed;
+        Some(DiskChange::Conflict)
+    }
+
+    /// The file is as last loaded or saved.
+    fn restored(&self) -> Option<DiskChange> {
+        let mut on_disk = self.on_disk.borrow_mut();
+        if on_disk.disk == Disk::Same {
+            return None;
+        }
+        on_disk.disk = Disk::Same;
+        Some(DiskChange::Restored)
+    }
+
+    /// Loads the file again, dropping unsaved changes, as one undo step.
+    pub fn revert(&self) -> io::Result<()> {
+        let Some(path) = self.path() else {
+            return Ok(());
+        };
+        if !self.reload(load(&path)?, false) {
+            return Err(io::Error::other("the file's text couldn't all be taken"));
+        }
+        Ok(())
+    }
+
+    /// Takes `loaded` as the text, changing only the lines that differ, as
+    /// one undo step, and as saved. With `join`, it joins the undo step of
+    /// the reload just before, if nothing came between. Every editor's
+    /// cursor is parked, to follow the change.
+    ///
+    /// Returns false if the buffer didn't take all of it: then it keeps
+    /// what it took as an unsaved edit, and saving asks first.
+    fn reload(&self, loaded: Loaded, join: bool) -> bool {
+        if let Some(owner) = self.cursor_owner.take() {
+            self.park(owner);
+        }
+        let steps = self.buffer.replace_changed_lines(&loaded.text);
+        let took = self.buffer.text() == loaded.text;
+        let mut history = self.history.borrow_mut();
+        if took {
+            history.record_reload(steps, join);
+            self.file.borrow_mut().line_ending = loaded.line_ending;
+            *self.on_disk.borrow_mut() = OnDisk {
+                stamp: loaded.stamp,
+                disk: Disk::Same,
+            };
+        } else {
+            history.break_group();
+            history.record(EditKind::Other, steps);
+            history.break_group();
+            self.on_disk.borrow_mut().disk = Disk::Changed;
+        }
+        drop(history);
+        self.follow_edits();
+        took
     }
 
     /// Saves to `path` from now on, highlighting for its language.
@@ -317,13 +493,21 @@ pub struct Loaded {
     pub line_ending: LineEnding,
     /// The file mixed line endings (or had lone `\r`s); saving will normalize them.
     pub mixed_endings: bool,
+    /// `None` if there was no file.
+    pub stamp: Option<Stamp>,
 }
 
 /// Reads `path`. A missing file loads as empty, to be created on save.
 pub fn load(path: &Path) -> io::Result<Loaded> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+    let (bytes, stamp) = match fs::File::open(path) {
+        Ok(mut file) => {
+            let meta = file.metadata()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let stamp = Stamp::new(&meta, &bytes);
+            (bytes, Some(stamp))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (Vec::new(), None),
         Err(e) => return Err(e),
     };
     let text = String::from_utf8(bytes)
@@ -345,14 +529,16 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
         text,
         line_ending,
         mixed_endings,
+        stamp,
     })
 }
 
 /// Writes `text` (with `\n` line breaks) to `path` atomically: a sibling
 /// temporary file is written, synced, and renamed over the target, so a failed
 /// save never leaves a truncated file. Existing permissions are kept, and a
-/// symlink's target is written rather than the link replaced.
-pub fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Result<()> {
+/// symlink's target is written rather than the link replaced. Returns the
+/// file as written.
+pub fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Result<Stamp> {
     let target = resolve_symlinks(path)?;
     let dir = match target.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
@@ -378,7 +564,9 @@ pub fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Result<()> 
             file.set_permissions(meta.permissions())?;
         }
         file.sync_all()?;
-        fs::rename(&tmp, &target)
+        let stamp = Stamp::new(&file.metadata()?, contents.as_bytes());
+        fs::rename(&tmp, &target)?;
+        Ok(stamp)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -491,6 +679,79 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn takes_changes_on_disk_unless_it_has_unsaved_ones() {
+        let _serial = crate::test_serial();
+        let dir = temp_dir("disk");
+        let path = dir.join("a.txt");
+        fs::write(&path, "one\ntwo\n").unwrap();
+        let theme = Rc::new(Theme::new().unwrap());
+        let (doc, _) = Document::open(Some(path.clone()), theme).unwrap();
+        assert_eq!(doc.check_disk(), None);
+        doc.save(&path).unwrap();
+        assert_eq!(doc.check_disk(), None, "its own save isn't a change");
+
+        // Taken as one undo step; the cursor stays on "two".
+        doc.buffer.set_cursor(1, 1);
+        doc.cursor_owner.set(Some(7));
+        fs::write(&path, "zero\none\ntwo\n").unwrap();
+        assert_eq!(doc.check_disk(), Some(DiskChange::Reloaded));
+        assert_eq!(doc.text(), "zero\none\ntwo\n");
+        assert!(!doc.is_modified());
+        assert_eq!(doc.cursor_owner.get(), None);
+        let parked = doc.parked(7).unwrap();
+        assert_eq!((parked.row, parked.col), (2, 1));
+        fs::write(&path, "zero\none\ntwo\n").unwrap();
+        assert_eq!(doc.check_disk(), None, "written again the same");
+
+        // Changes in a row, with no edit between, are one undo step.
+        fs::write(&path, "zero\none\ntwo\nthree\n").unwrap();
+        assert_eq!(doc.check_disk(), Some(DiskChange::Reloaded));
+        fs::write(&path, "zero\none\ntwo\nthree\nfour\n").unwrap();
+        assert_eq!(doc.check_disk(), Some(DiskChange::Reloaded));
+        undo(&doc);
+        assert_eq!(doc.text(), "one\ntwo\n");
+        assert!(doc.is_modified());
+        fs::write(&path, "zero\none\ntwo\n").unwrap();
+        doc.revert().unwrap();
+
+        // With unsaved changes, a change is a conflict, once.
+        doc.buffer.set_cursor(0, 0);
+        let steps = doc.buffer.insert_text("x");
+        doc.history.borrow_mut().record(EditKind::Type('x'), steps);
+        fs::write(&path, "other\n").unwrap();
+        assert_eq!(doc.check_disk(), Some(DiskChange::Conflict));
+        assert_eq!(doc.disk(), Disk::Changed);
+        assert_eq!(doc.text(), "xzero\none\ntwo\n");
+        assert_eq!(doc.check_disk(), None);
+
+        // Gone, then back as it last loaded it.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(doc.check_disk(), Some(DiskChange::Deleted));
+        assert_eq!(doc.disk(), Disk::Deleted);
+        assert_eq!(doc.check_disk(), None);
+        fs::write(&path, "zero\none\ntwo\n").unwrap();
+        assert_eq!(doc.check_disk(), Some(DiskChange::Restored));
+        assert_eq!(doc.disk(), Disk::Same);
+
+        // Reverting drops the unsaved changes, as one undo step.
+        fs::write(&path, "other\n").unwrap();
+        doc.revert().unwrap();
+        assert_eq!(doc.text(), "other\n");
+        assert!(!doc.is_modified());
+        assert_eq!(doc.disk(), Disk::Same);
+        undo(&doc);
+        assert_eq!(doc.text(), "xzero\none\ntwo\n");
+    }
+
+    /// Undoes one step, as an editor does.
+    fn undo(doc: &Document) {
+        let steps = doc.history.borrow_mut().undo().unwrap();
+        for _ in 0..steps {
+            doc.buffer.undo();
+        }
     }
 
     #[test]

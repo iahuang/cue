@@ -23,8 +23,6 @@
 
 - spaces versus tabs; ideally infer based on existing file content
 
-- file watcher to reflect updates to the filetree as well as to currently open buffers. follow vscode/zed convention--don't update the file if there r unsaved changes; instead enter "unsaved with conficts" mode where the next save will prompt you to either overwrite or defer to disk.
-
 - select + tab to indent, shift-tab to deindent
 
 - nerdfont support

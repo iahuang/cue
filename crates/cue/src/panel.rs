@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use opentui::{Attributes, Buffer};
 
-use crate::document::Document;
+use crate::document::{Disk, Document};
 use crate::editor::{Editor, INACTIVE_STATUS_BG, STATUS_BG, STATUS_DIM, STATUS_FG};
 use crate::input::{Mouse, MouseKind};
 use crate::keymap::{Command, Keymap};
@@ -329,8 +329,9 @@ impl Panel {
         }
     }
 
-    /// The file's name, with [+] if it has unsaved changes, then dimmed,
-    /// the folder it's in.
+    /// The file's name, with [+] if it has unsaved changes and a note if
+    /// it changed on disk meanwhile or is gone, then dimmed, the folder
+    /// it's in.
     fn draw_header(&self, frame: &Buffer, workspace: &Workspace, active: bool, preview: bool) {
         let area = self.area;
         let (bg, fg) = if active {
@@ -367,8 +368,13 @@ impl Panel {
             None => (doc.untitled_name().unwrap_or_default(), String::new()),
         };
         let dirty = if doc.is_modified() { " [+]" } else { "" };
+        let disk = match doc.disk() {
+            Disk::Same => "",
+            Disk::Changed => " [changed on disk]",
+            Disk::Deleted => " [deleted]",
+        };
         let room = area.width.saturating_sub(1) as usize;
-        let name = truncate_left(&format!("{name}{dirty}"), room);
+        let name = truncate_left(&format!("{name}{dirty}{disk}"), room);
         let mut attributes = Attributes::BOLD;
         if preview {
             attributes |= Attributes::ITALIC;

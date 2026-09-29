@@ -21,9 +21,9 @@ use opentui::{
     SelectionColors, Viewport, WrapMode,
 };
 
-use crate::document::Document;
 #[cfg(test)]
 use crate::document::File;
+use crate::document::{Disk, Document};
 use crate::find::{self, Field, FindBar, Match, Target};
 use crate::history::{EditKind, History};
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
@@ -68,6 +68,9 @@ pub enum Action {
     /// The file has no name yet: the app asks where to save it, and calls
     /// [`Editor::save_as`].
     SaveAs,
+    /// The file changed on disk while this had unsaved changes: the app
+    /// asks whether to overwrite it or take the file's text.
+    Conflict,
 }
 
 struct Message {
@@ -1269,7 +1272,7 @@ impl Editor {
         // Matches never span lines, so the cursor's line keeps its place.
         let cursor = self.buffer.cursor();
         self.history().break_group();
-        let steps = self.buffer.replace_text(&replaced);
+        let steps = self.buffer.replace_changed_lines(&replaced);
         self.history().record(EditKind::Other, steps);
         self.history().break_group();
         self.anchor = None;
@@ -1322,15 +1325,26 @@ impl Editor {
 
     /// Writes the file to `path` from now on.
     pub fn save_as(&mut self, path: PathBuf) -> Action {
-        self.doc.rename(path);
-        self.save()
+        self.doc.rename(path.clone());
+        self.write(path)
     }
 
-    /// Writes the file, or asks for a name if it has none.
+    /// Writes the file, or asks for a name if it has none, or asks what to
+    /// do if it changed on disk.
     fn save(&mut self) -> Action {
         let Some(path) = self.path() else {
             return Action::SaveAs;
         };
+        // In case the change hasn't been heard of yet.
+        self.doc.check_disk();
+        if self.doc.disk() == Disk::Changed {
+            return Action::Conflict;
+        }
+        self.write(path)
+    }
+
+    /// Writes the file to `path`, whatever is there.
+    pub fn write(&mut self, path: PathBuf) -> Action {
         match self.doc.save(&path) {
             Ok(()) => {
                 let lines = self.buffer.line_count();

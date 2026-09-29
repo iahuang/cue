@@ -271,3 +271,46 @@ fn replace_text_is_one_undo_step_and_changes_the_epoch() {
     assert!(eb.undo());
     assert_eq!(eb.text(), "before");
 }
+
+#[test]
+fn replace_text_reports_running_out_of_memory_slots() {
+    let _serial = serial();
+    let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+    eb.set_text("start");
+    let failed = (0..300).find(|i| eb.replace_text(&format!("v{i}")) == 0);
+    let failed = failed.expect("the slots run out");
+    assert_eq!(eb.text(), format!("v{}", failed - 1), "left as it was");
+}
+
+#[test]
+fn replace_changed_lines_changes_only_those_and_never_runs_out() {
+    let _serial = serial();
+    let eb = EditBuffer::new(WidthMethod::Unicode).unwrap();
+    eb.set_text("one\ntwo\nthree\n");
+    // Replacing "two" deletes it and inserts "2": two snapshots.
+    assert_eq!(eb.replace_changed_lines("one\n2\nthree\n"), 2);
+    assert_eq!(eb.text(), "one\n2\nthree\n");
+    assert_eq!(eb.replace_changed_lines("one\n2\nthree\n"), 0);
+    // Appending only inserts.
+    assert_eq!(eb.replace_changed_lines("one\n2\nthree\nfour\n"), 1);
+    let cursor = eb.cursor();
+    assert_eq!((cursor.row, cursor.col), (4, 0), "after the insertion");
+    assert!(eb.undo());
+    assert_eq!(eb.text(), "one\n2\nthree\n");
+    assert!(eb.undo() && eb.undo());
+    assert_eq!(eb.text(), "one\ntwo\nthree\n");
+
+    // Unlike replace_text, as often as it's needed.
+    let mut text = String::new();
+    for i in 0..600 {
+        text.push_str(&format!("line {i}\n"));
+        eb.replace_changed_lines(&text);
+        assert_eq!(eb.text(), text);
+    }
+    // Wide and combined graphemes.
+    eb.replace_changed_lines("日本\ne\u{301}x\n");
+    eb.replace_changed_lines("日本\nex\n");
+    assert_eq!(eb.text(), "日本\nex\n");
+    eb.replace_changed_lines("");
+    assert_eq!(eb.text(), "");
+}

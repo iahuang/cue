@@ -26,6 +26,7 @@ mod terminal;
 mod theme;
 mod tree;
 mod tty;
+mod watch;
 mod words;
 mod workspace;
 

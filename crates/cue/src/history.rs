@@ -28,6 +28,9 @@ pub struct History {
     open: Option<EditKind>,
     /// Undo depth of the saved state; `None` when it is no longer reachable.
     saved: Option<usize>,
+    /// The last group took the file's text from disk, and nothing has
+    /// been recorded, undone, or redone since: the next reload joins it.
+    reloaded: bool,
 }
 
 impl History {
@@ -43,6 +46,7 @@ impl History {
         if steps == 0 {
             return;
         }
+        self.reloaded = false;
         if !self.redo.is_empty() {
             // The native buffer drops its redo history on a new edit too.
             if self.saved.is_some_and(|saved| saved > self.undo.len()) {
@@ -71,6 +75,7 @@ impl History {
     /// The number of snapshots to undo for the next group, moving it to redo.
     pub fn undo(&mut self) -> Option<u32> {
         self.open = None;
+        self.reloaded = false;
         let steps = self.undo.pop()?;
         self.redo.push(steps);
         Some(steps)
@@ -78,6 +83,7 @@ impl History {
 
     pub fn redo(&mut self) -> Option<u32> {
         self.open = None;
+        self.reloaded = false;
         let steps = self.redo.pop()?;
         self.undo.push(steps);
         Some(steps)
@@ -86,6 +92,23 @@ impl History {
     pub fn mark_saved(&mut self) {
         self.saved = Some(self.undo.len());
         self.open = None;
+    }
+
+    /// Records taking the file's text from disk, which took `steps`
+    /// snapshots, as saved. With `join`, reloads in a row, with no edit,
+    /// undo, or redo between, are one group, so a file that keeps changing
+    /// doesn't bury the edits before it.
+    pub fn record_reload(&mut self, steps: u32, join: bool) {
+        let joins = join && self.reloaded;
+        match self.undo.last_mut() {
+            Some(last) if joins => *last += steps,
+            _ => {
+                self.break_group();
+                self.record(EditKind::Other, steps);
+            }
+        }
+        self.mark_saved();
+        self.reloaded = join && (steps > 0 || joins);
     }
 
     pub fn is_modified(&self) -> bool {
@@ -179,5 +202,41 @@ mod tests {
         assert!(h.is_modified());
         h.undo();
         assert!(h.is_modified(), "the saved state is unreachable now");
+    }
+
+    #[test]
+    fn reloads_in_a_row_are_one_group() {
+        let mut h = History::new();
+        type_str(&mut h, "a");
+        h.mark_saved();
+        h.record_reload(2, true);
+        h.break_group();
+        h.record_reload(2, true);
+        h.record_reload(0, true);
+        h.record_reload(1, true);
+        assert!(!h.is_modified());
+        assert_eq!(h.undo(), Some(5), "all three reloads");
+        assert!(h.is_modified());
+        h.redo();
+        assert!(!h.is_modified());
+
+        // An edit, undo, or redo between starts a new one.
+        h.record_reload(1, true);
+        assert_eq!(h.undo(), Some(1));
+        h.redo();
+        h.record_reload(1, true);
+        type_str(&mut h, "b");
+        h.undo();
+        h.record_reload(1, true);
+        let groups: Vec<_> = std::iter::from_fn(|| h.undo()).collect();
+        assert_eq!(groups, vec![1, 1, 1, 5, 1]);
+
+        // A revert, not joined, isn't joined by the next reload either.
+        let mut h = History::new();
+        h.record_reload(1, true);
+        h.record_reload(1, false);
+        h.record_reload(1, true);
+        let groups: Vec<_> = std::iter::from_fn(|| h.undo()).collect();
+        assert_eq!(groups, vec![1, 1, 1]);
     }
 }
