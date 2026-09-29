@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Uploads packaged archives (see package.sh) to R2 as a version, then points
+# Uploads packaged archives (see build.sh) to R2 as a version, then points
 # `latest` at it and uploads install.sh.
 #
 #   deployment/publish.sh <version> [dist-dir] [--force]

@@ -6,7 +6,7 @@ members = ["crates/opentui-sys", "crates/opentui", "crates/cue"]
 edition = "2021"
 license = "MIT"
 
-# Distributed binaries (deployment/release.sh); plain `release` stays fast to build.
+# Distributed binaries (deployment/build.sh); plain `release` stays fast to build.
 [profile.dist]
 inherits = "release"
 lto = true

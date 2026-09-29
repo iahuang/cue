@@ -24,6 +24,11 @@ bin_dir=${CUE_INSTALL:-$HOME/.cue}/bin
 archive=cue-$platform.tar.gz
 url=$base_url/v$version/$archive
 
+if [ -x "$bin_dir/cue" ] && [ "$("$bin_dir/cue" --version 2>/dev/null)" = "cue $version" ]; then
+  echo "cue $version is already installed at $bin_dir/cue"
+  exit 0
+fi
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 

@@ -21,9 +21,9 @@ use opentui::{
     SelectionColors, Viewport, WrapMode,
 };
 
+use crate::document::Document;
 #[cfg(test)]
 use crate::document::File;
-use crate::document::{self, Document};
 use crate::find::{self, Field, FindBar, Match, Target};
 use crate::history::{EditKind, History};
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
@@ -1331,11 +1331,8 @@ impl Editor {
         let Some(path) = self.path() else {
             return Action::SaveAs;
         };
-        let text = self.buffer.text();
-        let line_ending = self.doc.file.borrow().line_ending;
-        match document::save(&path, &text, line_ending) {
+        match self.doc.save(&path) {
             Ok(()) => {
-                self.history().mark_saved();
                 let lines = self.buffer.line_count();
                 let name = path
                     .file_name()

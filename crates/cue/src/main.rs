@@ -1,5 +1,6 @@
 //! cue: a terminal text editor on OpenTUI's native core.
 
+mod alert;
 mod app;
 mod context_menu;
 mod document;
@@ -106,7 +107,8 @@ fn help() -> String {
     help
 }
 
-/// The optional file or folder argument, or the exit code for `--help` / bad usage.
+/// The optional file or folder argument, or the exit code for `--help`,
+/// `--version`, or bad usage.
 fn parse_args() -> Result<Option<PathBuf>, ExitCode> {
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
@@ -117,6 +119,10 @@ fn parse_args() -> Result<Option<PathBuf>, ExitCode> {
     match first {
         Some(arg) if arg == "-h" || arg == "--help" => {
             print!("{}", help());
+            Err(ExitCode::SUCCESS)
+        }
+        Some(arg) if arg == "-V" || arg == "--version" => {
+            println!("cue {}", env!("CARGO_PKG_VERSION"));
             Err(ExitCode::SUCCESS)
         }
         Some(arg) => Ok(Some(PathBuf::from(arg))),

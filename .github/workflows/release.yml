@@ -48,8 +48,6 @@ jobs:
             os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
     runs-on: ${{ matrix.os }}
-    env:
-      BIN: target/${{ matrix.target }}/dist/cue
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.91
@@ -59,8 +57,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      # On Linux, Zig is also the C compiler and linker. Its bundled musl is
-      # new enough for Zig's std (statx, musl 1.2.5); distro musl-tools is not.
+      # Linux builds link with Zig (see deployment/build.sh).
       - if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2
         with:
@@ -69,19 +66,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - run: cargo ${{ runner.os == 'Linux' && 'zigbuild' || 'build' }} --locked --profile dist -p cue --target ${{ matrix.target }}
-
-      - if: runner.os == 'macOS'
-        # Apple Silicon refuses to run unsigned code. The linker signs ad hoc,
-        # but stripping can invalidate that, so sign again.
-        run: |
-          codesign --force --sign - "$BIN"
-          codesign --verify "$BIN"
-      - if: runner.os == 'Linux'
-        run: file "$BIN" | tee /dev/stderr | grep -q static
-      - run: '"$BIN" --help > /dev/null'
-
-      - run: deployment/package.sh ${{ matrix.platform }} "$BIN" dist
+      # Builds, signs or checks, smoke-tests, and packages into dist/.
+      - run: deployment/build.sh dist
       # Tarballs, because artifacts do not keep the executable bit.
       - uses: actions/upload-artifact@v4
         with:

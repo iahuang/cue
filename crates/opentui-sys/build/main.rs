@@ -17,9 +17,6 @@
 //!   `libc++.a`, `libc++abi.a`, and `libunwind.a` for the target.
 //! - `OPENTUI_ZIG`: the `zig` executable (default: `zig` on `PATH`; must be 0.16).
 //! - `OPENTUI_ZIG_OPTIMIZE`: Zig optimize mode (default: `ReleaseFast`).
-//! - `OPENTUI_LD`, `OPENTUI_OBJCOPY`, `OPENTUI_AR`: the tools that prelink the
-//!   archive (default: `ld`, `objcopy`, `ar`). When cross-compiling for Linux,
-//!   point them at binutils for the target, e.g. `x86_64-linux-gnu-ld`.
 
 mod gen;
 
@@ -37,9 +34,6 @@ fn main() {
         "OPENTUI_LIB_DIR",
         "OPENTUI_ZIG",
         "OPENTUI_ZIG_OPTIMIZE",
-        "OPENTUI_LD",
-        "OPENTUI_OBJCOPY",
-        "OPENTUI_AR",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
@@ -133,7 +127,7 @@ fn prelink(archive: &Path, runtime: &[PathBuf], exports: &[String], out_dir: &Pa
         _ => {
             let list: String = exports.iter().map(|name| format!("{name}\n")).collect();
             fs::write(&symbols, list).unwrap();
-            run(Command::new(tool("OPENTUI_LD", "ld"))
+            run(Command::new("ld")
                 .args(["-r", "--whole-archive"])
                 .arg(archive)
                 .args(["--no-whole-archive", "--start-group"])
@@ -141,7 +135,7 @@ fn prelink(archive: &Path, runtime: &[PathBuf], exports: &[String], out_dir: &Pa
                 .arg("--end-group")
                 .arg("-o")
                 .arg(&object));
-            run(Command::new(tool("OPENTUI_OBJCOPY", "objcopy"))
+            run(Command::new("objcopy")
                 .arg(format!("--keep-global-symbols={}", symbols.display()))
                 .arg(&object));
         }
@@ -150,7 +144,7 @@ fn prelink(archive: &Path, runtime: &[PathBuf], exports: &[String], out_dir: &Pa
     let lib = dir.join("libopentui.a");
     // `ar r` would add to an archive left over from a previous build.
     let _ = fs::remove_file(&lib);
-    run(Command::new(tool("OPENTUI_AR", "ar")).arg("rcs").arg(&lib).arg(&object));
+    run(Command::new("ar").arg("rcs").arg(&lib).arg(&object));
     dir
 }
 
@@ -307,11 +301,6 @@ fn zig_target(rust_target: &str) -> Option<(&'static str, &'static str)> {
         "aarch64-unknown-linux-musl" => ("aarch64-linux-musl", "aarch64-linux-musl"),
         _ => return None,
     })
-}
-
-/// The program named by the environment variable `var`, or `default`.
-fn tool(var: &str, default: &str) -> String {
-    env::var(var).unwrap_or_else(|_| default.into())
 }
 
 fn run(cmd: &mut Command) {

@@ -60,6 +60,7 @@ use std::time::Instant;
 
 use opentui::{Attributes, Buffer, Rgba};
 
+use crate::alert::{Alert, AlertAction, Button};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
 use crate::document::{self, Document};
 use crate::editor::{Action, Editor};
@@ -104,19 +105,26 @@ enum Recent {
     Untitled(u32),
 }
 
-/// Something that asked before going ahead, which asking for again, before
-/// doing anything else, goes ahead with.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Armed {
-    Quit,
-    /// Closing this, and losing its unsaved changes or stopping what's
-    /// running in it.
-    Close(Recent),
+/// Something that asked first with an alert, to do again once answered.
+#[derive(Clone)]
+enum Redo {
+    /// A command that closes something, or quits.
+    Run(Command),
+    /// Closing this tab.
+    CloseTab(TabId),
+    /// Closing a file or terminal the picker lists.
+    CloseItem(Choice),
     /// Moving this to the Trash.
     Trash(PathBuf),
-    /// Closing this tab, and losing unsaved changes or stopping programs in
-    /// its panels.
-    CloseTab(TabId),
+}
+
+/// An answer to an alert.
+#[derive(Clone)]
+enum Answer {
+    /// Go ahead, losing what the alert said would be lost.
+    Go(Redo),
+    /// Save these files, then go ahead.
+    Save(Vec<Rc<Document>>, Redo),
 }
 
 /// What the main loop should do after the app handled input.
@@ -213,8 +221,11 @@ pub struct App {
     height: u32,
     mouse_target: Option<MouseTarget>,
     header_drag: Option<HeaderDrag>,
-    /// Quitting or closing something asked first; asking again goes ahead.
-    armed: Option<Armed>,
+    /// A question to answer before going on, above everything else.
+    alert: Option<Alert<Answer>>,
+    /// The alert was answered: what it asked about goes ahead without
+    /// asking again.
+    confirmed: bool,
     /// The file opened as a preview, which the next preview replaces.
     preview: Option<Rc<Document>>,
     /// The row and time of the last click in the tree, to spot double clicks.
@@ -322,7 +333,8 @@ impl App {
             height,
             mouse_target: None,
             header_drag: None,
-            armed: None,
+            alert: None,
+            confirmed: false,
             preview: None,
             last_tree_click: None,
             last_tab_click: None,
@@ -362,6 +374,10 @@ impl App {
 
     fn dispatch_key(&mut self, key: Key) -> AppAction {
         self.active_panel_mut().clear_message();
+        if let Some(alert) = &mut self.alert {
+            let action = alert.handle_key(key);
+            return self.alert_action(action);
+        }
         if let Some(prompt) = &mut self.tab_prompt {
             match prompt.handle_key(key) {
                 PromptKey::Continue => {}
@@ -384,9 +400,7 @@ impl App {
                 if prefixed {
                     return self.prefixed_key(&terminal, key);
                 }
-                let command = self.keymap.lookup_terminal(key);
-                self.disarm_unless(command);
-                return match command {
+                return match self.keymap.lookup_terminal(key) {
                     Some(command) => self.run(command, false),
                     None => {
                         terminal.borrow_mut().send_key(key);
@@ -415,9 +429,7 @@ impl App {
                 .and_then(Editor::find_field)
                 .map_or(Context::Editor, find::Field::context),
         };
-        let binding = self.keymap.lookup(key, context);
-        self.disarm_unless(binding.map(|(command, _)| command));
-        match binding {
+        match self.keymap.lookup(key, context) {
             Some((command, select)) => {
                 // Other global commands (save, quit, ...) close the picker,
                 // search, or file dialog and run as usual.
@@ -449,34 +461,6 @@ impl App {
                 }
                 AppAction::Continue
             }
-        }
-    }
-
-    /// Forgets that quitting or closing asked first, unless `command` (from
-    /// a key) asks again, or goes through the picker on the way to asking
-    /// again, as from the command palette.
-    fn disarm_unless(&mut self, command: Option<Command>) {
-        use Command::*;
-        let keep = match command {
-            Some(command) => {
-                matches!(
-                    command,
-                    Quit | ClosePanel
-                        | CloseTab
-                        | CloseFile
-                        | CloseTerminal
-                        | TreeTrash
-                        | Palette
-                        | GoToFile
-                        // What follows it decides.
-                        | TerminalPrefix
-                ) || command.context() == Context::Picker
-            }
-            // Typing in the picker's query.
-            None => self.picker.is_some(),
-        };
-        if !keep {
-            self.armed = None;
         }
     }
 
@@ -612,11 +596,11 @@ impl App {
             }
             Command::CloseTerminal => {
                 if self.active_terminal().is_some() {
-                    self.close_shown();
+                    self.close_shown(Redo::Run(Command::CloseTerminal));
                 }
             }
             Command::CloseFile => {
-                if self.editor().is_some() && self.close_shown() {
+                if self.editor().is_some() && self.close_shown(Redo::Run(Command::CloseFile)) {
                     self.show_active_in_tree();
                 }
             }
@@ -726,6 +710,12 @@ impl App {
     }
 
     fn dispatch_mouse(&mut self, mouse: Mouse, now: Instant) -> AppAction {
+        if let Some(alert) = &mut self.alert {
+            // Nor does the rest of a click on it go anywhere else.
+            self.mouse_target = None;
+            let action = alert.handle_mouse(mouse);
+            return self.alert_action(action);
+        }
         if let Some((menu, _)) = &mut self.menu {
             let action = menu.handle_mouse(mouse);
             if action != MenuAction::CloseAndPass {
@@ -768,15 +758,9 @@ impl App {
         let Some(target) = target else {
             return AppAction::Continue;
         };
-        if let MouseKind::Press(button) = mouse.kind {
-            // Like a key press, a click dismisses messages, the quit and
-            // close confirmations, the terminal prefix, and prompts. But
-            // closing a tab with the middle button asks first, and doing it
-            // again goes ahead.
-            let armed = self.armed.take();
-            if button == MouseButton::Middle && matches!(target, MouseTarget::Tab(_)) {
-                self.armed = armed;
-            }
+        if let MouseKind::Press(_) = mouse.kind {
+            // Like a key press, a click dismisses messages, the terminal
+            // prefix, and prompts.
             self.terminal_prefix = false;
             self.tab_prompt = None;
             self.active_panel_mut().clear_message();
@@ -1009,7 +993,9 @@ impl App {
 
     /// Text pasted through the terminal.
     pub fn paste(&mut self, text: &str) {
-        self.armed = None;
+        if self.alert.is_some() {
+            return;
+        }
         if let Some(prompt) = &mut self.tab_prompt {
             prompt.paste(text);
             return;
@@ -1095,6 +1081,20 @@ impl App {
             let rect = drop.rect;
             frame.fill_rect(rect.x, rect.y, rect.width, rect.height, DROP_TINT);
         }
+        let cursor = self.draw_popups(frame, cursor);
+        match &self.alert {
+            // Over any popup it asks for.
+            Some(alert) => {
+                alert.draw(frame);
+                None
+            }
+            None => cursor,
+        }
+    }
+
+    /// Draws the popup that's open, if any, and returns where the cursor
+    /// goes: in it, or else at `cursor` if the editor has the keyboard.
+    fn draw_popups(&self, frame: &Buffer, cursor: Option<(u32, u32)>) -> Option<(u32, u32)> {
         if let Some((menu, _)) = &self.menu {
             menu.draw(frame);
             return None;
@@ -1175,7 +1175,7 @@ impl App {
             self.close_tab(self.tab);
             return;
         }
-        if !self.close_shown() {
+        if !self.close_shown(Redo::Run(Command::ClosePanel)) {
             return;
         }
         let tab = self.tab_mut();
@@ -1275,9 +1275,9 @@ impl App {
 
     /// Closes the tab at `index`, and what its panels show, as closing each
     /// of them would (see [`App::close_shown`]). If that loses unsaved
-    /// changes or stops a program, it asks first, and closing it again goes
-    /// ahead. The tab after it takes its place on screen, or the one before
-    /// it. The only tab is emptied instead, down to one empty panel.
+    /// changes or stops a program, it asks first. The tab after it takes
+    /// its place on screen, or the one before it. The only tab is emptied
+    /// instead, down to one empty panel.
     fn close_tab(&mut self, index: usize) {
         let Some(closing) = self.tabs.get(index) else {
             return;
@@ -1303,24 +1303,17 @@ impl App {
             .filter_map(Panel::terminal)
             .cloned()
             .collect();
-        let unsaved: Vec<String> = documents
+        let unsaved: Vec<Rc<Document>> = documents
             .iter()
             .filter(|doc| doc.is_modified())
-            .map(|doc| self.document_name(doc))
+            .cloned()
             .collect();
         let running = running_programs(&terminals);
-        let armed = Some(Armed::CloseTab(closing.id));
-        if (!unsaved.is_empty() || !running.is_empty()) && self.armed != armed {
-            self.armed = armed;
-            let message = format!(
-                "{} {} again to close the tab anyway.",
-                losing_reasons(&unsaved, &running),
-                self.shortcut(Command::CloseTab)
-            );
-            self.show_message(message, true);
+        let title = format!("Close tab {}?", index + 1);
+        let redo = Redo::CloseTab(closing.id);
+        if !self.ask_first(title, unsaved, &running, "&Close Tab", redo) {
             return;
         }
-        self.armed = None;
         self.tab_prompt = None;
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -1390,10 +1383,6 @@ impl App {
             }
             PickerAction::Accept(choice) => {
                 self.picker = None;
-                // A command from the palette may ask again to close.
-                if !matches!(choice, Choice::Command(_)) {
-                    self.armed = None;
-                }
                 match choice {
                     Choice::File(path) => {
                         if self.open(&path, false) {
@@ -1690,13 +1679,13 @@ impl App {
 
     /// Closes what the active panel shows, as closing the panel does,
     /// leaving it empty: a terminal, or a file, unless another panel, in
-    /// any tab, shows it too. Returns false if it asked first instead (see
-    /// [`App::confirm_close`]).
-    fn close_shown(&mut self) -> bool {
+    /// any tab, shows it too. Returns false if it asked first instead, to
+    /// `redo` once answered (see [`App::ask_first`]).
+    fn close_shown(&mut self, redo: Redo) -> bool {
         if let Some(terminal) = self.active_terminal() {
-            let target = Recent::Terminal(terminal.borrow().id());
-            let losing = self.terminal_losing(&terminal);
-            if !self.confirm_close(target, losing) {
+            let title = format!("Close {}?", terminal.borrow().name());
+            let running = running_programs(std::slice::from_ref(&terminal));
+            if !self.ask_first(title, Vec::new(), &running, "&Close", redo) {
                 return false;
             }
             self.destroy_terminal(&terminal);
@@ -1710,8 +1699,7 @@ impl App {
             self.active_panel_mut().forget(&doc);
             return true;
         }
-        let losing = self.document_losing(&doc, true);
-        if !self.confirm_close(document_target(&doc), losing) {
+        if !self.ask_to_close(&doc, redo) {
             return false;
         }
         self.destroy_document(&doc);
@@ -1722,11 +1710,11 @@ impl App {
     /// wherever it's shown, asking first as closing a panel does. A file
     /// that isn't open is only no longer listed as recent.
     fn close_item(&mut self, choice: Choice) {
+        let redo = Redo::CloseItem(choice.clone());
         match choice {
             Choice::File(path) => {
                 if let Some(doc) = self.find_document(&path) {
-                    let losing = self.document_losing(&doc, false);
-                    if !self.confirm_close(Recent::File(path.clone()), losing) {
+                    if !self.ask_to_close(&doc, redo) {
                         return;
                     }
                     self.destroy_document(&doc);
@@ -1736,8 +1724,7 @@ impl App {
             }
             Choice::Untitled(number) => {
                 if let Some(doc) = self.find_untitled(number) {
-                    let losing = self.document_losing(&doc, false);
-                    if self.confirm_close(Recent::Untitled(number), losing) {
+                    if self.ask_to_close(&doc, redo) {
                         self.destroy_document(&doc);
                     }
                 }
@@ -1745,8 +1732,9 @@ impl App {
             Choice::Terminal(id) => {
                 let terminal = self.terminals.iter().find(|t| t.borrow().id() == id);
                 if let Some(terminal) = terminal.cloned() {
-                    let losing = self.terminal_losing(&terminal);
-                    if self.confirm_close(Recent::Terminal(id), losing) {
+                    let title = format!("Close {}?", terminal.borrow().name());
+                    let running = running_programs(std::slice::from_ref(&terminal));
+                    if self.ask_first(title, Vec::new(), &running, "&Close", redo) {
                         self.destroy_terminal(&terminal);
                     }
                 }
@@ -1755,51 +1743,98 @@ impl App {
         }
     }
 
-    /// Whether to go ahead closing `target`, which would lose unsaved
-    /// changes or stop a program if there's `losing`, which says so. The
-    /// first time, it does, and closing it again goes ahead.
-    fn confirm_close(&mut self, target: Recent, losing: Option<String>) -> bool {
-        let armed = Some(Armed::Close(target));
-        let go = losing.is_none() || self.armed == armed;
-        self.armed = if go { None } else { armed };
-        match losing {
-            Some(losing) if !go => {
-                self.show_message(losing, true);
-                false
-            }
-            _ => true,
-        }
-    }
-
-    /// What closing `doc` would lose, if anything. Saving is suggested if
-    /// it's `on_screen`.
-    fn document_losing(&self, doc: &Document, on_screen: bool) -> Option<String> {
-        if !doc.is_modified() {
-            return None;
-        }
-        let save = match on_screen {
-            true => format!(", or save it ({})", self.shortcut(Command::Save)),
-            false => String::new(),
+    /// Whether to go ahead closing `doc` now, or ask first, to `redo` once
+    /// answered, as it has unsaved changes.
+    fn ask_to_close(&mut self, doc: &Rc<Document>, redo: Redo) -> bool {
+        let title = format!("Close {}?", self.document_name(doc));
+        let unsaved = match doc.is_modified() {
+            true => vec![doc.clone()],
+            false => Vec::new(),
         };
-        Some(format!(
-            "{} has unsaved changes. Close it again to discard them{save}.",
-            self.document_name(doc)
-        ))
+        self.ask_first(title, unsaved, &[], "&Close", redo)
     }
 
-    /// What closing `terminal` would stop, if anything.
-    fn terminal_losing(&self, terminal: &Rc<RefCell<Terminal>>) -> Option<String> {
-        let terminal = terminal.borrow();
-        if !terminal.is_busy() {
-            return None;
+    /// Whether to go ahead now with what would lose `unsaved` files'
+    /// changes or stop `running` programs: if it loses nothing, or an alert
+    /// about it was just answered. Otherwise it asks, titled `title`, to
+    /// `redo` once answered: saving first, where the files have names, or
+    /// not, or, with only programs to stop, going ahead as `go` says.
+    fn ask_first(
+        &mut self,
+        title: String,
+        unsaved: Vec<Rc<Document>>,
+        running: &[String],
+        go: &str,
+        redo: Redo,
+    ) -> bool {
+        if self.confirmed || (unsaved.is_empty() && running.is_empty()) {
+            return true;
         }
-        let program = terminal
-            .program()
-            .unwrap_or_else(|| "A program".to_string());
-        Some(format!(
-            "{program} is running in {}. Close it again to stop it.",
-            terminal.name()
-        ))
+        let names: Vec<String> = unsaved.iter().map(|doc| self.document_name(doc)).collect();
+        let message = losing_reasons(&names, running);
+        let mut buttons = Vec::new();
+        if !unsaved.is_empty() && unsaved.iter().all(|doc| doc.path().is_some()) {
+            let save = if unsaved.len() == 1 {
+                "&Save"
+            } else {
+                "&Save All"
+            };
+            buttons.push(Button::new(
+                save,
+                Answer::Save(unsaved.clone(), redo.clone()),
+            ));
+        }
+        let go = if unsaved.is_empty() {
+            go
+        } else {
+            "Do&n't Save"
+        };
+        buttons.push(Button::new(go, Answer::Go(redo)).danger());
+        self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
+        false
+    }
+
+    fn alert_action(&mut self, action: AlertAction<Answer>) -> AppAction {
+        let answer = match action {
+            AlertAction::Continue => return AppAction::Continue,
+            AlertAction::Cancel => {
+                self.alert = None;
+                return AppAction::Continue;
+            }
+            AlertAction::Answer(answer) => answer,
+        };
+        self.alert = None;
+        let redo = match answer {
+            Answer::Go(redo) => redo,
+            Answer::Save(docs, redo) => {
+                for doc in &docs {
+                    let Some(path) = doc.path() else { continue };
+                    if let Err(err) = doc.save(&path) {
+                        let message = format!("Can't save: {err} ({})", path.display());
+                        self.show_message(message, true);
+                        return AppAction::Continue;
+                    }
+                }
+                redo
+            }
+        };
+        self.confirmed = true;
+        let action = match redo {
+            Redo::Run(command) => self.run(command, false),
+            Redo::CloseTab(id) => {
+                if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
+                    self.close_tab(index);
+                }
+                AppAction::Continue
+            }
+            Redo::CloseItem(choice) => self.picker_action(PickerAction::CloseItem(choice)),
+            Redo::Trash(path) => {
+                self.trash(&path, true);
+                AppAction::Continue
+            }
+        };
+        self.confirmed = false;
+        action
     }
 
     /// Closes `doc`, wherever it's shown, dropping its unsaved changes.
@@ -2036,27 +2071,18 @@ impl App {
     }
 
     fn quit(&mut self) -> AppAction {
-        let unsaved: Vec<String> = self
+        let unsaved: Vec<Rc<Document>> = self
             .documents
             .iter()
             .filter(|doc| doc.is_modified())
-            .map(|doc| self.document_name(doc))
+            .cloned()
             .collect();
         let running = running_programs(&self.terminals);
-        if (unsaved.is_empty() && running.is_empty()) || self.armed == Some(Armed::Quit) {
-            return AppAction::Quit;
+        let redo = Redo::Run(Command::Quit);
+        match self.ask_first("Quit cue?".into(), unsaved, &running, "&Quit", redo) {
+            true => AppAction::Quit,
+            false => AppAction::Continue,
         }
-        self.armed = Some(Armed::Quit);
-        let reasons = losing_reasons(&unsaved, &running);
-        let quit = self.shortcut(Command::Quit);
-        let message = if unsaved.is_empty() {
-            format!("{reasons} {quit} again to quit.")
-        } else {
-            let save = self.shortcut(Command::Save);
-            format!("{reasons} {quit} again to quit, {save} to save.")
-        };
-        self.show_message(message, true);
-        AppAction::Continue
     }
 
     fn tree_action(&mut self, action: TreeAction) {
@@ -2347,14 +2373,17 @@ impl App {
     /// unsaved changes, which saving puts back.
     fn trash(&mut self, path: &Path, confirmed: bool) {
         let name = file_name(path);
-        let armed = Some(Armed::Trash(path.to_path_buf()));
-        if !confirmed && self.armed != armed {
-            self.armed = armed;
-            let again = self.shortcut(Command::TreeTrash);
-            self.show_message(format!("{again} again moves {name} to the Trash."), true);
+        if !confirmed {
+            let message = match path.is_dir() {
+                true => "The folder and everything in it can be restored from the Trash.",
+                false => "It can be restored from the Trash.",
+            };
+            let redo = Redo::Trash(path.to_path_buf());
+            let buttons = vec![Button::new("Move to &Trash", Answer::Go(redo)).danger()];
+            let title = format!("Move {name} to the Trash?");
+            self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
             return;
         }
-        self.armed = None;
         let resolved = document::resolve(path);
         if let Err(err) = move_to_trash(path) {
             self.show_message(format!("Can't move {name} to the Trash: {err}"), true);
@@ -2467,6 +2496,7 @@ impl App {
     /// The terminal keys go to, if one has the keyboard.
     fn keyboard_terminal(&self) -> Option<Rc<RefCell<Terminal>>> {
         let popup = self.picker.is_some()
+            || self.alert.is_some()
             || self.search.is_some()
             || self.dialog.is_some()
             || self.menu.is_some()
@@ -2482,14 +2512,11 @@ impl App {
     /// cancels.
     fn prefixed_key(&mut self, terminal: &Rc<RefCell<Terminal>>, key: Key) -> AppAction {
         let command = self.keymap.lookup(key, Context::Editor);
-        self.disarm_unless(command.map(|(command, _)| command));
         if self.keymap.lookup_terminal(key) == Some(Command::TerminalPrefix) {
-            self.armed = None;
             terminal.borrow_mut().send_key(key);
             return AppAction::Continue;
         }
         if key == Key::new(KeyCode::Esc, Mods::NONE) {
-            self.armed = None;
             return AppAction::Continue;
         }
         match command {
@@ -2633,6 +2660,9 @@ impl App {
         if let Some((menu, _)) = &mut self.menu {
             menu.set_size(self.width, self.height);
         }
+        if let Some(alert) = &mut self.alert {
+            alert.set_size(self.width, self.height);
+        }
         // Tabs off screen are laid out when they come back.
         let area = self.main_area();
         self.tab_mut().set_area(area);
@@ -2698,8 +2728,10 @@ fn running_programs(terminals: &[Rc<RefCell<Terminal>>]) -> Vec<String> {
 /// and the programs `running` in terminals.
 fn losing_reasons(unsaved: &[String], running: &[String]) -> String {
     let mut reasons = Vec::new();
-    if !unsaved.is_empty() {
-        reasons.push(format!("Unsaved changes in {}.", unsaved.join(", ")));
+    match unsaved {
+        [] => {}
+        [file] => reasons.push(format!("{file} has unsaved changes.")),
+        files => reasons.push(format!("{} have unsaved changes.", files.join(", "))),
     }
     match running {
         [] => {}
@@ -2923,14 +2955,15 @@ mod tests {
         assert!(screen(&app).contains("1alpha"), "a.txt kept its edit");
 
         assert!(matches!(ctrl(&mut app, 'q'), AppAction::Continue));
-        assert!(screen(&app).contains("Unsaved changes in a.txt."));
-        assert!(matches!(ctrl(&mut app, 'q'), AppAction::Quit));
+        assert!(screen(&app).contains("a.txt has unsaved changes."));
+        assert!(matches!(key(&mut app, KeyCode::Char('n')), AppAction::Quit));
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "alpha");
     }
 
     #[test]
-    fn quit_confirmation_is_disarmed_by_other_keys() {
+    fn quitting_asks_about_unsaved_files_and_can_save_them() {
         let _serial = crate::test_serial();
-        let root = fixture("quit", &[]);
+        let root = fixture("quit", &[("a.txt", "alpha")]);
         let mut app = app(&root, None);
         assert!(
             matches!(ctrl(&mut app, 'q'), AppAction::Quit),
@@ -2939,9 +2972,39 @@ mod tests {
         app.focus = Focus::Editor;
         type_text(&mut app, "x");
         assert!(matches!(ctrl(&mut app, 'q'), AppAction::Continue));
+        // An untitled file can't be saved from the alert.
+        let text = screen(&app);
+        assert!(text.contains(" Don't Save    Cancel "), "{text}");
+        assert!(!text.contains(" Save    Don't Save "), "{text}");
+        // The alert takes the keys, and Esc cancels it.
         type_text(&mut app, "y");
         assert!(matches!(ctrl(&mut app, 'q'), AppAction::Continue));
-        assert!(matches!(ctrl(&mut app, 'q'), AppAction::Quit));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.alert.is_none());
+        assert_eq!(app.ed().text(), "x");
+
+        assert!(app.open(&root.join("a.txt"), false));
+        type_text(&mut app, "1");
+        ctrl(&mut app, 'q');
+        let text = screen(&app);
+        assert!(text.contains("Quit cue?"), "{text}");
+        assert!(
+            text.contains("Untitled-1, a.txt have unsaved changes."),
+            "{text}"
+        );
+        assert!(!text.contains("Save All"), "Untitled-1 has no name");
+        key(&mut app, KeyCode::Esc);
+        app.destroy_document(&app.find_untitled(1).unwrap());
+
+        // Saved from the alert, then gone ahead with.
+        ctrl(&mut app, 'q');
+        assert!(
+            screen(&app).contains(" Save    Don't Save "),
+            "{}",
+            screen(&app)
+        );
+        assert!(matches!(key(&mut app, KeyCode::Enter), AppAction::Quit));
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "1alpha");
     }
 
     #[test]
@@ -3025,6 +3088,7 @@ mod tests {
             "{}",
             screen(&app)
         );
+        key(&mut app, KeyCode::Esc);
 
         // Opening a file replaces the terminal, which keeps running.
         app.open(&root.join("a.txt"), false);
@@ -3355,7 +3419,7 @@ mod tests {
         ctrl(&mut app, 'w');
         assert!(screen(&app).contains("Untitled-1 has unsaved changes."));
         assert_eq!(app.documents.len(), 3);
-        ctrl(&mut app, 'w');
+        key(&mut app, KeyCode::Char('n'));
         assert!(app.picker.is_some());
         assert_eq!(app.documents.len(), 2);
         assert!(!screen(&app).contains("Untitled-1"));
@@ -3430,15 +3494,17 @@ mod tests {
     }
 
     #[test]
-    fn a_click_disarms_quit_and_clears_messages() {
+    fn a_click_outside_an_alert_cancels_it() {
         let _serial = crate::test_serial();
         let root = fixture("click-quit", &[("a.txt", "")]);
         let mut app = app(&root, Some("a.txt"));
         type_text(&mut app, "x");
         ctrl(&mut app, 'q');
-        assert!(screen(&app).contains("Unsaved changes"));
-        press(&mut app, 50, 0);
-        assert!(!screen(&app).contains("Unsaved changes"));
+        assert!(screen(&app).contains("unsaved changes"));
+        press(&mut app, 0, 0);
+        assert!(!screen(&app).contains("unsaved changes"));
+        assert!(app.alert.is_none());
+        assert_eq!(app.focus, Focus::Editor, "nor did the click go to the tree");
         assert!(matches!(ctrl(&mut app, 'q'), AppAction::Continue));
     }
 
@@ -4059,7 +4125,9 @@ mod tests {
         ctrl(&mut app, 'w');
         assert_eq!(app.tab().panels.len(), 2);
         assert!(screen(&app).contains("b.txt has unsaved changes."));
-        ctrl(&mut app, 'w');
+        // Selecting Don't Save.
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Enter);
         assert_eq!(app.tab().panels.len(), 1);
         assert_eq!(
             app.ed().path().as_deref(),
@@ -4109,8 +4177,11 @@ mod tests {
         });
         prefixed_ctrl(&mut app, 'w');
         assert_eq!(app.terminals.len(), 1);
-        assert!(screen(&app).contains("sleep is running in Terminal 1."));
-        prefixed_ctrl(&mut app, 'w');
+        let text = screen(&app);
+        assert!(text.contains("Close Terminal 1?"), "{text}");
+        assert!(text.contains("sleep is running in a terminal."), "{text}");
+        // The alert has the keyboard, not the terminal.
+        key(&mut app, KeyCode::Char('c'));
         assert!(app.terminals.is_empty());
         assert!(app.active_terminal().is_none());
     }
@@ -4509,12 +4580,10 @@ mod tests {
         type_text(&mut app, "edited ");
         with_mods(&mut app, KeyCode::Char('w'), CTRL_ALT);
         assert_eq!(app.tabs.len(), 2);
-        assert!(
-            screen(&app).contains("Unsaved changes in b.txt. Ctrl+Alt+W again"),
-            "{}",
-            screen(&app)
-        );
-        with_mods(&mut app, KeyCode::Char('w'), CTRL_ALT);
+        let text = screen(&app);
+        assert!(text.contains("Close tab 2?"), "{text}");
+        assert!(text.contains("b.txt has unsaved changes."), "{text}");
+        key(&mut app, KeyCode::Char('n'));
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(open_paths(&app), ["a.txt"]);
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "beta");
@@ -4808,8 +4877,8 @@ mod tests {
         app.tree.reveal(&root.join("a.txt"));
         key(&mut app, KeyCode::Delete);
         assert!(root.join("a.txt").exists());
-        assert!(tall_screen(&app).contains("Delete again moves a.txt to the Trash."));
-        key(&mut app, KeyCode::Delete);
+        assert!(tall_screen(&app).contains("Move a.txt to the Trash?"));
+        key(&mut app, KeyCode::Enter);
         assert!(!root.join("a.txt").exists());
         assert!(!app.ed_is_shown(), "its unedited file closed");
 

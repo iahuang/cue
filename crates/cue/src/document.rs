@@ -250,6 +250,15 @@ impl Document {
         self.buffer.text()
     }
 
+    /// Writes the text to `path`, with the file's line endings, and marks
+    /// it saved.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let line_ending = self.file.borrow().line_ending;
+        save(path, &self.buffer.text(), line_ending)?;
+        self.history.borrow_mut().mark_saved();
+        Ok(())
+    }
+
     /// Saves to `path` from now on, highlighting for its language.
     pub fn rename(&self, path: PathBuf) {
         self.file.borrow_mut().path = Some(path);
