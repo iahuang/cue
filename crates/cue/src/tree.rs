@@ -15,6 +15,7 @@ use ignore::WalkBuilder;
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::file_index;
+use crate::icons;
 use crate::keymap::Command;
 use crate::workspace::{deepest_root, root_name};
 
@@ -234,7 +235,7 @@ impl FileTree {
     pub fn selected_position(&self) -> Option<(u32, u32)> {
         let row = self.rows.get(self.selected)?;
         let y = self.selected.checked_sub(self.scroll)?;
-        (y < self.height).then_some((3 + 2 * row.depth as u32, y as u32))
+        (y < self.height).then_some((3 + 2 * row.depth as u32 + icons::width(), y as u32))
     }
 
     /// Selects the entry on screen row `y`, as a right click does, without
@@ -351,14 +352,19 @@ impl FileTree {
                 frame.fill_rect(x, y, width, 1, bg);
             }
             let indent = x + 1 + 2 * row.depth as u32;
-            let name_x = indent + 2;
+            let open = self.expanded.contains(&row.path);
             if row.is_dir {
-                let arrow = if self.expanded.contains(&row.path) {
-                    "▾"
-                } else {
-                    "▸"
-                };
+                let arrow = if open { "▾" } else { "▸" };
                 frame.draw_text(arrow, indent, y, ARROW_FG, None, Attributes::NONE);
+            }
+            let mut name_x = indent + 2;
+            if icons::enabled() {
+                let icon = match row.is_dir {
+                    true => icons::folder(open),
+                    false => icons::file(&row.name),
+                };
+                let dim = row.ignored.then_some(IGNORED_FG);
+                name_x = icon.draw(frame, name_x, y, dim);
             }
             let (fg, attributes) = if row.depth == 0 {
                 (ROOT_FG, Attributes::BOLD)
@@ -840,5 +846,30 @@ mod tests {
         let text = screen.to_text(true);
         let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
         assert_eq!(lines[..3], [" ▾ draw", "   ▸ folder", "     a-very-lo…"]);
+    }
+
+    #[test]
+    fn draws_icons_before_names_when_enabled() {
+        let _serial = crate::test_serial();
+        crate::icons::enable();
+        let root = fixture("icons", &["folder/", "main.rs"]);
+        let mut tree = tree(&[root]);
+        tree.set_height(3);
+        let screen =
+            opentui::OwnedBuffer::new(16, 3, false, opentui::WidthMethod::Unicode, "test").unwrap();
+        screen.clear(Rgba::BLACK);
+        tree.draw(&screen, 0, 16, true);
+        let text = screen.to_text(true);
+        let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+        assert_eq!(
+            lines,
+            [
+                " ▾ \u{e5fe} icons",
+                "   ▸ \u{e5ff} folder",
+                "     \u{e7a8} main.rs"
+            ]
+        );
+        tree.select(2);
+        assert_eq!(tree.selected_position(), Some((7, 2)));
     }
 }

@@ -20,6 +20,7 @@ use opentui::{Attributes, Buffer};
 
 use crate::document::{Disk, Document};
 use crate::editor::{Editor, INACTIVE_STATUS_BG, STATUS_BG, STATUS_DIM, STATUS_FG};
+use crate::icons::{self, Icon};
 use crate::input::{Mouse, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::layout::{PanelId, Rect};
@@ -316,11 +317,12 @@ impl Panel {
         } else {
             terminal.program().unwrap_or_else(|| terminal.name())
         };
-        let room = area.width.saturating_sub(1) as usize;
+        let icon = header_icon(frame, icons::terminal(), area, active);
+        let room = area.width.saturating_sub(1 + icon) as usize;
         let name = truncate_left(&name, room);
-        frame.draw_text(&name, area.x + 1, area.y, fg, None, Attributes::BOLD);
+        frame.draw_text(&name, area.x + 1 + icon, area.y, fg, None, Attributes::BOLD);
         if let Some(status) = terminal.exit() {
-            let used = 1 + name.chars().count() + 2;
+            let used = (1 + icon) as usize + name.chars().count() + 2;
             let note = format!("[{}]", terminal::describe_exit(status).to_lowercase());
             if used + note.chars().count() < area.width as usize {
                 let x = area.x + used as u32;
@@ -367,20 +369,21 @@ impl Panel {
             }
             None => (doc.untitled_name().unwrap_or_default(), String::new()),
         };
+        let icon = header_icon(frame, icons::file(&name), area, active);
         let dirty = if doc.is_modified() { " [+]" } else { "" };
         let disk = match doc.disk() {
             Disk::Same => "",
             Disk::Changed => " [changed on disk]",
             Disk::Deleted => " [deleted]",
         };
-        let room = area.width.saturating_sub(1) as usize;
+        let room = area.width.saturating_sub(1 + icon) as usize;
         let name = truncate_left(&format!("{name}{dirty}{disk}"), room);
         let mut attributes = Attributes::BOLD;
         if preview {
             attributes |= Attributes::ITALIC;
         }
-        frame.draw_text(&name, area.x + 1, area.y, fg, None, attributes);
-        let used = 1 + name.chars().count() + 2;
+        frame.draw_text(&name, area.x + 1 + icon, area.y, fg, None, attributes);
+        let used = (1 + icon) as usize + name.chars().count() + 2;
         let room = (area.width as usize).saturating_sub(used + 1);
         if !folder.is_empty() && room > 1 {
             let folder = truncate_left(&folder, room);
@@ -422,6 +425,18 @@ impl Panel {
 }
 
 /// The last `max` characters of `s`, marked with a leading ellipsis if cut.
+/// Draws `icon` at the start of a header, dimmed unless the panel is
+/// `active`, if icons are shown and there's room. Returns the columns it
+/// took.
+fn header_icon(frame: &Buffer, icon: Icon, area: Rect, active: bool) -> u32 {
+    if !icons::enabled() || area.width < 1 + 3 * icons::WIDTH {
+        return 0;
+    }
+    let dim = (!active).then_some(STATUS_DIM);
+    icon.draw(frame, area.x + 1, area.y, dim);
+    icons::WIDTH
+}
+
 fn truncate_left(s: &str, max: usize) -> String {
     let count = s.chars().count();
     if count <= max {

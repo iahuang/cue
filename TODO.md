@@ -19,13 +19,10 @@
 
 - maybe: make proper move rather than unix style unified move-rename verb
 - dim gitignored files, folders in the file tree and also exclude them from the search + file picker
-- support for nerdfonts
 
 - spaces versus tabs; ideally infer based on existing file content
 
 - select + tab to indent, shift-tab to deindent
-
-- nerdfont support
 
 - panel history nav
 

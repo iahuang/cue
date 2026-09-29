@@ -31,6 +31,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::document;
+use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::{Caret, Edit};
@@ -747,11 +748,24 @@ impl FileDialog {
     /// matched highlighted, a folder's ending in `/`, and a file's size on
     /// the right.
     fn draw_row(&self, frame: &Buffer, row: Row, x: u32, y: u32, room: usize) {
-        let Row::Entry(i) = row else {
+        let entry = match row {
+            Row::Entry(i) => Some(&self.listing.entries[i]),
+            Row::Parent => None,
+        };
+        let (x, room) = if icons::enabled() && room > 2 * icons::WIDTH as usize {
+            let icon = match entry {
+                Some(entry) if !entry.is_dir => icons::file(&entry.name),
+                _ => icons::folder(false),
+            };
+            let dim = entry.is_none().then_some(DIM);
+            (icon.draw(frame, x, y, dim), room - icons::WIDTH as usize)
+        } else {
+            (x, room)
+        };
+        let Some(entry) = entry else {
             frame.draw_text("../", x, y, DIM, None, Attributes::NONE);
             return;
         };
-        let entry = &self.listing.entries[i];
         let size = entry.size.map(human_size).unwrap_or_default();
         let size_width = size.chars().count();
         let room = if size_width > 0 && size_width + 2 < room {

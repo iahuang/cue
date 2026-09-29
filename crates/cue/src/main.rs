@@ -9,6 +9,7 @@ mod file_dialog;
 mod file_index;
 mod find;
 mod history;
+mod icons;
 mod input;
 mod keymap;
 mod language;
@@ -88,7 +89,7 @@ const USAGE: &str = "usage: cue [FILE | FOLDER]";
 fn help() -> String {
     let keymap = Keymap::default();
     let mut help = format!(
-        "{USAGE}\n\nOpens FOLDER, or the current folder with FILE (or a new, unnamed buffer) open.\nShift+movement or the mouse selects.\n\n"
+        "{USAGE}\n\nOpens FOLDER, or the current folder with FILE (or a new, unnamed buffer) open.\nShift+movement or the mouse selects.\nSet CUE_NERD_FONT=1 to show file icons, if your terminal uses a Nerd Font.\n\n"
     );
     let key = |command| {
         keymap

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use opentui::{Attributes, Buffer, Rgba};
 
+use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::{Caret, Edit};
@@ -699,7 +700,13 @@ impl SearchModal {
         let count_width = count.chars().count() as u32;
         let count_x = x + room.saturating_sub(count_width);
         frame.draw_text(&count, count_x, y, DIM, None, Attributes::NONE);
-        let room = room.saturating_sub(count_width + 2) as usize;
+        let mut room = room.saturating_sub(count_width + 2) as usize;
+        let mut x = x;
+        if icons::enabled() && room > 2 * icons::WIDTH as usize {
+            let name = file.display.rsplit('/').next().unwrap_or_default();
+            x = icons::file(name).draw(frame, x, y, None);
+            room -= icons::WIDTH as usize;
+        }
         let chars: Vec<char> = file.display.chars().collect();
         // Cut on the left, to keep the name.
         let (shown, cut) = if chars.len() <= room {
@@ -707,7 +714,6 @@ impl SearchModal {
         } else {
             (&chars[chars.len() + 1 - room.max(1)..], true)
         };
-        let mut x = x;
         if cut {
             frame.draw_text("…", x, y, DIM, None, Attributes::NONE);
             x += 1;

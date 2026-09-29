@@ -25,6 +25,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::file_index::FileIndex;
+use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Context, Keymap};
 use crate::line_edit::{Caret, Edit};
@@ -600,6 +601,19 @@ impl Picker {
     /// characters highlighted, and its detail on the right. A long file path
     /// is cut on the left, to keep its name.
     fn draw_item(&self, frame: &Buffer, item: &Item, x: u32, y: u32, room: usize) {
+        let icon = match &item.choice {
+            Choice::File(path) => Some(icons::file(
+                &path.file_name().unwrap_or_default().to_string_lossy(),
+            )),
+            Choice::Untitled(_) => Some(icons::file("")),
+            Choice::Terminal(_) => Some(icons::terminal()),
+            Choice::Command(_) => None,
+        };
+        let (x, room) = match icon.filter(|_| icons::enabled() && room > 2 * icons::WIDTH as usize)
+        {
+            Some(icon) => (icon.draw(frame, x, y, None), room - icons::WIDTH as usize),
+            None => (x, room),
+        };
         let detail = item.detail.chars().count();
         if detail > 0 && detail + 2 < room {
             let detail_x = x + (room - detail) as u32;
