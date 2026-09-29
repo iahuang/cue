@@ -34,7 +34,7 @@
 - save workspace layouts
 	- maybe do this in like a "sessions" format, similar to claude code and others?
 	- to avoid bloat sessions should probably be opt-in
-	- would be nice tbh even to have the option to leave sessions in the background, i.e. their terminals stay alive even when the main process is killed. would be really useful in ssh contexts (avoid having to wrap qedit in `tmux` or `screen`. nontrivial UX question though.
+	- would be nice tbh even to have the option to leave sessions in the background, i.e. their terminals stay alive even when the main process is killed. would be really useful in ssh contexts (avoid having to wrap cue in `tmux` or `screen`. nontrivial UX question though.
 
 # bespoke features (think about these carefully)
 

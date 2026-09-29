@@ -914,7 +914,7 @@ mod tests {
     /// A fresh folder with `files` (paths ending in `/` are folders).
     fn fixture(name: &str, files: &[&str]) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("qedit-dialog-{}", std::process::id()))
+            .join(format!("cue-dialog-{}", std::process::id()))
             .join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

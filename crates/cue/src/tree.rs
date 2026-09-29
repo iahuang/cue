@@ -524,7 +524,7 @@ mod tests {
     /// A fresh directory with `files` (paths ending in `/` are folders).
     fn fixture(name: &str, files: &[&str]) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("qedit-tree-{}", std::process::id()))
+            .join(format!("cue-tree-{}", std::process::id()))
             .join(name);
         let _ = fs::remove_dir_all(&dir);
         for file in files {

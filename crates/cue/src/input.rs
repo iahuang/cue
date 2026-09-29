@@ -1,7 +1,7 @@
 //! Turns terminal input bytes into key events.
 //!
 //! OpenTUI's native core only writes to the terminal; key parsing lives in its
-//! TypeScript layer. This is a small parser for what qedit needs. It accepts
+//! TypeScript layer. This is a small parser for what cue needs. It accepts
 //! the three encodings the renderer can switch the terminal into: legacy
 //! sequences, xterm's modifyOtherKeys (`CSI 27;m;c ~`), and the kitty keyboard
 //! protocol (`CSI c;m u`). Bracketed paste arrives as one event. Everything
@@ -473,7 +473,7 @@ fn codepoint_token(cp: u32, mods: Mods) -> Token {
         9 => KeyCode::Tab,
         8 | 127 => KeyCode::Backspace,
         27 => KeyCode::Esc,
-        // Kitty's private-use range: keypad and media keys qedit doesn't use.
+        // Kitty's private-use range: keypad and media keys cue doesn't use.
         57344..=63743 => return Token::Ignored,
         _ => match char::from_u32(cp) {
             Some(c) => KeyCode::Char(c),

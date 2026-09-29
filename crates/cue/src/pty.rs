@@ -4,7 +4,7 @@
 //! The program gets the pty's terminal end as its controlling terminal,
 //! in a session of its own, so the kernel sends it and its jobs their
 //! signals: SIGINT for Ctrl+C, SIGWINCH on resize, SIGHUP when the pty
-//! closes. qedit holds the other end, non-blocking, and reads it when
+//! closes. cue holds the other end, non-blocking, and reads it when
 //! `poll` says it's ready.
 
 use std::ffi::OsString;
@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
-/// Environment variables that describe the terminal qedit runs in, which
+/// Environment variables that describe the terminal cue runs in, which
 /// would mislead programs in its terminals.
 const HOST_VARIABLES: &[&str] = &[
     "ALACRITTY_WINDOW_ID",
@@ -69,7 +69,7 @@ impl Pty {
             .current_dir(cwd)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
-            .env("TERM_PROGRAM", "qedit")
+            .env("TERM_PROGRAM", "cue")
             .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         for variable in HOST_VARIABLES {
             command.env_remove(variable);
@@ -91,7 +91,7 @@ impl Pty {
             });
         }
         let child = command.spawn()?;
-        // Closes qedit's copies of the terminal end, so reading the master
+        // Closes cue's copies of the terminal end, so reading the master
         // ends once the program's copies are closed too.
         drop(command);
         set_nonblocking(master.as_raw_fd())?;

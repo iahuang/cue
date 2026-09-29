@@ -188,7 +188,7 @@ pub struct App {
     terminals: Vec<Rc<RefCell<Terminal>>>,
     /// The id for the next new terminal.
     next_terminal: u32,
-    /// The terminal prefix (Ctrl+`) was pressed: the next key is a qedit
+    /// The terminal prefix (Ctrl+`) was pressed: the next key is a cue
     /// shortcut.
     terminal_prefix: bool,
     /// The terminal last told it has the keyboard.
@@ -394,7 +394,7 @@ impl App {
                     }
                 };
             }
-            // With the shell gone, keys are qedit's, but Enter starts a
+            // With the shell gone, keys are cue's, but Enter starts a
             // new one.
             if key == Key::new(KeyCode::Enter, Mods::NONE) {
                 if let Err(err) = terminal.borrow_mut().restart() {
@@ -636,7 +636,7 @@ impl App {
             Command::TerminalPrefix if self.keyboard_terminal().is_some() => {
                 self.terminal_prefix = true;
                 let message = format!(
-                    "Next shortcut goes to qedit; {} again sends it to the shell.",
+                    "Next shortcut goes to cue; {} again sends it to the shell.",
                     self.shortcut(Command::TerminalPrefix)
                 );
                 self.show_message(message, false);
@@ -2477,7 +2477,7 @@ impl App {
         self.active_terminal()
     }
 
-    /// A key after the terminal prefix: a qedit shortcut, as if no terminal
+    /// A key after the terminal prefix: a cue shortcut, as if no terminal
     /// had the keyboard. The prefix again goes to the shell, and Esc
     /// cancels.
     fn prefixed_key(&mut self, terminal: &Rc<RefCell<Terminal>>, key: Key) -> AppAction {
@@ -2495,14 +2495,14 @@ impl App {
         match command {
             Some((command, select)) => self.run(command, select),
             None => {
-                self.show_message(format!("{key} isn't a qedit shortcut."), false);
+                self.show_message(format!("{key} isn't a cue shortcut."), false);
                 AppAction::Continue
             }
         }
     }
 
     /// Copies the active terminal's selection, or pastes the last text
-    /// copied in qedit into it. (The terminal qedit runs in pastes its own
+    /// copied in cue into it. (The terminal cue runs in pastes its own
     /// clipboard itself.)
     fn terminal_clipboard(&mut self, command: Command) -> AppAction {
         let Some(terminal) = self.active_terminal() else {
@@ -2801,7 +2801,7 @@ mod tests {
     /// A fresh workspace folder with `files` (name, contents).
     fn fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("qedit-app-{}", std::process::id()))
+            .join(format!("cue-app-{}", std::process::id()))
             .join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -2841,7 +2841,7 @@ mod tests {
         app.handle_key(Key::new(KeyCode::Char(c), Mods::CTRL))
     }
 
-    /// Ctrl+`c` from a terminal, after the prefix that makes it qedit's.
+    /// Ctrl+`c` from a terminal, after the prefix that makes it cue's.
     fn prefixed_ctrl(app: &mut App, c: char) -> AppAction {
         app.handle_key(Key::new(KeyCode::Char('`'), Mods::CTRL));
         ctrl(app, c)
@@ -2994,12 +2994,12 @@ mod tests {
         });
         assert!(!app.ed_is_shown(), "typing went to the shell");
 
-        // Ctrl+P is the shell's, and qedit's after the prefix, Ctrl+`, which
+        // Ctrl+P is the shell's, and cue's after the prefix, Ctrl+`, which
         // the status bar hints.
-        assert!(screen(&app).contains("^` qedit keys"), "{}", screen(&app));
+        assert!(screen(&app).contains("^` cue keys"), "{}", screen(&app));
         let prefix = Key::new(KeyCode::Char('`'), Mods::CTRL);
         app.handle_key(prefix);
-        assert!(screen(&app).contains("Next shortcut goes to qedit"));
+        assert!(screen(&app).contains("Next shortcut goes to cue"));
         ctrl(&mut app, 'p');
         assert!(app.picker.is_some());
         key(&mut app, KeyCode::Esc);
@@ -3009,7 +3009,7 @@ mod tests {
         assert!(!app.terminal_prefix);
         app.handle_key(prefix);
         ctrl(&mut app, 'j');
-        assert!(screen(&app).contains("Ctrl+J isn't a qedit shortcut."));
+        assert!(screen(&app).contains("Ctrl+J isn't a cue shortcut."));
         assert!(app.picker.is_none());
 
         // A program running keeps quitting from being immediate.
@@ -4552,7 +4552,7 @@ mod tests {
         };
         app.handle_key(Key::new(KeyCode::Char('n'), ctrl_shift));
         let terminal = app.active_terminal().expect("a terminal");
-        // Ctrl+T is the shell's; after the prefix, it's qedit's.
+        // Ctrl+T is the shell's; after the prefix, it's cue's.
         ctrl(&mut app, 't');
         assert_eq!(app.tabs.len(), 1);
         prefixed_ctrl(&mut app, 't');

@@ -165,7 +165,7 @@ impl ExcerptHighlighter {
 
     /// The colors of each of `lines` of `text`, the file at `path` in
     /// `language`. `lines` are byte ranges of `text`, in order, each within
-    /// one line. `None` if qedit can't highlight the language, the text is
+    /// one line. `None` if cue can't highlight the language, the text is
     /// too big, or parsing was stopped by `stop`. There's no time limit: how
     /// long is too long depends on the machine and the build.
     ///
@@ -382,7 +382,7 @@ pub struct Highlighter {
 }
 
 impl Highlighter {
-    /// A highlighter for text in `language`, if qedit can highlight it.
+    /// A highlighter for text in `language`, if cue can highlight it.
     pub fn new(language: &'static Language, theme: &Theme) -> Option<Highlighter> {
         let grammar = grammar(language)?;
         let mut parser = Parser::new();

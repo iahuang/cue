@@ -2,7 +2,7 @@
 //!
 //! A search runs on background threads over the same files as the file
 //! picker, skipping `.git`, ignored files, binary files, and files that
-//! aren't UTF-8 (which qedit can't open). Each file's matches come back with
+//! aren't UTF-8 (which cue can't open). Each file's matches come back with
 //! the lines around them, for showing excerpts. Open files with unsaved
 //! changes are searched as they are in the editor, not as saved.
 //!
@@ -442,7 +442,7 @@ struct Excerpts<'t> {
 }
 
 /// What coloring `lines` of the file at `path`, or of `unsaved` if given,
-/// takes. `None` if qedit doesn't highlight its language, or it's too big, or
+/// takes. `None` if cue doesn't highlight its language, or it's too big, or
 /// changed since it was searched.
 fn excerpts<'t>(path: &Path, unsaved: Option<&'t String>, lines: &[Line]) -> Option<Excerpts<'t>> {
     let read = || -> Option<Cow<'t, str>> {
@@ -574,7 +574,7 @@ mod tests {
     /// A fresh workspace folder with `files` (name, contents).
     fn fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("qedit-search-{}", std::process::id()))
+            .join(format!("cue-search-{}", std::process::id()))
             .join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

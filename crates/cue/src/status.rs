@@ -122,7 +122,7 @@ pub fn draw(
             frame.draw_text(&left, 0, y, STATUS_FG, None, Attributes::NONE);
             // In a terminal, those keys are the shell's.
             let hints: &[(Command, &str)] = match status {
-                Status::Terminal(_) => &[(Command::TerminalPrefix, "qedit keys")],
+                Status::Terminal(_) => &[(Command::TerminalPrefix, "cue keys")],
                 _ => &[
                     (Command::Save, "save"),
                     (Command::FocusTree, "files"),

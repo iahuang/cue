@@ -3053,7 +3053,7 @@ export fn editorViewSetViewportSize(view_handle: NativeHandle, width: u32, heigh
     object_ptr.setViewportSize(width, height);
 }
 
-/// qedit patch: see `EditorView.takeCursor`.
+/// cue patch: see `EditorView.takeCursor`.
 export fn editorViewTakeCursor(view_handle: NativeHandle) void {
     const object_ptr = acquireEditorView(view_handle) orelse return;
     object_ptr.takeCursor();

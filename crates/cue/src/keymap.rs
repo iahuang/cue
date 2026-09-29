@@ -111,7 +111,7 @@ commands! {
     ClearTerminal => "terminal:clear", "Clear Terminal";
     CloseTerminal => "terminal:close", "Close Terminal";
     RenameTerminal => "terminal:rename", "Rename Terminal";
-    TerminalPrefix => "terminal:prefix", "Terminal: Send Next Shortcut to qedit";
+    TerminalPrefix => "terminal:prefix", "Terminal: Send Next Shortcut to cue";
     TreeUp => "tree:up", "File Tree: Select Previous";
     TreeDown => "tree:down", "File Tree: Select Next";
     TreeExpand => "tree:expand", "File Tree: Expand";
@@ -503,7 +503,7 @@ impl Default for Keymap {
         }
         // In a terminal, Ctrl+C and Ctrl+V are the shell's; as in Linux
         // terminals, Ctrl+Shift copies and pastes. Ctrl+` makes the next
-        // shortcut qedit's, as in tmux (VS Code's terminal toggle; shells
+        // shortcut cue's, as in tmux (VS Code's terminal toggle; shells
         // don't use it). Terminals without the kitty keyboard protocol send
         // it as Ctrl+Space. Ctrl+1 to 9 go to tabs, from terminals too:
         // shells don't use them either.
@@ -555,7 +555,7 @@ impl Keymap {
 
     /// The command bound to `key` in a terminal, which gets the key when
     /// there is none. The shell has the keys a terminal would send it:
-    /// qedit keeps only its terminal bindings, and global shortcuts with
+    /// cue keeps only its terminal bindings, and global shortcuts with
     /// Cmd (Super), Ctrl+Alt, or Ctrl+Shift, which shells don't use.
     /// Ctrl+Shift+key doesn't stand in for Ctrl+key, which is the shell's;
     /// Ctrl+Shift is kept for shortcuts of its own. The prefix, Ctrl+`,
@@ -885,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn terminals_get_keys_but_qedits_chords() {
+    fn terminals_get_keys_but_cues_chords() {
         let keymap = Keymap::default();
         let key =
             |c, shift, alt, ctrl, sup| Key::new(KeyCode::Char(c), mods(shift, alt, ctrl, sup));
@@ -909,7 +909,7 @@ mod tests {
         ] {
             assert_eq!(lookup(key), None, "{key}");
         }
-        // qedit's: Cmd, Ctrl+Alt, and Ctrl+Shift bindings.
+        // cue's: Cmd, Ctrl+Alt, and Ctrl+Shift bindings.
         for (key, command) in [
             (key('f', true, false, true, false), Command::SearchWorkspace),
             (key('\\', true, false, true, false), Command::SplitDown),
@@ -942,7 +942,7 @@ mod tests {
         ] {
             assert_eq!(lookup(key), Some(command), "{key}");
         }
-        // Cmd with an editing key is the editor's, not the shell's or qedit's.
+        // Cmd with an editing key is the editor's, not the shell's or cue's.
         assert_eq!(
             lookup(Key::new(KeyCode::Left, mods(false, false, false, true))),
             None

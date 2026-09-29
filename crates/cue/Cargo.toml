@@ -1,5 +1,5 @@
 [package]
-name = "qedit"
+name = "cue"
 version = "0.1.0"
 description = "A terminal text editor built on OpenTUI's native core"
 edition.workspace = true

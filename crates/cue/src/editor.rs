@@ -1519,7 +1519,7 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("qedit-editor-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-editor-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         let _ = fs::remove_file(&path);

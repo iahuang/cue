@@ -150,7 +150,7 @@ pub const EditorView = struct {
     }
 
     /// Makes this the view that keeps the buffer's cursor in sight; the
-    /// buffer's other views stop following it (qedit patch).
+    /// buffer's other views stop following it (cue patch).
     pub fn takeCursor(self: *EditorView) void {
         self.edit_buffer.cursor_owner = self;
     }

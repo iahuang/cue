@@ -1,4 +1,4 @@
-//! The folders qedit is working in. The file tree shows them, and the file
+//! The folders cue is working in. The file tree shows them, and the file
 //! picker lists their files.
 //!
 //! There can be several roots, but the command line only opens one for now.
@@ -88,7 +88,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("qedit-workspace-{}", std::process::id()))
+            .join(format!("cue-workspace-{}", std::process::id()))
             .join(name);
         fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()

@@ -3,7 +3,7 @@
 //!
 //! Like open files, terminals belong to the app and outlive the panels that
 //! show them, but a terminal is in at most one panel at a time: its pty has
-//! one size. Keys qedit doesn't keep for itself go to the shell (see
+//! one size. Keys cue doesn't keep for itself go to the shell (see
 //! [`crate::keymap::Keymap::lookup_terminal`]), encoded as the program in
 //! the foreground asked for.
 //!

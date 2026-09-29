@@ -12,7 +12,7 @@ pub struct Language {
     file_names: &'static [&'static str],
     /// Programs a `#!` line runs the file with, without version numbers.
     interpreters: &'static [&'static str],
-    /// How to highlight it, if qedit can.
+    /// How to highlight it, if cue can.
     pub syntax: Option<Syntax>,
 }
 
@@ -152,7 +152,7 @@ static LANGUAGES: &[Language] = &[
     ),
 ];
 
-/// Every language qedit knows.
+/// Every language cue knows.
 #[cfg(test)]
 pub fn all() -> &'static [Language] {
     LANGUAGES

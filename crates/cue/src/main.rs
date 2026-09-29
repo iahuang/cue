@@ -1,4 +1,4 @@
-//! qedit: a terminal text editor on OpenTUI's native core.
+//! cue: a terminal text editor on OpenTUI's native core.
 
 mod app;
 mod context_menu;
@@ -63,20 +63,20 @@ fn main() -> ExitCode {
     };
     let result = std::panic::catch_unwind(|| run(path));
     if let Some(message) = PANIC.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        eprintln!("qedit crashed: {message}");
+        eprintln!("cue crashed: {message}");
         return ExitCode::FAILURE;
     }
     match result {
         Ok(Ok(())) => ExitCode::SUCCESS,
         Ok(Err(err)) => {
-            eprintln!("qedit: {err}");
+            eprintln!("cue: {err}");
             ExitCode::FAILURE
         }
         Err(_) => ExitCode::FAILURE,
     }
 }
 
-const USAGE: &str = "usage: qedit [FILE | FOLDER]";
+const USAGE: &str = "usage: cue [FILE | FOLDER]";
 
 /// Usage and every command with its shortcut.
 fn help() -> String {

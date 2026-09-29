@@ -51,7 +51,7 @@ pub struct Document {
     pub file: RefCell<File>,
     /// What the file is written in, if known.
     pub language: Cell<Option<&'static Language>>,
-    /// Highlights the text on screen as it's drawn, if qedit knows how.
+    /// Highlights the text on screen as it's drawn, if cue knows how.
     pub syntax: RefCell<Option<Highlighter>>,
     pub history: RefCell<History>,
     pub theme: Rc<Theme>,
@@ -354,7 +354,7 @@ pub fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Result<()> 
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a file path"))?;
     let mut tmp_name = std::ffi::OsString::from(".");
     tmp_name.push(name);
-    tmp_name.push(format!(".qedit-{}.tmp", std::process::id()));
+    tmp_name.push(format!(".cue-{}.tmp", std::process::id()));
     let tmp = dir.join(tmp_name);
 
     let contents = match line_ending {
@@ -478,7 +478,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("qedit-test-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

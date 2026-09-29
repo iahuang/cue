@@ -1,7 +1,7 @@
 //! Word-wise cursor movement.
 //!
 //! The native word boundaries are line-wrap break points (they stop inside
-//! leading whitespace and skip CJK words), so qedit uses the usual editor
+//! leading whitespace and skip CJK words), so cue uses the usual editor
 //! rule instead: a forward jump skips whitespace, including line breaks, then
 //! one run of word characters or of punctuation; a backward jump mirrors it.
 //!

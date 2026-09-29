@@ -848,7 +848,7 @@ mod tests {
     /// A fresh workspace folder with `files` (name, contents).
     fn fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("qedit-search-modal-{}", std::process::id()))
+            .join(format!("cue-search-modal-{}", std::process::id()))
             .join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
