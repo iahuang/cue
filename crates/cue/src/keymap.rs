@@ -63,6 +63,8 @@ commands! {
     ToggleWrap => "editor:toggle-wrap", "Toggle Word Wrap";
     NewLine => "editor:newline", "Insert Line Break";
     InsertTab => "editor:insert-tab", "Insert Tab";
+    Indent => "editor:indent", "Indent Lines";
+    Outdent => "editor:outdent", "Outdent Lines";
     DeleteBackward => "editor:delete-backward", "Delete Backward";
     DeleteForward => "editor:delete-forward", "Delete Forward";
     DeleteWordBackward => "editor:delete-word-backward", "Delete Word Backward";
@@ -87,6 +89,8 @@ commands! {
     SplitRight => "panel:split-right", "Split Panel Right";
     SplitDown => "panel:split-down", "Split Panel Down";
     ClosePanel => "panel:close", "Close Panel";
+    GoBack => "panel:go-back", "Go Back";
+    GoForward => "panel:go-forward", "Go Forward";
     FocusPanelLeft => "panel:focus-left", "Focus Panel Left";
     FocusPanelRight => "panel:focus-right", "Focus Panel Right";
     FocusPanelUp => "panel:focus-up", "Focus Panel Above";
@@ -196,11 +200,11 @@ impl Command {
         match self {
             Quit | Palette | Save | SaveAs | NewFile | CreateFile | OpenFile | GoToFile
             | SearchWorkspace | Find | FindReplace | FindNext | FindPrevious | ToggleTree
-            | FocusTree | FocusEditor | SplitRight | SplitDown | ClosePanel | FocusPanelLeft
-            | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal | NewTab | CloseTab
-            | NextTab | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1
-            | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8
-            | GoToTab9 => Context::Global,
+            | FocusTree | FocusEditor | SplitRight | SplitDown | ClosePanel | GoBack
+            | GoForward | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown
+            | NewTerminal | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
+            | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5
+            | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu
             | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate
@@ -244,7 +248,7 @@ impl Command {
     }
 
     /// Whether Shift plus this command's key still runs it when that shifted
-    /// key has no binding of its own. Shift+Tab is kept free for outdenting.
+    /// key has no binding of its own. Shift+Tab outdents.
     fn ignores_shift(self) -> bool {
         self != Command::InsertTab
     }
@@ -383,6 +387,13 @@ impl Default for Keymap {
             bindings.push((key(code, CTRL_ALT), command));
             bindings.push((key(code, SUPER_ALT), command));
         }
+        // As in VS Code on macOS. Legacy terminals send Ctrl+- as Ctrl+_;
+        // some report Ctrl+Shift+- as Ctrl+Shift+_. In a terminal, Ctrl+-
+        // is the shell's (undo, in readline).
+        bindings.push((key(Char('-'), Mods::CTRL), GoBack));
+        bindings.push((key(Char('_'), Mods::CTRL), GoBack));
+        bindings.push((key(Char('-'), CTRL_SHIFT), GoForward));
+        bindings.push((key(Char('_'), CTRL_SHIFT), GoForward));
         // As in VS Code and browsers. In a terminal, the shell has them.
         bindings.push((key(PageDown, Mods::CTRL), NextTab));
         bindings.push((key(PageUp, Mods::CTRL), PreviousTab));
@@ -399,6 +410,12 @@ impl Default for Keymap {
             (key(Esc, Mods::NONE), ClearSelection),
             (key(Enter, Mods::NONE), NewLine),
             (key(Tab, Mods::NONE), InsertTab),
+            (key(Tab, SHIFT), Outdent),
+            // As in VS Code. Legacy terminals send Ctrl+[ as Esc.
+            (key(Char(']'), Mods::CTRL), Indent),
+            (key(Char(']'), SUPER), Indent),
+            (key(Char('['), Mods::CTRL), Outdent),
+            (key(Char('['), SUPER), Outdent),
             (key(Backspace, Mods::NONE), DeleteBackward),
             (key(Delete, Mods::NONE), DeleteForward),
             // Word and line editing: Alt (Option) is the macOS modifier, Ctrl
@@ -828,7 +845,10 @@ mod tests {
             in_editor(&keymap, Key::new(KeyCode::Enter, shift)),
             Some((Command::NewLine, false))
         );
-        assert_eq!(in_editor(&keymap, Key::new(KeyCode::Tab, shift)), None);
+        assert_eq!(
+            in_editor(&keymap, Key::new(KeyCode::Tab, shift)),
+            Some((Command::Outdent, false))
+        );
         // A shifted binding of its own wins over the fallback.
         assert_eq!(
             in_editor(

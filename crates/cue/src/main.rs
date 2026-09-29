@@ -10,6 +10,7 @@ mod file_index;
 mod find;
 mod history;
 mod icons;
+mod indent;
 mod input;
 mod keymap;
 mod language;

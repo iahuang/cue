@@ -8,15 +8,19 @@
 //! and closing a panel closes only what it shows.
 //!
 //! A header across the top names the file or terminal, brighter on the
-//! active panel. An empty panel, as a new split starts, lists how to open
+//! active panel, with buttons at its right end to go back, go forward, and
+//! close the panel. An empty panel, as a new split starts, lists how to open
 //! something.
+//!
+//! Like a browser tab, a panel keeps a history of what it showed, to go
+//! back and forward through (Ctrl+- and Ctrl+Shift+-).
 
 use std::cell::RefCell;
-use std::path::Path;
-use std::rc::Rc;
+use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
 use std::time::Instant;
 
-use opentui::{Attributes, Buffer};
+use opentui::{Attributes, Buffer, Rgba};
 
 use crate::document::{Disk, Document};
 use crate::editor::{Editor, INACTIVE_STATUS_BG, STATUS_BG, STATUS_DIM, STATUS_FG};
@@ -30,6 +34,58 @@ use crate::workspace::Workspace;
 
 /// What an empty panel suggests.
 const SUGGESTIONS: &[Command] = &[Command::GoToFile, Command::NewFile, Command::NewTerminal];
+/// How far back a panel's history goes.
+const HISTORY: usize = 50;
+/// The header's buttons, left to right, and their labels.
+const BUTTONS: [(HeaderButton, &str); 3] = [
+    (HeaderButton::Back, " < "),
+    (HeaderButton::Forward, " > "),
+    (HeaderButton::Close, " × "),
+];
+/// Each header button takes this many columns.
+const BUTTON_WIDTH: u32 = 3;
+/// Headers narrower than this leave the buttons out, for the name.
+const MIN_BUTTONS_WIDTH: u32 = 24;
+/// A button with nothing to do: back or forward with no history that way.
+const BUTTON_DISABLED: Rgba = Rgba::rgb(88, 91, 112);
+
+/// A button at the right end of a panel's header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderButton {
+    Back,
+    Forward,
+    Close,
+}
+
+/// Something a panel showed, to go back or forward to.
+#[derive(Debug, Clone)]
+pub enum Visit {
+    /// A file: its document while it's open, and its path, to open it
+    /// again once it's closed.
+    File(Weak<Document>, Option<PathBuf>),
+    /// A terminal, by id.
+    Terminal(u32),
+}
+
+impl Visit {
+    fn is(&self, other: &Visit) -> bool {
+        match (self, other) {
+            (Visit::File(a, a_path), Visit::File(b, b_path)) => {
+                a.ptr_eq(b) || (a_path.is_some() && a_path == b_path)
+            }
+            (Visit::Terminal(a), Visit::Terminal(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// What a panel showed before what it shows now, most recent last, and
+/// what it went back from, most recent last.
+#[derive(Debug, Default)]
+pub struct History {
+    back: Vec<Visit>,
+    forward: Vec<Visit>,
+}
 
 pub struct Panel {
     pub id: PanelId,
@@ -42,6 +98,7 @@ pub struct Panel {
     /// While empty, a message for the status bar until the next key press.
     message: Option<(String, bool)>,
     area: Rect,
+    history: History,
 }
 
 impl Panel {
@@ -53,6 +110,7 @@ impl Panel {
             terminal: None,
             message: None,
             area: Rect::default(),
+            history: History::default(),
         }
     }
 
@@ -102,6 +160,10 @@ impl Panel {
     /// Shows `terminal`, sized to fit. An unnamed document left behind that
     /// was never typed in is dropped.
     pub fn show_terminal(&mut self, terminal: Rc<RefCell<Terminal>>) {
+        let id = terminal.borrow().id();
+        if !matches!(self.visit(), Some(Visit::Terminal(shown)) if shown == id) {
+            self.leave();
+        }
         terminal.borrow_mut().set_area(self.body());
         self.terminal = Some(terminal);
         self.message = None;
@@ -114,6 +176,7 @@ impl Panel {
 
     /// Stops showing a terminal, leaving the panel empty.
     pub fn hide_terminal(&mut self) {
+        self.leave();
         self.terminal = None;
     }
 
@@ -164,6 +227,9 @@ impl Panel {
     /// Shows `doc`, where it was left if it was shown here before. An
     /// unnamed document left behind that was never typed in is dropped.
     pub fn show(&mut self, doc: &Rc<Document>) -> opentui::Result<()> {
+        if !self.shows(doc) {
+            self.leave();
+        }
         let index = match self
             .editors
             .iter()
@@ -203,6 +269,9 @@ impl Panel {
         else {
             return;
         };
+        if self.current == Some(index) {
+            self.leave();
+        }
         self.editors.remove(index);
         self.current = match self.current {
             Some(current) if current == index => None,
@@ -211,12 +280,86 @@ impl Panel {
         };
     }
 
-    /// Empties the panel, dropping its editors.
+    /// Empties the panel, dropping its editors. Its history stays.
     pub fn clear(&mut self) {
+        self.leave();
         self.editors.clear();
         self.current = None;
         self.terminal = None;
         self.message = None;
+    }
+
+    // --- history ------------------------------------------------------------------
+
+    /// What's on screen, as the history keeps it. An unnamed document that
+    /// was never typed in isn't worth going back to.
+    fn visit(&self) -> Option<Visit> {
+        if let Some(terminal) = &self.terminal {
+            return Some(Visit::Terminal(terminal.borrow().id()));
+        }
+        let doc = self.document().filter(|doc| !doc.is_blank())?;
+        Some(Visit::File(Rc::downgrade(doc), doc.path()))
+    }
+
+    /// Notes what's on screen, which is about to go, as the place to go
+    /// back to. Going somewhere new, there's no going forward.
+    fn leave(&mut self) {
+        let Some(visit) = self.visit() else {
+            return;
+        };
+        let History { back, forward } = &mut self.history;
+        forward.clear();
+        back.retain(|old| !old.is(&visit));
+        back.push(visit);
+        if back.len() > HISTORY {
+            back.remove(0);
+        }
+    }
+
+    /// Goes back through the history (or forward, if not `back`): takes the
+    /// last place there that `usable` accepts, and puts what's on screen
+    /// on the other side, for going the other way. Places it doesn't
+    /// accept, which are gone, are dropped. The caller shows the place,
+    /// with the history taken out meanwhile (see [`Panel::take_history`]).
+    pub fn step_history(&mut self, back: bool, usable: impl Fn(&Visit) -> bool) -> Option<Visit> {
+        let current = self.visit();
+        let History {
+            back: behind,
+            forward: ahead,
+        } = &mut self.history;
+        let (from, to) = if back {
+            (behind, ahead)
+        } else {
+            (ahead, behind)
+        };
+        let visit = loop {
+            let visit = from.pop()?;
+            let here = current.as_ref().is_some_and(|current| current.is(&visit));
+            if !here && usable(&visit) {
+                break visit;
+            }
+        };
+        to.extend(current);
+        Some(visit)
+    }
+
+    /// Whether there's a place to go back to (or forward to, if not
+    /// `back`). It may turn out to be gone.
+    pub fn can_go(&self, back: bool) -> bool {
+        match back {
+            true => !self.history.back.is_empty(),
+            false => !self.history.forward.is_empty(),
+        }
+    }
+
+    /// Takes the history out, so that showing a place from it doesn't
+    /// count as going somewhere new, until it's put back.
+    pub fn take_history(&mut self) -> History {
+        std::mem::take(&mut self.history)
+    }
+
+    pub fn restore_history(&mut self, history: History) {
+        self.history = history;
     }
 
     /// Shows `text` in the status bar until the next key press.
@@ -285,12 +428,14 @@ impl Panel {
         frame.with_clip(area.x, area.y, area.width, area.height, || {
             if let Some(terminal) = &self.terminal {
                 self.draw_terminal_header(frame, &terminal.borrow(), active);
+                self.draw_buttons(frame, active);
                 let body = self.body();
                 return frame.with_clip(body.x, body.y, body.width, body.height, || {
                     terminal.borrow().draw(frame, active)
                 });
             }
             self.draw_header(frame, workspace, active, preview);
+            self.draw_buttons(frame, active);
             match self.editor() {
                 Some(editor) => Some(editor.draw(frame, keymap)),
                 None => {
@@ -299,6 +444,46 @@ impl Panel {
                 }
             }
         })
+    }
+
+    /// The header's buttons, with the screen column each starts at, if the
+    /// header is wide enough for them.
+    fn buttons(&self) -> impl Iterator<Item = (HeaderButton, &'static str, u32)> {
+        let area = self.area;
+        let shown = area.width >= MIN_BUTTONS_WIDTH;
+        let start = (area.x + area.width).saturating_sub(BUTTON_WIDTH * BUTTONS.len() as u32);
+        BUTTONS
+            .into_iter()
+            .filter(move |_| shown)
+            .zip(0..)
+            .map(move |((button, label), i)| (button, label, start + BUTTON_WIDTH * i))
+    }
+
+    /// The header's columns left of its buttons.
+    fn title_width(&self) -> u32 {
+        let buttons = self.buttons().count() as u32 * BUTTON_WIDTH;
+        self.area.width.saturating_sub(buttons)
+    }
+
+    /// The header button at screen column `x`, if any.
+    pub fn header_button(&self, x: u32) -> Option<HeaderButton> {
+        self.buttons()
+            .find(|&(_, _, start)| (start..start + BUTTON_WIDTH).contains(&x))
+            .map(|(button, ..)| button)
+    }
+
+    /// Draws the header's buttons over it, in its color, and dimmer where
+    /// there's nothing to go back or forward to.
+    fn draw_buttons(&self, frame: &Buffer, active: bool) {
+        let fg = if active { STATUS_FG } else { STATUS_DIM };
+        for (button, label, x) in self.buttons() {
+            let fg = match button {
+                HeaderButton::Back if !self.can_go(true) => BUTTON_DISABLED,
+                HeaderButton::Forward if !self.can_go(false) => BUTTON_DISABLED,
+                _ => fg,
+            };
+            frame.draw_text(label, x, self.area.y, fg, None, Attributes::NONE);
+        }
     }
 
     /// The title the program set, or the program running, then dimmed,
@@ -311,6 +496,7 @@ impl Panel {
             (INACTIVE_STATUS_BG, STATUS_DIM)
         };
         frame.fill_rect(area.x, area.y, area.width, 1, bg);
+        let width = self.title_width();
         let title = terminal.title();
         let name = if !title.trim().is_empty() {
             title
@@ -318,13 +504,13 @@ impl Panel {
             terminal.program().unwrap_or_else(|| terminal.name())
         };
         let icon = header_icon(frame, icons::terminal(), area, active);
-        let room = area.width.saturating_sub(1 + icon) as usize;
+        let room = width.saturating_sub(2 + icon) as usize;
         let name = truncate_left(&name, room);
         frame.draw_text(&name, area.x + 1 + icon, area.y, fg, None, Attributes::BOLD);
         if let Some(status) = terminal.exit() {
             let used = (1 + icon) as usize + name.chars().count() + 2;
             let note = format!("[{}]", terminal::describe_exit(status).to_lowercase());
-            if used + note.chars().count() < area.width as usize {
+            if used + note.chars().count() < width as usize {
                 let x = area.x + used as u32;
                 frame.draw_text(&note, x, area.y, STATUS_DIM, None, Attributes::NONE);
             }
@@ -342,6 +528,7 @@ impl Panel {
             (INACTIVE_STATUS_BG, STATUS_DIM)
         };
         frame.fill_rect(area.x, area.y, area.width, 1, bg);
+        let width = self.title_width();
         let Some(doc) = self.document() else {
             frame.draw_text(
                 " No file",
@@ -376,7 +563,7 @@ impl Panel {
             Disk::Changed => " [changed on disk]",
             Disk::Deleted => " [deleted]",
         };
-        let room = area.width.saturating_sub(1 + icon) as usize;
+        let room = width.saturating_sub(2 + icon) as usize;
         let name = truncate_left(&format!("{name}{dirty}{disk}"), room);
         let mut attributes = Attributes::BOLD;
         if preview {
@@ -384,7 +571,7 @@ impl Panel {
         }
         frame.draw_text(&name, area.x + 1 + icon, area.y, fg, None, attributes);
         let used = (1 + icon) as usize + name.chars().count() + 2;
-        let room = (area.width as usize).saturating_sub(used + 1);
+        let room = (width as usize).saturating_sub(used + 1);
         if !folder.is_empty() && room > 1 {
             let folder = truncate_left(&folder, room);
             let x = area.x + used as u32;

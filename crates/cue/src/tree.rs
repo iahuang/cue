@@ -6,6 +6,9 @@
 //! path, so collapsing a folder and expanding it again restores its subfolders.
 //! What `.gitignore` and `.ignore` files exclude is shown dimmed, and left
 //! out of the file picker and workspace search.
+//!
+//! Scrolled down, the folders the top rows are in stick to the top, one
+//! row each, outermost first, so it's clear where in the tree you are.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -28,6 +31,8 @@ const IGNORED_FG: Rgba = Rgba::rgb(108, 112, 134);
 const SELECTED_BG: Rgba = Rgba::rgb(69, 71, 110);
 /// The selection while the editor has focus.
 const SELECTED_BG_UNFOCUSED: Rgba = Rgba::rgb(49, 50, 68);
+/// Folders stuck to the top.
+const STICKY_BG: Rgba = Rgba::rgb(36, 37, 52);
 
 /// Rows the mouse wheel scrolls.
 const WHEEL_ROWS: usize = 3;
@@ -234,19 +239,64 @@ impl FileTree {
     /// tree's left edge, and the row. `None` if it's scrolled out of view.
     pub fn selected_position(&self) -> Option<(u32, u32)> {
         let row = self.rows.get(self.selected)?;
-        let y = self.selected.checked_sub(self.scroll)?;
+        let sticky = self.sticky();
+        let y = match sticky.iter().position(|&index| index == self.selected) {
+            Some(y) => y,
+            None => self
+                .selected
+                .checked_sub(self.scroll)
+                .filter(|&y| y >= sticky.len())?,
+        };
         (y < self.height).then_some((3 + 2 * row.depth as u32 + icons::width(), y as u32))
     }
 
     /// Selects the entry on screen row `y`, as a right click does, without
     /// opening it. Returns false if there's none there.
     pub fn select_at(&mut self, y: u32) -> bool {
-        let index = self.scroll + y as usize;
-        if index >= self.rows.len() {
+        let Some(index) = self.row_at(y) else {
             return false;
-        }
+        };
         self.select(index);
         true
+    }
+
+    /// The index of the row on screen row `y`, if any: a folder stuck to
+    /// the top, or the row scrolled there.
+    fn row_at(&self, y: u32) -> Option<usize> {
+        let y = y as usize;
+        let index = match self.sticky().get(y) {
+            Some(&index) => index,
+            None => self.scroll + y,
+        };
+        (index < self.rows.len()).then_some(index)
+    }
+
+    /// The folders stuck to the top, as row indices, outermost first: the
+    /// folders the first rows below them are in, where they're scrolled
+    /// out of sight above. They take at most half the rows.
+    fn sticky(&self) -> Vec<usize> {
+        let mut sticky = Vec::new();
+        while sticky.len() < self.height / 2 {
+            let depth = sticky.len();
+            // The row just below, if this one sticks.
+            let below = self.scroll + depth + 1;
+            if self.rows.get(below).is_none_or(|row| row.depth <= depth) {
+                break;
+            }
+            // The folder it's in at this depth: the last row above it no deeper.
+            let Some(folder) = self.rows[..below]
+                .iter()
+                .rposition(|row| row.depth <= depth)
+            else {
+                break;
+            };
+            // Where it would be on screen anyway.
+            if folder >= self.scroll + depth {
+                break;
+            }
+            sticky.push(folder);
+        }
+        sticky
     }
 
     /// Follows `from`, and what's in it, to `to`: folders expanded there
@@ -317,8 +367,14 @@ impl FileTree {
     /// the file and keeps focus in the tree; a `double` click keeps the file
     /// open and moves focus to it.
     pub fn click(&mut self, y: u32, double: bool) -> TreeAction {
-        let index = self.scroll + y as usize;
-        if index >= self.rows.len() {
+        let Some(index) = self.row_at(y) else {
+            return TreeAction::None;
+        };
+        if self.sticky().contains(&index) {
+            // A folder stuck to the top: scroll back to it, below the
+            // folders it's in.
+            self.scroll = index.saturating_sub(self.rows[index].depth);
+            self.select(index);
             return TreeAction::None;
         }
         self.select(index);
@@ -341,45 +397,62 @@ impl FileTree {
     }
 
     fn draw_rows(&self, frame: &Buffer, x: u32, width: u32, focused: bool) {
-        let visible = self.rows.iter().enumerate().skip(self.scroll);
-        for ((index, row), y) in visible.zip(0..self.height as u32) {
-            if index == self.selected {
-                let bg = if focused {
-                    SELECTED_BG
-                } else {
-                    SELECTED_BG_UNFOCUSED
-                };
-                frame.fill_rect(x, y, width, 1, bg);
-            }
-            let indent = x + 1 + 2 * row.depth as u32;
-            let open = self.expanded.contains(&row.path);
-            if row.is_dir {
-                let arrow = if open { "▾" } else { "▸" };
-                frame.draw_text(arrow, indent, y, ARROW_FG, None, Attributes::NONE);
-            }
-            let mut name_x = indent + 2;
-            if icons::enabled() {
-                let icon = match row.is_dir {
-                    true => icons::folder(open),
-                    false => icons::file(&row.name),
-                };
-                let dim = row.ignored.then_some(IGNORED_FG);
-                name_x = icon.draw(frame, name_x, y, dim);
-            }
-            let (fg, attributes) = if row.depth == 0 {
-                (ROOT_FG, Attributes::BOLD)
-            } else if self.active.as_ref() == Some(&row.path) && self.active_preview {
-                (ACTIVE_FG, Attributes::BOLD | Attributes::ITALIC)
-            } else if self.active.as_ref() == Some(&row.path) {
-                (ACTIVE_FG, Attributes::BOLD)
-            } else if row.ignored {
-                (IGNORED_FG, Attributes::NONE)
-            } else {
-                (FG, Attributes::NONE)
-            };
-            let room = (x + width).saturating_sub(name_x + 1) as usize;
-            frame.draw_text(&truncate(&row.name, room), name_x, y, fg, None, attributes);
+        let sticky = self.sticky();
+        let visible = (self.scroll..self.rows.len()).skip(sticky.len());
+        for (index, y) in visible.zip(sticky.len() as u32..self.height as u32) {
+            self.draw_row(frame, index, (x, y, width), None, focused);
         }
+        for (y, &index) in sticky.iter().enumerate() {
+            self.draw_row(frame, index, (x, y as u32, width), Some(STICKY_BG), focused);
+        }
+    }
+
+    /// Draws row `index` at (`x`, `y`), `width` wide, over `bg`.
+    fn draw_row(
+        &self,
+        frame: &Buffer,
+        index: usize,
+        (x, y, width): (u32, u32, u32),
+        bg: Option<Rgba>,
+        focused: bool,
+    ) {
+        let row = &self.rows[index];
+        let bg = match index == self.selected {
+            true if focused => Some(SELECTED_BG),
+            true => Some(SELECTED_BG_UNFOCUSED),
+            false => bg,
+        };
+        if let Some(bg) = bg {
+            frame.fill_rect(x, y, width, 1, bg);
+        }
+        let indent = x + 1 + 2 * row.depth as u32;
+        let open = self.expanded.contains(&row.path);
+        if row.is_dir {
+            let arrow = if open { "▾" } else { "▸" };
+            frame.draw_text(arrow, indent, y, ARROW_FG, None, Attributes::NONE);
+        }
+        let mut name_x = indent + 2;
+        if icons::enabled() {
+            let icon = match row.is_dir {
+                true => icons::folder(open),
+                false => icons::file(&row.name),
+            };
+            let dim = row.ignored.then_some(IGNORED_FG);
+            name_x = icon.draw(frame, name_x, y, dim);
+        }
+        let (fg, attributes) = if row.depth == 0 {
+            (ROOT_FG, Attributes::BOLD)
+        } else if self.active.as_ref() == Some(&row.path) && self.active_preview {
+            (ACTIVE_FG, Attributes::BOLD | Attributes::ITALIC)
+        } else if self.active.as_ref() == Some(&row.path) {
+            (ACTIVE_FG, Attributes::BOLD)
+        } else if row.ignored {
+            (IGNORED_FG, Attributes::NONE)
+        } else {
+            (FG, Attributes::NONE)
+        };
+        let room = (x + width).saturating_sub(name_x + 1) as usize;
+        frame.draw_text(&truncate(&row.name, room), name_x, y, fg, None, attributes);
     }
 
     // --- navigation -----------------------------------------------------------
@@ -397,6 +470,10 @@ impl FileTree {
             self.scroll = self.selected + 1 - self.height;
         }
         self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.height));
+        // Nor under the folders stuck to the top.
+        while self.scroll > 0 && self.selected < self.scroll + self.sticky().len() {
+            self.scroll -= 1;
+        }
     }
 
     /// Enter/Space/click: opens the selected file, or expands/collapses a
@@ -846,6 +923,92 @@ mod tests {
         let text = screen.to_text(true);
         let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
         assert_eq!(lines[..3], [" ▾ draw", "   ▸ folder", "     a-very-lo…"]);
+    }
+
+    /// The tree's rows as drawn, `width` columns wide.
+    fn drawn(tree: &FileTree, width: u32) -> Vec<String> {
+        let height = tree.height as u32;
+        let screen =
+            opentui::OwnedBuffer::new(width, height, false, opentui::WidthMethod::Unicode, "test")
+                .unwrap();
+        screen.clear(Rgba::BLACK);
+        tree.draw(&screen, 0, width, true);
+        let text = screen.to_text(true);
+        text.lines().map(|l| l.trim_end().to_string()).collect()
+    }
+
+    #[test]
+    fn the_folders_scrolled_past_stick_to_the_top() {
+        let _serial = crate::test_serial();
+        let files: Vec<String> = (0..8)
+            .map(|i| format!("a/b/{i}.rs"))
+            .chain(["a/z.rs".to_string()])
+            .chain((1..=4).map(|i| format!("m{i}.txt")))
+            .collect();
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        let root = fixture("sticky", &files);
+        let mut tree = tree(std::slice::from_ref(&root));
+        tree.reveal(&root.join("a/b/0.rs"));
+        tree.set_height(6);
+        tree.run(Command::TreeFirst);
+        assert!(tree.sticky().is_empty(), "nothing scrolled past");
+
+        // Scrolled 3 rows down: sticky, a, and b stick, over 0.rs to 2.rs.
+        tree.scroll(1);
+        assert_eq!(tree.scroll, 3);
+        assert_eq!(
+            drawn(&tree, 16),
+            [
+                " ▾ sticky",
+                "   ▾ a",
+                "     ▾ b",
+                "         3.rs",
+                "         4.rs",
+                "         5.rs"
+            ]
+        );
+        // Clicking a stuck folder scrolls back to it.
+        assert_eq!(tree.click(2, false), TreeAction::None);
+        assert_eq!(selected(&tree), "b");
+        assert_eq!(tree.scroll, 0);
+        assert_eq!(drawn(&tree, 16)[2], "     ▾ b", "not collapsed");
+
+        // Past b's files, only the folders the top rows are in stick.
+        tree.scroll(3);
+        assert_eq!(
+            drawn(&tree, 16),
+            [
+                " ▾ sticky",
+                "   ▾ a",
+                "       z.rs",
+                "     m1.txt",
+                "     m2.txt",
+                "     m3.txt"
+            ]
+        );
+        tree.scroll(1);
+        assert_eq!(
+            drawn(&tree, 16),
+            [
+                " ▾ sticky",
+                "       z.rs",
+                "     m1.txt",
+                "     m2.txt",
+                "     m3.txt",
+                "     m4.txt"
+            ]
+        );
+
+        // Stepping up from the first row below them scrolls, rather than
+        // selecting a row they cover.
+        tree.run(Command::TreeFirst);
+        tree.scroll(1);
+        tree.select_at(3);
+        assert_eq!(selected(&tree), "3.rs");
+        tree.run(Command::TreeUp);
+        assert_eq!(selected(&tree), "2.rs");
+        assert_eq!(tree.selected_position().map(|(_, y)| y), Some(3));
+        assert_eq!(drawn(&tree, 16)[3], "         2.rs");
     }
 
     #[test]

@@ -26,6 +26,7 @@ use crate::document::File;
 use crate::document::{Disk, Document};
 use crate::find::{self, Field, FindBar, Match, Target};
 use crate::history::{EditKind, History};
+use crate::indent::Indent;
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::Edit;
@@ -56,6 +57,9 @@ const CURRENT_MATCH: SelectionColors = SelectionColors {
 const FIND_HIGHLIGHTS: u16 = 1;
 
 const WHEEL_LINES: u32 = 3;
+/// The view keeps the cursor this fraction of its height from its top and
+/// bottom: the native view's default.
+const SCROLL_MARGIN: f32 = 0.15;
 /// Line numbers are hidden when they would leave the text less room than this.
 const MIN_TEXT_WIDTH: u32 = 20;
 
@@ -395,7 +399,12 @@ impl Editor {
             }
             Command::ToggleWrap => self.toggle_wrap(),
             Command::NewLine => self.edit(EditKind::Other, EditBuffer::new_line),
-            Command::InsertTab => self.edit(EditKind::Type('\t'), |eb| eb.insert_text("\t")),
+            // With lines selected, Tab indents them, as in most editors.
+            Command::InsertTab if self.selection_spans_lines() => self.indent_lines(Forward),
+            Command::InsertTab => self.insert_indent(),
+            Command::Indent => self.indent_lines(Forward),
+            Command::Outdent => self.indent_lines(Backward),
+            Command::DeleteBackward if self.delete_indent() => {}
             Command::DeleteBackward => self.delete(EditBuffer::delete_char_backward),
             Command::DeleteForward => self.delete(EditBuffer::delete_char),
             Command::DeleteWordBackward => self.delete_word(Backward),
@@ -677,6 +686,154 @@ impl Editor {
         self.history().record(EditKind::Other, steps);
     }
 
+    /// Tab: inserts a tab, or spaces to the next multiple of the indent
+    /// width, as the file indents.
+    fn insert_indent(&mut self) {
+        match self.doc.indent.get() {
+            Indent::Tabs => self.edit(EditKind::Type('\t'), |eb| eb.insert_text("\t")),
+            Indent::Spaces(width) => self.edit(EditKind::Type(' '), |eb| {
+                let col = eb.cursor().col;
+                eb.insert_text(&" ".repeat((width - col % width) as usize))
+            }),
+        }
+    }
+
+    /// Backspace in indentation of spaces deletes back to the previous
+    /// multiple of the indent width, as Tab inserted it. Returns false,
+    /// deleting nothing, anywhere else.
+    fn delete_indent(&mut self) -> bool {
+        let Indent::Spaces(width) = self.doc.indent.get() else {
+            return false;
+        };
+        let eb = &*self.buffer;
+        let cursor = eb.cursor();
+        if cursor.col == 0 || self.has_selection() {
+            return false;
+        }
+        let line_start = eb.position_to_offset(cursor.row, 0);
+        let before = eb.text_range(line_start, cursor.offset);
+        if !before.bytes().all(|b| b == b' ') {
+            return false;
+        }
+        let spaces = before.len() as u32;
+        let count = match spaces % width {
+            0 => width,
+            over => over,
+        };
+        let steps = eb.delete_range((cursor.row, spaces - count), (cursor.row, spaces));
+        self.history().record(EditKind::Delete, steps);
+        true
+    }
+
+    /// Whether the selection covers more than one line.
+    fn selection_spans_lines(&self) -> bool {
+        let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) else {
+            return false;
+        };
+        let row = |offset| self.buffer.offset_to_position(offset).map(|p| p.row);
+        row(start) != row(end)
+    }
+
+    /// Tab with lines selected, Shift+Tab, and Ctrl+] / Ctrl+[: indents
+    /// (`Forward`) or outdents the lines holding the cursor or selection one
+    /// level, as one undo step. The cursor and selection stay on their text;
+    /// a selection from the start of a line takes in the indentation added.
+    fn indent_lines(&mut self, direction: Direction) {
+        let indent = self.doc.indent.get();
+        let buffer = self.buffer.clone();
+        let eb = &*buffer;
+        let cursor = eb.cursor().offset;
+        let selection = self.view.selection().filter(|(s, e)| s != e);
+        let anchor = selection.map(|(start, end)| {
+            self.anchor
+                .unwrap_or(if cursor == start { end } else { start })
+        });
+        // Where an offset is, as its line and the bytes before it there.
+        let locate = |offset: u32| {
+            let p = eb.offset_to_position(offset)?;
+            let line_start = eb.position_to_offset(p.row, 0);
+            Some((p.row, eb.text_range(line_start, offset).len()))
+        };
+        let Some(at_cursor) = locate(cursor) else {
+            return;
+        };
+        let at_anchor = match anchor.map(locate) {
+            Some(None) => return,
+            located => located.flatten(),
+        };
+        let (start, end) = match at_anchor {
+            Some(at) => (at.min(at_cursor), at.max(at_cursor)),
+            None => (at_cursor, at_cursor),
+        };
+        let first = start.0;
+        // A selection ending at the start of a line doesn't take it in.
+        let last = match end {
+            (row, 0) if row > first => row - 1,
+            (row, _) => row,
+        };
+
+        let text = eb.text();
+        let mut changed = String::with_capacity(text.len());
+        // Bytes each changed line gained (or with a minus, lost), by row.
+        let mut shifts: Vec<(u32, isize)> = Vec::new();
+        for (row, line) in text.split('\n').enumerate() {
+            let row = row as u32;
+            if row > 0 {
+                changed.push('\n');
+            }
+            let new = match direction {
+                _ if !(first..=last).contains(&row) => None,
+                Direction::Forward => indent.indent(line),
+                Direction::Backward => {
+                    let cut = indent.outdent(line);
+                    (cut > 0).then(|| line[cut..].to_string())
+                }
+            };
+            match new {
+                Some(new) => {
+                    shifts.push((row, new.len() as isize - line.len() as isize));
+                    changed.push_str(&new);
+                }
+                None => changed.push_str(line),
+            }
+        }
+        if shifts.is_empty() {
+            return;
+        }
+        self.history().break_group();
+        self.view.clear_selection();
+        let steps = eb.replace_changed_lines(&changed);
+        self.history().record(EditKind::Other, steps);
+        self.history().break_group();
+
+        // A selection's start at the start of its line stays there.
+        let shift = |(row, byte): (u32, usize)| {
+            let keep_start = selection.is_some() && (row, byte) == start && byte == 0;
+            let byte = match shifts.iter().find(|&&(r, _)| r == row) {
+                Some(_) if keep_start => 0,
+                Some(&(_, gained)) => byte.saturating_add_signed(gained),
+                None => byte,
+            };
+            eb.set_cursor(row, 0);
+            step_bytes(eb, byte)
+        };
+        match at_anchor {
+            Some(at_anchor) => {
+                let anchor = shift(at_anchor);
+                let cursor = shift(at_cursor);
+                self.view.set_cursor_by_offset(cursor);
+                self.view
+                    .set_selection(anchor.min(cursor), anchor.max(cursor), SELECTION);
+                self.anchor = Some(anchor);
+            }
+            None => {
+                self.anchor = None;
+                let cursor = shift(at_cursor);
+                self.view.set_cursor_by_offset(cursor);
+            }
+        }
+    }
+
     /// Alt+Up/Down: swaps the lines holding the cursor or selection with the
     /// line above or below, keeping the cursor and selection on the moved text.
     fn move_lines(&mut self, direction: Direction) {
@@ -943,15 +1100,20 @@ impl Editor {
     }
 
     /// Scrolls the viewport, dragging the cursor along so it stays visible.
+    /// It scrolls past the end of the text, until the last line is near the
+    /// top.
     fn scroll(&mut self, dx: i64, dy: i64) {
         if dx != 0 && self.wrap != WrapMode::None {
             return;
         }
         let vp = self.view.viewport();
+        // The cursor, dragged to the last line, stays the scroll margin
+        // from the top, or the view would scroll back to it.
+        let margin = ((vp.height as f32 * SCROLL_MARGIN) as u32).max(1);
         let max_y = self
             .view
             .total_virtual_line_count()
-            .saturating_sub(vp.height);
+            .saturating_sub(1 + margin);
         let y = (vp.y as i64 + dy).clamp(0, max_y as i64) as u32;
         let x = (vp.x as i64 + dx).max(0) as u32;
         if (x, y) != (vp.x, vp.y) {
@@ -1310,6 +1472,7 @@ impl Editor {
             Some((start, end)) if start != end => format!(" ({} sel)", end - start),
             _ => String::new(),
         };
+        let indent = self.doc.indent.get().label();
         let language = self.doc.language.get().map_or("Plain Text", |l| l.name);
         let line_ending = self.doc.file.borrow().line_ending.label();
         let wrap = match self.wrap {
@@ -1317,7 +1480,7 @@ impl Editor {
             _ => "wrap",
         };
         Status::Info(format!(
-            "Ln {}, Col {}{selected}  {language}  {line_ending}  {wrap}",
+            "Ln {}, Col {}{selected}  {indent}  {language}  {line_ending}  {wrap}",
             row + 1,
             col + 1,
         ))
@@ -1774,6 +1937,107 @@ mod tests {
 
     fn pos(eb: &EditBuffer) -> (u32, u32) {
         (eb.cursor().row, eb.cursor().col)
+    }
+
+    /// An editor of `text`, which is how it infers its indentation.
+    fn editor_of(text: &str) -> (Rc<EditBuffer>, Editor) {
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text(text);
+        let editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 8).unwrap();
+        (eb, editor)
+    }
+
+    #[test]
+    fn tab_indents_as_the_file_does() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of("fn a() {\n  b();\n}\n");
+        assert!(
+            status(&editor).contains("  Spaces: 2  "),
+            "{}",
+            status(&editor)
+        );
+        // To the next multiple of the width.
+        eb.set_cursor(1, 3);
+        key(&mut editor, KeyCode::Tab);
+        assert_eq!(eb.text(), "fn a() {\n  b ();\n}\n");
+        key(&mut editor, KeyCode::Tab);
+        assert_eq!(eb.text(), "fn a() {\n  b   ();\n}\n");
+        // Backspace in indentation deletes back to the previous stop.
+        eb.set_cursor(1, 0);
+        press(&mut editor, " ");
+        key(&mut editor, KeyCode::Backspace);
+        assert_eq!(eb.text(), "fn a() {\n  b   ();\n}\n");
+        eb.set_cursor(1, 2);
+        key(&mut editor, KeyCode::Backspace);
+        assert_eq!(eb.text(), "fn a() {\nb   ();\n}\n");
+        // Past the indentation, a character at a time.
+        eb.set_cursor(1, 4);
+        key(&mut editor, KeyCode::Backspace);
+        assert_eq!(eb.text(), "fn a() {\nb  ();\n}\n");
+
+        let (eb, mut editor) = editor_of("fn a() {\n\tb();\n}\n");
+        assert!(status(&editor).contains("  Tabs  "), "{}", status(&editor));
+        eb.set_cursor(0, 0);
+        key(&mut editor, KeyCode::Tab);
+        assert_eq!(eb.text(), "\tfn a() {\n\tb();\n}\n");
+    }
+
+    #[test]
+    fn tab_and_shift_tab_indent_and_outdent_selected_lines() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of("a\n    b\n\n  c\nd");
+        editor.doc.indent.set(Indent::Spaces(4));
+        // From inside line 1 to inside line 3, backward.
+        eb.set_cursor(3, 3);
+        shift(&mut editor, KeyCode::Up);
+        shift(&mut editor, KeyCode::Up);
+        shift(&mut editor, KeyCode::Left);
+        assert_eq!(editor.view.selected_text(), "  b\n\n  c");
+        key(&mut editor, KeyCode::Tab);
+        // Empty lines stay empty; the selection stays on its text.
+        assert_eq!(eb.text(), "a\n        b\n\n      c\nd");
+        assert_eq!(editor.view.selected_text(), "  b\n\n      c");
+        assert_eq!(
+            pos(&eb),
+            (1, 6),
+            "the cursor stays at the selection's start"
+        );
+        shift(&mut editor, KeyCode::Tab);
+        assert_eq!(eb.text(), "a\n    b\n\n    c\nd", "to the previous stop");
+        shift(&mut editor, KeyCode::Tab);
+        assert_eq!(eb.text(), "a\nb\n\nc\nd");
+        assert_eq!(editor.view.selected_text(), "b\n\nc");
+        // Each was one undo step.
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "a\n    b\n\n    c\nd");
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "a\n        b\n\n      c\nd");
+
+        // Whole lines selected from the start of the first keep the
+        // indentation added in the selection, and leave the next line be.
+        let (eb, mut editor) = editor_of("a\nb\nc");
+        eb.set_cursor(0, 0);
+        shift(&mut editor, KeyCode::Down);
+        shift(&mut editor, KeyCode::Down);
+        key(&mut editor, KeyCode::Tab);
+        assert_eq!(eb.text(), "    a\n    b\nc");
+        assert_eq!(editor.view.selected_text(), "    a\n    b\n");
+
+        // Without a selection, Shift+Tab and Ctrl+[ / Ctrl+] act on the
+        // cursor's line, keeping the cursor on its text.
+        let (eb, mut editor) = editor_of("    x = 1");
+        eb.set_cursor(0, 6);
+        shift(&mut editor, KeyCode::Tab);
+        assert_eq!((eb.text().as_str(), pos(&eb)), ("x = 1", (0, 2)));
+        ctrl(&mut editor, ']');
+        assert_eq!((eb.text().as_str(), pos(&eb)), ("    x = 1", (0, 6)));
+        ctrl(&mut editor, '[');
+        assert_eq!(eb.text(), "x = 1");
+        // A single-line selection is typed over.
+        eb.set_cursor(0, 0);
+        shift(&mut editor, KeyCode::Right);
+        key(&mut editor, KeyCode::Tab);
+        assert_eq!(eb.text(), "     = 1");
     }
 
     #[test]
@@ -2347,8 +2611,9 @@ mod tests {
         let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 10).unwrap();
         editor.set_wrap(WrapMode::Word);
         let _ = screen_lines(&editor, 40, 10);
-        let vp = editor.view.viewport();
-        let max_y = editor.view.total_virtual_line_count() - vp.height;
+        // Past the end, until the last line is a row from the top, where
+        // the cursor dragged along stays clear of the scroll margin.
+        let max_y = editor.view.total_virtual_line_count() - 2;
         let mut y = 0;
         while y < max_y {
             editor.scroll(0, 3);
@@ -2357,6 +2622,19 @@ mod tests {
             assert_eq!(next, (y + 3).min(max_y), "scrolling down from {y}");
             y = next;
         }
+        let (lines, cursor) = screen_lines(&editor, 40, 10);
+        assert_eq!(lines[1], " 40  line 39", "{lines:?}");
+        assert_eq!(lines[2], "", "{lines:?}");
+        assert_eq!(cursor.1, 1, "the cursor came along to the last line");
+        // Unwrapped, and resized, it stays there.
+        editor.toggle_wrap();
+        editor.set_area(0, 0, 40, 12);
+        let (lines, _) = screen_lines(&editor, 40, 12);
+        assert_eq!(lines[1], " 40  line 39", "{lines:?}");
+        editor.toggle_wrap();
+        editor.set_area(0, 0, 40, 10);
+        let _ = screen_lines(&editor, 40, 10);
+        y = editor.view.viewport().y;
         while y > 0 {
             editor.scroll(0, -3);
             let _ = screen_lines(&editor, 40, 10);

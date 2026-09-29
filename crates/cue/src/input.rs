@@ -106,6 +106,9 @@ pub enum MouseButton {
     Left,
     Middle,
     Right,
+    /// The side buttons some mice have, for going back and forward.
+    Back,
+    Forward,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,10 +440,13 @@ fn parse_sgr_mouse(params: &[u8], release: bool) -> Token {
         ctrl: code & 16 != 0,
         sup: false,
     };
-    let button = match code & 3 {
-        0 => Some(MouseButton::Left),
-        1 => Some(MouseButton::Middle),
-        2 => Some(MouseButton::Right),
+    // Buttons 8 and up set bit 128.
+    let button = match (code & 128 != 0, code & 3) {
+        (false, 0) => Some(MouseButton::Left),
+        (false, 1) => Some(MouseButton::Middle),
+        (false, 2) => Some(MouseButton::Right),
+        (true, 0) => Some(MouseButton::Back),
+        (true, 1) => Some(MouseButton::Forward),
         _ => None,
     };
     let kind = if code & 64 != 0 {
@@ -723,6 +729,14 @@ mod tests {
                 mouse(MouseKind::ScrollDown, 0, 0, Mods::NONE),
                 mouse(MouseKind::Press(MouseButton::Left), 9, 1, shift),
                 mouse(MouseKind::Move, 1, 1, Mods::NONE),
+            ]
+        );
+        // The back and forward buttons, 8 and 9.
+        assert_eq!(
+            p.feed(b"\x1b[<128;3;3M\x1b[<129;3;3m"),
+            [
+                mouse(MouseKind::Press(MouseButton::Back), 2, 2, Mods::NONE),
+                mouse(MouseKind::Release(MouseButton::Forward), 2, 2, Mods::NONE),
             ]
         );
         // Split across reads.

@@ -292,7 +292,9 @@ pub const EditorView = struct {
             }
         } else if (cursor_line >= vp.y + viewport_height - margin_lines) {
             const desired_offset = cursor_line + margin_lines - viewport_height + 1;
-            new_offset_y = @min(desired_offset, max_offset_y);
+            // A view scrolled past the end stays there (cue patch): the
+            // margin below the cursor needn't show lines that aren't there.
+            new_offset_y = @min(desired_offset, @max(max_offset_y, vp.y));
         }
 
         if (self.text_buffer_view.wrap_mode == .none) {
@@ -533,7 +535,8 @@ pub const EditorView = struct {
 
         const vp = self.text_buffer_view.getViewport() orelse return;
         const total_lines = self.text_buffer_view.getVirtualLineCount();
-        const max_offset_y = if (total_lines > vp.height) total_lines - vp.height else 0;
+        // Views may scroll past the end, down to the last line (cue patch).
+        const max_offset_y = if (total_lines > 0) total_lines - 1 else 0;
 
         var new_offset_x = vp.x;
         if (self.text_buffer_view.wrap_mode == .none) {
@@ -584,7 +587,8 @@ pub const EditorView = struct {
         if (mode != .none) vp.x = 0;
         if (top) |t| {
             const total = view.getVirtualLineCount();
-            const max_y = if (total > vp.height) total - vp.height else 0;
+            // Views may scroll past the end (cue patch).
+            const max_y = if (total > 0) total - 1 else 0;
             vp.y = @min(view.findVisualLineIndex(t.row, t.col), max_y);
         }
         view.setViewport(vp);

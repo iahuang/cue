@@ -6,25 +6,13 @@
 
 # qol
 
-- display number of index/n_matches in within-file and workspace search
-
 - indentation guides in editor
-- that thing where when scrolling thru the file explorer, the directory descendants stay sticked at the top so you always know where u are
-- click below last line should put ur cursor at the end of the buffer
-- header controls for panels; close button at least, maybe a meatball menu too?
-
-- allow scrolling past the end of the file
+- configurable indent from auto guessing indent
 
 # feat
 
 - maybe: make proper move rather than unix style unified move-rename verb
 - dim gitignored files, folders in the file tree and also exclude them from the search + file picker
-
-- spaces versus tabs; ideally infer based on existing file content
-
-- select + tab to indent, shift-tab to deindent
-
-- panel history nav
 
 - save workspace layouts
 	- maybe do this in like a "sessions" format, similar to claude code and others?

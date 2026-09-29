@@ -71,7 +71,7 @@ use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLIC
 use crate::keymap::{Command, Context, Keymap};
 use crate::layout::{self, Axis, Direction, Layout, PanelId, Rect};
 use crate::line_edit::Edit;
-use crate::panel::Panel;
+use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::status::{self, Prompt, PromptKey};
@@ -580,6 +580,8 @@ impl App {
             Command::SplitRight => self.split(Axis::Horizontal),
             Command::SplitDown => self.split(Axis::Vertical),
             Command::ClosePanel => self.close_panel(),
+            Command::GoBack => self.go_history(true),
+            Command::GoForward => self.go_history(false),
             Command::FocusPanelLeft => self.focus_panel(Direction::Left),
             Command::FocusPanelRight => self.focus_panel(Direction::Right),
             Command::FocusPanelUp => self.focus_panel(Direction::Up),
@@ -734,6 +736,14 @@ impl App {
     }
 
     fn dispatch_mouse(&mut self, mouse: Mouse, now: Instant) -> AppAction {
+        if let MouseKind::Press(button) | MouseKind::Drag(button) | MouseKind::Release(button) =
+            mouse.kind
+        {
+            if matches!(button, MouseButton::Back | MouseButton::Forward) {
+                self.history_button(mouse);
+                return AppAction::Continue;
+            }
+        }
         if let Some(alert) = &mut self.alert {
             // Nor does the rest of a click on it go anywhere else.
             self.mouse_target = None;
@@ -859,6 +869,28 @@ impl App {
         AppAction::Continue
     }
 
+    /// The mouse's back or forward button: goes back or forward in the
+    /// panel under it, as in a browser, unless a popup is open.
+    fn history_button(&mut self, mouse: Mouse) {
+        let MouseKind::Press(button) = mouse.kind else {
+            return;
+        };
+        let popup = self.alert.is_some()
+            || self.menu.is_some()
+            || self.search.is_some()
+            || self.picker.is_some()
+            || self.dialog.is_some();
+        if popup {
+            return;
+        }
+        if let Some(MouseTarget::Panel(id) | MouseTarget::Header(id)) =
+            self.target_at(mouse.x, mouse.y)
+        {
+            self.activate(id);
+        }
+        self.go_history(button == MouseButton::Back);
+    }
+
     /// What's at screen cell (`x`, `y`), if anything.
     fn target_at(&self, x: u32, y: u32) -> Option<MouseTarget> {
         let area = self.main_area();
@@ -910,6 +942,18 @@ impl App {
         match mouse.kind {
             MouseKind::Press(MouseButton::Left) => {
                 self.activate(id);
+                let button = self
+                    .tab_mut()
+                    .panel_mut(id)
+                    .and_then(|panel| panel.header_button(mouse.x));
+                if let Some(button) = button {
+                    match button {
+                        HeaderButton::Back => self.go_history(true),
+                        HeaderButton::Forward => self.go_history(false),
+                        HeaderButton::Close => self.close_panel(),
+                    }
+                    return;
+                }
                 let handle = self
                     .tab()
                     .layout
@@ -1295,6 +1339,66 @@ impl App {
         }
         self.prune_documents();
         self.prune_terminals();
+    }
+
+    /// Shows what the active panel showed before what it shows now, or
+    /// with `back` false, what it went back from. A closed file opens
+    /// again; closed terminals, and those another panel shows now, are
+    /// skipped.
+    fn go_history(&mut self, back: bool) {
+        let active = self.tab().active;
+        let elsewhere: Vec<u32> = tab::all_panels(&self.tabs)
+            .filter(|panel| panel.id != active)
+            .filter_map(Panel::terminal)
+            .map(|terminal| terminal.borrow().id())
+            .collect();
+        let (documents, terminals) = (&self.documents, &self.terminals);
+        let usable = |visit: &Visit| match visit {
+            Visit::File(doc, path) => {
+                let open = doc
+                    .upgrade()
+                    .is_some_and(|doc| documents.iter().any(|d| Rc::ptr_eq(d, &doc)));
+                open || path.as_ref().is_some_and(|path| path.is_file())
+            }
+            Visit::Terminal(id) => {
+                !elsewhere.contains(id) && terminals.iter().any(|t| t.borrow().id() == *id)
+            }
+        };
+        let Some(visit) = self.tabs[self.tab]
+            .active_panel_mut()
+            .step_history(back, usable)
+        else {
+            let message = match back {
+                true => "Nothing to go back to.",
+                false => "Nothing to go forward to.",
+            };
+            self.show_message(message, false);
+            return;
+        };
+        let history = self.active_panel_mut().take_history();
+        match visit {
+            Visit::File(doc, path) => {
+                let doc = doc
+                    .upgrade()
+                    .filter(|doc| self.documents.iter().any(|d| Rc::ptr_eq(d, doc)));
+                match (doc, path) {
+                    (Some(doc), _) => self.show_document(&doc),
+                    (None, Some(path)) => {
+                        if self.open(&path, false) {
+                            self.focus = Focus::Editor;
+                        }
+                    }
+                    (None, None) => {}
+                }
+            }
+            Visit::Terminal(id) => {
+                let terminal = self.terminals.iter().find(|t| t.borrow().id() == id);
+                if let Some(terminal) = terminal.cloned() {
+                    self.show_terminal(terminal);
+                }
+            }
+        }
+        self.active_panel_mut().restore_history(history);
     }
 
     /// Moves the keyboard to the panel next to the active one in
@@ -3334,6 +3438,122 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "B\n");
     }
 
+    /// The file the active panel shows, by name.
+    fn shown_name(app: &App) -> Option<String> {
+        app.editor()
+            .and_then(Editor::path)
+            .map(|path| file_name(&path))
+    }
+
+    #[test]
+    fn panels_go_back_and_forward_through_what_they_showed() {
+        let _serial = crate::test_serial();
+        let root = fixture("history", &[("a.txt", "a"), ("b.txt", "b"), ("c.txt", "c")]);
+        let mut app = app(&root, Some("a.txt"));
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        let forward = |app: &mut App| app.handle_key(Key::new(KeyCode::Char('-'), ctrl_shift));
+        app.open(&root.join("b.txt"), false);
+        app.open(&root.join("c.txt"), false);
+        ctrl(&mut app, '-');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        // Legacy terminals send Ctrl+- as Ctrl+_.
+        ctrl(&mut app, '_');
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        ctrl(&mut app, '-');
+        assert!(screen(&app).contains("Nothing to go back to."));
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        forward(&mut app);
+        forward(&mut app);
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
+        forward(&mut app);
+        assert!(screen(&app).contains("Nothing to go forward to."));
+
+        // Going somewhere new, there's no going forward.
+        ctrl(&mut app, '-');
+        app.open(&root.join("a.txt"), false);
+        forward(&mut app);
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        ctrl(&mut app, '-');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+
+        // A closed file opens again.
+        app.run(Command::CloseFile, false);
+        assert!(!app.ed_is_shown());
+        assert!(app.find_document(&root.join("b.txt")).is_none());
+        ctrl(&mut app, '-');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+
+        // Terminals are in it too; the mouse's back button goes back.
+        let terminal = Key::new(KeyCode::Char('n'), ctrl_shift);
+        app.handle_key(terminal);
+        assert!(app.active_terminal().is_some());
+        let back = Mouse {
+            kind: MouseKind::Press(MouseButton::Back),
+            x: 50,
+            y: 3,
+            mods: Mods::NONE,
+        };
+        app.handle_mouse(back, Instant::now());
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        forward(&mut app);
+        assert!(app.active_terminal().is_some());
+        // Ctrl+- is the shell's; the prefix makes it cue's.
+        prefixed_ctrl(&mut app, '-');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+
+        // Each panel has its own; a terminal another panel shows now is
+        // skipped.
+        ctrl(&mut app, '\\');
+        assert!(!app.ed_is_shown());
+        ctrl(&mut app, '-');
+        assert!(screen(&app).contains("Nothing to go back to."));
+        app.open(&root.join("c.txt"), false);
+        let id = app.terminals[0].borrow().id();
+        app.picker_action(PickerAction::Accept(Choice::Terminal(id)));
+        assert!(app.active_terminal().is_some());
+        app.run(Command::FocusPanelLeft, false);
+        forward(&mut app);
+        assert!(
+            app.active_terminal().is_none(),
+            "the terminal is the other panel's"
+        );
+        assert!(screen(&app).contains("Nothing to go forward to."));
+    }
+
+    #[test]
+    fn header_buttons_go_back_forward_and_close_the_panel() {
+        let _serial = crate::test_serial();
+        let root = fixture("header-buttons", &[("a.txt", "a"), ("b.txt", "b")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.open(&root.join("b.txt"), false);
+        let area = app.active_panel().area();
+        let header = screen(&app).lines().nth(area.y as usize).unwrap().to_string();
+        assert!(header.ends_with(" <  >  × "), "{header:?}");
+        let button = |i: u32| area.x + area.width - 9 + 3 * i + 1;
+        left_click(&mut app, button(0), area.y);
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        left_click(&mut app, button(1), area.y);
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        // Clicking the header elsewhere doesn't.
+        left_click(&mut app, area.x + 20, area.y);
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+
+        // Closing the other of two panels gives its room back.
+        app.run(Command::SplitRight, false);
+        assert_eq!(app.tab().panels.len(), 2);
+        let area = app.active_panel().area();
+        left_click(&mut app, area.x + area.width - 2, area.y);
+        assert_eq!(app.tab().panels.len(), 1);
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        // The last one is emptied, as Ctrl+W does.
+        let area = app.active_panel().area();
+        left_click(&mut app, area.x + area.width - 2, area.y);
+        assert!(!app.ed_is_shown());
+    }
+
     #[test]
     fn terminals_take_the_keyboard_and_outlive_their_panel() {
         let _serial = crate::test_serial();
@@ -4332,7 +4552,7 @@ mod tests {
             "{headers}"
         );
         // One status bar, the active panel's.
-        assert!(cells(&app, 9, 0..80).starts_with(" Ln 1, Col 1  Plain Text"));
+        assert!(cells(&app, 9, 0..80).starts_with(" Ln 1, Col 1  Spaces: 4  Plain Text"));
 
         // Split down, from a panel showing a file.
         with_mods(

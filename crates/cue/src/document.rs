@@ -23,6 +23,7 @@ use std::time::SystemTime;
 use opentui::{EditBuffer, WidthMethod};
 
 use crate::history::{EditKind, History};
+use crate::indent::Indent;
 use crate::language::{self, Language};
 use crate::syntax::Highlighter;
 use crate::theme::{self, Theme};
@@ -118,6 +119,8 @@ pub struct Document {
     pub file: RefCell<File>,
     /// What the file is written in, if known.
     pub language: Cell<Option<&'static Language>>,
+    /// What Tab inserts: inferred from the text as it was opened.
+    pub indent: Cell<Indent>,
     /// Highlights the text on screen as it's drawn, if cue knows how.
     pub syntax: RefCell<Option<Highlighter>>,
     pub history: RefCell<History>,
@@ -190,10 +193,12 @@ impl Document {
         buffer.set_default_fg(Some(theme::TEXT));
         let language = detect_language(&buffer, file.path.as_deref());
         let syntax = language.and_then(|language| Highlighter::new(language, &theme));
+        let indent = Indent::infer(&buffer.text(), language);
         Document {
             buffer,
             file: RefCell::new(file),
             language: Cell::new(language),
+            indent: Cell::new(indent),
             syntax: RefCell::new(syntax),
             history: RefCell::new(History::new()),
             theme,
@@ -435,12 +440,15 @@ impl Document {
         took
     }
 
-    /// Saves to `path` from now on, highlighting for its language.
+    /// Saves to `path` from now on, highlighting and indenting for its
+    /// language.
     pub fn rename(&self, path: PathBuf) {
         self.file.borrow_mut().path = Some(path);
         let language = detect_language(&self.buffer, self.path().as_deref());
         if language.map(|l| l.name) != self.language.get().map(|l| l.name) {
             self.language.set(language);
+            self.indent
+                .set(Indent::infer(&self.buffer.text(), language));
             self.buffer.remove_highlights(crate::syntax::HIGHLIGHTS);
             let highlighter = language.and_then(|language| Highlighter::new(language, &self.theme));
             *self.syntax.borrow_mut() = highlighter;

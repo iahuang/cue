@@ -295,11 +295,8 @@ impl Terminal {
             MouseKind::Press(button) => {
                 self.forwarding_mouse = false;
                 if offer {
-                    let bytes = self.vt.encode_mouse(&event(
-                        MouseAction::Press,
-                        Some(term_button(button)),
-                        true,
-                    ));
+                    let event = event(MouseAction::Press, term_button(button), true);
+                    let bytes = self.vt.encode_mouse(&event);
                     if !bytes.is_empty() {
                         self.forwarding_mouse = true;
                         self.pty.write(&bytes);
@@ -310,11 +307,8 @@ impl Terminal {
                 self.selecting_from = (button == MouseButton::Left).then_some((x as u16, y as u16));
             }
             MouseKind::Drag(button) if self.forwarding_mouse => {
-                let bytes = self.vt.encode_mouse(&event(
-                    MouseAction::Motion,
-                    Some(term_button(button)),
-                    true,
-                ));
+                let event = event(MouseAction::Motion, term_button(button), true);
+                let bytes = self.vt.encode_mouse(&event);
                 self.pty.write(&bytes);
             }
             MouseKind::Drag(_) => {
@@ -324,11 +318,8 @@ impl Terminal {
             }
             MouseKind::Release(button) if self.forwarding_mouse => {
                 self.forwarding_mouse = false;
-                let bytes = self.vt.encode_mouse(&event(
-                    MouseAction::Release,
-                    Some(term_button(button)),
-                    false,
-                ));
+                let event = event(MouseAction::Release, term_button(button), false);
+                let bytes = self.vt.encode_mouse(&event);
                 self.pty.write(&bytes);
             }
             MouseKind::Release(_) => self.selecting_from = None,
@@ -423,11 +414,14 @@ fn key_mods(mods: Mods) -> KeyMods {
     out
 }
 
-fn term_button(button: MouseButton) -> TermButton {
+/// The button as programs are told of it; cue keeps the back and forward
+/// buttons.
+fn term_button(button: MouseButton) -> Option<TermButton> {
     match button {
-        MouseButton::Left => TermButton::Left,
-        MouseButton::Middle => TermButton::Middle,
-        MouseButton::Right => TermButton::Right,
+        MouseButton::Left => Some(TermButton::Left),
+        MouseButton::Middle => Some(TermButton::Middle),
+        MouseButton::Right => Some(TermButton::Right),
+        MouseButton::Back | MouseButton::Forward => None,
     }
 }
 
