@@ -72,10 +72,13 @@ use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLIC
 use crate::keymap::{Command, Context, Keymap};
 use crate::layout::{self, Axis, Direction, Layout, PanelId, Rect};
 use crate::line_edit::Edit;
+use crate::location::{Position, Target};
 use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
+use crate::recovery::{self, Orphan, Recovery};
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::status::{self, Prompt, PromptKey};
+use crate::symbols::{self, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
 use crate::theme::Theme;
@@ -133,6 +136,10 @@ enum Answer {
     /// Take the file's text from disk, dropping unsaved changes, then
     /// carry on saving, if it was.
     Revert(Rc<Document>, Option<Saving>),
+    /// Open these files with the unsaved changes a cue that's gone left.
+    Recover(Vec<Orphan>),
+    /// Let those changes go.
+    DiscardRecovered(Vec<Orphan>),
 }
 
 /// What's left of saving files and then going ahead, while one that
@@ -161,6 +168,7 @@ enum Focus {
 /// Where a mouse press landed; drags and the release go there too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MouseTarget {
+    Language,
     Tree,
     /// The tree's divider.
     Divider,
@@ -253,6 +261,11 @@ pub struct App {
     picker: Option<Picker>,
     /// Every file in the workspace, for the picker.
     files: FileIndex,
+    /// Every symbol the workspace's files define, for the picker.
+    symbols: SymbolIndex,
+    /// The picker asked for the workspace's symbols before its files were
+    /// all listed: index them once they are.
+    index_symbols_after_listing: bool,
     /// Hears of files other programs change, in the tree's open folders
     /// and those of open files.
     watcher: Watcher,
@@ -272,6 +285,8 @@ pub struct App {
     search_memory: Memory,
     /// The last find bar's query and replacement.
     find_memory: find::Memory,
+    /// Copies of unsaved changes, in case cue exits without quitting.
+    recovery: Recovery,
 }
 
 /// A popup's query line, which typing, pasting, and the editor's cursor
@@ -344,6 +359,8 @@ impl App {
             })?;
         let mut app = App {
             files: FileIndex::new(&workspace),
+            symbols: SymbolIndex::new(&workspace),
+            index_symbols_after_listing: false,
             watcher: Watcher::new(),
             watching: None,
             workspace,
@@ -381,6 +398,11 @@ impl App {
             menu: None,
             search_memory: Memory::default(),
             find_memory: find::Memory::default(),
+            // Tests keep none; those of recovery set a folder of their own.
+            recovery: Recovery::new(match cfg!(test) {
+                true => None,
+                false => Recovery::default_dir(),
+            }),
         };
         if doc.path().is_none() {
             doc.untitled.set(1);
@@ -397,6 +419,7 @@ impl App {
         }
         app.note_recent();
         app.watch_folders();
+        app.offer_recovery(false);
         Ok(app)
     }
 
@@ -477,6 +500,10 @@ impl App {
                     && !matches!(
                         command,
                         Command::GoToFile
+                            | Command::GoToLine
+                            | Command::GoToSymbol
+                            | Command::GoToWorkspaceSymbol
+                            | Command::GoToTerminal
                             | Command::Palette
                             | Command::SearchWorkspace
                             | Command::OpenFile
@@ -587,6 +614,10 @@ impl App {
             }
             Command::FocusEditor => self.focus = Focus::Editor,
             Command::GoToFile => self.show_picker(Mode::Files),
+            Command::GoToLine => self.show_picker(Mode::Line),
+            Command::GoToSymbol => self.show_picker(Mode::Symbols),
+            Command::GoToWorkspaceSymbol => self.show_picker(Mode::WorkspaceSymbols),
+            Command::GoToTerminal => self.show_picker(Mode::Terminals),
             Command::Palette => self.show_picker(Mode::Commands),
             Command::SearchWorkspace => self.show_search(),
             Command::NewFile => self.new_untitled(),
@@ -627,6 +658,7 @@ impl App {
                     self.show_message(message, false);
                 }
             }
+            Command::RecoverUnsaved => self.offer_recovery(true),
             Command::RenameTab => {
                 let name = self.tab().name.clone().unwrap_or_default();
                 self.tab_prompt = Some(Prompt::new("Rename tab", &name));
@@ -823,6 +855,11 @@ impl App {
         }
 
         match target {
+            MouseTarget::Language => {
+                if let MouseKind::Press(MouseButton::Left) = mouse.kind {
+                    self.show_picker(Mode::Languages);
+                }
+            }
             MouseTarget::Tree => match mouse.kind {
                 // Ctrl+click, as on macOS.
                 MouseKind::Press(button)
@@ -871,6 +908,12 @@ impl App {
             MouseTarget::Panel(id) => {
                 if let MouseKind::Press(MouseButton::Left) = mouse.kind {
                     self.activate(id);
+                    // As Cmd+click in terminals on macOS, which terminals
+                    // keep for themselves.
+                    if mouse.mods.ctrl && self.open_from_terminal(mouse.x, mouse.y) {
+                        self.mouse_target = None;
+                        return AppAction::Continue;
+                    }
                 }
                 // The wheel scrolls any panel; the rest goes to the active one.
                 if let Some(panel) = self.tab_mut().panel_mut(id) {
@@ -914,7 +957,19 @@ impl App {
     fn target_at(&self, x: u32, y: u32) -> Option<MouseTarget> {
         let area = self.main_area();
         if y >= area.bottom() {
-            // The status bar.
+            if self.height > 1
+                && y == self.height - 1
+                && x < self.width
+                && self.tab_prompt.is_none()
+            {
+                if let crate::status::Status::EditorInfo { language, .. } =
+                    self.active_panel().status()
+                {
+                    if language.contains(&x) {
+                        return Some(MouseTarget::Language);
+                    }
+                }
+            }
             return None;
         }
         let tree_width = self.visible_tree_width();
@@ -1120,6 +1175,7 @@ impl App {
         self.editor_mut();
         self.note_terminal_focus();
         self.watch_folders();
+        self.feed_picker();
     }
 
     /// Draws the frame and returns where the terminal cursor goes (0-based
@@ -1218,11 +1274,23 @@ impl App {
         }
         changed |= self.search.as_mut().is_some_and(SearchModal::poll);
         if self.files.poll() {
+            if self.index_symbols_after_listing && !self.files.listing() {
+                self.index_symbols_after_listing = false;
+                self.index_symbols();
+            }
             if let Some(picker) = &mut self.picker {
                 picker.set_files(&self.files);
                 changed = true;
             }
         }
+        if self.symbols.poll() {
+            if let Some(picker) = &mut self.picker {
+                picker.set_workspace_symbols(self.symbols.items(), self.symbols.indexing());
+                changed = true;
+            }
+        }
+        self.recovery
+            .sync(&self.documents, self.workspace.roots(), false);
         if let Some(changes) = self.watcher.poll() {
             changed |= self.disk_changed(changes);
             // Folders may have come back for open files, and the tree may
@@ -1467,6 +1535,7 @@ impl App {
             if let Some(panel) = tab.panel_mut(active) {
                 panel.clear_message();
             }
+            tab.previous = Some(active);
             tab.active = id;
             self.show_active_in_tree();
         }
@@ -1589,7 +1658,7 @@ impl App {
             Some(picker) if picker.mode() == mode => self.picker = None,
             Some(picker) => picker.set_mode(mode),
             None => {
-                if mode == Mode::Files {
+                if matches!(mode, Mode::Files | Mode::WorkspaceSymbols) {
                     // Files may have come or gone since the last listing,
                     // which is shown until this one is done.
                     self.files.refresh();
@@ -1631,6 +1700,34 @@ impl App {
                             self.focus = Focus::Editor;
                         }
                     }
+                    Choice::FileAt(path, position) => {
+                        if self.open(&path, false) {
+                            self.focus = Focus::Editor;
+                            self.go_to(position);
+                        }
+                    }
+                    Choice::Line(position) => {
+                        self.focus = Focus::Editor;
+                        self.go_to(position);
+                    }
+                    Choice::Symbol(path, line, bytes) => {
+                        let shown = match &path {
+                            Some(path) => self.open(path, false),
+                            None => self.editor().is_some(),
+                        };
+                        if let Some(editor) = self.editor_mut().filter(|_| shown) {
+                            editor.select_in_line(line, bytes);
+                            self.focus = Focus::Editor;
+                        }
+                    }
+                    Choice::Language(name) => {
+                        if let Some(editor) = self.editor() {
+                            let language = name.and_then(|name| {
+                                crate::language::all().find(|language| language.name == name)
+                            });
+                            editor.document().set_language(language);
+                        }
+                    }
                     Choice::Command(command) => return self.run(command, false),
                     Choice::Terminal(id) => {
                         let terminal = self.terminals.iter().find(|t| t.borrow().id() == id);
@@ -1647,6 +1744,65 @@ impl App {
             }
         }
         AppAction::Continue
+    }
+
+    /// Gives the picker what its mode lists, if it's waiting for it: the
+    /// symbols of the file on screen, or the workspace's.
+    fn feed_picker(&mut self) {
+        if self.picker.as_ref().is_some_and(Picker::wants_outline) {
+            let items = self.outline_items();
+            if let Some(picker) = &mut self.picker {
+                picker.set_outline(items);
+            }
+        }
+        if self
+            .picker
+            .as_mut()
+            .is_some_and(Picker::take_symbols_request)
+        {
+            self.index_symbols();
+            let (items, indexing) = (self.symbols.items(), self.symbols.indexing());
+            if let Some(picker) = &mut self.picker {
+                picker.set_workspace_symbols(items, indexing);
+            }
+        }
+    }
+
+    /// The symbols the file on screen defines, in order.
+    fn outline_items(&self) -> Vec<Item> {
+        let Some(doc) = self.editor().map(Editor::document) else {
+            return Vec::new();
+        };
+        let Some(language) = doc.language.get() else {
+            return Vec::new();
+        };
+        symbols::outline(language, &doc.text())
+            .into_iter()
+            .map(Item::symbol)
+            .collect()
+    }
+
+    /// Indexes the workspace's symbols again, in the background, once its
+    /// files are listed.
+    fn index_symbols(&mut self) {
+        if self.files.listing() {
+            self.index_symbols_after_listing = true;
+            return;
+        }
+        let files = self
+            .files
+            .files()
+            .iter()
+            .filter_map(|item| item.path().map(Path::to_path_buf))
+            .collect();
+        self.symbols.refresh(files);
+    }
+
+    /// Puts the active editor's cursor at `position`.
+    pub fn go_to(&mut self, position: Position) {
+        if let Some(editor) = self.editor_mut() {
+            editor.go_to(position);
+        }
     }
 
     // --- search -----------------------------------------------------------------
@@ -1792,7 +1948,10 @@ impl App {
     /// screen there already. Returns false, with a message, if it can't
     /// be opened.
     fn open_image(&mut self, path: &Path) -> bool {
-        let shown = self.active_panel().image().is_some_and(|image| image.path() == path);
+        let shown = self
+            .active_panel()
+            .image()
+            .is_some_and(|image| image.path() == path);
         if !shown {
             match ImageView::open(path) {
                 Ok(image) => self.show_image(image),
@@ -1819,7 +1978,10 @@ impl App {
     /// in every panel.
     fn close_images(&mut self, path: &Path) {
         for panel in tab::all_panels_mut(&mut self.tabs) {
-            if panel.image().is_some_and(|image| image.path().starts_with(path)) {
+            if panel
+                .image()
+                .is_some_and(|image| image.path().starts_with(path))
+            {
                 panel.hide_image();
             }
         }
@@ -2029,7 +2191,11 @@ impl App {
                     }
                 }
             }
-            Choice::Command(_) => {}
+            Choice::FileAt(..)
+            | Choice::Line(_)
+            | Choice::Symbol(..)
+            | Choice::Command(_)
+            | Choice::Language(_) => {}
         }
     }
 
@@ -2093,11 +2259,7 @@ impl App {
              with your changes, or revert to the file on disk and lose them?"
         );
         let buttons = vec![
-            Button::new(
-                "&Overwrite",
-                Answer::Overwrite(doc.clone(), saving.clone()),
-            )
-            .danger(),
+            Button::new("&Overwrite", Answer::Overwrite(doc.clone(), saving.clone())).danger(),
             Button::new("&Revert", Answer::Revert(doc, saving)).danger(),
         ];
         let title = format!("Save {name}?");
@@ -2134,6 +2296,14 @@ impl App {
         self.alert = None;
         let saving = match answer {
             Answer::Go(redo) => return self.go(redo),
+            Answer::Recover(orphans) => {
+                self.recover(&orphans);
+                return AppAction::Continue;
+            }
+            Answer::DiscardRecovered(orphans) => {
+                recovery::remove(&orphans);
+                return AppAction::Continue;
+            }
             Answer::Save(docs, redo) => Saving { docs, redo },
             Answer::Overwrite(doc, saving) => {
                 let action = self.overwrite(&doc);
@@ -2261,11 +2431,19 @@ impl App {
             self.focus = Focus::Editor;
             return;
         }
+        if let Some(doc) = self.open_untitled() {
+            self.show_document(&doc);
+        }
+    }
+
+    /// Opens a new, untitled file, numbered after the untitled files open,
+    /// without showing it.
+    fn open_untitled(&mut self) -> Option<Rc<Document>> {
         let doc = match Document::open(None, self.theme.clone()) {
             Ok((doc, _)) => doc,
             Err(err) => {
                 self.show_message(format!("Can't open a new file: {err}"), true);
-                return;
+                return None;
             }
         };
         let taken: Vec<u32> = self
@@ -2277,7 +2455,88 @@ impl App {
         let number = (1..).find(|n| !taken.contains(n)).unwrap_or(1);
         doc.untitled.set(number);
         self.documents.push(doc.clone());
-        self.show_document(&doc);
+        Some(doc)
+    }
+
+    // --- recovery ---------------------------------------------------------------
+
+    /// Offers back the unsaved changes cues that are gone left in this
+    /// workspace, if any (see [`crate::recovery`]). `asked`, it says so if
+    /// there are none.
+    fn offer_recovery(&mut self, asked: bool) {
+        let orphans = self.recovery.orphans(self.workspace.roots());
+        if orphans.is_empty() {
+            if asked {
+                self.show_message("There are no unsaved changes to recover.", false);
+            }
+            return;
+        }
+        let names: Vec<String> = orphans
+            .iter()
+            .map(|orphan| match &orphan.path {
+                Some(path) => self.workspace.display_path(path),
+                None => "an untitled file".to_string(),
+            })
+            .collect();
+        let message = format!(
+            "cue exited without saving changes to {}. Open them to save or look over, or \
+             discard them?",
+            names.join(", ")
+        );
+        let buttons = vec![
+            Button::new("&Recover", Answer::Recover(orphans.clone())),
+            Button::new("&Discard", Answer::DiscardRecovered(orphans)).danger(),
+        ];
+        let title = "Recover unsaved changes?";
+        self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
+    }
+
+    /// Opens the files `orphans` are of with their text, as unsaved changes,
+    /// showing the first, and removes the copies.
+    fn recover(&mut self, orphans: &[Orphan]) {
+        let mut first = None;
+        let mut count = 0;
+        for orphan in orphans {
+            let doc = match &orphan.path {
+                Some(path) => match self.find_document(path) {
+                    Some(doc) => doc,
+                    None => match Document::open(Some(path.clone()), self.theme.clone()) {
+                        Ok((doc, _)) => {
+                            self.documents.push(doc.clone());
+                            doc
+                        }
+                        Err(reason) => {
+                            self.cant_open(&reason, path);
+                            continue;
+                        }
+                    },
+                },
+                None => match self.open_untitled() {
+                    Some(doc) => doc,
+                    None => continue,
+                },
+            };
+            doc.restore_text(&orphan.text);
+            count += 1;
+            first.get_or_insert(doc);
+        }
+        recovery::remove(orphans);
+        if let Some(doc) = first {
+            self.show_document(&doc);
+            let files = match count {
+                1 => "1 file".to_string(),
+                count => format!("{count} files"),
+            };
+            self.show_message(
+                format!("Recovered unsaved changes to {files}; save to keep them."),
+                false,
+            );
+        }
+    }
+
+    /// Lets unsaved changes go, as quitting does: their copies are removed.
+    pub fn discard_recovery(&mut self) {
+        self.recovery.discard();
     }
 
     /// The workspace folder being worked in, where terminals start: the one
@@ -2291,7 +2550,9 @@ impl App {
         let path = selected
             .or_else(|| self.active_panel().path())
             .or_else(|| Some(self.active_terminal()?.borrow().cwd().to_path_buf()));
-        let root = path.as_deref().and_then(|path| self.workspace.root_of(path));
+        let root = path
+            .as_deref()
+            .and_then(|path| self.workspace.root_of(path));
         match root.or_else(|| self.workspace.roots().first().map(PathBuf::as_path)) {
             Some(root) => root.to_path_buf(),
             None => std::env::current_dir().unwrap_or_default(),
@@ -2743,6 +3004,7 @@ impl App {
     fn roots_changed(&mut self) {
         self.tree.set_roots(self.workspace.roots());
         self.files = FileIndex::new(&self.workspace);
+        self.symbols = SymbolIndex::new(&self.workspace);
         self.watching = None;
         self.watch_folders();
         self.show_active_in_tree();
@@ -2752,7 +3014,10 @@ impl App {
     fn roots_in(&self, path: &Path) -> Vec<PathBuf> {
         let path = document::resolve(path);
         let roots = self.workspace.roots().iter();
-        roots.filter(|root| root.starts_with(&path)).cloned().collect()
+        roots
+            .filter(|root| root.starts_with(&path))
+            .cloned()
+            .collect()
     }
 
     /// Creates the folder `path`, and those it's in if need be.
@@ -2898,7 +3163,73 @@ impl App {
         }
     }
 
+    /// Opens `url` in the browser.
+    fn open_url(&mut self, url: &str) {
+        let opener = match cfg!(target_os = "macos") {
+            true => "open",
+            false => "xdg-open",
+        };
+        let spawned = std::process::Command::new(opener)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+            Err(err) => self.show_message(format!("Can't open {url}: {err}"), true),
+        }
+    }
+
     // --- terminals --------------------------------------------------------------
+
+    /// A Ctrl+click at (`x`, `y`) in the active panel's terminal: opens
+    /// the file or URL there, if any (see [`Terminal::target_at`]).
+    /// Returns whether it did.
+    fn open_from_terminal(&mut self, x: u32, y: u32) -> bool {
+        let Some(terminal) = self.active_terminal() else {
+            return false;
+        };
+        let target = terminal.borrow().target_at(x, y, self.workspace.roots());
+        match target {
+            None => false,
+            Some(Target::Url(url)) => {
+                self.open_url(&url);
+                true
+            }
+            Some(Target::File(path, position)) => {
+                self.open_beside_terminal(&path, position);
+                true
+            }
+        }
+    }
+
+    /// Opens `path` at `position` in a panel other than the active one,
+    /// which shows a terminal, so it stays in view: the panel active
+    /// before, unless it shows a terminal too, or else another that
+    /// doesn't, or else a new one to its right.
+    fn open_beside_terminal(&mut self, path: &Path, position: Option<Position>) {
+        let tab = self.tab();
+        let usable = |panel: &&Panel| panel.id != tab.active && panel.terminal().is_none();
+        let beside = tab
+            .previous
+            .and_then(|id| tab.panels.iter().find(|panel| panel.id == id))
+            .filter(usable)
+            .or_else(|| tab.panels.iter().find(usable))
+            .map(|panel| panel.id);
+        match beside {
+            Some(id) => self.activate(id),
+            // Without room to split, the file takes the terminal's place;
+            // the terminal keeps running.
+            None => self.split(Axis::Horizontal),
+        }
+        if self.open(path, false) {
+            self.focus = Focus::Editor;
+            if let Some(position) = position {
+                self.go_to(position);
+            }
+        }
+    }
 
     /// Starts a shell in the workspace's first folder, in the active panel.
     fn new_terminal(&mut self) {
@@ -3207,6 +3538,15 @@ fn losing_reasons(unsaved: &[String], running: &[String]) -> String {
     reasons.join(" ")
 }
 
+/// Exiting other than by quitting, as on a panic, an error, or a hangup,
+/// copies what's unsaved, however recently it was copied.
+impl Drop for App {
+    fn drop(&mut self) {
+        self.recovery
+            .sync(&self.documents, self.workspace.roots(), true);
+    }
+}
+
 /// `doc`, as the picker lists it.
 fn document_target(doc: &Document) -> Recent {
     match doc.path() {
@@ -3373,6 +3713,52 @@ mod tests {
                 now,
             );
         }
+    }
+
+    #[test]
+    fn clicking_the_language_changes_highlighting_and_escape_cancels() {
+        let _serial = crate::test_serial();
+        let root = fixture("language-picker", &[("a.txt", "fn main() {}")]);
+        let mut app = app(&root, Some("a.txt"));
+        let language_x = |app: &App| match app.ed().status() {
+            crate::status::Status::EditorInfo { language, .. } => language.start,
+            other => panic!("{other:?}"),
+        };
+        let x = language_x(&app);
+        left_click(&mut app, x - 1, 9);
+        assert!(app.picker.is_none());
+        left_click(&mut app, x, 9);
+        assert_eq!(app.picker.as_ref().unwrap().mode(), Mode::Languages);
+        type_text(&mut app, "Rust");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none());
+        let doc = app.ed().document().clone();
+        assert_eq!(doc.language.get().unwrap().name, "Rust");
+        assert!(doc.syntax.borrow().is_some());
+        assert!(!doc.is_modified());
+        doc.rename(root.join("renamed.py"));
+        assert_eq!(doc.language.get().unwrap().name, "Rust");
+
+        let x = language_x(&app);
+        left_click(&mut app, x, 9);
+        type_text(&mut app, "Python");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(doc.language.get().unwrap().name, "Rust");
+        left_click(&mut app, x, 9);
+        type_text(&mut app, "Plain Text");
+        // Selecting a result with the mouse uses the same picker path.
+        let text = screen(&app);
+        let (y, line) = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("Plain Text"))
+            .last()
+            .unwrap();
+        let x = line[..line.find("Plain Text").unwrap()].chars().count() as u32;
+        left_click(&mut app, x, y as u32);
+        assert!(app.picker.is_none());
+        assert!(doc.language.get().is_none());
+        assert!(doc.syntax.borrow().is_none());
     }
 
     #[test]
@@ -3630,10 +4016,7 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "xa\n");
         assert!(screen(&app).contains("Save b.txt?"), "{}", screen(&app));
-        assert!(matches!(
-            key(&mut app, KeyCode::Char('r')),
-            AppAction::Quit
-        ));
+        assert!(matches!(key(&mut app, KeyCode::Char('r')), AppAction::Quit));
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "B\n");
     }
 
@@ -3729,7 +4112,11 @@ mod tests {
         let mut app = app(&root, Some("a.txt"));
         app.open(&root.join("b.txt"), false);
         let area = app.active_panel().area();
-        let header = screen(&app).lines().nth(area.y as usize).unwrap().to_string();
+        let header = screen(&app)
+            .lines()
+            .nth(area.y as usize)
+            .unwrap()
+            .to_string();
         assert!(header.ends_with(" <  >  × "), "{header:?}");
         let button = |i: u32| area.x + area.width - 9 + 3 * i + 1;
         left_click(&mut app, button(0), area.y);
@@ -3843,22 +4230,24 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("terminal-commands", &[("a.txt", "alpha")]);
         let mut app = app(&root, Some("a.txt"));
-        let palette = |app: &mut App| {
+        let palette = |app: &mut App, query: &str| {
             app.run(Command::Palette, false);
-            type_text(app, "terminal");
+            type_text(app, query);
             let shown = screen(app);
             key(app, KeyCode::Esc);
             shown
         };
-        let shown = palette(&mut app);
+        let shown = palette(&mut app, "terminal");
         assert!(shown.contains("New Terminal"), "{shown}");
         assert!(!shown.contains("Close Terminal"), "{shown}");
         assert!(!shown.contains("Clear Terminal"), "{shown}");
 
         app.run(Command::NewTerminal, false);
-        let shown = palette(&mut app);
+        let shown = palette(&mut app, "terminal");
         assert!(shown.contains("Close Terminal"), "{shown}");
         assert!(shown.contains("Clear Terminal"), "{shown}");
+        // More than fit on screen match "terminal".
+        let shown = palette(&mut app, "rename terminal");
         assert!(shown.contains("Rename Terminal"), "{shown}");
 
         // Its name is in the status bar. Renaming it asks for another
@@ -4772,7 +5161,8 @@ mod tests {
             .find(|panel| panel.id == id)
             .unwrap();
         match panel.status() {
-            crate::status::Status::Info(info) => info,
+            crate::status::Status::Info(info)
+            | crate::status::Status::EditorInfo { text: info, .. } => info,
             other => panic!("{other:?}"),
         }
     }
@@ -5827,7 +6217,10 @@ mod tests {
         assert_eq!(app.tree.selected().unwrap().path, two);
         click_item(&mut app, "Remove Folder from Workspace");
         assert_eq!(app.workspace.roots(), std::slice::from_ref(&one));
-        assert_eq!(app.ed().path().as_deref(), Some(one.join("a.txt").as_path()));
+        assert_eq!(
+            app.ed().path().as_deref(),
+            Some(one.join("a.txt").as_path())
+        );
         right_click(&mut app, 4, 0);
         let text = tall_screen(&app);
         assert!(text.contains("Add Folder to Workspace…"), "{text}");
@@ -5847,7 +6240,10 @@ mod tests {
             app.run(command, false);
             assert!(app.dialog.is_none() && app.alert.is_none());
             let text = tall_screen(&app);
-            assert!(text.contains("has the workspace folder pkg in it"), "{text}");
+            assert!(
+                text.contains("has the workspace folder pkg in it"),
+                "{text}"
+            );
         }
         assert!(pkg.exists());
 
@@ -5855,5 +6251,323 @@ mod tests {
         assert!(app.open(&pkg.join("x.txt"), false));
         assert_eq!(app.workspace.display_path(&pkg.join("x.txt")), "pkg/x.txt");
         assert_eq!(app.current_root(), pkg);
+    }
+
+    /// Where the active editor's cursor is: `Ln 3, Col 5`.
+    fn cursor_at(app: &App) -> String {
+        let info = status_of(app, app.tab().active);
+        info.split("  ").next().unwrap().to_string()
+    }
+
+    const CTRL_SHIFT: Mods = Mods {
+        shift: true,
+        ..Mods::CTRL
+    };
+
+    #[test]
+    fn the_picker_goes_to_lines_and_symbols() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "go-to",
+            &[
+                (
+                    "a.rs",
+                    "fn alpha() {}\n\nstruct Beta;\n\nimpl Beta {\n    fn gamma(&self) {}\n}\n",
+                ),
+                ("src/b.py", "x = 1\n\ndef delta():\n    pass\n"),
+            ],
+        );
+        let mut app = app(&root, Some("a.rs"));
+
+        // A line, and a column, after `:`.
+        ctrl(&mut app, 'l');
+        assert_eq!(app.picker.as_ref().unwrap().mode(), Mode::Line);
+        type_text(&mut app, "5:3");
+        assert!(
+            screen(&app).contains("Go to line 5, column 3"),
+            "{}",
+            screen(&app)
+        );
+        key(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none());
+        assert_eq!(cursor_at(&app), "Ln 5, Col 3");
+        ctrl(&mut app, 'l');
+        type_text(&mut app, "x");
+        assert!(screen(&app).contains("Not a line number"));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_some());
+        key(&mut app, KeyCode::Esc);
+
+        // The file's symbols after `@`, in order, with what they're in.
+        ctrl(&mut app, 'r');
+        assert_eq!(app.picker.as_ref().unwrap().mode(), Mode::Symbols);
+        let text = screen(&app);
+        let order: Vec<usize> = ["alpha", "Beta ", "gamma Beta"]
+            .iter()
+            .map(|name| text.find(name).unwrap_or_else(|| panic!("{name}:\n{text}")))
+            .collect();
+        assert!(order.is_sorted(), "{text}");
+        type_text(&mut app, "gam");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.ed().selected_text().as_deref(), Some("gamma"));
+        assert_eq!(cursor_at(&app), "Ln 6, Col 13 (5 sel)");
+
+        // A file's name can end with a line to go to.
+        go_to_file(&mut app);
+        type_text(&mut app, "b.py:3");
+        assert!(screen(&app).contains("src/b.py"), "{}", screen(&app));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.ed().path().unwrap().ends_with("src/b.py"));
+        assert_eq!(cursor_at(&app), "Ln 3, Col 1");
+
+        // The workspace's symbols after `#`, once they're indexed.
+        app.handle_key(Key::new(KeyCode::Char('r'), CTRL_SHIFT));
+        assert_eq!(app.picker.as_ref().unwrap().mode(), Mode::WorkspaceSymbols);
+        wait_until(&mut app, "the symbols", |app| !app.symbols.indexing());
+        type_text(&mut app, "alpha");
+        assert!(screen(&app).contains("alpha a.rs:1"), "{}", screen(&app));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.ed().path().unwrap().ends_with("a.rs"));
+        assert_eq!(app.ed().selected_text().as_deref(), Some("alpha"));
+
+        // Plain text has none.
+        app.editor_mut().unwrap().document().set_language(None);
+        ctrl(&mut app, 'r');
+        assert!(screen(&app).contains("No symbols in this file"));
+    }
+
+    #[test]
+    fn the_command_line_opens_a_file_at_a_line() {
+        let _serial = crate::test_serial();
+        let root = fixture("command-line-line", &[("a.txt", &numbered(20))]);
+        let mut app = app(&root, Some("a.txt"));
+        app.go_to(Position::printed(12, Some(3)));
+        assert_eq!(cursor_at(&app), "Ln 12, Col 3");
+        // Past the end, the last line; past a line's end, its end.
+        app.go_to(Position::printed(99, Some(99)));
+        assert_eq!(cursor_at(&app), "Ln 21, Col 1");
+        app.go_to(Position::printed(2, Some(99)));
+        assert_eq!(cursor_at(&app), "Ln 2, Col 7");
+    }
+
+    #[test]
+    fn ctrl_click_in_a_terminal_opens_the_file_beside_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("terminal-links", &[("src/main.rs", &numbered(20))]);
+        let mut app = app(&root, None);
+        app.handle_key(Key::new(KeyCode::Char('n'), CTRL_SHIFT));
+        assert!(app.active_terminal().is_some());
+        // Printed so the command typed doesn't read the same.
+        type_text(&mut app, "printf '%s:%s\\n' src/main.rs 12:3");
+        key(&mut app, KeyCode::Enter);
+        let printed = "│src/main.rs:12:3";
+        wait_until(&mut app, "the path printed", |app| {
+            screen(app).contains(printed)
+        });
+        // Where the path is on screen, a few characters in.
+        let find = |app: &App| {
+            let text = screen(app);
+            let (y, line) = text
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains(printed))
+                .unwrap();
+            let x = line[..line.find(printed).unwrap()].chars().count() as u32 + 5;
+            (x, y as u32)
+        };
+        let ctrl_click = |app: &mut App, (x, y): (u32, u32)| {
+            for kind in [
+                MouseKind::Press(MouseButton::Left),
+                MouseKind::Release(MouseButton::Left),
+            ] {
+                let mods = Mods::CTRL;
+                app.handle_mouse(Mouse { kind, x, y, mods }, Instant::now());
+            }
+        };
+        let terminal_panel = app.tab().active;
+
+        // A plain click selects, as before.
+        let (x, y) = find(&app);
+        left_click(&mut app, x, y);
+        assert_eq!(app.tab().panels.len(), 1);
+
+        // It opens to the right, leaving the terminal on screen.
+        ctrl_click(&mut app, (x, y));
+        assert_eq!(app.tab().panels.len(), 2);
+        assert_ne!(app.tab().active, terminal_panel);
+        assert!(app.ed().path().unwrap().ends_with("src/main.rs"));
+        assert_eq!(cursor_at(&app), "Ln 12, Col 3");
+        let terminal_shown = app
+            .tab()
+            .panels
+            .iter()
+            .any(|panel| panel.id == terminal_panel && panel.terminal().is_some());
+        assert!(terminal_shown);
+
+        // Again, into the same panel rather than another.
+        app.activate(terminal_panel);
+        let at = find(&app);
+        ctrl_click(&mut app, at);
+        assert_eq!(app.tab().panels.len(), 2);
+        assert_ne!(app.tab().active, terminal_panel);
+        assert!(app.ed().path().unwrap().ends_with("src/main.rs"));
+
+        // Where there's nothing to open, nothing happens.
+        app.activate(terminal_panel);
+        let (x, _) = find(&app);
+        ctrl_click(&mut app, (x, 0));
+        assert_eq!(app.tab().active, terminal_panel);
+    }
+
+    /// A recovery folder of its own for a test, empty.
+    fn recovery_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("cue-recovery-{}", std::process::id()))
+            .join(name);
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn unsaved_changes_are_copied_until_saved_or_quit() {
+        let _serial = crate::test_serial();
+        let root = fixture("recovery-copies", &[("a.txt", "alpha")]);
+        let dir = recovery_dir("copies");
+        let copies = |dir: &Path| -> Vec<String> {
+            let mut texts: Vec<String> = fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|e| e == "txt"))
+                .map(|entry| fs::read_to_string(entry.path()).unwrap())
+                .collect();
+            texts.sort();
+            texts
+        };
+        let mut app = app(&root, Some("a.txt"));
+        app.recovery = Recovery::new(Some(dir.clone()));
+        app.poll();
+        assert!(copies(&dir).is_empty());
+
+        type_text(&mut app, "x");
+        app.poll();
+        let copied = copies(&dir);
+        assert_eq!(copied.len(), 1);
+        assert!(copied[0].contains(&format!("path {}", root.join("a.txt").display())));
+        assert!(copied[0].ends_with("\n\nxalpha"), "{}", copied[0]);
+
+        // Saving removes it.
+        ctrl(&mut app, 's');
+        app.poll();
+        assert!(copies(&dir).is_empty());
+
+        // Dropped without quitting, as on a crash, the latest text is
+        // copied, however recently it was.
+        type_text(&mut app, "y");
+        app.poll();
+        type_text(&mut app, "z");
+        drop(app);
+        let copied = copies(&dir);
+        assert_eq!(copied.len(), 1);
+        assert!(copied[0].ends_with("\n\nxyzalpha"), "{}", copied[0]);
+
+        // Quitting lets them go.
+        let dir = recovery_dir("quit");
+        let mut app = self::app(&root, Some("a.txt"));
+        app.recovery = Recovery::new(Some(dir.clone()));
+        type_text(&mut app, "q");
+        app.poll();
+        assert_eq!(copies(&dir).len(), 1);
+        app.discard_recovery();
+        drop(app);
+        assert!(copies(&dir).is_empty());
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "the lock is gone too"
+        );
+    }
+
+    #[test]
+    fn copies_a_cue_that_is_gone_left_are_offered_back() {
+        let _serial = crate::test_serial();
+        let root = fixture("recovery-offer", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let dir = recovery_dir("offer");
+        fs::create_dir_all(&dir).unwrap();
+        // From a process that's gone: no one holds its lock.
+        let copy = |id: u32, header: String, text: &str| {
+            let file = dir.join(format!("999999-{id}.txt"));
+            fs::write(file, format!("cue recovery 1\n{header}\n{text}")).unwrap();
+        };
+        copy(
+            1,
+            format!("path {}\n", root.join("a.txt").display()),
+            "alpha, edited",
+        );
+        copy(2, format!("untitled\nroot {}\n", root.display()), "notes");
+        // The same as the file now: nothing to recover.
+        copy(
+            3,
+            format!("path {}\n", root.join("b.txt").display()),
+            "beta",
+        );
+        // Elsewhere: kept for when cue opens there.
+        copy(4, "path /elsewhere/c.txt\n".to_string(), "gamma");
+        copy(5, "untitled\nroot /elsewhere\n".to_string(), "delta");
+        fs::write(dir.join("999999.lock"), "").unwrap();
+
+        let mut app = app(&root, None);
+        app.recovery = Recovery::new(Some(dir.clone()));
+        app.offer_recovery(false);
+        let text = screen(&app);
+        assert!(text.contains("Recover unsaved changes?"), "{text}");
+        assert!(!dir.join("999999-3.txt").exists());
+
+        key(&mut app, KeyCode::Char('r'));
+        assert!(app.alert.is_none());
+        let a = app.find_document(&root.join("a.txt")).unwrap();
+        assert!(a.is_modified());
+        assert_eq!(a.text(), "alpha, edited");
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "alpha");
+        let untitled = app
+            .documents
+            .iter()
+            .find(|doc| doc.path().is_none() && doc.text() == "notes");
+        assert!(untitled.is_some_and(|doc| doc.is_modified()));
+        assert!(app.ed().path().is_some_and(|path| path.ends_with("a.txt")));
+        assert!(screen(&app).contains("Recovered unsaved changes to 2 files"));
+        // Undoing goes back to the file as it is.
+        ctrl(&mut app, 'z');
+        assert_eq!(a.text(), "alpha");
+
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["999999-4.txt", "999999-5.txt", "999999.lock"]);
+
+        // Asked for again, there's nothing more here.
+        app.run(Command::RecoverUnsaved, false);
+        assert!(app.alert.is_none());
+        assert!(screen(&app).contains("no unsaved changes to recover"));
+    }
+
+    #[test]
+    fn discarding_recovered_changes_removes_them() {
+        let _serial = crate::test_serial();
+        let root = fixture("recovery-discard", &[("a.txt", "alpha")]);
+        let dir = recovery_dir("discard");
+        fs::create_dir_all(&dir).unwrap();
+        let header = format!("cue recovery 1\npath {}\n\n", root.join("a.txt").display());
+        fs::write(dir.join("999998-1.txt"), header + "edited").unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        app.recovery = Recovery::new(Some(dir.clone()));
+        app.offer_recovery(false);
+        key(&mut app, KeyCode::Char('d'));
+        assert!(app.alert.is_none());
+        assert!(!app.ed().is_modified());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     }
 }

@@ -17,12 +17,15 @@ mod keymap;
 mod language;
 mod layout;
 mod line_edit;
+mod location;
 mod panel;
 mod picker;
 mod pty;
+mod recovery;
 mod search;
 mod search_modal;
 mod status;
+mod symbols;
 mod syntax;
 mod tab;
 mod terminal;
@@ -35,6 +38,7 @@ mod workspace;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -85,13 +89,13 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: cue [FOLDER]... [FILE]";
+const USAGE: &str = "usage: cue [FOLDER]... [FILE[:LINE[:COLUMN]]]";
 
 /// Usage and every command with its shortcut.
 fn help() -> String {
     let keymap = Keymap::default();
     let mut help = format!(
-        "{USAGE}\n\nOpens each FOLDER, or the current folder, with FILE (or a new, unnamed buffer) open.\nShift+movement or the mouse selects.\nSet CUE_NERD_FONT=1 to show file icons, if your terminal uses a Nerd Font.\n\n"
+        "{USAGE}\n\nOpens each FOLDER, or the current folder, with FILE (or a new, unnamed buffer) open,\nat LINE and COLUMN if given, as compilers print them: src/main.rs:12:5.\nShift+movement or the mouse selects.\nSet CUE_NERD_FONT=1 to show file icons, if your terminal uses a Nerd Font.\n\n"
     );
     let key = |command| {
         keymap
@@ -129,12 +133,26 @@ fn parse_args() -> Result<Vec<PathBuf>, ExitCode> {
     Ok(paths)
 }
 
+/// Set on SIGHUP, as when an ssh connection drops, or SIGTERM: cue exits,
+/// copying what's unsaved for next time (see [`recovery`]).
+static HUNG_UP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn hang_up(_: libc::c_int) {
+    HUNG_UP.store(true, Ordering::Relaxed);
+}
+
 fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     // Load before taking over the terminal so errors print normally.
     let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) =
         paths.into_iter().partition(|path| path.is_dir());
     let mut files = files.into_iter();
-    let file = files.next();
+    let (file, position) = match files.next() {
+        Some(file) => {
+            let (file, position) = file_and_position(file);
+            (Some(file), position)
+        }
+        None => (None, None),
+    };
     if let Some(extra) = files.next() {
         return Err(format!("{}: only one file opens at a time", extra.display()).into());
     }
@@ -144,6 +162,9 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     };
     let (mut width, mut height) = tty::size();
     let mut app = App::new(workspace, file, width, height)?;
+    if let Some(position) = position {
+        app.go_to(position);
+    }
 
     let mut renderer = Renderer::new(width, height, Output::Stdout)?;
     renderer.setup_terminal(true);
@@ -153,6 +174,14 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     // Clicks, drags, and the wheel; plain motion isn't needed.
     renderer.enable_mouse(false);
     let mut parser = Parser::new();
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        unsafe {
+            libc::signal(
+                signal,
+                hang_up as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            )
+        };
+    }
 
     // When stdin last had input, to tell a lone ESC from the start of a
     // sequence split across reads.
@@ -180,6 +209,10 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                 timeout = timeout.min(FRAME.saturating_sub(drawn.elapsed()));
             }
             let bytes = tty::read_input(timeout, &app.watched())?;
+            // Dropping the app copies what's unsaved.
+            if HUNG_UP.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let events = if !bytes.is_empty() {
                 last_input = Instant::now();
                 parser.feed(&bytes)
@@ -215,7 +248,10 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             match action {
-                AppAction::Quit => return Ok(()),
+                AppAction::Quit => {
+                    app.discard_recovery();
+                    return Ok(());
+                }
                 AppAction::Copy(text) => {
                     renderer.copy_to_clipboard(&text);
                 }
@@ -229,6 +265,21 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
             renderer.resize(width, height);
             app.resize(width, height);
         }
+    }
+}
+
+/// A file argument, and the position printed after its name, as in
+/// `src/main.rs:12:5`, unless a file is named that whole.
+fn file_and_position(arg: PathBuf) -> (PathBuf, Option<location::Position>) {
+    if arg.exists() {
+        return (arg, None);
+    }
+    let Some(text) = arg.to_str() else {
+        return (arg, None);
+    };
+    match location::split_position(text) {
+        (path, Some(position)) if !path.is_empty() => (PathBuf::from(path), Some(position)),
+        _ => (arg, None),
     }
 }
 

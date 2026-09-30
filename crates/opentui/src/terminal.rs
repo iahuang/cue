@@ -136,6 +136,17 @@ pub struct Cursor {
     pub style: CursorStyle,
 }
 
+/// What's at a cell of a terminal's screen (see
+/// [`EmbeddedTerminal::line_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineAt {
+    /// An OSC 8 hyperlink's URI.
+    Link(String),
+    /// The text of the cell's line, joined across soft wraps, and the byte
+    /// in it where the cell's text starts, unless the cell is past it.
+    Text { text: String, offset: Option<usize> },
+}
+
 /// A terminal's screen, scrollback, and modes (`EmbeddedTerminal`).
 pub struct EmbeddedTerminal {
     handle: sys::Handle,
@@ -227,6 +238,40 @@ impl EmbeddedTerminal {
     pub fn selected_text(&self) -> String {
         read_sized(|out, len, required| unsafe {
             sys::embeddedTerminalGetSelectedText(self.handle, out, len, required)
+        })
+    }
+
+    /// What's at screen cell (`x`, `y`), for opening it.
+    pub fn line_at(&self, x: u16, y: u16) -> Option<LineAt> {
+        let mut offset = u32::MAX;
+        let mut is_link = 0u8;
+        let mut failed = false;
+        let text = read_sized(|out, len, required| {
+            let written = unsafe {
+                sys::embeddedTerminalLineAt(
+                    self.handle,
+                    x,
+                    y,
+                    out,
+                    len,
+                    required,
+                    &mut offset,
+                    &mut is_link,
+                )
+            };
+            failed = written < 0 && written != OUT_OF_SPACE;
+            written
+        });
+        if failed {
+            return None;
+        }
+        Some(if is_link != 0 {
+            LineAt::Link(text)
+        } else {
+            LineAt::Text {
+                text,
+                offset: (offset != u32::MAX).then_some(offset as usize),
+            }
         })
     }
 

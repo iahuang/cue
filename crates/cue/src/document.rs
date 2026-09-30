@@ -119,6 +119,7 @@ pub struct Document {
     pub file: RefCell<File>,
     /// What the file is written in, if known.
     pub language: Cell<Option<&'static Language>>,
+    language_override: Cell<bool>,
     /// What Tab inserts: inferred from the text as it was opened.
     pub indent: Cell<Indent>,
     /// Highlights the text on screen as it's drawn, if cue knows how.
@@ -198,6 +199,7 @@ impl Document {
             buffer,
             file: RefCell::new(file),
             language: Cell::new(language),
+            language_override: Cell::new(false),
             indent: Cell::new(indent),
             syntax: RefCell::new(syntax),
             history: RefCell::new(History::new()),
@@ -313,6 +315,37 @@ impl Document {
 
     pub fn is_modified(&self) -> bool {
         self.history.borrow().is_modified()
+    }
+
+    /// The text, if it has unsaved changes. Safe to call while unwinding
+    /// from a panic: taken to have them if its history is in use.
+    pub fn unsaved_text(&self) -> Option<String> {
+        let modified = self
+            .history
+            .try_borrow()
+            .map_or(true, |history| history.is_modified());
+        modified.then(|| self.buffer.text())
+    }
+
+    /// The file's path, or `None` if it has none or it's in use; see
+    /// [`Document::unsaved_text`].
+    pub fn try_path(&self) -> Option<PathBuf> {
+        self.file.try_borrow().ok()?.path.clone()
+    }
+
+    /// Takes `text`, recovered after a crash, as an unsaved edit, one undo
+    /// step.
+    pub fn restore_text(&self, text: &str) {
+        if let Some(owner) = self.cursor_owner.take() {
+            self.park(owner);
+        }
+        let steps = self.buffer.replace_changed_lines(text);
+        let mut history = self.history.borrow_mut();
+        history.break_group();
+        history.record(EditKind::Other, steps);
+        history.break_group();
+        drop(history);
+        self.follow_edits();
     }
 
     /// An unnamed document that was never typed in, which opening a file
@@ -440,10 +473,22 @@ impl Document {
         took
     }
 
+    /// Overrides highlighting for every view of this document, including after saving.
+    pub fn set_language(&self, language: Option<&'static Language>) {
+        self.language_override.set(true);
+        self.language.set(language);
+        self.buffer.remove_highlights(crate::syntax::HIGHLIGHTS);
+        *self.syntax.borrow_mut() =
+            language.and_then(|language| Highlighter::new(language, &self.theme));
+    }
+
     /// Saves to `path` from now on, highlighting and indenting for its
     /// language.
     pub fn rename(&self, path: PathBuf) {
         self.file.borrow_mut().path = Some(path);
+        if self.language_override.get() {
+            return;
+        }
         let language = detect_language(&self.buffer, self.path().as_deref());
         if language.map(|l| l.name) != self.language.get().map(|l| l.name) {
             self.language.set(language);

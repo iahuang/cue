@@ -34,6 +34,9 @@ pub struct Syntax {
     /// Applied as one query: where to highlight parts of the text as
     /// another language, such as a Markdown code block's.
     pub injections: &'static [&'static str],
+    /// Applied as one query: what the text defines, for Go to Symbol (see
+    /// [`crate::symbols`]).
+    pub tags: &'static [&'static str],
 }
 
 impl Language {
@@ -47,7 +50,19 @@ impl Language {
                 grammar,
                 highlights,
                 injections: &[],
+                tags: &[],
             }),
+            ..self
+        }
+    }
+
+    /// Outlines it for Go to Symbol with `tags`.
+    const fn tagged(self, tags: &'static [&'static str]) -> Language {
+        let Some(syntax) = self.syntax else {
+            panic!("tags without highlights");
+        };
+        Language {
+            syntax: Some(Syntax { tags, ..syntax }),
             ..self
         }
     }
@@ -96,10 +111,12 @@ const fn language(
 }
 
 static LANGUAGES: &[Language] = &[
-    language("Rust", &["rs"], &[], &[]).highlighted(
-        || tree_sitter_rust::LANGUAGE.into(),
-        &[include_str!("../queries/rust/highlights.scm")],
-    ),
+    language("Rust", &["rs"], &[], &[])
+        .highlighted(
+            || tree_sitter_rust::LANGUAGE.into(),
+            &[include_str!("../queries/rust/highlights.scm")],
+        )
+        .tagged(&[include_str!("../queries/rust/tags.scm")]),
     language("TOML", &["toml"], &["Cargo.lock"], &[]).highlighted(
         || tree_sitter_toml_ng::LANGUAGE.into(),
         &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
@@ -117,17 +134,20 @@ static LANGUAGES: &[Language] = &[
         .injecting(&[
             tree_sitter_md::INJECTION_QUERY_BLOCK,
             include_str!("../queries/markdown/injections.scm"),
-        ]),
+        ])
+        .tagged(&[include_str!("../queries/markdown/tags.scm")]),
     language("JSON", &["json", "jsonc"], &[], &[])
         .indented(Indent::Spaces(2))
         .highlighted(
             || tree_sitter_json::LANGUAGE.into(),
             &[tree_sitter_json::HIGHLIGHTS_QUERY],
         ),
-    language("Python", &["py", "pyi", "pyw"], &[], &["python"]).highlighted(
-        || tree_sitter_python::LANGUAGE.into(),
-        &[tree_sitter_python::HIGHLIGHTS_QUERY],
-    ),
+    language("Python", &["py", "pyi", "pyw"], &[], &["python"])
+        .highlighted(
+            || tree_sitter_python::LANGUAGE.into(),
+            &[tree_sitter_python::HIGHLIGHTS_QUERY],
+        )
+        .tagged(&[tree_sitter_python::TAGS_QUERY]),
     language("JavaScript", &["js", "mjs", "cjs", "jsx"], &[], &["node"])
         .indented(Indent::Spaces(2))
         .highlighted(
@@ -136,7 +156,8 @@ static LANGUAGES: &[Language] = &[
                 tree_sitter_javascript::HIGHLIGHT_QUERY,
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             ],
-        ),
+        )
+        .tagged(&[tree_sitter_javascript::TAGS_QUERY]),
     // TypeScript's queries only add to JavaScript's.
     language("TypeScript", &["ts", "mts", "cts"], &[], &["deno", "bun"])
         .indented(Indent::Spaces(2))
@@ -146,7 +167,11 @@ static LANGUAGES: &[Language] = &[
                 tree_sitter_javascript::HIGHLIGHT_QUERY,
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
             ],
-        ),
+        )
+        .tagged(&[
+            tree_sitter_javascript::TAGS_QUERY,
+            tree_sitter_typescript::TAGS_QUERY,
+        ]),
     language("TSX", &["tsx"], &[], &[])
         .indented(Indent::Spaces(2))
         .highlighted(
@@ -156,18 +181,25 @@ static LANGUAGES: &[Language] = &[
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
             ],
-        ),
+        )
+        .tagged(&[
+            tree_sitter_javascript::TAGS_QUERY,
+            tree_sitter_typescript::TAGS_QUERY,
+        ]),
     // Indented as gofmt writes it.
     language("Go", &["go"], &[], &[])
         .indented(Indent::Tabs)
         .highlighted(
             || tree_sitter_go::LANGUAGE.into(),
             &[tree_sitter_go::HIGHLIGHTS_QUERY],
-        ),
-    language("C", &["c", "h"], &[], &[]).highlighted(
-        || tree_sitter_c::LANGUAGE.into(),
-        &[tree_sitter_c::HIGHLIGHT_QUERY],
-    ),
+        )
+        .tagged(&[tree_sitter_go::TAGS_QUERY]),
+    language("C", &["c", "h"], &[], &[])
+        .highlighted(
+            || tree_sitter_c::LANGUAGE.into(),
+            &[tree_sitter_c::HIGHLIGHT_QUERY],
+        )
+        .tagged(&[tree_sitter_c::TAGS_QUERY]),
     // C++'s queries only add to C's. CUDA is C++ with a few extensions,
     // which C++'s grammar gets mostly right: CUDA's own grammar is ~7 MB.
     language(
@@ -183,7 +215,8 @@ static LANGUAGES: &[Language] = &[
             tree_sitter_c::HIGHLIGHT_QUERY,
             tree_sitter_cpp::HIGHLIGHT_QUERY,
         ],
-    ),
+    )
+    .tagged(&[tree_sitter_cpp::TAGS_QUERY]),
     language(
         "Shell",
         &["sh", "bash", "zsh"],
@@ -199,7 +232,8 @@ static LANGUAGES: &[Language] = &[
     .highlighted(
         || tree_sitter_bash::LANGUAGE.into(),
         &[tree_sitter_bash::HIGHLIGHT_QUERY],
-    ),
+    )
+    .tagged(&[include_str!("../queries/bash/tags.scm")]),
     language("YAML", &["yaml", "yml"], &[], &[])
         .indented(Indent::Spaces(2))
         .highlighted(
@@ -219,22 +253,28 @@ static LANGUAGES: &[Language] = &[
             || tree_sitter_css::LANGUAGE.into(),
             &[tree_sitter_css::HIGHLIGHTS_QUERY],
         ),
-    language("Zig", &["zig", "zon"], &[], &[]).highlighted(
-        || tree_sitter_zig::LANGUAGE.into(),
-        &[include_str!("../queries/zig/highlights.scm")],
-    ),
-    language("Java", &["java"], &[], &[]).highlighted(
-        || tree_sitter_java::LANGUAGE.into(),
-        &[tree_sitter_java::HIGHLIGHTS_QUERY],
-    ),
+    language("Zig", &["zig", "zon"], &[], &[])
+        .highlighted(
+            || tree_sitter_zig::LANGUAGE.into(),
+            &[include_str!("../queries/zig/highlights.scm")],
+        )
+        .tagged(&[include_str!("../queries/zig/tags.scm")]),
+    language("Java", &["java"], &[], &[])
+        .highlighted(
+            || tree_sitter_java::LANGUAGE.into(),
+            &[tree_sitter_java::HIGHLIGHTS_QUERY],
+        )
+        .tagged(&[tree_sitter_java::TAGS_QUERY]),
     language("Kotlin", &["kt", "kts"], &[], &[]).highlighted(
         || arborium_kotlin::language().into(),
         &[arborium_kotlin::HIGHLIGHTS_QUERY],
     ),
-    language("Swift", &["swift"], &[], &["swift"]).highlighted(
-        || tree_sitter_swift::LANGUAGE.into(),
-        &[tree_sitter_swift::HIGHLIGHTS_QUERY],
-    ),
+    language("Swift", &["swift"], &[], &["swift"])
+        .highlighted(
+            || tree_sitter_swift::LANGUAGE.into(),
+            &[tree_sitter_swift::HIGHLIGHTS_QUERY],
+        )
+        .tagged(&[tree_sitter_swift::TAGS_QUERY]),
     language("Dart", &["dart"], &[], &[])
         .indented(Indent::Spaces(2))
         .highlighted(
@@ -251,7 +291,8 @@ static LANGUAGES: &[Language] = &[
     .highlighted(
         || tree_sitter_ruby::LANGUAGE.into(),
         &[tree_sitter_ruby::HIGHLIGHTS_QUERY],
-    ),
+    )
+    .tagged(&[tree_sitter_ruby::TAGS_QUERY]),
     // Text outside `<?php ?>` is HTML.
     language("PHP", &["php", "phtml"], &[], &["php"])
         .highlighted(
@@ -261,7 +302,8 @@ static LANGUAGES: &[Language] = &[
         .injecting(&[
             tree_sitter_php::INJECTIONS_QUERY,
             include_str!("../queries/php/injections.scm"),
-        ]),
+        ])
+        .tagged(&[tree_sitter_php::TAGS_QUERY]),
     language("Perl", &["pl", "pm"], &[], &["perl"])
         .highlighted(
             || arborium_perl::language().into(),
@@ -274,17 +316,20 @@ static LANGUAGES: &[Language] = &[
             || tree_sitter_elixir::LANGUAGE.into(),
             &[tree_sitter_elixir::HIGHLIGHTS_QUERY],
         )
-        .injecting(&[tree_sitter_elixir::INJECTIONS_QUERY]),
+        .injecting(&[tree_sitter_elixir::INJECTIONS_QUERY])
+        .tagged(&[tree_sitter_elixir::TAGS_QUERY]),
     language("Haskell", &["hs"], &[], &["runhaskell", "runghc"])
         .highlighted(
             || tree_sitter_haskell::LANGUAGE.into(),
             &[include_str!("../queries/haskell/highlights.scm")],
         )
         .injecting(&[tree_sitter_haskell::INJECTIONS_QUERY]),
-    language("R", &["r"], &[".Rprofile"], &["Rscript"]).highlighted(
-        || tree_sitter_r::LANGUAGE.into(),
-        &[tree_sitter_r::HIGHLIGHTS_QUERY],
-    ),
+    language("R", &["r"], &[".Rprofile"], &["Rscript"])
+        .highlighted(
+            || tree_sitter_r::LANGUAGE.into(),
+            &[tree_sitter_r::HIGHLIGHTS_QUERY],
+        )
+        .tagged(&[tree_sitter_r::TAGS_QUERY]),
     language("SQL", &["sql"], &[], &[]).highlighted(
         || tree_sitter_sequel::LANGUAGE.into(),
         &[tree_sitter_sequel::HIGHLIGHTS_QUERY],
@@ -452,7 +497,6 @@ static MARKDOWN_INLINE: Language = language("Markdown inline", &[], &[], &[])
     .injecting(&[tree_sitter_md::INJECTION_QUERY_INLINE]);
 
 /// Every language cue knows.
-#[cfg(test)]
 pub fn all() -> impl Iterator<Item = &'static Language> {
     LANGUAGES.iter().chain([&MARKDOWN_INLINE])
 }

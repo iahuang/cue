@@ -3,7 +3,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use opentui::{
-    Attributes, CursorStyle, EmbeddedTerminal, KeyEvent, KeyMods, MouseAction, MouseButton,
+    Attributes, CursorStyle, EmbeddedTerminal, KeyEvent, KeyMods, LineAt, MouseAction, MouseButton,
     MouseEvent, OwnedBuffer, Rgba, WidthMethod,
 };
 
@@ -37,6 +37,36 @@ fn draws_output_where_asked_within_the_clip() {
     let frame = buffer(6, 2);
     term.draw(&frame, 0, 0);
     assert!(frame.to_text(true).starts_with("ab"));
+}
+
+#[test]
+fn line_at_gives_links_and_lines_joined_across_wraps() {
+    let _serial = serial();
+    let mut term = EmbeddedTerminal::new(10, 4, 1000).unwrap();
+    term.write(b"0123456789abcdef\r\nx \x1b]8;;file:///tmp/a.rs\x1b\\link\x1b]8;;\x1b\\ y")
+        .unwrap();
+    // The second row continues the first.
+    assert_eq!(
+        term.line_at(2, 1),
+        Some(LineAt::Text {
+            text: "0123456789abcdef".into(),
+            offset: Some(12),
+        })
+    );
+    assert_eq!(
+        term.line_at(3, 2),
+        Some(LineAt::Link("file:///tmp/a.rs".into()))
+    );
+    let Some(LineAt::Text { text, offset }) = term.line_at(0, 2) else {
+        panic!("not text");
+    };
+    assert_eq!((text.as_str(), offset), ("x link y", Some(0)));
+    // Past the end of the line's text.
+    assert!(matches!(
+        term.line_at(9, 2),
+        Some(LineAt::Text { offset: None, .. })
+    ));
+    assert_eq!(term.line_at(0, 9), None, "off screen");
 }
 
 #[test]

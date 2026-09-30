@@ -40,6 +40,9 @@ pub const EmbeddedTerminal = struct {
     pub fn selectedText(_: *EmbeddedTerminal) Error![:0]const u8 {
         return error.Unsupported;
     }
+    pub fn lineAt(_: *EmbeddedTerminal, _: anytype, _: *usize, _: *bool) Error![:0]const u8 {
+        return error.Unsupported;
+    }
     pub fn freeSelectedText(_: *EmbeddedTerminal, _: [:0]const u8) void {}
     pub fn invalidate(_: *EmbeddedTerminal) void {}
     pub fn setTransparentBackground(_: *EmbeddedTerminal, _: bool) void {}

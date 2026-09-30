@@ -34,6 +34,8 @@ pub struct Tab {
     /// The panel keys go to while the tab is on screen, unless the file
     /// tree has focus.
     pub active: PanelId,
+    /// The panel active before, which may have closed since.
+    pub previous: Option<PanelId>,
     /// The name it was given, if it was renamed.
     pub name: Option<String>,
 }
@@ -46,6 +48,7 @@ impl Tab {
             layout: Layout::Panel(panel),
             panels: vec![Panel::new(panel)],
             active: panel,
+            previous: None,
             name: None,
         }
     }

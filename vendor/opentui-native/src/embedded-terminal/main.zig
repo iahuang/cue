@@ -133,6 +133,44 @@ pub const EmbeddedTerminal = struct {
         return try screen.selectionString(self.allocator, .{ .sel = selection });
     }
 
+    /// What's at viewport cell `at`, for the host to open: the URI of an
+    /// OSC 8 hyperlink there (`is_link` set), or else the text of its line,
+    /// joined across soft wraps, with `offset` set to the byte in it where
+    /// the cell's text starts (maxInt if the cell is blank past the end).
+    /// Free with `freeSelectedText`.
+    pub fn lineAt(self: *EmbeddedTerminal, at: ghostty.Coordinate, offset: *usize, is_link: *bool) Error![:0]const u8 {
+        offset.* = std.math.maxInt(usize);
+        is_link.* = false;
+        const screen = self.terminal.screens.active;
+        const pin = screen.pages.pin(.{ .viewport = at }) orelse return error.InvalidValue;
+        const page = pin.node.page();
+        const cell = page.getRowAndCell(pin.x, pin.y).cell;
+        if (cell.hyperlink) {
+            if (page.lookupHyperlink(cell)) |id| {
+                const link = page.hyperlink_set.get(page.memory, id);
+                is_link.* = true;
+                offset.* = 0;
+                return try self.allocator.dupeZ(u8, link.uri.slice(page.memory));
+            }
+        }
+        const selection = screen.selectLine(.{
+            .pin = pin,
+            .whitespace = null,
+            .semantic_prompt_boundary = false,
+        }) orelse return try self.allocator.dupeZ(u8, "");
+        var map: ghostty.StringMap = undefined;
+        const text = try screen.selectionString(self.allocator, .{ .sel = selection, .trim = false, .map = &map });
+        defer map.deinit(self.allocator);
+        for (0..map.map.count()) |i| {
+            const mapped = map.map.get(i) orelse continue;
+            if (mapped.node == pin.node and mapped.x == pin.x and mapped.y == pin.y) {
+                offset.* = i;
+                break;
+            }
+        }
+        return text;
+    }
+
     pub fn freeSelectedText(self: *EmbeddedTerminal, text: [:0]const u8) void {
         self.allocator.free(text);
     }

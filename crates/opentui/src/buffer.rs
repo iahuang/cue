@@ -184,6 +184,16 @@ impl Buffer {
         (!bg.is_null()).then(|| Rgba(unsafe { *bg.add(index) }))
     }
 
+    /// The attributes of cell (`x`, `y`), or `None` outside the buffer.
+    pub fn attributes_at(&self, x: u32, y: u32) -> Option<Attributes> {
+        if x >= self.width() || y >= self.height() {
+            return None;
+        }
+        let index = y as usize * self.width() as usize + x as usize;
+        let attributes = unsafe { sys::bufferGetAttributesPtr(self.handle) };
+        (!attributes.is_null()).then(|| Attributes(unsafe { *attributes.add(index) }))
+    }
+
     /// The native handle, for calling [`sys`](crate::sys) functions directly.
     pub fn raw_handle(&self) -> sys::Handle {
         self.handle

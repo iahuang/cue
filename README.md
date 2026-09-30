@@ -15,5 +15,8 @@ curl -fsSL https://s3.ianhuang.dev/cue/install.sh | bash
 
 - multi panel editing
 - `ripgrep` search
-- terminal buffers
+- go to symbol, in the file (`ctrl+r`) or the workspace (`ctrl+shift+r`), from tree-sitter; go to line (`ctrl+l`)
+- terminal buffers; `ctrl+click` opens a path (`src/main.rs:12:5`) or URL printed in one
+- `cue src/main.rs:12:5` opens a file at a line and column
+- unsaved changes survive crashes and dropped ssh sessions, and are offered back next time
 - image viewer (kitty graphics protocol)

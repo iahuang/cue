@@ -3,6 +3,12 @@
 //! untitled files included, or, when the query starts with `>`, every command with its
 //! shortcut (Ctrl+K), as in Sublime and VS Code.
 //!
+//! As there, the query's first character can ask for something else: `@`
+//! for the symbols the file on screen defines (Ctrl+R), `#` for those the
+//! whole workspace does (Ctrl+Shift+R), `:` for a line to go to
+//! (Ctrl+L), and `$` for just the terminals. A file's name can end in a line to go to, as compilers print
+//! it: `main.rs:12` or `main.rs:12:5`.
+//!
 //! Matching is fuzzy: the query's characters must appear in order, so `abcr`
 //! finds `abracadabra.rs`. Matches at word starts, after `/`, and in runs
 //! rank higher.
@@ -29,6 +35,9 @@ use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Context, Keymap};
 use crate::line_edit::{Caret, Edit};
+use crate::location::{self, Position};
+use crate::symbols::{self, Symbol};
+use crate::theme::SyntaxColor;
 use crate::workspace::Workspace;
 
 /// The terminal's own background, as behind the editor; the border sets
@@ -47,18 +56,51 @@ const MAX_ROWS: u32 = 14;
 /// Rows the mouse wheel scrolls.
 const WHEEL_ROWS: usize = 3;
 
-/// What the picker lists. The query decides: `>` first means commands.
+/// What the picker lists. Outside language selection, the query's first
+/// character decides (see [`Mode::prefix`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Files,
     Commands,
+    Languages,
+    /// A line in the file on screen.
+    Line,
+    /// The symbols the file on screen defines.
+    Symbols,
+    /// The symbols the workspace's files define.
+    WorkspaceSymbols,
+    /// The terminals, as listed among what was shown recently.
+    Terminals,
+}
+
+impl Mode {
+    /// The character that starts a query for this mode.
+    fn prefix(self) -> Option<char> {
+        match self {
+            Mode::Files | Mode::Languages => None,
+            Mode::Commands => Some('>'),
+            Mode::Line => Some(':'),
+            Mode::Symbols => Some('@'),
+            Mode::WorkspaceSymbols => Some('#'),
+            // A shell's prompt.
+            Mode::Terminals => Some('$'),
+        }
+    }
 }
 
 /// What was picked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
     File(PathBuf),
+    /// A file, at a line and maybe a column.
+    FileAt(PathBuf, Position),
+    /// A line, and maybe a column, in the file on screen.
+    Line(Position),
+    /// A symbol's name: in the file at the path, or on screen without one;
+    /// on a line, 0-based, in its bytes there.
+    Symbol(Option<PathBuf>, u32, Range<usize>),
     Command(Command),
+    Language(Option<&'static str>),
     /// A terminal, by its id.
     Terminal(u32),
     /// An untitled file, by its number.
@@ -86,6 +128,9 @@ pub struct Item {
     /// Shown on the right: a command's shortcut, or `recent`.
     detail: String,
     choice: Choice,
+    /// The color of the text that isn't dimmed: a symbol's name, as the
+    /// editor colors it.
+    color: Option<SyntaxColor>,
 }
 
 impl Item {
@@ -99,6 +144,7 @@ impl Item {
             dim: 0..folder,
             detail: detail.to_string(),
             choice: Choice::File(path),
+            color: None,
         }
     }
 
@@ -115,6 +161,7 @@ impl Item {
             text,
             detail: "terminal".to_string(),
             choice: Choice::Terminal(id),
+            color: None,
         }
     }
 
@@ -125,6 +172,37 @@ impl Item {
             dim: 0..0,
             detail: "unsaved".to_string(),
             choice: Choice::Untitled(number),
+            color: None,
+        }
+    }
+
+    /// `symbol`, defined in the file on screen.
+    pub fn symbol(symbol: Symbol) -> Item {
+        let name = symbol.name.chars().count();
+        let text = match symbol.container.is_empty() {
+            true => symbol.name,
+            false => format!("{} {}", symbol.name, symbol.container),
+        };
+        Item {
+            dim: name..text.chars().count(),
+            text,
+            detail: symbol.kind.to_string(),
+            color: symbols::color(symbol.kind),
+            choice: Choice::Symbol(None, symbol.line, symbol.bytes),
+        }
+    }
+
+    /// `symbol`, defined in the file at `path`, which is `shown` as named
+    /// in the workspace.
+    pub fn workspace_symbol(symbol: Symbol, path: PathBuf, shown: &str) -> Item {
+        let name = symbol.name.chars().count();
+        let text = format!("{} {shown}:{}", symbol.name, symbol.line + 1);
+        Item {
+            dim: name..text.chars().count(),
+            text,
+            detail: symbol.kind.to_string(),
+            color: symbols::color(symbol.kind),
+            choice: Choice::Symbol(Some(path), symbol.line, symbol.bytes),
         }
     }
 
@@ -139,13 +217,15 @@ impl Item {
                 .shortcut(command)
                 .map_or(String::new(), |key| key.to_string()),
             choice: Choice::Command(command),
+            color: None,
         }
     }
 
-    fn path(&self) -> Option<&Path> {
+    /// The file it is, if it's one.
+    pub fn path(&self) -> Option<&Path> {
         match &self.choice {
             Choice::File(path) => Some(path),
-            Choice::Command(_) | Choice::Terminal(_) | Choice::Untitled(_) => None,
+            _ => None,
         }
     }
 }
@@ -156,6 +236,8 @@ pub struct Picker {
     /// What was shown recently, files and terminals, most recent first.
     /// Listed before the rest.
     recent: Vec<Item>,
+    /// The terminals among `recent`, in terminal mode.
+    terminals: Vec<Item>,
     /// The workspace's files, from the file index.
     files: Rc<Vec<Item>>,
     /// Positions in `files` of the recent files, ascending, so that each
@@ -168,6 +250,20 @@ pub struct Picker {
     /// The bottom border's hint for closing what was shown recently.
     close_hint: String,
     commands: Vec<Item>,
+    languages: Vec<Item>,
+    language_mode: bool,
+    /// The symbols the file on screen defines, once given.
+    outline: Option<Vec<Item>>,
+    /// The workspace's symbols, from the app's symbol index.
+    workspace_symbols: Rc<Vec<Item>>,
+    /// Whether the workspace's symbols are still being indexed.
+    indexing: bool,
+    /// The workspace's symbols were asked for, and not yet given.
+    wants_symbols: bool,
+    /// What `:` and a line number go to, in line mode.
+    line: Vec<Item>,
+    /// The line a file's name in the query ends with, in file mode.
+    position: Option<Position>,
     pattern: Pattern,
     matcher: RefCell<Matcher>,
     /// Positions of the matching items (see [`Picker::item`]), best first.
@@ -214,6 +310,7 @@ impl Picker {
         let mut picker = Picker {
             query: String::new(),
             caret: Caret::default(),
+            terminals: terminals(&recent),
             recent,
             files: Rc::new(Vec::new()),
             duplicates: Vec::new(),
@@ -223,6 +320,23 @@ impl Picker {
                 .shortcut(Command::PickerCloseItem)
                 .map_or(String::new(), |key| format!(" {key:#} close ")),
             commands,
+            languages: std::iter::once(None)
+                .chain(crate::language::all().map(|language| Some(language.name)))
+                .map(|name| Item {
+                    text: name.unwrap_or("Plain Text").to_string(),
+                    dim: 0..0,
+                    detail: String::new(),
+                    choice: Choice::Language(name),
+                    color: None,
+                })
+                .collect(),
+            language_mode: false,
+            outline: None,
+            workspace_symbols: Rc::new(Vec::new()),
+            indexing: false,
+            wants_symbols: false,
+            line: Vec::new(),
+            position: None,
             pattern: Pattern::default(),
             matcher: RefCell::new(Matcher::new(Config::DEFAULT.match_paths())),
             matches: Vec::new(),
@@ -237,22 +351,68 @@ impl Picker {
     }
 
     pub fn mode(&self) -> Mode {
-        if self.query.starts_with('>') {
-            Mode::Commands
-        } else {
-            Mode::Files
+        if self.language_mode {
+            return Mode::Languages;
         }
+        let first = self.query.chars().next();
+        [
+            Mode::Commands,
+            Mode::Line,
+            Mode::Symbols,
+            Mode::WorkspaceSymbols,
+            Mode::Terminals,
+        ]
+        .into_iter()
+        .find(|mode| first.is_some() && mode.prefix() == first)
+        .unwrap_or(Mode::Files)
     }
 
     /// Switches to listing `mode`, keeping what was typed.
     pub fn set_mode(&mut self, mode: Mode) {
         let needle = self.needle().to_string();
-        self.query = match mode {
-            Mode::Files => needle,
-            Mode::Commands => format!(">{needle}"),
+        self.language_mode = mode == Mode::Languages;
+        self.query = match mode.prefix() {
+            Some(prefix) => format!("{prefix}{needle}"),
+            None => needle,
         };
         self.caret.move_to_end();
         self.query_changed();
+    }
+
+    /// Whether it lists the file's symbols, but wasn't given them yet
+    /// (see [`Picker::set_outline`]).
+    pub fn wants_outline(&self) -> bool {
+        self.mode() == Mode::Symbols && self.outline.is_none()
+    }
+
+    /// Lists `items` as the symbols of the file on screen, in order.
+    pub fn set_outline(&mut self, items: Vec<Item>) {
+        self.outline = Some(items);
+        if self.mode() == Mode::Symbols {
+            self.refilter(None);
+        }
+    }
+
+    /// Whether it lists the workspace's symbols, and hasn't asked for them
+    /// since it opened: true once.
+    pub fn take_symbols_request(&mut self) -> bool {
+        if self.mode() != Mode::WorkspaceSymbols || self.wants_symbols {
+            return false;
+        }
+        self.wants_symbols = true;
+        true
+    }
+
+    /// Lists `items` as the workspace's symbols, keeping the selection on
+    /// the same one if it's still there. `indexing` says the first index
+    /// isn't complete.
+    pub fn set_workspace_symbols(&mut self, items: Rc<Vec<Item>>, indexing: bool) {
+        let selected = self.selected_item().map(|item| item.text.clone());
+        self.workspace_symbols = items;
+        self.indexing = indexing;
+        if self.mode() == Mode::WorkspaceSymbols {
+            self.refilter(selected);
+        }
     }
 
     pub fn set_size(&mut self, width: u32, height: u32) {
@@ -275,6 +435,7 @@ impl Picker {
     /// Lists `recent` first from now on, as after one was closed, keeping
     /// the selection where it was.
     pub fn set_recent(&mut self, recent: Vec<Item>) {
+        self.terminals = terminals(&recent);
         self.recent = recent;
         self.find_duplicates();
         let (selected, scroll) = (self.selected, self.scroll);
@@ -313,11 +474,14 @@ impl Picker {
             Command::PickerClose => return PickerAction::Close,
             Command::PickerCloseItem => {
                 // Only what was shown recently is open to close.
-                let recent = self.mode() == Mode::Files
-                    && self
+                let recent = match self.mode() {
+                    Mode::Files => self
                         .matches
                         .get(self.selected)
-                        .is_some_and(|&i| i < self.recent.len());
+                        .is_some_and(|&i| i < self.recent.len()),
+                    Mode::Terminals => true,
+                    _ => false,
+                };
                 if let Some(item) = self.selected_item().filter(|_| recent) {
                     return PickerAction::CloseItem(item.choice.clone());
                 }
@@ -382,15 +546,35 @@ impl Picker {
 
     // --- matching -----------------------------------------------------------
 
-    /// The query without the `>` that asks for commands.
+    /// The query without the character that asks for the mode, or in file
+    /// mode, the line a name ends with.
     fn needle(&self) -> &str {
-        self.query.strip_prefix('>').unwrap_or(&self.query)
+        let mode = self.mode();
+        match mode.prefix() {
+            Some(prefix) => &self.query[prefix.len_utf8()..],
+            None if mode == Mode::Files => match location::split_position(&self.query) {
+                (name, Some(_)) if !name.is_empty() => name,
+                _ => &self.query,
+            },
+            None => &self.query,
+        }
     }
 
     fn query_changed(&mut self) {
         // A new query starts at the best match.
         self.selected = 0;
         self.scroll = 0;
+        self.position = match self.mode() {
+            Mode::Files => match location::split_position(&self.query) {
+                (name, position) if !name.is_empty() => position,
+                _ => None,
+            },
+            _ => None,
+        };
+        self.line = match self.mode() {
+            Mode::Line => line_item(self.needle()).into_iter().collect(),
+            _ => Vec::new(),
+        };
         self.refilter(None);
     }
 
@@ -400,6 +584,11 @@ impl Picker {
         match self.mode() {
             Mode::Files => (&self.recent, &self.files),
             Mode::Commands => (&self.commands, &[]),
+            Mode::Languages => (&self.languages, &[]),
+            Mode::Line => (&self.line, &[]),
+            Mode::Symbols => (self.outline.as_deref().unwrap_or_default(), &[]),
+            Mode::WorkspaceSymbols => (&self.workspace_symbols, &[]),
+            Mode::Terminals => (&self.terminals, &[]),
         }
     }
 
@@ -420,12 +609,17 @@ impl Picker {
     /// text `selected` if it matches. Better matches come first; among equal
     /// ones, recent files, then shorter paths.
     fn refilter(&mut self, selected: Option<String>) {
-        self.pattern = Pattern::parse(self.needle(), CaseMatching::Smart, Normalization::Smart);
+        // The line's number is what's asked for; it isn't matched.
+        let needle = match self.mode() {
+            Mode::Line => "",
+            _ => self.needle(),
+        };
+        self.pattern = Pattern::parse(needle, CaseMatching::Smart, Normalization::Smart);
         let mut matcher = self.matcher.borrow_mut();
         let (first, rest) = self.lists();
         let mut skip = match self.mode() {
             Mode::Files => &self.duplicates[..],
-            Mode::Commands => &[],
+            _ => &[],
         }
         .iter()
         .map(|&i| first.len() + i)
@@ -465,10 +659,13 @@ impl Picker {
     }
 
     fn accept(&self) -> PickerAction {
-        match self.selected_item() {
-            Some(item) => PickerAction::Accept(item.choice.clone()),
-            None => PickerAction::Continue,
-        }
+        let Some(item) = self.selected_item() else {
+            return PickerAction::Continue;
+        };
+        PickerAction::Accept(match (&item.choice, self.position) {
+            (Choice::File(path), Some(position)) => Choice::FileAt(path.clone(), position),
+            (choice, _) => choice.clone(),
+        })
     }
 
     // --- layout and drawing -------------------------------------------------
@@ -521,12 +718,21 @@ impl Picker {
         let (title, noun) = match self.mode() {
             Mode::Files => ("Go to File", "files"),
             Mode::Commands => ("Commands", "commands"),
+            Mode::Languages => ("Syntax Highlighting", "languages"),
+            Mode::Line => ("Go to Line", "lines"),
+            Mode::Symbols => ("Go to Symbol in File", "symbols"),
+            Mode::WorkspaceSymbols => ("Go to Symbol in Workspace", "symbols"),
+            Mode::Terminals => ("Go to Terminal", "terminals"),
         };
         draw_frame(frame, area, title);
         let status = self.status(noun);
         draw_status(frame, area, &status);
         let room = width.saturating_sub(status.chars().count() as u32 + 6) as usize;
-        let closable = self.mode() == Mode::Files && !self.recent.is_empty();
+        let closable = match self.mode() {
+            Mode::Files => !self.recent.is_empty(),
+            Mode::Terminals => !self.terminals.is_empty(),
+            _ => false,
+        };
         if closable && self.close_hint.chars().count() <= room {
             let bottom = y + height - 1;
             frame.draw_text(&self.close_hint, x + 2, bottom, DIM, None, Attributes::NONE);
@@ -541,8 +747,15 @@ impl Picker {
         let cursor = (text_x + column as u32, y + 1);
         if self.needle().is_empty() {
             let hint = match self.mode() {
-                Mode::Files => "Search files by name, or type > for commands",
+                Mode::Files => {
+                    "Search files by name, or type > for commands, @ for symbols, $ for terminals"
+                }
                 Mode::Commands => "Search commands",
+                Mode::Languages => "Search languages",
+                Mode::Line => "Type a line number, or line:column",
+                Mode::Symbols => "Search symbols in this file",
+                Mode::WorkspaceSymbols => "Search symbols in the workspace",
+                Mode::Terminals => "Search terminals by name or what's running",
             };
             let hint: String = hint
                 .chars()
@@ -554,10 +767,18 @@ impl Picker {
 
         let list = y + 3;
         if self.matches.is_empty() {
-            let empty = if self.listing() {
-                "Listing files…".to_string()
-            } else {
-                format!("No matching {noun}")
+            let (first, rest) = self.lists();
+            let empty = match self.mode() {
+                _ if self.listing() => "Listing files…".to_string(),
+                Mode::WorkspaceSymbols if self.indexing => "Indexing symbols…".to_string(),
+                Mode::Line if !self.needle().is_empty() => "Not a line number".to_string(),
+                Mode::Line => String::new(),
+                Mode::Symbols if self.outline.is_none() => String::new(),
+                Mode::Symbols if first.is_empty() => "No symbols in this file".to_string(),
+                // The one on screen isn't listed.
+                Mode::Terminals if first.is_empty() => "No other terminals".to_string(),
+                _ if first.is_empty() && rest.is_empty() => format!("No {noun}"),
+                _ => format!("No matching {noun}"),
             };
             frame.draw_text(&empty, text_x, list, DIM, None, Attributes::NONE);
         }
@@ -578,6 +799,9 @@ impl Picker {
 
     /// The count of matches, or of files so far while listing them.
     fn status(&self, noun: &str) -> String {
+        if self.mode() == Mode::Line {
+            return String::new();
+        }
         let (first, rest) = self.lists();
         let mut total = first.len() + rest.len();
         if self.mode() == Mode::Files {
@@ -585,6 +809,8 @@ impl Picker {
         }
         let listing = if self.listing() {
             " listing…"
+        } else if self.indexing && self.mode() == Mode::WorkspaceSymbols {
+            " indexing…"
         } else if self.truncated && self.mode() == Mode::Files {
             " (too many to list all)"
         } else {
@@ -607,7 +833,7 @@ impl Picker {
             )),
             Choice::Untitled(_) => Some(icons::file("")),
             Choice::Terminal(_) => Some(icons::terminal()),
-            Choice::Command(_) => None,
+            _ => None,
         };
         let (x, room) = match icon.filter(|_| icons::enabled() && room > 2 * icons::WIDTH as usize)
         {
@@ -643,13 +869,21 @@ impl Picker {
             (0..room.saturating_sub(1), "…")
         };
         let mut x = x;
+        // A colored name's matches keep its color, as the match color
+        // could be the name's own.
+        let color = item
+            .color
+            .map(|color| (color.fg().unwrap_or(FG), color.attributes()));
         let style = |i: usize| {
-            if highlights.contains(&i) {
-                (MATCH_FG, Attributes::BOLD)
-            } else if item.dim.contains(&i) {
-                (DIM, Attributes::NONE)
-            } else {
-                (FG, Attributes::NONE)
+            let dim = item.dim.contains(&i);
+            match (highlights.contains(&i), color.filter(|_| !dim)) {
+                (true, Some((fg, attributes))) => {
+                    (fg, attributes | Attributes::BOLD | Attributes::UNDERLINE)
+                }
+                (true, None) => (MATCH_FG, Attributes::BOLD),
+                (false, _) if dim => (DIM, Attributes::NONE),
+                (false, Some(style)) => style,
+                (false, None) => (FG, Attributes::NONE),
             }
         };
         let mut draw = |text: &str, (fg, attributes): (Rgba, Attributes)| {
@@ -679,6 +913,33 @@ impl Picker {
             draw(ellipsis, (DIM, Attributes::NONE));
         }
     }
+}
+
+/// The terminals among `recent`, in order.
+fn terminals(recent: &[Item]) -> Vec<Item> {
+    recent
+        .iter()
+        .filter(|item| matches!(item.choice, Choice::Terminal(_)))
+        .cloned()
+        .collect()
+}
+
+/// What `needle`, a line number or `line:column` typed after `:`, goes to.
+fn line_item(needle: &str) -> Option<Item> {
+    let query = format!(":{}", needle.trim());
+    let (rest, position) = location::split_position(&query);
+    let position = position.filter(|_| rest.is_empty())?;
+    let text = match position.column {
+        Some(column) => format!("Go to line {}, column {}", position.line + 1, column + 1),
+        None => format!("Go to line {}", position.line + 1),
+    };
+    Some(Item {
+        text,
+        dim: 0..0,
+        detail: String::new(),
+        choice: Choice::Line(position),
+        color: None,
+    })
 }
 
 /// Where a popup is on screen.
@@ -882,6 +1143,43 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_dollar_lists_only_terminals() {
+        let root = fixture("terminals", &["build.rs", "a.rs"]);
+        let (workspace, index) = index(&root);
+        let recent = vec![
+            Item::file(root.join("build.rs"), &workspace, "recent"),
+            Item::terminal(1, "shell", "cargo build"),
+            Item::untitled(1),
+            Item::terminal(2, "server", ""),
+        ];
+        let mut picker = Picker::new(
+            Mode::Files,
+            &Keymap::default(),
+            |_| true,
+            recent,
+            &index,
+            80,
+            24,
+        );
+        picker.edit(Edit::Insert("$"));
+        assert_eq!(picker.mode(), Mode::Terminals);
+        assert_eq!(listed(&picker), ["shell cargo build", "server"]);
+        // What's running in it matches too, but files don't.
+        picker.edit(Edit::Insert("build"));
+        assert_eq!(listed(&picker), ["shell cargo build"]);
+        assert_eq!(
+            picker.run(Command::PickerAccept),
+            PickerAction::Accept(Choice::Terminal(1))
+        );
+        assert_eq!(
+            picker.run(Command::PickerCloseItem),
+            PickerAction::CloseItem(Choice::Terminal(1))
+        );
+        picker.set_recent(vec![Item::terminal(2, "server", "")]);
+        assert!(listed(&picker).is_empty());
+    }
+
+    #[test]
     fn a_leading_angle_bracket_lists_commands() {
         let root = fixture("commands", &["a.rs"]);
         let mut picker = picker(&root, Mode::Files, Vec::new());
@@ -977,5 +1275,79 @@ mod tests {
         assert!(lines[4].trim_end().ends_with("name.rs │"), "{text}");
         assert!(lines[5].contains("1 of 2"), "{text}");
         assert_eq!(cursor, (picker.area().x + 6, 2));
+    }
+
+    #[test]
+    fn symbols_are_colored_by_kind() {
+        let _serial = crate::test_serial();
+        let root = fixture("symbol-colors", &["a.rs"]);
+        let (_, index) = index(&root);
+        let mut picker = Picker::new(
+            Mode::Symbols,
+            &Keymap::default(),
+            |_| true,
+            Vec::new(),
+            &index,
+            60,
+            12,
+        );
+        let symbol = |name: &str, kind, container: &str| {
+            Item::symbol(Symbol {
+                name: name.to_string(),
+                kind,
+                line: 0,
+                bytes: 0..name.len(),
+                container: container.to_string(),
+            })
+        };
+        picker.set_outline(vec![
+            symbol("Point", "struct", ""),
+            symbol("norm", "method", "Point"),
+            symbol("geometry", "module", ""),
+        ]);
+        let screen =
+            opentui::OwnedBuffer::new(60, 12, false, opentui::WidthMethod::Unicode, "test")
+                .unwrap();
+        let draw = |picker: &Picker| {
+            screen.clear(Rgba::BLACK);
+            picker.draw(&screen);
+            let text = screen.to_text(true);
+            // The column of `name` in its row, and the row.
+            move |name: &str| {
+                let (y, line) = text
+                    .lines()
+                    .enumerate()
+                    .find(|(_, line)| line.contains(&format!("│ {name}")))
+                    .unwrap_or_else(|| panic!("{name}:\n{text}"));
+                let x = line[..line.find(name).unwrap()].chars().count() as u32;
+                (x, y as u32)
+            }
+        };
+        let fg = |(x, y): (u32, u32)| screen.fg_at(x, y).unwrap();
+        let at = draw(&picker);
+        // As the editor colors them: types, functions; modules plainly.
+        assert_eq!(
+            fg(at("Point")),
+            SyntaxColor::of("type").unwrap().fg().unwrap()
+        );
+        let norm = at("norm");
+        assert_eq!(fg(norm), SyntaxColor::of("function").unwrap().fg().unwrap());
+        // What it's in is dimmed, not colored.
+        assert_eq!(fg((norm.0 + 5, norm.1)), DIM);
+        assert_eq!(fg(at("geometry")), FG);
+
+        // A match keeps the name's color, bold and underlined.
+        picker.edit(Edit::Insert("no"));
+        let norm = draw(&picker)("norm");
+        assert_eq!(fg(norm), SyntaxColor::of("function").unwrap().fg().unwrap());
+        let attributes = screen.attributes_at(norm.0, norm.1).unwrap();
+        assert_eq!(
+            attributes.0 & (Attributes::BOLD | Attributes::UNDERLINE).0,
+            (Attributes::BOLD | Attributes::UNDERLINE).0
+        );
+        assert_eq!(
+            fg((norm.0 + 2, norm.1)),
+            SyntaxColor::of("function").unwrap().fg().unwrap()
+        );
     }
 }

@@ -398,6 +398,40 @@ export fn embeddedTerminalGetSelectedText(
     return @intCast(text.len);
 }
 
+/// What's at viewport cell (`x`, `y`): an OSC 8 link's URI (`out_is_link`
+/// 1), or the text of its line across soft wraps, with `out_offset` the byte
+/// where the cell's text starts, or 0xFFFFFFFF if the cell is past it.
+/// Returns the length copied, or `out_of_space` with `out_required` set.
+export fn embeddedTerminalLineAt(
+    handle: NativeHandle,
+    x: u16,
+    y: u16,
+    out_ptr: ?[*]u8,
+    out_len: u32,
+    out_required_ptr: ?*u32,
+    out_offset_ptr: ?*u32,
+    out_is_link_ptr: ?*u8,
+) i32 {
+    const out_required = out_required_ptr orelse return EmbeddedTerminalStatus.invalid;
+    const out_offset = out_offset_ptr orelse return EmbeddedTerminalStatus.invalid;
+    const out_is_link = out_is_link_ptr orelse return EmbeddedTerminalStatus.invalid;
+    out_required.* = 0;
+    out_offset.* = std.math.maxInt(u32);
+    out_is_link.* = 0;
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    const output = embeddedTerminalOutput(out_ptr, out_len) orelse return EmbeddedTerminalStatus.invalid;
+    var offset: usize = 0;
+    var is_link = false;
+    const text = terminal_value.lineAt(.{ .x = x, .y = y }, &offset, &is_link) catch |err| return embeddedTerminalStatus(err);
+    defer terminal_value.freeSelectedText(text);
+    out_required.* = std.math.cast(u32, text.len) orelse return EmbeddedTerminalStatus.out_of_memory;
+    if (text.len > output.len) return EmbeddedTerminalStatus.out_of_space;
+    @memcpy(output[0..text.len], text);
+    out_offset.* = std.math.cast(u32, offset) orelse std.math.maxInt(u32);
+    out_is_link.* = @intFromBool(is_link);
+    return @intCast(text.len);
+}
+
 export fn embeddedTerminalCompose(
     handle: NativeHandle,
     buffer_handle: NativeHandle,

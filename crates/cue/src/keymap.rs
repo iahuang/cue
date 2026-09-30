@@ -44,6 +44,11 @@ commands! {
     OpenFile => "file:open", "Open File…";
     CloseFile => "file:close", "Close File";
     GoToFile => "file:go-to", "Go to File";
+    GoToLine => "editor:go-to-line", "Go to Line…";
+    GoToSymbol => "editor:go-to-symbol", "Go to Symbol in File…";
+    GoToWorkspaceSymbol => "search:symbols", "Go to Symbol in Workspace…";
+    GoToTerminal => "terminal:go-to", "Go to Terminal…";
+    RecoverUnsaved => "file:recover", "Recover Unsaved Changes…";
     SearchWorkspace => "search:workspace", "Search in Workspace";
     Find => "find:show", "Find in File";
     FindReplace => "find:show-replace", "Replace in File";
@@ -201,6 +206,7 @@ impl Command {
         use Command::*;
         match self {
             Quit | Palette | Save | SaveAs | NewFile | CreateFile | OpenFile | GoToFile
+            | GoToLine | GoToSymbol | GoToWorkspaceSymbol | GoToTerminal | RecoverUnsaved
             | SearchWorkspace | Find | FindReplace | FindNext | FindPrevious | ToggleTree
             | FocusTree | FocusEditor | SplitRight | SplitDown | ClosePanel | GoBack
             | GoForward | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown
@@ -321,6 +327,9 @@ impl Default for Keymap {
             // `>` in the file picker gets there too.
             ('p', GoToFile),
             ('k', Palette),
+            // Ctrl+R as in Sublime; Ctrl+G, VS Code's, finds the next match.
+            ('r', GoToSymbol),
+            ('l', GoToLine),
             ('f', Find),
             // Ctrl+G, as in VS Code on macOS and in browsers.
             ('g', FindNext),
@@ -344,6 +353,10 @@ impl Default for Keymap {
         // the command palette has it.
         bindings.push((key(Char('f'), CTRL_SHIFT), SearchWorkspace));
         bindings.push((key(Char('f'), SUPER_SHIFT), SearchWorkspace));
+        // As in Sublime. Legacy terminals send it as Ctrl+R, the file's
+        // symbols; there, `#` in the file picker has them.
+        bindings.push((key(Char('r'), CTRL_SHIFT), GoToWorkspaceSymbol));
+        bindings.push((key(Char('r'), SUPER_SHIFT), GoToWorkspaceSymbol));
         bindings.push((key(Char('g'), CTRL_SHIFT), FindPrevious));
         bindings.push((key(Char('g'), SUPER_SHIFT), FindPrevious));
         // As in VS Code, Sublime, and Zed; on macOS, VS Code's Cmd+Alt+F.
@@ -738,6 +751,8 @@ mod tests {
     fn every_command_has_a_shortcut() {
         // Reached only from the command palette, or the tree's context menu.
         const UNBOUND: &[Command] = &[
+            // `$` in the file picker gets there too.
+            Command::GoToTerminal,
             Command::ToggleWrap,
             Command::CloseFile,
             Command::ClearTerminal,
@@ -752,6 +767,7 @@ mod tests {
             Command::TreeReveal,
             Command::TreeOpenInTerminal,
             Command::AddFolder,
+            Command::RecoverUnsaved,
             Command::TreeRemoveFolder,
         ];
         let keymap = Keymap::default();

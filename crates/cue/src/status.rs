@@ -14,6 +14,11 @@ use crate::keymap::{Command, Keymap};
 pub enum Status {
     /// The cursor's position and the file's details.
     Info(String),
+    /// File details and the language's screen columns, offset by the leading space.
+    EditorInfo {
+        text: String,
+        language: std::ops::Range<u32>,
+    },
     /// A terminal's name and what it's running.
     Terminal(String),
     /// Shown until the next key press.
@@ -27,7 +32,9 @@ impl Status {
     #[cfg(test)]
     pub fn text(&self) -> String {
         match self {
-            Status::Info(info) | Status::Terminal(info) => format!(" {info}"),
+            Status::Info(info) | Status::Terminal(info) | Status::EditorInfo { text: info, .. } => {
+                format!(" {info}")
+            }
             Status::Message { text, .. } => format!(" {text}"),
             Status::Prompt { label, input } => format!(" {label}: {input}"),
         }
@@ -116,7 +123,7 @@ pub fn draw(
             frame.draw_text(&format!(" {text}"), 0, y, STATUS_FG, None, Attributes::BOLD);
             None
         }
-        Status::Info(info) | Status::Terminal(info) => {
+        Status::Info(info) | Status::Terminal(info) | Status::EditorInfo { text: info, .. } => {
             frame.fill_rect(0, y, width, 1, STATUS_BG);
             let left = format!(" {info}");
             frame.draw_text(&left, 0, y, STATUS_FG, None, Attributes::NONE);

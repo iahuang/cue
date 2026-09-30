@@ -30,6 +30,7 @@ use crate::indent::Indent;
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::Edit;
+use crate::location::Position;
 use crate::search::Toggle;
 use crate::status::Status;
 #[cfg(test)]
@@ -304,6 +305,22 @@ impl Editor {
             self.view.set_selection(start, end, SELECTION);
         }
         self.reveal(vp, row);
+    }
+
+    /// Puts the cursor at `position`, as a compiler printed it: the line's
+    /// start without a column, and its end past it.
+    pub fn go_to(&mut self, position: Position) {
+        let text = self.buffer.text();
+        let row = position
+            .line
+            .min(self.buffer.line_count().saturating_sub(1));
+        let line = text.split('\n').nth(row as usize).unwrap_or_default();
+        let column = position.column.unwrap_or(0) as usize;
+        let byte = line
+            .char_indices()
+            .nth(column)
+            .map_or(line.len(), |(byte, _)| byte);
+        self.select_in_line(row, byte..byte);
     }
 
     /// Scrolls line `row`, where the cursor moved, a third of the way down
@@ -1479,11 +1496,12 @@ impl Editor {
             WrapMode::None => "nowrap",
             _ => "wrap",
         };
-        Status::Info(format!(
-            "Ln {}, Col {}{selected}  {indent}  {language}  {line_ending}  {wrap}",
-            row + 1,
-            col + 1,
-        ))
+        let prefix = format!("Ln {}, Col {}{selected}  {indent}  ", row + 1, col + 1);
+        let start = 1 + prefix.chars().count() as u32;
+        Status::EditorInfo {
+            text: format!("{prefix}{language}  {line_ending}  {wrap}"),
+            language: start..start + language.chars().count() as u32,
+        }
     }
 
     /// Writes the file to `path` from now on.
@@ -2790,6 +2808,20 @@ mod tests {
     const FUNCTION: Rgba = Rgba::indexed(4);
     const COMMENT: Rgba = Rgba::indexed(8);
     const STRING: Rgba = Rgba::indexed(2);
+
+    #[test]
+    fn changing_language_recolors_existing_text() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("fn main() {}");
+        let editor = Editor::new(eb, unnamed(), theme(), 40, 6).unwrap();
+        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(theme::TEXT));
+        let rust = crate::language::all().find(|language| language.name == "Rust");
+        editor.document().set_language(rust);
+        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(KEYWORD));
+        editor.document().set_language(None);
+        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(theme::TEXT));
+    }
 
     #[test]
     fn highlights_syntax_as_the_text_changes() {

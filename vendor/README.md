@@ -73,7 +73,10 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   `embeddedTerminalGetTitle`, and `embeddedTerminalTakeClipboard`, which hands
   over the latest OSC 52 clipboard write from the program (Ghostty's
   `clipboard_write` effect; reads and clears aren't forwarded) for the host
-  to copy.
+  to copy. `embeddedTerminalLineAt` gives what's at a cell, for opening it:
+  an OSC 8 hyperlink's URI, or else the cell's line joined across soft wraps
+  (Ghostty's `selectLine`) and the byte offset of the cell in it (from the
+  selection string's pin map).
 
 ## `tree-sitter-latex/`
 

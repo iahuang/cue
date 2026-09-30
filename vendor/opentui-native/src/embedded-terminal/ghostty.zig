@@ -5,6 +5,7 @@ pub const TerminalStream = vt.TerminalStream;
 pub const Coordinate = vt.Coordinate;
 pub const RenderState = vt.RenderState;
 pub const Selection = vt.Selection;
+pub const StringMap = vt.StringMap;
 
 // libghostty-vt doesn't export its clipboard module; take the types from
 // the effect's signature.

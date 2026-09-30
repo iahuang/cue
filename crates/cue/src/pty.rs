@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
 /// Environment variables that describe the terminal cue runs in, which
@@ -206,6 +206,62 @@ impl Pty {
     pub fn foreground_name(&self) -> Option<String> {
         None
     }
+
+    /// The folders the program that has the terminal, and the program
+    /// started (the shell), are working in now, in that order, as far as
+    /// they can be found.
+    pub fn working_folders(&self) -> Vec<PathBuf> {
+        let foreground = unsafe { libc::tcgetpgrp(self.fd()) };
+        let mut folders = Vec::new();
+        for pid in [Some(foreground).filter(|&pid| pid > 0), self.pid()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(folder) = working_folder(pid) {
+                if !folders.contains(&folder) {
+                    folders.push(folder);
+                }
+            }
+        }
+        folders
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn working_folder(pid: libc::pid_t) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            info.pvi_cdir.vip_path.as_ptr().cast(),
+            std::mem::size_of_val(&info.pvi_cdir.vip_path),
+        )
+    };
+    let path = &raw[..raw.iter().position(|&b| b == 0)?];
+    (!path.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+}
+
+#[cfg(target_os = "linux")]
+fn working_folder(pid: libc::pid_t) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn working_folder(_pid: libc::pid_t) -> Option<PathBuf> {
+    None
 }
 
 impl Drop for Pty {

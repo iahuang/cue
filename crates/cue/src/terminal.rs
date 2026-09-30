@@ -20,11 +20,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use opentui::{
-    Buffer, EmbeddedTerminal, KeyEvent, KeyMods, MouseAction, MouseButton as TermButton, MouseEvent,
+    Buffer, EmbeddedTerminal, KeyEvent, KeyMods, LineAt, MouseAction, MouseButton as TermButton,
+    MouseEvent,
 };
 
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind};
 use crate::layout::Rect;
+use crate::location::{self, Target};
 use crate::pty::Pty;
 use crate::status::{Prompt, PromptKey, Status};
 
@@ -363,6 +365,38 @@ impl Terminal {
                 }
             }
             MouseKind::ScrollLeft | MouseKind::ScrollRight | MouseKind::Move => {}
+        }
+    }
+
+    /// What's at screen cell (`x`, `y`), for a Ctrl+click to open: a link
+    /// (OSC 8), a URL, or the path of a file that exists, with the position
+    /// printed after it. Relative paths are looked for where the program
+    /// and the shell are working, then where the terminal started, then in
+    /// `roots`.
+    pub fn target_at(&self, x: u32, y: u32, roots: &[PathBuf]) -> Option<Target> {
+        if !self.area.contains(x, y) {
+            return None;
+        }
+        let at = self
+            .vt
+            .line_at((x - self.area.x) as u16, (y - self.area.y) as u16)?;
+        let mut folders = match self.exit {
+            None => self.pty.working_folders(),
+            Some(_) => Vec::new(),
+        };
+        for folder in std::iter::once(&self.cwd).chain(roots) {
+            if !folders.contains(folder) {
+                folders.push(folder.clone());
+            }
+        }
+        let resolve = |path: &str| location::find_file(path, &folders);
+        match at {
+            LineAt::Link(uri) => location::target_of_link(&uri, resolve),
+            LineAt::Text {
+                text,
+                offset: Some(offset),
+            } => location::target_in_line(&text, offset, resolve),
+            LineAt::Text { offset: None, .. } => None,
         }
     }
 
