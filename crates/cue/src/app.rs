@@ -229,6 +229,8 @@ pub struct App {
     tab_prompt: Option<Prompt>,
     /// Text from the last copy or cut, shared by all editors.
     clipboard: Option<String>,
+    /// Text a terminal's program copied, for the system clipboard.
+    copied: Option<String>,
     focus: Focus,
     tree_visible: bool,
     /// The tree's width when there is room for it.
@@ -359,6 +361,7 @@ impl App {
             next_panel: 1,
             tab_prompt: None,
             clipboard: None,
+            copied: None,
             focus,
             tree_visible: true,
             tree_width: DEFAULT_TREE_WIDTH,
@@ -589,6 +592,7 @@ impl App {
             Command::NewFile => self.new_untitled(),
             Command::OpenFile => self.show_dialog(Purpose::Open),
             Command::CreateFile => self.show_dialog(Purpose::Create),
+            Command::AddFolder => self.show_dialog(Purpose::AddFolder),
             Command::SaveAs => self.show_dialog(Purpose::SaveAs),
             Command::SplitRight => self.split(Axis::Horizontal),
             Command::SplitDown => self.split(Axis::Vertical),
@@ -723,7 +727,8 @@ impl App {
             | Command::TreeCopyPath
             | Command::TreeCopyRelativePath
             | Command::TreeReveal
-            | Command::TreeOpenInTerminal => {
+            | Command::TreeOpenInTerminal
+            | Command::TreeRemoveFolder => {
                 let target = self.file_target();
                 return self.file_command(command, target, false);
             }
@@ -1201,7 +1206,12 @@ impl App {
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         for terminal in &self.terminals {
-            changed |= terminal.borrow_mut().poll();
+            let mut terminal = terminal.borrow_mut();
+            changed |= terminal.poll();
+            if let Some(text) = terminal.take_copied() {
+                self.clipboard = Some(text.clone());
+                self.copied = Some(text);
+            }
         }
         if changed {
             self.prune_terminals();
@@ -1221,6 +1231,12 @@ impl App {
             self.watch_folders();
         }
         changed
+    }
+
+    /// Text a terminal's program copied since the last call, for the
+    /// system clipboard.
+    pub fn take_copied(&mut self) -> Option<String> {
+        self.copied.take()
     }
 
     /// Watches the folders open in the tree, and those of open files, if
@@ -2264,10 +2280,20 @@ impl App {
         self.show_document(&doc);
     }
 
-    /// The workspace's first folder, where terminals start.
-    fn workspace_folder(&self) -> PathBuf {
-        match self.workspace.roots().first() {
-            Some(root) => root.clone(),
+    /// The workspace folder being worked in, where terminals start: the one
+    /// with the tree's selection, if the tree has the keyboard, or else the
+    /// one with what's on screen, or the first.
+    fn current_root(&self) -> PathBuf {
+        let selected = match self.focus {
+            Focus::Tree => self.tree.selected().map(|entry| entry.path),
+            _ => None,
+        };
+        let path = selected
+            .or_else(|| self.active_panel().path())
+            .or_else(|| Some(self.active_terminal()?.borrow().cwd().to_path_buf()));
+        let root = path.as_deref().and_then(|path| self.workspace.root_of(path));
+        match root.or_else(|| self.workspace.roots().first().map(PathBuf::as_path)) {
+            Some(root) => root.to_path_buf(),
             None => std::env::current_dir().unwrap_or_default(),
         }
     }
@@ -2300,7 +2326,15 @@ impl App {
             .as_deref()
             .and_then(Path::file_name)
             .map_or(String::new(), |name| name.to_string_lossy().into_owned());
-        self.open_dialog(purpose, &self.dialog_folder(), &name, current);
+        let folder = match purpose {
+            // Among the folders beside the one being worked in.
+            Purpose::AddFolder => {
+                let root = self.current_root();
+                root.parent().map_or(root.clone(), Path::to_path_buf)
+            }
+            _ => self.dialog_folder(),
+        };
+        self.open_dialog(purpose, &folder, &name, current);
     }
 
     /// Opens the file dialog for `purpose` in `dir`, with `name` suggested,
@@ -2330,7 +2364,7 @@ impl App {
         let file = self.active_panel().path();
         match file.as_deref().and_then(Path::parent) {
             Some(folder) if folder.is_dir() => folder.to_path_buf(),
-            _ => self.workspace_folder(),
+            _ => self.current_root(),
         }
     }
 
@@ -2352,6 +2386,7 @@ impl App {
                     Purpose::SaveAs => self.save_as(&path),
                     Purpose::Create => self.create_file(&path),
                     Purpose::CreateFolder => self.create_folder(&path),
+                    Purpose::AddFolder => self.add_folder(&path),
                     Purpose::Move | Purpose::Duplicate => match dialog.current() {
                         Some(from) => {
                             let from = from.to_path_buf();
@@ -2493,7 +2528,7 @@ impl App {
             };
         }
         Entry {
-            path: self.workspace_folder(),
+            path: self.current_root(),
             is_dir: true,
             is_root: true,
         }
@@ -2538,7 +2573,15 @@ impl App {
         if target.is_dir {
             items.push(item(TreeOpenInTerminal, "Open in Terminal"));
         }
-        if !target.is_root {
+        if target.is_root {
+            items.extend([
+                MenuItem::Separator,
+                item(AddFolder, "Add Folder to Workspace…"),
+            ]);
+            if self.workspace.roots().len() > 1 {
+                items.push(item(TreeRemoveFolder, "Remove Folder from Workspace"));
+            }
+        } else {
             items.extend([
                 MenuItem::Separator,
                 item(TreeRename, "Rename…"),
@@ -2591,7 +2634,7 @@ impl App {
     fn file_command(&mut self, command: Command, target: Entry, from_menu: bool) -> AppAction {
         let parent = match target.path.parent() {
             Some(parent) => parent.to_path_buf(),
-            None => self.workspace_folder(),
+            None => self.current_root(),
         };
         let folder = match target.is_dir {
             true => target.path.clone(),
@@ -2617,14 +2660,26 @@ impl App {
             Command::TreeRename | Command::TreeDuplicate | Command::TreeTrash if target.is_root => {
                 self.show_message(format!("{name} is a workspace folder."), false);
             }
-            Command::TreeRename => {
-                self.open_dialog(Purpose::Move, &parent, &name, Some(target.path));
+            Command::TreeRename | Command::TreeTrash => {
+                if let Some(root) = self.roots_in(&target.path).first() {
+                    let root = self.workspace.name(root).unwrap_or_default();
+                    let message = format!("{name} has the workspace folder {root} in it.");
+                    self.show_message(message, false);
+                    return AppAction::Continue;
+                }
+                match command {
+                    Command::TreeRename => {
+                        self.open_dialog(Purpose::Move, &parent, &name, Some(target.path));
+                    }
+                    _ => self.trash(&target.path, from_menu),
+                }
             }
             Command::TreeDuplicate => {
                 let copy = copy_name(&target.path);
                 self.open_dialog(Purpose::Duplicate, &parent, &copy, Some(target.path));
             }
-            Command::TreeTrash => self.trash(&target.path, from_menu),
+            Command::AddFolder => self.show_dialog(Purpose::AddFolder),
+            Command::TreeRemoveFolder => self.remove_folder(&target),
             Command::TreeCopyPath => {
                 return self.copy_path(target.path.display().to_string());
             }
@@ -2650,6 +2705,54 @@ impl App {
         self.show_message(format!("Copied {text}"), false);
         self.clipboard = Some(text.clone());
         AppAction::Copy(text)
+    }
+
+    /// Adds the folder `path` to the workspace, and selects it in the tree.
+    fn add_folder(&mut self, path: &Path) -> Result<AppAction, String> {
+        let root = path
+            .canonicalize()
+            .map_err(|err| format!("Can't add {}: {err}", file_name(path)))?;
+        if self.workspace.roots().contains(&root) {
+            return Err(format!("{} is in the workspace already.", file_name(path)));
+        }
+        self.workspace
+            .add_root(&root)
+            .map_err(|err| format!("Can't add {}: {err}", file_name(path)))?;
+        self.roots_changed();
+        self.tree.reveal(&root);
+        self.focus = Focus::Tree;
+        Ok(AppAction::Continue)
+    }
+
+    /// Takes `target`, a workspace folder, out of the workspace. Its files
+    /// stay open.
+    fn remove_folder(&mut self, target: &Entry) {
+        let name = file_name(&target.path);
+        if !self.workspace.roots().contains(&target.path) {
+            self.show_message(format!("{name} isn't a workspace folder."), false);
+        } else if self.workspace.roots().len() == 1 {
+            self.show_message(format!("{name} is the only workspace folder."), false);
+        } else {
+            self.workspace.remove_root(&target.path);
+            self.roots_changed();
+            self.show_message(format!("Removed {name} from the workspace."), false);
+        }
+    }
+
+    /// Shows the workspace's folders, after one came or went.
+    fn roots_changed(&mut self) {
+        self.tree.set_roots(self.workspace.roots());
+        self.files = FileIndex::new(&self.workspace);
+        self.watching = None;
+        self.watch_folders();
+        self.show_active_in_tree();
+    }
+
+    /// The workspace folders in `path`, or that are it.
+    fn roots_in(&self, path: &Path) -> Vec<PathBuf> {
+        let path = document::resolve(path);
+        let roots = self.workspace.roots().iter();
+        roots.filter(|root| root.starts_with(&path)).cloned().collect()
     }
 
     /// Creates the folder `path`, and those it's in if need be.
@@ -2799,7 +2902,7 @@ impl App {
 
     /// Starts a shell in the workspace's first folder, in the active panel.
     fn new_terminal(&mut self) {
-        self.new_terminal_in(&self.workspace_folder());
+        self.new_terminal_in(&self.current_root());
     }
 
     /// Starts a shell in `cwd`, in the active panel.
@@ -3381,6 +3484,26 @@ mod tests {
         ctrl(&mut app, 'v');
         assert!(screen(&app).contains("copy me"));
         assert!(app.ed().is_modified());
+    }
+
+    #[test]
+    fn programs_in_terminals_copy_to_the_clipboard() {
+        let _serial = crate::test_serial();
+        let root = fixture("terminal-copy", &[("a.txt", "")]);
+        let mut app = app(&root, Some("a.txt"));
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('n'), ctrl_shift));
+        // OSC 52 with "copied" in base64, as programs send over ssh.
+        type_text(&mut app, r"printf '\033]52;c;Y29waWVk\a'");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the copy", |app| app.copied.is_some());
+        assert_eq!(app.take_copied().as_deref(), Some("copied"));
+        assert_eq!(app.take_copied(), None);
+        // Pasting in cue gets it too.
+        assert_eq!(app.clipboard.as_deref(), Some("copied"));
     }
 
     /// Polls `app` until `done`, or panics after a few seconds.
@@ -5654,5 +5777,76 @@ mod tests {
             );
         }
         assert!(app.menu.is_some());
+    }
+
+    #[test]
+    fn folders_are_added_to_the_workspace_and_removed() {
+        let _serial = crate::test_serial();
+        let dir = fixture("add-folder", &[("one/a.txt", "a"), ("two/b.txt", "b")]);
+        let (one, two) = (dir.join("one"), dir.join("two"));
+        let mut app = tall_app(&one, Some("a.txt"));
+
+        // It lists the folders beside the one being worked in.
+        app.run(Command::AddFolder, false);
+        assert_eq!(
+            app.dialog.as_ref().map(|d| d.purpose()),
+            Some(Purpose::AddFolder)
+        );
+        type_text(&mut app, "tw");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_some(), "Enter went into two");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none(), "{}", tall_screen(&app));
+        assert_eq!(app.workspace.roots(), [one.clone(), two.clone()]);
+        assert_eq!(app.tree.selected().unwrap().path, two);
+        app.files.wait();
+        let files: Vec<String> = app.files.files().iter().map(|f| f.text.clone()).collect();
+        assert_eq!(files, ["one/a.txt", "two/b.txt"]);
+
+        // Terminals start in the folder being worked in.
+        assert_eq!(app.current_root(), two, "the tree's selection");
+        app.focus = Focus::Editor;
+        assert_eq!(app.current_root(), one, "the file on screen");
+
+        app.run(Command::AddFolder, false);
+        type_text(&mut app, "two/");
+        key(&mut app, KeyCode::Enter);
+        assert!(tall_screen(&app).contains("two is in the workspace already."));
+        key(&mut app, KeyCode::Esc);
+
+        // The menu of a root has it, when there's another.
+        app.tree.reveal(&two);
+        right_click(&mut app, 4, 2);
+        assert_eq!(app.tree.selected().unwrap().path, two);
+        click_item(&mut app, "Remove Folder from Workspace");
+        assert_eq!(app.workspace.roots(), std::slice::from_ref(&one));
+        assert_eq!(app.ed().path().as_deref(), Some(one.join("a.txt").as_path()));
+        right_click(&mut app, 4, 0);
+        let text = tall_screen(&app);
+        assert!(text.contains("Add Folder to Workspace…"), "{text}");
+        assert!(!text.contains("Remove Folder"), "{text}");
+    }
+
+    #[test]
+    fn folders_with_workspace_folders_in_them_stay_put() {
+        let _serial = crate::test_serial();
+        let root = fixture("nested-roots", &[("packages/pkg/x.txt", "x")]);
+        let pkg = root.join("packages/pkg");
+        let workspace = Workspace::new([root.clone(), pkg.clone()]).unwrap();
+        let mut app = App::new(workspace, None, 80, 24).unwrap();
+        app.tree.reveal(&root.join("packages"));
+        app.focus = Focus::Tree;
+        for command in [Command::TreeRename, Command::TreeTrash] {
+            app.run(command, false);
+            assert!(app.dialog.is_none() && app.alert.is_none());
+            let text = tall_screen(&app);
+            assert!(text.contains("has the workspace folder pkg in it"), "{text}");
+        }
+        assert!(pkg.exists());
+
+        // Its file belongs to it, and shows there.
+        assert!(app.open(&pkg.join("x.txt"), false));
+        assert_eq!(app.workspace.display_path(&pkg.join("x.txt")), "pkg/x.txt");
+        assert_eq!(app.current_root(), pkg);
     }
 }

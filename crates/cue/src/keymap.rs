@@ -138,6 +138,8 @@ commands! {
     TreeCopyRelativePath => "tree:copy-relative-path", "File Tree: Copy Relative Path";
     TreeReveal => "tree:reveal", "File Tree: Reveal in File Manager";
     TreeOpenInTerminal => "tree:open-in-terminal", "File Tree: Open in Terminal";
+    AddFolder => "workspace:add-folder", "Add Folder to Workspace…";
+    TreeRemoveFolder => "tree:remove-folder", "File Tree: Remove Folder from Workspace";
     PickerUp => "picker:up", "Picker: Select Previous";
     PickerDown => "picker:down", "Picker: Select Next";
     PickerPageUp => "picker:page-up", "Picker: Page Up";
@@ -204,13 +206,12 @@ impl Command {
             | GoForward | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown
             | NewTerminal | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
             | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5
-            | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 => Context::Global,
+            | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu
             | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate
-            | TreeTrash | TreeCopyPath | TreeCopyRelativePath | TreeReveal | TreeOpenInTerminal => {
-                Context::Tree
-            }
+            | TreeTrash | TreeCopyPath | TreeCopyRelativePath | TreeReveal | TreeOpenInTerminal
+            | TreeRemoveFolder => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
@@ -727,6 +728,8 @@ mod tests {
             Command::TreeCopyRelativePath,
             Command::TreeReveal,
             Command::TreeOpenInTerminal,
+            Command::AddFolder,
+            Command::TreeRemoveFolder,
         ];
         let keymap = Keymap::default();
         for &command in Command::ALL {

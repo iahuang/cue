@@ -57,6 +57,10 @@ pub const EmbeddedTerminal = struct {
         return error.Unsupported;
     }
     pub fn freeEncoded(_: *EmbeddedTerminal, _: []u8) void {}
+    pub fn takeClipboard(_: *EmbeddedTerminal, _: []u8, required: *usize) ?usize {
+        required.* = 0;
+        return null;
+    }
     pub fn drainResponses(_: *EmbeddedTerminal, _: []u8) Error!usize {
         return error.Unsupported;
     }

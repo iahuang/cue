@@ -19,6 +19,9 @@
 //! From the file tree, it also names a new folder, where to rename or move
 //! a file or folder, and where to duplicate one. None of those replace
 //! anything already there.
+//!
+//! Adding a folder to the workspace, it lists only folders, and Enter takes
+//! the folder listed once nothing's typed after the last `/`.
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
@@ -62,6 +65,8 @@ pub enum Purpose {
     Move,
     /// Where to copy the dialog's current file or folder.
     Duplicate,
+    /// A folder that exists, to add to the workspace.
+    AddFolder,
 }
 
 impl Purpose {
@@ -73,12 +78,13 @@ impl Purpose {
             Purpose::CreateFolder => "New Folder",
             Purpose::Move => "Rename or Move",
             Purpose::Duplicate => "Duplicate",
+            Purpose::AddFolder => "Add Folder to Workspace",
         }
     }
 
     /// Whether the path chosen may not exist yet.
     fn names_a_new_file(self) -> bool {
-        self != Purpose::Open
+        !matches!(self, Purpose::Open | Purpose::AddFolder)
     }
 }
 
@@ -163,11 +169,13 @@ impl FileDialog {
         width: u32,
         height: u32,
     ) -> FileDialog {
-        let hints = [
-            (Command::DialogComplete, "complete"),
-            (Command::DialogParent, "parent folder"),
-        ]
-        .iter()
+        let add = (purpose == Purpose::AddFolder).then_some((Command::PickerAccept, "add"));
+        let hints = add
+            .iter()
+            .chain(&[
+                (Command::DialogComplete, "complete"),
+                (Command::DialogParent, "parent folder"),
+            ])
         .filter_map(|&(command, name)| Some(format!("{} {name}", keymap.shortcut(command)?)))
         .collect::<Vec<_>>()
         .join(" · ");
@@ -179,7 +187,7 @@ impl FileDialog {
             base: dir.clone(),
             current,
             name_selected: !name.is_empty(),
-            listing: Listing::read(&dir),
+            listing: Listing::read(&dir, purpose),
             rows: Vec::new(),
             selected: None,
             scroll: 0,
@@ -369,7 +377,7 @@ impl FileDialog {
         self.confirm = None;
         let dir = self.resolve(self.folder_text());
         if dir != self.listing.dir {
-            self.listing = Listing::read(&dir);
+            self.listing = Listing::read(&dir, self.purpose);
         }
         self.refilter();
     }
@@ -485,6 +493,20 @@ impl FileDialog {
             None => {}
         }
         let path = self.resolve(&self.text);
+        if self.purpose == Purpose::AddFolder {
+            return match path.is_dir() {
+                // The folder listed.
+                true if self.name().is_empty() => DialogAction::Accept(path),
+                true => {
+                    self.navigate(&path, false);
+                    DialogAction::Continue
+                }
+                false => {
+                    self.show_error("There's no such folder.".to_string());
+                    DialogAction::Continue
+                }
+            };
+        }
         if self.purpose == Purpose::Move && self.current.as_ref() == Some(&path) {
             // Left where it is.
             return DialogAction::Close;
@@ -509,7 +531,7 @@ impl FileDialog {
         let exists = fs::symlink_metadata(&path).is_ok();
         let name = file_name(&path);
         match self.purpose {
-            Purpose::Open => DialogAction::Accept(path),
+            Purpose::Open | Purpose::AddFolder => DialogAction::Accept(path),
             Purpose::Create if exists => {
                 self.show_error(format!("{name} already exists."));
                 DialogAction::Continue
@@ -592,6 +614,10 @@ impl FileDialog {
         self.rows = rows;
         self.selected = match self.purpose {
             Purpose::Open => self.rows.iter().position(|&row| row != Row::Parent),
+            // Enter takes the folder listed, until a name is typed.
+            Purpose::AddFolder if !filter.is_empty() => {
+                self.rows.iter().position(|&row| row != Row::Parent)
+            }
             _ => None,
         };
         self.scroll = 0;
@@ -704,7 +730,9 @@ impl FileDialog {
     fn empty_text(&self) -> Option<(String, Rgba)> {
         if let Some(error) = self.listing.error {
             let text = match (error, self.purpose) {
-                (io::ErrorKind::NotFound, Purpose::Open) => "There's no such folder.".to_string(),
+                (io::ErrorKind::NotFound, Purpose::Open | Purpose::AddFolder) => {
+                    "There's no such folder.".to_string()
+                }
                 (io::ErrorKind::NotFound, _) => "A new folder, created with the file.".to_string(),
                 (io::ErrorKind::NotADirectory, _) => "That's a file, not a folder.".to_string(),
                 (error, _) => format!("Can't read this folder: {}.", io::Error::from(error)),
@@ -720,8 +748,12 @@ impl FileDialog {
             return None;
         }
         let text = match self.purpose {
+            Purpose::AddFolder if self.filter().is_empty() => {
+                "No folders in it. Enter adds it.".to_string()
+            }
             _ if self.filter().is_empty() => "An empty folder.".to_string(),
             Purpose::Open => "No matching files.".to_string(),
+            Purpose::AddFolder => "No matching folders.".to_string(),
             Purpose::SaveAs => format!("Enter saves as {}.", self.name()),
             Purpose::Create | Purpose::CreateFolder => format!("Enter creates {}.", self.name()),
             Purpose::Move => format!("Enter moves it to {}.", self.name()),
@@ -814,8 +846,8 @@ impl FileDialog {
 
 impl Listing {
     /// The entries of `dir`, folders first, each group by name ignoring
-    /// case, as in the file tree.
-    fn read(dir: &Path) -> Listing {
+    /// case, as in the file tree. Only folders, for adding one.
+    fn read(dir: &Path, purpose: Purpose) -> Listing {
         let read = match fs::read_dir(dir) {
             Ok(read) => read,
             Err(err) => {
@@ -844,6 +876,7 @@ impl Listing {
                     size: meta.filter(|_| !is_dir).map(|meta| meta.len()),
                 }
             })
+            .filter(|entry| entry.is_dir || purpose != Purpose::AddFolder)
             .collect();
         entries.sort_by(|a, b| {
             (!a.is_dir, a.name.to_lowercase(), &a.name).cmp(&(

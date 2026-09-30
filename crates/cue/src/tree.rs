@@ -4,6 +4,7 @@
 //! Folders are read when they are expanded and re-read on refresh; nothing
 //! watches the file system yet. Which folders are expanded is remembered by
 //! path, so collapsing a folder and expanding it again restores its subfolders.
+//! A root inside another shows in both, expanded apart in each.
 //! What `.gitignore` and `.ignore` files exclude is shown dimmed, and left
 //! out of the file picker and workspace search.
 //!
@@ -20,7 +21,7 @@ use opentui::{Attributes, Buffer, Rgba};
 use crate::file_index;
 use crate::icons;
 use crate::keymap::Command;
-use crate::workspace::{deepest_root, root_name};
+use crate::workspace::{deepest_root, root_names};
 
 const FG: Rgba = Rgba::rgb(186, 194, 222);
 const ROOT_FG: Rgba = Rgba::rgb(205, 214, 244);
@@ -56,6 +57,8 @@ struct Row {
     name: String,
     /// 0 for workspace roots.
     depth: usize,
+    /// The root it's listed under, by position.
+    root: usize,
     is_dir: bool,
     /// Excluded by an ignore file, or inside a folder that is.
     ignored: bool,
@@ -79,13 +82,17 @@ pub enum TreeAction {
 pub struct Entry {
     pub path: PathBuf,
     pub is_dir: bool,
-    /// A workspace root, which isn't renamed, moved, or deleted from here.
+    /// A workspace root, which isn't renamed, moved, or deleted from here,
+    /// wherever it's listed.
     pub is_root: bool,
 }
 
 pub struct FileTree {
     roots: Vec<PathBuf>,
-    expanded: HashSet<PathBuf>,
+    /// What each root is called.
+    names: Vec<String>,
+    /// The folders expanded under each root.
+    expanded: HashMap<PathBuf, HashSet<PathBuf>>,
     /// Every visible entry, top to bottom.
     rows: Vec<Row>,
     /// Counts changes to `rows`, to tell when the open folders may have.
@@ -106,7 +113,8 @@ impl FileTree {
     pub fn new(roots: &[PathBuf]) -> FileTree {
         let mut tree = FileTree {
             roots: Vec::new(),
-            expanded: HashSet::new(),
+            names: Vec::new(),
+            expanded: HashMap::new(),
             rows: Vec::new(),
             listing: 0,
             selected: 0,
@@ -121,35 +129,45 @@ impl FileTree {
 
     /// Shows `roots`; new ones start expanded.
     pub fn set_roots(&mut self, roots: &[PathBuf]) {
+        self.expanded.retain(|root, _| roots.contains(root));
         for root in roots {
-            if !self.roots.contains(root) {
-                self.expanded.insert(root.clone());
-            }
+            self.expanded
+                .entry(root.clone())
+                .or_insert_with(|| HashSet::from([root.clone()]));
         }
         self.roots = roots.to_vec();
+        self.names = root_names(roots);
         self.refresh();
     }
 
     /// Re-reads every expanded folder, keeping the selection on the same
-    /// path when it still exists.
+    /// entry when it still exists.
     pub fn refresh(&mut self) {
-        let selected = self.rows.get(self.selected).map(|row| row.path.clone());
+        let selected = self
+            .rows
+            .get(self.selected)
+            .map(|row| (self.roots.get(row.root).cloned(), row.path.clone()));
         let mut rows = Vec::new();
-        for root in &self.roots {
+        for (index, root) in self.roots.iter().enumerate() {
             rows.push(Row {
                 path: root.clone(),
-                name: root_name(root),
+                name: self.names[index].clone(),
                 depth: 0,
+                root: index,
                 is_dir: true,
                 ignored: false,
             });
-            if self.expanded.contains(root) {
-                self.push_children(&mut rows, root, 1, false);
+            if self.expanded[root].contains(root) {
+                self.push_children(&mut rows, index, root, 1, false);
             }
         }
         self.rows = rows;
         self.listing += 1;
-        if let Some(index) = selected.and_then(|path| self.index_of(&path)) {
+        let selected = selected.and_then(|(root, path)| {
+            let root = self.roots.iter().position(|other| Some(other) == root.as_ref())?;
+            self.index_of(root, &path)
+        });
+        if let Some(index) = selected {
             self.selected = index;
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
@@ -189,7 +207,7 @@ impl FileTree {
     pub fn open_folders(&self) -> impl Iterator<Item = &PathBuf> {
         self.rows
             .iter()
-            .filter(|row| row.is_dir && self.expanded.contains(&row.path))
+            .filter(|row| row.is_dir && self.is_open(row))
             .map(|row| &row.path)
     }
 
@@ -222,7 +240,7 @@ impl FileTree {
         self.rows.get(self.selected).map(|row| Entry {
             path: row.path.clone(),
             is_dir: row.is_dir,
-            is_root: row.depth == 0,
+            is_root: row.depth == 0 || self.roots.contains(&row.path),
         })
     }
 
@@ -302,15 +320,16 @@ impl FileTree {
     /// Follows `from`, and what's in it, to `to`: folders expanded there
     /// stay expanded. Refreshes and selects `to`.
     pub fn moved(&mut self, from: &Path, to: &Path) {
-        let expanded = std::mem::take(&mut self.expanded);
-        self.expanded = expanded
-            .into_iter()
-            .map(|path| match path.strip_prefix(from) {
-                Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
-                Ok(rest) => to.join(rest),
-                Err(_) => path,
-            })
-            .collect();
+        for expanded in self.expanded.values_mut() {
+            *expanded = std::mem::take(expanded)
+                .into_iter()
+                .map(|path| match path.strip_prefix(from) {
+                    Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
+                    Ok(rest) => to.join(rest),
+                    Err(_) => path,
+                })
+                .collect();
+        }
         self.refresh();
         self.reveal(to);
     }
@@ -320,26 +339,30 @@ impl FileTree {
         self.active_preview
     }
 
-    /// Expands the folders down to `path` and selects it, if it is in the
-    /// workspace. Re-reads the tree only if it had to expand a folder or
-    /// doesn't list `path` yet.
+    /// Expands the folders down to `path` under the deepest root it's in,
+    /// and selects it there, if it is in the workspace. Re-reads the tree
+    /// only if it had to expand a folder or doesn't list `path` yet.
     pub fn reveal(&mut self, path: &Path) {
-        let Some(root) = deepest_root(&self.roots, path) else {
+        let Some(root) = deepest_root(&self.roots, path).map(Path::to_path_buf) else {
             return;
         };
+        let Some(index) = self.roots.iter().position(|other| *other == root) else {
+            return;
+        };
+        let expanded = self.expanded.entry(root.clone()).or_default();
         let folders: Vec<PathBuf> = path
             .ancestors()
             .skip(1)
-            .take_while(|dir| dir.starts_with(root))
+            .take_while(|dir| dir.starts_with(&root))
             .map(Path::to_path_buf)
             .collect();
-        let collapsed = folders.iter().any(|dir| !self.expanded.contains(dir));
-        self.expanded.extend(folders);
-        if collapsed || self.index_of(path).is_none() {
+        let collapsed = folders.iter().any(|dir| !expanded.contains(dir));
+        expanded.extend(folders);
+        if collapsed || self.index_of(index, path).is_none() {
             self.refresh();
         }
-        if let Some(index) = self.index_of(path) {
-            self.select(index);
+        if let Some(row) = self.index_of(index, path) {
+            self.select(row);
         }
     }
 
@@ -426,7 +449,7 @@ impl FileTree {
             frame.fill_rect(x, y, width, 1, bg);
         }
         let indent = x + 1 + 2 * row.depth as u32;
-        let open = self.expanded.contains(&row.path);
+        let open = self.is_open(row);
         if row.is_dir {
             let arrow = if open { "▾" } else { "▸" };
             frame.draw_text(arrow, indent, y, ARROW_FG, None, Attributes::NONE);
@@ -489,7 +512,7 @@ impl FileTree {
                 preview,
             };
         }
-        if self.expanded.contains(&row.path) {
+        if self.is_open(row) {
             self.collapse(self.selected);
         } else {
             self.expand(self.selected);
@@ -505,7 +528,7 @@ impl FileTree {
         if !row.is_dir {
             return;
         }
-        if !self.expanded.contains(&row.path) {
+        if !self.is_open(row) {
             self.expand(self.selected);
         } else if self
             .rows
@@ -521,7 +544,7 @@ impl FileTree {
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
-        if row.is_dir && self.expanded.contains(&row.path) {
+        if row.is_dir && self.is_open(row) {
             self.collapse(self.selected);
             return;
         }
@@ -536,17 +559,18 @@ impl FileTree {
 
     fn expand(&mut self, index: usize) {
         let row = &self.rows[index];
-        let (path, depth, ignored) = (row.path.clone(), row.depth, row.ignored);
-        self.expanded.insert(path.clone());
+        let (path, depth, root, ignored) = (row.path.clone(), row.depth, row.root, row.ignored);
+        self.expanded_under(root).insert(path.clone());
         let mut children = Vec::new();
-        self.push_children(&mut children, &path, depth + 1, ignored);
+        self.push_children(&mut children, root, &path, depth + 1, ignored);
         self.rows.splice(index + 1..index + 1, children);
         self.listing += 1;
     }
 
     fn collapse(&mut self, index: usize) {
-        let depth = self.rows[index].depth;
-        self.expanded.remove(&self.rows[index].path);
+        let (depth, root) = (self.rows[index].depth, self.rows[index].root);
+        let path = self.rows[index].path.clone();
+        self.expanded_under(root).remove(&path);
         let end = self.rows[index + 1..]
             .iter()
             .position(|row| row.depth <= depth)
@@ -561,28 +585,49 @@ impl FileTree {
         self.scroll_into_view();
     }
 
-    fn index_of(&self, path: &Path) -> Option<usize> {
-        self.rows.iter().position(|row| row.path == path)
+    /// Where `path` is listed under the root at position `root`.
+    fn index_of(&self, root: usize, path: &Path) -> Option<usize> {
+        self.rows.iter().position(|row| row.root == root && row.path == path)
     }
 
-    /// Appends the entries of `dir`, and of its expanded subfolders. Those
-    /// of an `ignored` folder are all ignored.
-    fn push_children(&self, rows: &mut Vec<Row>, dir: &Path, depth: usize, ignored: bool) {
-        for row in read_dir(dir, depth, ignored) {
-            let expand = row.is_dir && self.expanded.contains(&row.path);
+    /// Whether `row`'s folder is expanded where it's listed.
+    fn is_open(&self, row: &Row) -> bool {
+        let root = &self.roots[row.root];
+        self.expanded.get(root).is_some_and(|open| open.contains(&row.path))
+    }
+
+    /// The folders expanded under the root at position `root`.
+    fn expanded_under(&mut self, root: usize) -> &mut HashSet<PathBuf> {
+        self.expanded.entry(self.roots[root].clone()).or_default()
+    }
+
+    /// Appends the entries of `dir`, under the root at position `root`, and
+    /// of its expanded subfolders. Those of an `ignored` folder are all
+    /// ignored.
+    fn push_children(
+        &self,
+        rows: &mut Vec<Row>,
+        root: usize,
+        dir: &Path,
+        depth: usize,
+        ignored: bool,
+    ) {
+        let expanded = &self.expanded[&self.roots[root]];
+        for row in read_dir(dir, depth, root, ignored) {
+            let expand = row.is_dir && expanded.contains(&row.path);
             let (path, ignored) = (row.path.clone(), row.ignored);
             rows.push(row);
             if expand {
-                self.push_children(rows, &path, depth + 1, ignored);
+                self.push_children(rows, root, &path, depth + 1, ignored);
             }
         }
     }
 }
 
-/// The entries of `dir`, folders first, each group by name ignoring case.
-/// An unreadable folder shows as empty. The entries of an `ignored` folder
-/// are all ignored.
-fn read_dir(dir: &Path, depth: usize, ignored: bool) -> Vec<Row> {
+/// The entries of `dir`, listed under the root at position `root`, folders
+/// first, each group by name ignoring case. An unreadable folder shows as
+/// empty. The entries of an `ignored` folder are all ignored.
+fn read_dir(dir: &Path, depth: usize, root: usize, ignored: bool) -> Vec<Row> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -608,6 +653,7 @@ fn read_dir(dir: &Path, depth: usize, ignored: bool) -> Vec<Row> {
                 ignored: !kept.contains(&path),
                 path,
                 depth,
+                root,
                 is_dir,
             }
         })
@@ -889,6 +935,51 @@ mod tests {
         let two = fixture("two", &["y"]);
         let tree = tree(&[one, two]);
         assert_eq!(listing(&tree), ["one/", "  x", "two/", "  y"]);
+    }
+
+    #[test]
+    fn a_root_inside_another_is_expanded_apart_and_owns_its_files() {
+        let outer = fixture("outer", &[".gitignore", "pkg/src/lib.rs", "top.rs"]);
+        fs::write(outer.join(".gitignore"), "pkg/\n").unwrap();
+        let inner = outer.join("pkg");
+        let mut tree = tree(&[outer.clone(), inner.clone()]);
+        assert_eq!(
+            listing(&tree),
+            ["outer/", "  pkg/", "  .gitignore", "  top.rs", "pkg/", "  src/"]
+        );
+        let ignored = |tree: &FileTree| -> Vec<(usize, String)> {
+            let rows = tree.rows.iter().filter(|row| row.ignored);
+            rows.map(|row| (row.root, row.name.clone())).collect()
+        };
+        assert_eq!(ignored(&tree), [(0, "pkg".to_string())], "only in outer");
+
+        // Revealed under the root it belongs to, not in outer's listing.
+        tree.reveal(&inner.join("src/lib.rs"));
+        assert_eq!(tree.rows[tree.selected].root, 1);
+        assert_eq!(selected(&tree), "lib.rs");
+        assert_eq!(listing(&tree)[1], "  pkg/", "outer's pkg stays shut");
+        let entry = tree.selected().unwrap();
+        assert!(!entry.is_root);
+
+        // Outer's copy of the root is a root too, for the file commands.
+        tree.select(1);
+        assert!(tree.selected().unwrap().is_root);
+        tree.run(Command::TreeExpand);
+        assert_eq!(listing(&tree)[..3], ["outer/", "  pkg/", "    src/"]);
+        tree.refresh();
+        assert_eq!(selected(&tree), "pkg");
+        assert_eq!(tree.rows[tree.selected].root, 0, "the selection stays put");
+
+        tree.set_roots(std::slice::from_ref(&outer));
+        assert_eq!(listing(&tree)[..3], ["outer/", "  pkg/", "    src/"]);
+        assert_eq!(listing(&tree).len(), 5);
+    }
+
+    #[test]
+    fn roots_with_the_same_name_are_told_apart() {
+        let root = fixture("same-name", &["a/src/x.rs", "b/src/y.rs"]);
+        let tree = tree(&[root.join("a/src"), root.join("b/src")]);
+        assert_eq!(listing(&tree), ["a/src/", "  x.rs", "b/src/", "  y.rs"]);
     }
 
     #[test]

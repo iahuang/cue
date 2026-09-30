@@ -1,7 +1,8 @@
 //! The folders cue is working in. The file tree shows them, and the file
 //! picker lists their files.
 //!
-//! There can be several roots, but the command line only opens one for now.
+//! Roots may nest, as when a package of a monorepo is added beside the
+//! repository: a file belongs to the deepest root it's in.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,12 +11,17 @@ use std::path::{Path, PathBuf};
 pub struct Workspace {
     /// Absolute, symlink-free paths, in the order they were added.
     roots: Vec<PathBuf>,
+    /// What each root is called, by [`root_names`].
+    names: Vec<String>,
 }
 
 impl Workspace {
     /// A workspace of the directories in `roots`.
     pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> io::Result<Workspace> {
-        let mut workspace = Workspace { roots: Vec::new() };
+        let mut workspace = Workspace {
+            roots: Vec::new(),
+            names: Vec::new(),
+        };
         for root in roots {
             workspace.add_root(&root)?;
         }
@@ -37,8 +43,17 @@ impl Workspace {
         }
         if !self.roots.contains(&root) {
             self.roots.push(root);
+            self.names = root_names(&self.roots);
         }
         Ok(())
+    }
+
+    /// Removes the root `root`. Returns false if it isn't one.
+    pub fn remove_root(&mut self, root: &Path) -> bool {
+        let count = self.roots.len();
+        self.roots.retain(|other| other != root);
+        self.names = root_names(&self.roots);
+        self.roots.len() < count
     }
 
     /// The deepest root containing `path`, if any. Roots may nest.
@@ -57,10 +72,14 @@ impl Workspace {
         if self.roots.len() == 1 {
             return relative.display().to_string();
         }
-        Path::new(&root_name(root))
-            .join(relative)
-            .display()
-            .to_string()
+        let name = self.name(root).unwrap_or_default();
+        Path::new(name).join(relative).display().to_string()
+    }
+
+    /// What the root `root` is called, if it is one.
+    pub fn name(&self, root: &Path) -> Option<&str> {
+        let index = self.roots.iter().position(|other| other == root)?;
+        Some(&self.names[index])
     }
 }
 
@@ -73,12 +92,36 @@ pub fn deepest_root<'a>(roots: &'a [PathBuf], path: &Path) -> Option<&'a Path> {
         .map(PathBuf::as_path)
 }
 
-/// The name shown for a root: its last component, or the whole path for `/`.
-pub fn root_name(root: &Path) -> String {
-    match root.file_name() {
-        Some(name) => name.to_string_lossy().into_owned(),
-        None => root.display().to_string(),
-    }
+/// The names shown for `roots`, in order: each its last component (the
+/// whole path for `/`), with as many of the folders above it as it takes to
+/// tell it from the others, as `api/src` and `web/src`.
+pub fn root_names(roots: &[PathBuf]) -> Vec<String> {
+    // Each root's last `n` components, or its whole path if it has fewer.
+    let tail = |root: &Path, n: usize| {
+        let names: Vec<_> = root.iter().skip(root.has_root() as usize).collect();
+        if n > names.len() {
+            return root.display().to_string();
+        }
+        let tail: PathBuf = names[names.len() - n..].iter().collect();
+        tail.display().to_string()
+    };
+    roots
+        .iter()
+        .map(|root| {
+            let mut n = 1;
+            loop {
+                let name = tail(root, n);
+                let taken = roots
+                    .iter()
+                    .any(|other| other != root && tail(other, n) == name);
+                // A whole path is told apart from the others already.
+                if !taken || name == root.display().to_string() {
+                    return name;
+                }
+                n += 1;
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -121,5 +164,27 @@ mod tests {
         assert_eq!(nested.root_of(&file), Some(inner.as_path()));
         assert_eq!(nested.display_path(&file), "inner/a.rs");
         assert_eq!(nested.display_path(&outer.join("c.rs")), "outer/c.rs");
+    }
+
+    #[test]
+    fn roots_with_the_same_name_are_told_apart() {
+        let roots = |paths: &[&str]| paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            root_names(&roots(&["/w/api/src", "/w/web/src", "/w/docs"])),
+            ["api/src", "web/src", "docs"]
+        );
+        assert_eq!(root_names(&roots(&["/src", "/w/src"])), ["/src", "w/src"]);
+        assert_eq!(root_names(&roots(&["/"])), ["/"]);
+
+        let dir = temp_dir("names");
+        let (a, b) = (dir.join("a/lib"), dir.join("b/lib"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let mut workspace = Workspace::new([a.clone(), b.clone()]).unwrap();
+        assert_eq!(workspace.display_path(&a.join("x.rs")), "a/lib/x.rs");
+        assert!(workspace.remove_root(&b));
+        assert!(!workspace.remove_root(&b));
+        assert_eq!(workspace.roots(), std::slice::from_ref(&a));
+        assert_eq!(workspace.display_path(&a.join("x.rs")), "x.rs");
     }
 }

@@ -97,6 +97,39 @@ fn encodes_input_for_the_programs_modes() {
 }
 
 #[test]
+fn hands_over_clipboard_writes() {
+    let _serial = serial();
+    let mut term = EmbeddedTerminal::new(10, 3, 1000).unwrap();
+    assert_eq!(term.take_clipboard(), None);
+    // Longer than the first read's buffer.
+    let text = "clip ".repeat(100);
+    let encoded = base64(text.as_bytes());
+    term.write(format!("\x1b]52;c;{encoded}\x1b\\").as_bytes())
+        .unwrap();
+    assert_eq!(term.take_clipboard().as_deref(), Some(text.as_str()));
+    assert_eq!(term.take_clipboard(), None);
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[test]
 fn answers_queries_and_reports_state() {
     let _serial = serial();
     let mut term = EmbeddedTerminal::new(10, 3, 1000).unwrap();

@@ -37,6 +37,10 @@ pub const EmbeddedTerminal = struct {
     rows: u16,
     responses: std.ArrayListUnmanaged(u8) = .empty,
     response_error: ?Error = null,
+    /// The text the program last put on the clipboard (OSC 52), until
+    /// taken; the host puts it on its own.
+    clipboard: std.ArrayListUnmanaged(u8) = .empty,
+    clipboard_pending: bool = false,
     mouse_last_cell: ?ghostty.Coordinate = null,
     force_redraw: bool = true,
     transparent_background: bool = false,
@@ -63,6 +67,7 @@ pub const EmbeddedTerminal = struct {
 
         var handler = self.terminal.vtHandler();
         handler.effects.write_pty = &writePty;
+        handler.effects.clipboard_write = &clipboardWrite;
         self.stream = .init(.{ .allocator = allocator, .handler = handler });
         return self;
     }
@@ -73,6 +78,7 @@ pub const EmbeddedTerminal = struct {
         self.render_state.deinit(allocator);
         self.terminal.deinit(allocator);
         self.responses.deinit(allocator);
+        self.clipboard.deinit(allocator);
         allocator.destroy(self);
     }
 
@@ -251,6 +257,38 @@ pub const EmbeddedTerminal = struct {
         std.mem.copyForwards(u8, self.responses.items[0 .. self.responses.items.len - count], self.responses.items[count..]);
         self.responses.items.len -= count;
         return count;
+    }
+
+    /// The text the program put on the clipboard since this was last
+    /// called with room for it, or null. Stays pending when `output` is too
+    /// short; `required` is then set to its length.
+    pub fn takeClipboard(self: *EmbeddedTerminal, output: []u8, required: *usize) ?usize {
+        required.* = 0;
+        if (!self.clipboard_pending) return null;
+        const text = self.clipboard.items;
+        required.* = text.len;
+        if (text.len > output.len) return null;
+        @memcpy(output[0..text.len], text);
+        self.clipboard_pending = false;
+        self.clipboard.clearRetainingCapacity();
+        return text.len;
+    }
+
+    /// Keeps the latest write for the host. All destinations (clipboard,
+    /// selection, primary) mean the one clipboard there. Clearing one is
+    /// ignored, so a program can't wipe what the user copied elsewhere.
+    fn clipboardWrite(handler: *ghostty.TerminalStream.Handler, request: ghostty.ClipboardWrite) ghostty.ClipboardWriteResult {
+        const self: *EmbeddedTerminal = @fieldParentPtr("terminal", handler.terminal);
+        const text = for (request.contents) |content| {
+            if (std.mem.eql(u8, content.mime, "text/plain")) break content.data;
+        } else return .unsupported;
+        self.clipboard.clearRetainingCapacity();
+        self.clipboard.appendSlice(self.allocator, text) catch {
+            self.clipboard_pending = false;
+            return .io_error;
+        };
+        self.clipboard_pending = true;
+        return .success;
     }
 
     fn writePty(handler: *ghostty.TerminalStream.Handler, data: [:0]const u8) void {

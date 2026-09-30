@@ -6,6 +6,12 @@ pub const Coordinate = vt.Coordinate;
 pub const RenderState = vt.RenderState;
 pub const Selection = vt.Selection;
 
+// libghostty-vt doesn't export its clipboard module; take the types from
+// the effect's signature.
+const clipboard_write_fn = @typeInfo(@typeInfo(@FieldType(TerminalStream.Handler.Effects, "clipboard_write")).optional.child).pointer.child;
+pub const ClipboardWrite = @typeInfo(clipboard_write_fn).@"fn".params[1].type.?;
+pub const ClipboardWriteResult = @typeInfo(clipboard_write_fn).@"fn".return_type.?;
+
 pub const Key = struct {
     action: vt.input.KeyAction = .press,
     key: vt.input.Key = .unidentified,

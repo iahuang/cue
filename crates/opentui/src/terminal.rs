@@ -379,6 +379,16 @@ impl EmbeddedTerminal {
         }
     }
 
+    /// Takes the text the program last put on the clipboard (OSC 52), if
+    /// it did since the last call. Only writes: requests to read the
+    /// clipboard are ignored, and so are requests to clear it.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        let text = read_sized(|out, len, required| unsafe {
+            sys::embeddedTerminalTakeClipboard(self.handle, out, len, required)
+        });
+        (!text.is_empty()).then_some(text)
+    }
+
     /// The native handle, for calling [`sys`](crate::sys) functions directly.
     pub fn raw_handle(&self) -> sys::Handle {
         self.handle

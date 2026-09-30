@@ -136,9 +136,9 @@ impl FileIndex {
 }
 
 /// Starts listing the files in `workspace` on other threads, reporting the
-/// files found so far along the way if `progress`. Folders inside another
-/// root are listed once, as part of it. The listing stops early if the
-/// receiver is dropped.
+/// files found so far along the way if `progress`. A root inside another is
+/// listed once, as itself. The listing stops early if the receiver is
+/// dropped.
 fn list(workspace: &Workspace, progress: bool) -> Receiver<Message> {
     let (sender, receiver) = mpsc::channel();
     let workspace = workspace.clone();
@@ -183,21 +183,24 @@ fn collect(workspace: &Workspace, progress: bool, sender: &Sender<Message>) {
 }
 
 /// A walk over the workspace's files, or `None` if it has no roots. It
-/// skips `.git`, `.DS_Store`, and what `.gitignore` and `.ignore` files exclude, and lists
-/// folders inside another root once, as part of it. The file picker and
-/// workspace search use the same rules.
+/// skips `.git`, `.DS_Store`, and what `.gitignore` and `.ignore` files
+/// exclude. A root inside another is walked as itself and skipped in the
+/// other, so each file is found once, and the other's ignore files don't
+/// hide the root added. The file picker and workspace search use the same
+/// rules.
 pub fn walker(workspace: &Workspace) -> Option<WalkBuilder> {
-    let roots = workspace.roots();
-    let mut outermost = roots.iter().filter(|root| {
-        !roots
-            .iter()
-            .any(|other| other != *root && root.starts_with(other))
-    });
-    let mut builder = WalkBuilder::new(outermost.next()?);
-    for root in outermost {
+    let (first, rest) = workspace.roots().split_first()?;
+    let mut builder = WalkBuilder::new(first);
+    for root in rest {
         builder.add(root);
     }
     skip_ignored(&mut builder);
+    if !rest.is_empty() {
+        let roots = workspace.roots().to_vec();
+        builder.filter_entry(move |entry| {
+            shown(entry) && (entry.depth() == 0 || !roots.iter().any(|root| root == entry.path()))
+        });
+    }
     Some(builder)
 }
 
@@ -208,9 +211,14 @@ pub fn skip_ignored(builder: &mut WalkBuilder) -> &mut WalkBuilder {
         // Dotfiles such as .env are shown, as in the tree; .git and
         // .DS_Store never are.
         .hidden(false)
-        .filter_entry(|entry| !tree::is_hidden(entry.file_name()))
+        .filter_entry(shown)
         // Honor .gitignore in folders that aren't git repositories too.
         .require_git(false)
+}
+
+/// Whether a walked entry is ever shown.
+fn shown(entry: &DirEntry) -> bool {
+    !tree::is_hidden(entry.file_name())
 }
 
 /// Whether a walked entry is a file, or a symlink to one.
@@ -301,10 +309,30 @@ mod tests {
     #[test]
     fn nested_roots_list_each_file_once() {
         let root = fixture("nested", &["inner/a.rs", "b.rs"]);
-        let workspace = Workspace::new([root.clone(), root.join("inner")]).unwrap();
+        for roots in [
+            [root.clone(), root.join("inner")],
+            [root.join("inner"), root.clone()],
+        ] {
+            let mut index = FileIndex::new(&Workspace::new(roots).unwrap());
+            index.wait();
+            assert_eq!(texts(&index), ["inner/a.rs", "nested/b.rs"]);
+        }
+    }
+
+    #[test]
+    fn a_root_inside_an_ignored_folder_is_listed() {
+        let root = fixture(
+            "nested-ignored",
+            &[".gitignore", "a.rs", "worktrees/feature/b.rs", "worktrees/other/c.rs"],
+        );
+        fs::write(root.join(".gitignore"), "worktrees/\n").unwrap();
+        let workspace = Workspace::new([root.clone(), root.join("worktrees/feature")]).unwrap();
         let mut index = FileIndex::new(&workspace);
         index.wait();
-        assert_eq!(index.files().len(), 2);
+        assert_eq!(
+            texts(&index),
+            ["feature/b.rs", "nested-ignored/.gitignore", "nested-ignored/a.rs"]
+        );
     }
 
     #[test]

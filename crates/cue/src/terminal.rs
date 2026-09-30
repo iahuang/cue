@@ -80,6 +80,11 @@ impl Terminal {
         })
     }
 
+    /// The folder it started in.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     /// Starts a new shell, after the last one exited, on a clear screen
     /// with none of the modes the last one left on.
     pub fn restart(&mut self) -> io::Result<()> {
@@ -129,6 +134,13 @@ impl Terminal {
             }
         }
         changed
+    }
+
+    /// The text the program put on the clipboard (OSC 52) since the last
+    /// call, if any. Programs do this over ssh, where they can't reach the
+    /// system clipboard themselves.
+    pub fn take_copied(&mut self) -> Option<String> {
+        self.vt.take_clipboard()
     }
 
     pub fn id(&self) -> u32 {

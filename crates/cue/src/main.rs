@@ -66,11 +66,11 @@ fn main() -> ExitCode {
         *PANIC.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{info}\n{backtrace}"));
     }));
 
-    let path = match parse_args() {
-        Ok(path) => path,
+    let paths = match parse_args() {
+        Ok(paths) => paths,
         Err(code) => return code,
     };
-    let result = std::panic::catch_unwind(|| run(path));
+    let result = std::panic::catch_unwind(|| run(paths));
     if let Some(message) = PANIC.lock().unwrap_or_else(|e| e.into_inner()).take() {
         eprintln!("cue crashed: {message}");
         return ExitCode::FAILURE;
@@ -85,13 +85,13 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: cue [FILE | FOLDER]";
+const USAGE: &str = "usage: cue [FOLDER]... [FILE]";
 
 /// Usage and every command with its shortcut.
 fn help() -> String {
     let keymap = Keymap::default();
     let mut help = format!(
-        "{USAGE}\n\nOpens FOLDER, or the current folder with FILE (or a new, unnamed buffer) open.\nShift+movement or the mouse selects.\nSet CUE_NERD_FONT=1 to show file icons, if your terminal uses a Nerd Font.\n\n"
+        "{USAGE}\n\nOpens each FOLDER, or the current folder, with FILE (or a new, unnamed buffer) open.\nShift+movement or the mouse selects.\nSet CUE_NERD_FONT=1 to show file icons, if your terminal uses a Nerd Font.\n\n"
     );
     let key = |command| {
         keymap
@@ -111,38 +111,37 @@ fn help() -> String {
     help
 }
 
-/// The optional file or folder argument, or the exit code for `--help`,
+/// The file and folder arguments, or the exit code for `--help`,
 /// `--version`, or bad usage.
-fn parse_args() -> Result<Option<PathBuf>, ExitCode> {
-    let mut args = std::env::args_os().skip(1);
-    let first = args.next();
-    if args.next().is_some() {
-        eprintln!("{USAGE}");
-        return Err(ExitCode::FAILURE);
-    }
-    match first {
-        Some(arg) if arg == "-h" || arg == "--help" => {
+fn parse_args() -> Result<Vec<PathBuf>, ExitCode> {
+    let mut paths = Vec::new();
+    for arg in std::env::args_os().skip(1) {
+        if arg == "-h" || arg == "--help" {
             print!("{}", help());
-            Err(ExitCode::SUCCESS)
+            return Err(ExitCode::SUCCESS);
         }
-        Some(arg) if arg == "-V" || arg == "--version" => {
+        if arg == "-V" || arg == "--version" {
             println!("cue {}", env!("CARGO_PKG_VERSION"));
-            Err(ExitCode::SUCCESS)
+            return Err(ExitCode::SUCCESS);
         }
-        Some(arg) => Ok(Some(PathBuf::from(arg))),
-        None => Ok(None),
+        paths.push(PathBuf::from(arg));
     }
+    Ok(paths)
 }
 
-fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     // Load before taking over the terminal so errors print normally.
-    let cwd = std::env::current_dir()?;
-    let (root, file) = match path {
-        Some(path) if path.is_dir() => (path, None),
-        Some(path) => (cwd, Some(path)),
-        None => (cwd, None),
+    let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) =
+        paths.into_iter().partition(|path| path.is_dir());
+    let mut files = files.into_iter();
+    let file = files.next();
+    if let Some(extra) = files.next() {
+        return Err(format!("{}: only one file opens at a time", extra.display()).into());
+    }
+    let workspace = match folders.is_empty() {
+        true => Workspace::new([std::env::current_dir()?])?,
+        false => Workspace::new(folders)?,
     };
-    let workspace = Workspace::new([root])?;
     let (mut width, mut height) = tty::size();
     let mut app = App::new(workspace, file, width, height)?;
 
@@ -190,6 +189,9 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                 Vec::new()
             };
             changed |= app.poll();
+            if let Some(text) = app.take_copied() {
+                renderer.copy_to_clipboard(&text);
+            }
             changed |= renderer.poll_kitty_image_transport();
             let resized = tty::size() != (width, height);
             if !events.is_empty() || resized || (changed && drawn.elapsed() >= FRAME) {

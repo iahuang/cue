@@ -476,6 +476,29 @@ test "embedded terminal reports its title, alternate screen, and scrolls to the 
     try std.testing.expect(terminal.terminal.screens.active.pages.viewport == .active);
 }
 
+test "embedded terminal keeps the latest clipboard write for the host" {
+    const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 20, .rows = 4 });
+    defer terminal.deinit();
+    var required: usize = 0;
+    var out: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, null), terminal.takeClipboard(&out, &required));
+
+    // "first", then "hello" to the selection: the latest wins.
+    try terminal.write("\x1b]52;c;Zmlyc3Q=\x1b\\\x1b]52;s;aGVsbG8=\x07");
+    // Reads and clears aren't forwarded, and leave it pending.
+    try terminal.write("\x1b]52;c;?\x07\x1b]52;c;\x07");
+
+    var short: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, null), terminal.takeClipboard(&short, &required));
+    try std.testing.expectEqual(@as(usize, 5), required);
+    const len = terminal.takeClipboard(&out, &required).?;
+    try std.testing.expectEqualStrings("hello", out[0..len]);
+    try std.testing.expectEqual(@as(?usize, null), terminal.takeClipboard(&out, &required));
+
+    var response: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try terminal.drainResponses(&response));
+}
+
 comptime {
     _ = ghostty;
 }

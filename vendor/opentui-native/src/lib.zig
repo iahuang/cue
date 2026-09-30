@@ -554,6 +554,28 @@ export fn embeddedTerminalDrainResponses(handle: NativeHandle, out_ptr: ?[*]u8, 
     return @intCast(written);
 }
 
+/// Takes the text the program last put on the clipboard (OSC 52): its
+/// length, or 0 with none. When `out_len` is too short, it stays pending and
+/// `out_required` gives the length needed.
+export fn embeddedTerminalTakeClipboard(
+    handle: NativeHandle,
+    out_ptr: ?[*]u8,
+    out_len: u32,
+    out_required_ptr: ?*u32,
+) i32 {
+    const out_required = out_required_ptr orelse return EmbeddedTerminalStatus.invalid;
+    out_required.* = 0;
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    const output = embeddedTerminalOutput(out_ptr, out_len) orelse return EmbeddedTerminalStatus.invalid;
+    var required: usize = 0;
+    const written = terminal_value.takeClipboard(output, &required);
+    out_required.* = std.math.cast(u32, required) orelse return EmbeddedTerminalStatus.out_of_memory;
+    const count = written orelse {
+        return if (required > 0) EmbeddedTerminalStatus.out_of_space else 0;
+    };
+    return std.math.cast(i32, count) orelse EmbeddedTerminalStatus.out_of_memory;
+}
+
 export fn setLogCallback(callback: ?*const fn (level: u8, msgPtr: [*]const u8, msgLen: u32) callconv(.c) void) void {
     logger.setLogCallback(callback);
 }

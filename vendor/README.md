@@ -70,4 +70,7 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   the buffer's scissor rect (`set` ignores it). `encodeKey` treats Alt as Alt
   on macOS, since the host terminal already decided what Option is. New
   exports: `embeddedTerminalScrollToBottom`, `embeddedTerminalIsAlternateScreen`,
-  and `embeddedTerminalGetTitle`.
+  `embeddedTerminalGetTitle`, and `embeddedTerminalTakeClipboard`, which hands
+  over the latest OSC 52 clipboard write from the program (Ghostty's
+  `clipboard_write` effect; reads and clears aren't forwarded) for the host
+  to copy.
