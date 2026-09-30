@@ -575,9 +575,8 @@ impl Keymap {
     /// there is none. The shell has the keys a terminal would send it:
     /// cue keeps only its terminal bindings, and global shortcuts with
     /// Cmd (Super), Ctrl+Alt, or Ctrl+Shift, which shells don't use.
-    /// Ctrl+Shift+key doesn't stand in for Ctrl+key, which is the shell's;
-    /// Ctrl+Shift is kept for shortcuts of its own. The prefix, Ctrl+`,
-    /// reaches the rest.
+    /// Ctrl+Shift+key runs cue's Ctrl+key command, taking precedence over
+    /// its usual shifted binding. The prefix, Ctrl+`, reaches the rest.
     pub fn lookup_terminal(&self, key: Key) -> Option<Command> {
         let key = normalize(key);
         let bound = |key, context| {
@@ -586,6 +585,30 @@ impl Keymap {
                 .find(|b| b.key == key && b.context == context)
                 .map(|b| b.command)
         };
+        if key.mods.ctrl && key.mods.shift {
+            // Terminals may report the shifted character instead of the
+            // base key (for example, `|` instead of `\\`).
+            let code = match key.code {
+                KeyCode::Char(c) => {
+                    let base = "~!@#$%^&*()_+{}|:\"<>?"
+                        .chars()
+                        .zip("`1234567890-=[]\\;',./".chars())
+                        .find_map(|(shifted, base)| (c == shifted).then_some(base))
+                        .unwrap_or(c);
+                    KeyCode::Char(base)
+                }
+                code => code,
+            };
+            let unshifted = Key::new(
+                code,
+                Mods {
+                    shift: false,
+                    ..key.mods
+                },
+            );
+            return bound(unshifted, Context::Terminal)
+                .or_else(|| self.find(unshifted, Context::Editor));
+        }
         if let Some(command) = bound(key, Context::Terminal) {
             return Some(command);
         }
@@ -913,12 +936,8 @@ mod tests {
         let key =
             |c, shift, alt, ctrl, sup| Key::new(KeyCode::Char(c), mods(shift, alt, ctrl, sup));
         let lookup = |key| keymap.lookup_terminal(key);
-        // The shell's: Ctrl+key, Alt+key, Esc, arrows. Ctrl+Shift+key isn't
-        // Ctrl+key's shortcut.
+        // The shell's: Ctrl+key, Alt+key, Esc, arrows.
         for key in [
-            key('p', true, false, true, false),
-            key('P', false, false, true, false),
-            key('w', true, false, true, false),
             key('p', false, false, true, false),
             key('w', false, false, true, false),
             key('c', false, false, true, false),
@@ -932,17 +951,25 @@ mod tests {
         ] {
             assert_eq!(lookup(key), None, "{key}");
         }
-        // cue's: Cmd, Ctrl+Alt, and Ctrl+Shift bindings.
+        // cue's: Ctrl+Shift aliases Ctrl; Cmd and Ctrl+Alt keep their bindings.
         for (key, command) in [
-            (key('f', true, false, true, false), Command::SearchWorkspace),
-            (key('\\', true, false, true, false), Command::SplitDown),
+            (key('p', true, false, true, false), Command::GoToFile),
+            (key('P', false, false, true, false), Command::GoToFile),
+            (key('w', true, false, true, false), Command::ClosePanel),
+            (key('k', true, false, true, false), Command::Palette),
+            (key('z', true, false, true, false), Command::Undo),
+            (key('|', true, false, true, false), Command::SplitRight),
+            (key('!', true, false, true, false), Command::GoToTab1),
+            (key('_', true, false, true, false), Command::GoBack),
+            (key('f', true, false, true, false), Command::Find),
+            (key('\\', true, false, true, false), Command::SplitRight),
             (key('p', false, false, false, true), Command::GoToFile),
-            (key('n', true, false, true, false), Command::NewTerminal),
-            (key('N', false, false, true, false), Command::NewTerminal),
-            (key('`', true, false, true, false), Command::NewTerminal),
-            (key('~', true, false, true, false), Command::NewTerminal),
+            (key('n', true, false, true, false), Command::NewFile),
+            (key('N', false, false, true, false), Command::NewFile),
+            (key('`', true, false, true, false), Command::TerminalPrefix),
+            (key('~', true, false, true, false), Command::TerminalPrefix),
             (key('n', false, true, true, false), Command::CreateFile),
-            (key('s', true, false, true, false), Command::SaveAs),
+            (key('s', true, false, true, false), Command::Save),
             (
                 Key::new(KeyCode::Left, mods(false, true, true, false)),
                 Command::FocusPanelLeft,
@@ -956,7 +983,7 @@ mod tests {
             (key('[', false, true, true, false), Command::PreviousTab),
             (
                 Key::new(KeyCode::PageDown, mods(true, false, true, false)),
-                Command::MoveTabRight,
+                Command::NextTab,
             ),
             (key('c', true, false, true, false), Command::Copy),
             (key('c', false, false, false, true), Command::Copy),

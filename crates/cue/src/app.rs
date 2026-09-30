@@ -3776,6 +3776,13 @@ mod tests {
         });
         assert!(!app.ed_is_shown(), "typing went to the shell");
 
+        // Ctrl+Shift reaches cue's Ctrl shortcut directly while the
+        // terminal has focus, including uppercase terminal reports.
+        app.handle_key(Key::new(KeyCode::Char('P'), ctrl_shift));
+        assert!(app.picker.is_some());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.keyboard_terminal().is_some());
+
         // Ctrl+P is the shell's, and cue's after the prefix, Ctrl+`, which
         // the status bar hints.
         assert!(screen(&app).contains("^` cue keys"), "{}", screen(&app));
