@@ -23,6 +23,9 @@ pub struct Syntax {
     /// Applied as one query, in order: where patterns capture the same
     /// text, the last one wins, so later queries refine earlier ones.
     pub highlights: &'static [&'static str],
+    /// Applied as one query: where to highlight parts of the text as
+    /// another language, such as a Markdown code block's.
+    pub injections: &'static [&'static str],
 }
 
 impl Language {
@@ -35,6 +38,21 @@ impl Language {
             syntax: Some(Syntax {
                 grammar,
                 highlights,
+                injections: &[],
+            }),
+            ..self
+        }
+    }
+
+    /// Highlights parts of it as other languages, with `injections`.
+    const fn injecting(self, injections: &'static [&'static str]) -> Language {
+        let Some(syntax) = self.syntax else {
+            panic!("injections without highlights");
+        };
+        Language {
+            syntax: Some(Syntax {
+                injections,
+                ..syntax
             }),
             ..self
         }
@@ -65,12 +83,20 @@ static LANGUAGES: &[Language] = &[
         || tree_sitter_toml_ng::LANGUAGE.into(),
         &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
     ),
-    // Block structure only: inline markup needs the inline grammar,
-    // injected into each paragraph.
-    language("Markdown", &["md", "markdown"], &[], &[]).highlighted(
-        || tree_sitter_md::LANGUAGE.into(),
-        &[tree_sitter_md::HIGHLIGHT_QUERY_BLOCK],
-    ),
+    // Block structure: inline markup is `MARKDOWN_INLINE`, injected into
+    // each paragraph, heading, and table cell.
+    language("Markdown", &["md", "markdown"], &[], &[])
+        .highlighted(
+            || tree_sitter_md::LANGUAGE.into(),
+            &[
+                tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+                include_str!("../queries/markdown/highlights.scm"),
+            ],
+        )
+        .injecting(&[
+            tree_sitter_md::INJECTION_QUERY_BLOCK,
+            include_str!("../queries/markdown/injections.scm"),
+        ]),
     language("JSON", &["json", "jsonc"], &[], &[]).highlighted(
         || tree_sitter_json::LANGUAGE.into(),
         &[tree_sitter_json::HIGHLIGHTS_QUERY],
@@ -138,10 +164,12 @@ static LANGUAGES: &[Language] = &[
         || tree_sitter_yaml::LANGUAGE.into(),
         &[tree_sitter_yaml::HIGHLIGHTS_QUERY],
     ),
-    language("HTML", &["html", "htm"], &[], &[]).highlighted(
-        || tree_sitter_html::LANGUAGE.into(),
-        &[tree_sitter_html::HIGHLIGHTS_QUERY],
-    ),
+    language("HTML", &["html", "htm"], &[], &[])
+        .highlighted(
+            || tree_sitter_html::LANGUAGE.into(),
+            &[tree_sitter_html::HIGHLIGHTS_QUERY],
+        )
+        .injecting(&[tree_sitter_html::INJECTIONS_QUERY]),
     language("CSS", &["css"], &[], &[]).highlighted(
         || tree_sitter_css::LANGUAGE.into(),
         &[tree_sitter_css::HIGHLIGHTS_QUERY],
@@ -152,10 +180,39 @@ static LANGUAGES: &[Language] = &[
     ),
 ];
 
+/// Markdown's inline markup, which only comes injected into Markdown.
+static MARKDOWN_INLINE: Language = language("Markdown inline", &[], &[], &[])
+    .highlighted(
+        || tree_sitter_md::INLINE_LANGUAGE.into(),
+        &[
+            tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+            include_str!("../queries/markdown_inline/highlights.scm"),
+        ],
+    )
+    .injecting(&[tree_sitter_md::INJECTION_QUERY_INLINE]);
+
 /// Every language cue knows.
 #[cfg(test)]
-pub fn all() -> &'static [Language] {
-    LANGUAGES
+pub fn all() -> impl Iterator<Item = &'static Language> {
+    LANGUAGES.iter().chain([&MARKDOWN_INLINE])
+}
+
+/// The language an injection query names, as in a Markdown code block's
+/// info string: `rust`, `rs`, `c++`, `bash`, or `rust,ignore`.
+pub fn injected(name: &str) -> Option<&'static Language> {
+    if name == "markdown_inline" {
+        return Some(&MARKDOWN_INLINE);
+    }
+    let name = name
+        .split([',', ' ', '{', '}'])
+        .find(|word| !word.is_empty())?
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    LANGUAGES.iter().find(|l| {
+        l.name.eq_ignore_ascii_case(&name)
+            || l.extensions.contains(&name.as_str())
+            || l.interpreters.contains(&name.as_str())
+    })
 }
 
 /// The language of the file at `path`, going by its name, or else by the
@@ -221,6 +278,23 @@ mod tests {
         assert_eq!(name("run", "# not a shebang"), None);
         // The name wins over the first line.
         assert_eq!(name("run.rs", "#!/bin/sh"), Some("Rust"));
+    }
+
+    #[test]
+    fn finds_injected_languages_by_any_name() {
+        let name = |name: &str| injected(name).map(|l| l.name);
+        assert_eq!(name("rust"), Some("Rust"));
+        assert_eq!(name("rs"), Some("Rust"));
+        assert_eq!(name("Python"), Some("Python"));
+        assert_eq!(name("c++"), Some("C++"));
+        assert_eq!(name("shell"), Some("Shell"));
+        assert_eq!(name("zsh"), Some("Shell"));
+        assert_eq!(name("jsx"), Some("JavaScript"));
+        assert_eq!(name("rust,ignore"), Some("Rust"));
+        assert_eq!(name("{.python}"), Some("Python"));
+        assert_eq!(name("markdown_inline"), Some("Markdown inline"));
+        assert_eq!(name("mermaid"), None);
+        assert_eq!(name(""), None);
     }
 
     #[test]

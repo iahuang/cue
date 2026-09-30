@@ -770,7 +770,7 @@ impl SearchModal {
                 Some(_) => (MATCH_FG, Some(MATCH_BG), Attributes::BOLD),
                 None => match syntax.peek() {
                     Some((bytes, color)) if bytes.start <= byte => {
-                        (color.fg(), None, color.attributes())
+                        (color.fg().unwrap_or(FG), None, color.attributes())
                     }
                     _ => (FG, None, Attributes::NONE),
                 },

@@ -8,6 +8,10 @@
 //!
 //! An [`ExcerptHighlighter`] colors a few lines of a file at a time, for
 //! search results, on any thread, and remembers them for the next search.
+//!
+//! Both color text injected into a language as the language it is, like a
+//! Markdown code block's, or its paragraphs' inline markup: those are
+//! parsed as the lines they're in are highlighted.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -20,19 +24,27 @@ use std::time::{Duration, Instant};
 
 use opentui::{EditBuffer, Highlight};
 use tree_sitter::{
-    InputEdit, ParseOptions, ParseState, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
+    InputEdit, Node, ParseOptions, ParseState, Parser, Point, Query, QueryCursor,
+    StreamingIterator, Tree,
 };
 
-use crate::language::Language;
-use crate::theme::{SyntaxColor, Theme};
+use crate::language::{self, Language};
+use crate::theme::{SyntaxColor, SyntaxStyles, Theme};
 
 /// Tags syntax highlights.
 pub const HIGHLIGHTS: u16 = 2;
 /// Larger files are left plain.
 const MAX_BYTES: usize = 8 << 20;
 /// Parsing that takes longer gives up and leaves the file plain, rather than
-/// hold up the editor.
+/// hold up the editor. So does parsing the text injected into the lines on
+/// screen, which leaves what's left of it the colors of the text it's in.
 const PARSE_BUDGET: Duration = Duration::from_millis(300);
+/// How deep injections nest: Markdown's inline markup is one deep, HTML in
+/// it two, and a script in that three.
+const MAX_INJECTION_DEPTH: u32 = 3;
+/// At most this many injections are highlighted at once, which bounds the
+/// work for a screen of very long lines.
+const MAX_INJECTIONS: usize = 1000;
 /// At most this many captures are highlighted at once, which bounds the work
 /// for a screen of very long lines.
 const MAX_CAPTURES: usize = 20_000;
@@ -46,12 +58,23 @@ pub const MAX_EXCERPT_BYTES: usize = 2 << 20;
 /// spans, about 24 bytes each.
 const MAX_CACHED_SPANS: usize = 1 << 20;
 
-/// A language's grammar and compiled highlight query.
+/// A language's grammar and compiled queries.
 struct Grammar {
     language: tree_sitter::Language,
     query: Query,
     /// Colors by capture index; `None` for captures left uncolored.
     colors: Vec<Option<SyntaxColor>>,
+    /// Where other languages are injected into it, if anywhere.
+    injections: Option<InjectionQuery>,
+}
+
+struct InjectionQuery {
+    query: Query,
+    /// The capture of the injected text.
+    content: u32,
+    /// The capture of the injected language's name, if the query names
+    /// languages by text, like a code block's info string.
+    language: Option<u32>,
 }
 
 /// Grammars by language name; `None` for one whose query doesn't compile.
@@ -60,7 +83,7 @@ type Grammars = HashMap<&'static str, Option<Arc<Grammar>>>;
 /// Compiled on first use: a big query takes a while. Shared by every thread.
 static GRAMMARS: LazyLock<Mutex<Grammars>> = LazyLock::new(Default::default);
 
-fn grammar(language: &'static Language) -> Option<Arc<Grammar>> {
+fn grammar_of(language: &'static Language) -> Option<Arc<Grammar>> {
     let syntax = language.syntax.as_ref()?;
     let mut grammars = GRAMMARS.lock().unwrap_or_else(|e| e.into_inner());
     grammars
@@ -76,30 +99,40 @@ fn grammar(language: &'static Language) -> Option<Arc<Grammar>> {
                 .iter()
                 .map(|name| SyntaxColor::of(name))
                 .collect();
+            let injections = if syntax.injections.is_empty() {
+                None
+            } else {
+                let query = Query::new(&grammar, &syntax.injections.concat()).ok()?;
+                Some(InjectionQuery {
+                    content: query.capture_index_for_name("injection.content")?,
+                    language: query.capture_index_for_name("injection.language"),
+                    query,
+                })
+            };
             Some(Arc::new(Grammar {
                 language: grammar,
                 query,
                 colors,
+                injections,
             }))
         })
         .clone()
 }
 
 /// Parses `text` with `parser`, reusing `old`, the tree of the text before,
-/// for what didn't change. Gives up after `budget`, if any, or once `stop`
+/// for what didn't change. Gives up at `deadline`, if any, or once `stop`
 /// is set.
 fn parse(
     parser: &mut Parser,
     text: &str,
     old: Option<&Tree>,
-    budget: Option<Duration>,
+    deadline: Option<Instant>,
     stop: &AtomicBool,
 ) -> Option<Tree> {
     // Small texts are parsed before the first check of progress.
     if stop.load(Ordering::Relaxed) {
         return None;
     }
-    let deadline = budget.map(|budget| Instant::now() + budget);
     let mut progress = |_: &ParseState| {
         let late = deadline.is_some_and(|deadline| Instant::now() >= deadline);
         if !late && !stop.load(Ordering::Relaxed) {
@@ -116,17 +149,16 @@ fn parse(
     )
 }
 
-/// The styled spans of `bytes` of `text`, which `tree` is the tree of, with
-/// each capture's style from `styles`.
-fn query_spans<S: Copy>(
+/// What `grammar`'s highlight query captures in `bytes` of `text`, which
+/// `tree` is the tree of.
+fn query_captures(
     grammar: &Grammar,
     cursor: &mut QueryCursor,
     tree: &Tree,
     text: &str,
     bytes: Range<usize>,
-    styles: &[Option<S>],
-) -> Vec<Span<S>> {
-    cursor.set_byte_range(bytes.clone());
+) -> Vec<Capture<SyntaxColor>> {
+    cursor.set_byte_range(bytes);
     let mut captures = cursor.captures(&grammar.query, tree.root_node(), text.as_bytes());
     let mut found = Vec::new();
     while let Some((m, i)) = captures.next() {
@@ -134,14 +166,304 @@ fn query_spans<S: Copy>(
         found.push(Capture {
             bytes: capture.node.byte_range(),
             node: capture.node.id(),
-            style: styles[capture.index as usize],
+            style: grammar.colors[capture.index as usize],
             pattern: m.pattern_index,
         });
         if found.len() == MAX_CAPTURES {
             break;
         }
     }
-    flatten(found, bytes)
+    found
+}
+
+/// Text in another language: a node of the text it's in.
+struct Injection<'tree> {
+    language: &'static Language,
+    node: Node<'tree>,
+    /// Whether the node's children are in the language too.
+    include_children: bool,
+}
+
+/// The injections `query` finds in `bytes` of `text`, which `tree` is the
+/// tree of.
+fn find_injections<'tree>(
+    query: &InjectionQuery,
+    cursor: &mut QueryCursor,
+    tree: &'tree Tree,
+    text: &str,
+    bytes: Range<usize>,
+) -> Vec<Injection<'tree>> {
+    cursor.set_byte_range(bytes);
+    let mut matches = cursor.matches(&query.query, tree.root_node(), text.as_bytes());
+    let mut found = Vec::new();
+    while let Some(m) = matches.next() {
+        let mut content = None;
+        let mut name = None;
+        for capture in m.captures() {
+            if capture.index == query.content {
+                content = Some(capture.node);
+            } else if Some(capture.index) == query.language {
+                name = text.get(capture.node.byte_range());
+            }
+        }
+        let mut include_children = false;
+        for property in query.query.property_settings(m.pattern_index) {
+            match &*property.key {
+                "injection.language" => name = name.or(property.value.as_deref()),
+                "injection.include-children" => include_children = true,
+                _ => {}
+            }
+        }
+        let (Some(node), Some(language)) = (content, name.and_then(language::injected)) else {
+            continue;
+        };
+        found.push(Injection {
+            language,
+            node,
+            include_children,
+        });
+        if found.len() == MAX_INJECTIONS {
+            break;
+        }
+    }
+    found
+}
+
+/// The ranges of `node` that are injected text: all of it with `children`,
+/// or else what's between its named children, such as the `>` starting
+/// each line of a quote. Only what's also within `parent`, if not empty.
+fn included_ranges(
+    node: Node,
+    children: bool,
+    parent: &[tree_sitter::Range],
+) -> Vec<tree_sitter::Range> {
+    let mut ranges = Vec::new();
+    let mut rest = node.range();
+    if !children {
+        let mut cursor = node.walk();
+        // Empty children, like the block continuations of a code block
+        // not in a list or quote, split nothing.
+        let children = node.named_children(&mut cursor);
+        for child in children.filter(|child| child.start_byte() < child.end_byte()) {
+            ranges.push(tree_sitter::Range {
+                end_byte: child.start_byte(),
+                end_point: child.start_position(),
+                ..rest
+            });
+            rest.start_byte = child.end_byte();
+            rest.start_point = child.end_position();
+        }
+    }
+    ranges.push(rest);
+    ranges.retain(|range| range.start_byte < range.end_byte);
+    if parent.is_empty() {
+        return ranges;
+    }
+    let mut within = Vec::new();
+    for range in &ranges {
+        for outer in parent {
+            let start = if range.start_byte < outer.start_byte {
+                outer
+            } else {
+                range
+            };
+            let end = if range.end_byte > outer.end_byte {
+                outer
+            } else {
+                range
+            };
+            if start.start_byte < end.end_byte {
+                within.push(tree_sitter::Range {
+                    start_byte: start.start_byte,
+                    start_point: start.start_point,
+                    end_byte: end.end_byte,
+                    end_point: end.end_point,
+                });
+            }
+        }
+    }
+    within
+}
+
+/// Injected text's tree, kept for the next time its lines are highlighted.
+struct Injected {
+    /// The bytes of the node it's in.
+    node: Range<usize>,
+    /// What it was parsed from.
+    ranges: Vec<tree_sitter::Range>,
+    /// `None` if parsing took too long: it keeps the colors of the text
+    /// it's in from then on, as a file that took too long stays plain.
+    tree: Option<Tree>,
+    /// The text changed since: `tree` is edited to match, to parse again.
+    edited: bool,
+    /// Highlighted since [`Colorer::forget_unused`].
+    used: bool,
+}
+
+/// Colors text with its language's highlight query, and injected text with
+/// its own language's.
+struct Colorer {
+    /// Parses injected text.
+    parser: Parser,
+    cursor: QueryCursor,
+    /// Injected text's trees, by language and where the text starts.
+    injected: HashMap<(&'static str, usize), Injected>,
+}
+
+impl Colorer {
+    fn new() -> Colorer {
+        Colorer {
+            parser: Parser::new(),
+            cursor: QueryCursor::new(),
+            injected: HashMap::new(),
+        }
+    }
+
+    /// Keeps the trees of injected text through `edit` to the text, to
+    /// parse again from.
+    fn edit(&mut self, edit: &InputEdit) {
+        self.injected = std::mem::take(&mut self.injected)
+            .into_iter()
+            .map(|((language, start), mut injected)| {
+                if let Some(tree) = &mut injected.tree {
+                    tree.edit(edit);
+                }
+                injected.edited = true;
+                let start = if start >= edit.old_end_byte {
+                    start - edit.old_end_byte + edit.new_end_byte
+                } else {
+                    start
+                };
+                ((language, start), injected)
+            })
+            .collect();
+    }
+
+    /// Forgets the trees of injected text not highlighted since last time.
+    fn forget_unused(&mut self) {
+        self.injected
+            .retain(|_, injected| std::mem::take(&mut injected.used));
+    }
+
+    /// The tree of `injection` in `grammar`'s language, of `text`, within
+    /// `parent`, the ranges of the text it's in, if not all of `text`; and
+    /// the ranges it's of. The tree from before if the text's the same, or
+    /// else parsed, from the one before if any, by `deadline`. `Err` if
+    /// stopped by `stop`.
+    fn injected_tree(
+        &mut self,
+        injection: &Injection,
+        parent: &[tree_sitter::Range],
+        grammar: &Grammar,
+        text: &str,
+        deadline: Option<Instant>,
+        stop: &AtomicBool,
+    ) -> Result<Option<(Tree, Vec<tree_sitter::Range>)>, ()> {
+        let node = injection.node;
+        let key = (injection.language.name, node.start_byte());
+        let before = self.injected.remove(&key);
+        let same = (before.as_ref()).is_some_and(|b| !b.edited && b.node == node.byte_range());
+        // Working the ranges out walks the node's children, and a code
+        // block has one for each line.
+        let ranges = match &before {
+            Some(before) if same => before.ranges.clone(),
+            _ => included_ranges(node, injection.include_children, parent),
+        };
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let tree = match before {
+            Some(before) if same || before.tree.is_none() => before.tree,
+            before => {
+                let old = before.and_then(|before| before.tree);
+                let parser = &mut self.parser;
+                if parser.set_language(&grammar.language).is_err()
+                    || parser.set_included_ranges(&ranges).is_err()
+                {
+                    return Ok(None);
+                }
+                let tree = parse(parser, text, old.as_ref(), deadline, stop);
+                if tree.is_none() && stop.load(Ordering::Relaxed) {
+                    return Err(());
+                }
+                tree
+            }
+        };
+        self.injected.insert(
+            key,
+            Injected {
+                node: node.byte_range(),
+                ranges: ranges.clone(),
+                tree: tree.clone(),
+                edited: false,
+                used: true,
+            },
+        );
+        Ok(tree.map(|tree| (tree, ranges)))
+    }
+
+    /// The colored spans of `bytes` of `text`, which `tree` is the tree in
+    /// `grammar`'s language of, parsed from `ranges` if not all of `text`,
+    /// injected `depth` deep. Injected text left to parse at `deadline`, if
+    /// any, keeps the colors of the text it's in. `None` if stopped by
+    /// `stop`.
+    #[allow(clippy::too_many_arguments)]
+    fn spans(
+        &mut self,
+        grammar: &Grammar,
+        tree: &Tree,
+        text: &str,
+        bytes: Range<usize>,
+        ranges: &[tree_sitter::Range],
+        depth: u32,
+        deadline: Option<Instant>,
+        stop: &AtomicBool,
+    ) -> Option<Vec<Span<SyntaxColor>>> {
+        let captures = query_captures(grammar, &mut self.cursor, tree, text, bytes.clone());
+        let injections = match &grammar.injections {
+            Some(query) if depth < MAX_INJECTION_DEPTH => {
+                find_injections(query, &mut self.cursor, tree, text, bytes.clone())
+            }
+            _ => Vec::new(),
+        };
+        // Injected text shows the color captured for the node it's in,
+        // under its own: a heading keeps its color, and a code block with
+        // `@none` shows only its language's.
+        let bases: Vec<Option<SyntaxColor>> = injections
+            .iter()
+            .map(|injection| {
+                let own = captures.iter().filter(|c| c.node == injection.node.id());
+                own.max_by_key(|c| c.pattern).and_then(|c| c.style)
+            })
+            .collect();
+        let mut spans = flatten(captures, bytes.clone());
+        for (injection, base) in injections.iter().zip(bases) {
+            let Some(injected) = grammar_of(injection.language) else {
+                continue;
+            };
+            let tree = self.injected_tree(injection, ranges, &injected, text, deadline, stop);
+            let Some((tree, injected_ranges)) = tree.ok()? else {
+                continue;
+            };
+            let layer = self.spans(
+                &injected,
+                &tree,
+                text,
+                bytes.clone(),
+                &injected_ranges,
+                depth + 1,
+                deadline,
+                stop,
+            )?;
+            for range in &injected_ranges {
+                let range = range.start_byte.max(bytes.start)..range.end_byte.min(bytes.end);
+                if !range.is_empty() {
+                    paint(&mut spans, range, base, &layer);
+                }
+            }
+        }
+        Some(spans)
+    }
 }
 
 /// A line's syntax colors, as byte ranges in it, in order.
@@ -152,14 +474,14 @@ pub type LineColors = Vec<(Range<usize>, SyntaxColor)>;
 /// come out right. Runs on any thread.
 pub struct ExcerptHighlighter {
     parser: Parser,
-    cursor: QueryCursor,
+    colorer: Colorer,
 }
 
 impl ExcerptHighlighter {
     pub fn new() -> ExcerptHighlighter {
         ExcerptHighlighter {
             parser: Parser::new(),
-            cursor: QueryCursor::new(),
+            colorer: Colorer::new(),
         }
     }
 
@@ -219,22 +541,19 @@ impl ExcerptHighlighter {
         lines: &[Range<usize>],
         stop: &AtomicBool,
     ) -> Option<Vec<LineColors>> {
-        let grammar = grammar(language)?;
+        let grammar = grammar_of(language)?;
         self.parser.set_language(&grammar.language).ok()?;
         let tree = parse(&mut self.parser, text, None, None, stop)?;
+        // Injected text's trees are only kept for this text's excerpts.
+        self.colorer.injected.clear();
         let mut colors = Vec::with_capacity(lines.len());
         // Lines that follow each other are queried together: one query
         // per excerpt, not per line.
         for group in lines.chunk_by(|a, b| b.start <= a.end + 2) {
             let bytes = group[0].start..group[group.len() - 1].end;
-            let spans = query_spans(
-                &grammar,
-                &mut self.cursor,
-                &tree,
-                text,
-                bytes,
-                &grammar.colors,
-            );
+            let spans = self
+                .colorer
+                .spans(&grammar, &tree, text, bytes, &[], 0, None, stop)?;
             let mut first = 0;
             for line in group {
                 // Spans are in order and don't overlap; one can run on into
@@ -363,10 +682,9 @@ impl ExcerptCache {
 
 pub struct Highlighter {
     grammar: Arc<Grammar>,
-    /// Style ids by capture index; `None` for captures left uncolored.
-    styles: Vec<Option<u32>>,
+    styles: SyntaxStyles,
     parser: Parser,
-    cursor: QueryCursor,
+    colorer: Colorer,
     /// The tree of `text`.
     tree: Option<Tree>,
     text: String,
@@ -384,20 +702,14 @@ pub struct Highlighter {
 impl Highlighter {
     /// A highlighter for text in `language`, if cue can highlight it.
     pub fn new(language: &'static Language, theme: &Theme) -> Option<Highlighter> {
-        let grammar = grammar(language)?;
+        let grammar = grammar_of(language)?;
         let mut parser = Parser::new();
         parser.set_language(&grammar.language).ok()?;
-        let styles = grammar
-            .query
-            .capture_names()
-            .iter()
-            .map(|name| theme.capture_style(name))
-            .collect();
         Some(Highlighter {
             grammar,
-            styles,
+            styles: theme.syntax_styles(),
             parser,
-            cursor: QueryCursor::new(),
+            colorer: Colorer::new(),
             tree: None,
             text: String::new(),
             line_starts: vec![0],
@@ -456,6 +768,7 @@ impl Highlighter {
             .into_iter()
             .flat_map(|lines| self.highlights(buffer, lines))
             .collect();
+        self.colorer.forget_unused();
         buffer.replace_highlights(HIGHLIGHTS, &highlights);
     }
 
@@ -468,7 +781,10 @@ impl Highlighter {
         let line_starts = line_starts(&text);
         if let Some(tree) = &mut self.tree {
             match edit(&self.text, &self.line_starts, &text, &line_starts) {
-                Some(edit) => tree.edit(&edit),
+                Some(edit) => {
+                    tree.edit(&edit);
+                    self.colorer.edit(&edit);
+                }
                 None => return true,
             }
         }
@@ -477,7 +793,7 @@ impl Highlighter {
             &mut self.parser,
             &text,
             self.tree.as_ref(),
-            Some(PARSE_BUDGET),
+            Some(Instant::now() + PARSE_BUDGET),
             &never,
         );
         self.text = text;
@@ -497,14 +813,26 @@ impl Highlighter {
         let Some(tree) = &self.tree else {
             return Vec::new();
         };
-        query_spans(
+        let never = AtomicBool::new(false);
+        let deadline = Instant::now() + PARSE_BUDGET;
+        let spans = self.colorer.spans(
             &self.grammar,
-            &mut self.cursor,
             tree,
             &self.text,
             bytes,
-            &self.styles,
-        )
+            &[],
+            0,
+            Some(deadline),
+            &never,
+        );
+        spans
+            .unwrap_or_default()
+            .into_iter()
+            .map(|span| Span {
+                bytes: span.bytes,
+                style: self.styles.of(span.style),
+            })
+            .collect()
     }
 
     /// The highlights for lines `lines`.
@@ -610,6 +938,57 @@ fn flatten<S: Copy>(mut captures: Vec<Capture<S>>, within: Range<usize>) -> Vec<
     spans
 }
 
+/// Paints `layer` over `spans` across `range`: what was there gives way to
+/// `base`, if any, and that to `layer`'s spans. Spans are in order and don't
+/// overlap, before and after.
+fn paint<S: Copy>(
+    spans: &mut Vec<Span<S>>,
+    range: Range<usize>,
+    base: Option<S>,
+    layer: &[Span<S>],
+) {
+    let first = spans.partition_point(|s| s.bytes.end <= range.start);
+    let last = spans.partition_point(|s| s.bytes.start < range.end);
+    let mut painted = Vec::new();
+    // What sticks out either side stays.
+    if let Some(s) = spans.get(first).filter(|s| s.bytes.start < range.start) {
+        painted.push(Span {
+            bytes: s.bytes.start..range.start,
+            style: s.style,
+        });
+    }
+    let mut at = range.start;
+    let fill = |painted: &mut Vec<Span<S>>, bytes: Range<usize>| {
+        if let Some(style) = base.filter(|_| !bytes.is_empty()) {
+            painted.push(Span { bytes, style });
+        }
+    };
+    let from = layer.partition_point(|s| s.bytes.end <= range.start);
+    for s in layer[from..]
+        .iter()
+        .take_while(|s| s.bytes.start < range.end)
+    {
+        let bytes = s.bytes.start.max(range.start)..s.bytes.end.min(range.end);
+        fill(&mut painted, at..bytes.start);
+        at = bytes.end;
+        painted.push(Span {
+            bytes,
+            style: s.style,
+        });
+    }
+    fill(&mut painted, at..range.end);
+    if let Some(s) = spans[first..last]
+        .last()
+        .filter(|s| s.bytes.end > range.end)
+    {
+        painted.push(Span {
+            bytes: range.end..s.bytes.end,
+            style: s.style,
+        });
+    }
+    spans.splice(first..last, painted);
+}
+
 /// Where each line of `text` starts.
 fn line_starts(text: &str) -> Vec<usize> {
     std::iter::once(0)
@@ -703,7 +1082,7 @@ mod tests {
     fn every_highlight_query_compiles() {
         for language in language::all() {
             if language.syntax.is_some() {
-                assert!(grammar(language).is_some(), "{}", language.name);
+                assert!(grammar_of(language).is_some(), "{}", language.name);
             }
         }
     }
@@ -761,6 +1140,52 @@ mod tests {
                 "code",
                 Some("text.literal"),
             ),
+            // Inline markup, injected into paragraphs, headings, and cells.
+            ("a.md", "a `code` b\n", "code", Some("text.literal")),
+            ("a.md", "a `code` b\n", "`code", Some("text.delimiter")),
+            ("a.md", "a *em* b\n", "em", Some("text.emphasis")),
+            ("a.md", "a **st** b\n", "st", Some("text.strong")),
+            ("a.md", "a ~~del~~ b\n", "del", Some("text.strike")),
+            ("a.md", "[t](http://x)\n", "t]", Some("text.reference")),
+            ("a.md", "[t](http://x)\n", "http", Some("text.uri")),
+            ("a.md", "a <b>hi</b>\n", "b>", Some("tag")),
+            ("a.md", "a\\*b\n", "\\*", Some("string.escape")),
+            // A heading keeps its color around inline markup.
+            ("a.md", "## A `b` c\n", "##", Some("text.title")),
+            ("a.md", "## A `b` c\n", "c\n", Some("text.title")),
+            ("a.md", "## A `b` c\n", "b`", Some("text.literal")),
+            ("a.md", "- [x] a\n", "- ", Some("text.list")),
+            ("a.md", "- [x] a\n", "[x]", Some("text.list")),
+            // Quotes' markers aren't inline markup, though inside it.
+            ("a.md", "> a\n> `b`\n", "> `", Some("text.delimiter")),
+            ("a.md", "> a\n> `b`\n", "b`", Some("text.literal")),
+            ("a.md", "| a |\n|---|\n| `b` |\n", "a ", Some("text.strong")),
+            (
+                "a.md",
+                "| a |\n|---|\n| `b` |\n",
+                "b`",
+                Some("text.literal"),
+            ),
+            // Code blocks in a language cue knows are highlighted as it,
+            // and those in others as code.
+            ("a.md", "```rust\nlet x;\n```\n", "let", Some("keyword")),
+            ("a.md", "```rust\nlet x;\n```\n", "x;", None),
+            (
+                "a.md",
+                "```rust\nlet x;\n```\n",
+                "rust",
+                Some("text.delimiter"),
+            ),
+            ("a.md", "```wat\nlet x;\n```\n", "x;", Some("text.literal")),
+            ("a.md", "---\na: \"b\"\n---\n", "\"b\"", Some("string")),
+            // Injections in injections.
+            (
+                "a.md",
+                "```html\n<script>let x;</script>\n```\n",
+                "let",
+                Some("keyword"),
+            ),
+            ("a.html", "<style>/* c */</style>", "/* c", Some("comment")),
             // Keys are strings: `@string` comes after `@string.special.key`.
             ("a.json", "{\"a\": 1, \"b\": true}", "\"a\"", Some("string")),
             ("a.json", "{\"a\": 1, \"b\": true}", "1", Some("number")),
@@ -904,6 +1329,58 @@ mod tests {
     }
 
     #[test]
+    fn paint_covers_what_was_there() {
+        let span = |bytes: Range<usize>, style: u32| Span { bytes, style };
+        let painted = |base: Option<u32>, layer: &[Span<u32>]| {
+            let mut spans = vec![span(0..4, 1), span(6..12, 2), span(14..20, 3)];
+            paint(&mut spans, 2..16, base, layer);
+            spans
+                .into_iter()
+                .map(|s| (s.bytes, s.style))
+                .collect::<Vec<_>>()
+        };
+        // Clipped to the range; what sticks out either side stays.
+        let layer = [span(0..3, 7), span(8..9, 8), span(15..30, 9)];
+        assert_eq!(
+            painted(None, &layer),
+            [(0..2, 1), (2..3, 7), (8..9, 8), (15..16, 9), (16..20, 3)]
+        );
+        // The base fills the gaps.
+        assert_eq!(
+            painted(Some(5), &layer),
+            [
+                (0..2, 1),
+                (2..3, 7),
+                (3..8, 5),
+                (8..9, 8),
+                (9..15, 5),
+                (15..16, 9),
+                (16..20, 3)
+            ]
+        );
+        assert_eq!(painted(Some(5), &[]), [(0..2, 1), (2..16, 5), (16..20, 3)]);
+    }
+
+    #[test]
+    fn excerpts_are_highlighted_with_injections() {
+        let text = "# T\n\nsome `code`\n\n```rust\nfn f() {}\n```\n";
+        let markdown = language::detect(Some(Path::new("a.md")), String::new).unwrap();
+        let line = |n: usize| {
+            let start = line_starts(text)[n];
+            start..start + text[start..].find('\n').unwrap()
+        };
+        let never = AtomicBool::new(false);
+        let path = Path::new("/excerpts/injections.md");
+        let colors = ExcerptHighlighter::new()
+            .highlight(path, markdown, text, &[line(2), line(5)], &never)
+            .unwrap();
+        let literal = SyntaxColor::of("text.literal").unwrap();
+        let keyword = SyntaxColor::of("keyword").unwrap();
+        assert!(colors[0].contains(&(6..10, literal)), "{:?}", colors[0]);
+        assert_eq!(colors[1].first(), Some(&(0..2, keyword)));
+    }
+
+    #[test]
     fn flatten_shows_inner_captures_and_last_patterns() {
         // `#[derive(Debug)]`: an attribute around a bracket and a type.
         let captures = vec![
@@ -996,6 +1473,35 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn injected_text_highlights_the_same_after_edits() {
+        let _serial = crate::test_serial();
+        let theme = Theme::new().unwrap();
+        let markdown = language::detect(Some(Path::new("a.md")), String::new).unwrap();
+        let mut highlighter = Highlighter::new(markdown, &theme).unwrap();
+        let steps = [
+            "# A\n\nsome `code`\n\n```rust\nfn f() {}\n```\n",
+            "# A\n\nsome `code` *more*\n\n```rust\nfn f() {}\n```\n",
+            "# A\n\nsome `code` *more*\n\n```rust\nfn f() { let x = 1; }\n```\n",
+            "# A `b`\n\nsome `code` *more*\n\n```rust\nfn f() { let x = 1; }\n```\n",
+            "# A `b`\n\nsome `co\n\n```python\nfn f() { let x = 1; }\n```\n",
+            "```rust\nfn f() { let x = 1; }\n```\n",
+            "> ```rust\n> fn f() {}\n> ```\n",
+        ];
+        for text in steps {
+            assert!(highlighter.reparse(text.to_string()));
+            let spans = highlighter.spans(0..text.len());
+            let mut fresh = Highlighter::new(markdown, &theme).unwrap();
+            assert!(fresh.reparse(text.to_string()));
+            assert_eq!(spans, fresh.spans(0..text.len()), "{text:?}");
+        }
+        // Only what was highlighted last is kept.
+        assert!(!highlighter.colorer.injected.is_empty());
+        highlighter.colorer.forget_unused();
+        highlighter.colorer.forget_unused();
+        assert!(highlighter.colorer.injected.is_empty());
     }
 
     #[test]
