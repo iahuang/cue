@@ -1,0 +1,16 @@
+[package]
+name = "tree-sitter-mermaid-vendored"
+description = "Vendored tree-sitter grammar; see vendor/README.md"
+version = "0.0.0"
+edition.workspace = true
+license = "MIT"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"

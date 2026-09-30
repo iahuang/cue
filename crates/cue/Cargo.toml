@@ -30,8 +30,42 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-typescript = "0.23"
 tree-sitter-yaml = "0.7"
 tree-sitter-zig = "1.1"
+tree-sitter-asm = "0.24"
+tree-sitter-cmake = "0.7"
+tree-sitter-elixir = "0.3"
+tree-sitter-glsl = "0.2"
+tree-sitter-haskell = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-make = "1.1"
+tree-sitter-nginx = "1.0"
+tree-sitter-php = "0.24"
+tree-sitter-powershell = "0.26"
+tree-sitter-r = "1.3"
+tree-sitter-requirements = "0.6"
+tree-sitter-ruby = "0.23"
+tree-sitter-scheme = "0.24"
+tree-sitter-sequel = "0.3"
+tree-sitter-svelte-ng = "1.0"
+tree-sitter-swift = "0.7"
+tree-sitter-gdscript = { git = "https://github.com/PrestonKnopp/tree-sitter-gdscript", rev = "9686853b696db07118ad110e440d6de0ca6498b4" }
+# arborium packages these grammars' canonical repos, where their own crates
+# are stale or depend on an older tree-sitter.
+arborium-clojure = "2.18"
+arborium-commonlisp = "2.18"
+arborium-dart = "2.18"
+arborium-diff = "2.18"
+arborium-dockerfile = "2.18"
+arborium-graphql = "2.18"
+arborium-kotlin = "2.18"
+arborium-perl = "2.18"
+arborium-typst = "2.18"
+arborium-vim = "2.18"
+tree-sitter-bibtex = { git = "https://github.com/latex-lsp/tree-sitter-bibtex", rev = "8d04ed27b3bc7929f14b7df9236797dab9f3fa66" }
+tree-sitter-latex = { package = "tree-sitter-latex-vendored", path = "../../vendor/tree-sitter-latex" }
+tree-sitter-mermaid = { package = "tree-sitter-mermaid-vendored", path = "../../vendor/tree-sitter-mermaid" }
 trash = "5"
 notify = "8.2.0"
+
 
 # musl's allocator is slow under contention (parallel search, file indexing).
 [target.'cfg(target_env = "musl")'.dependencies]

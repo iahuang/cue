@@ -62,10 +62,34 @@ const MAX_CACHED_SPANS: usize = 1 << 20;
 struct Grammar {
     language: tree_sitter::Language,
     query: Query,
-    /// Colors by capture index; `None` for captures left uncolored.
-    colors: Vec<Option<SyntaxColor>>,
+    /// How each capture affects highlighting, by capture index.
+    captures: Vec<CaptureRule>,
     /// Where other languages are injected into it, if anywhere.
     injections: Option<InjectionQuery>,
+}
+
+/// Helper captures must not erase a color; unstyled captures can.
+#[derive(Clone, Copy)]
+enum CaptureRule {
+    Ignore,
+    Uncolored,
+    Styled(SyntaxColor),
+}
+
+impl CaptureRule {
+    fn of(name: &str) -> Self {
+        if name.starts_with('_') || ["spell", "nospell", "conceal"].contains(&name) {
+            Self::Ignore
+        } else {
+            SyntaxColor::of(name).map_or(Self::Uncolored, Self::Styled)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum QueryKind {
+    Highlights,
+    Injections,
 }
 
 struct InjectionQuery {
@@ -90,19 +114,17 @@ fn grammar_of(language: &'static Language) -> Option<Arc<Grammar>> {
         .entry(language.name)
         .or_insert_with(|| {
             let grammar = (syntax.grammar)();
-            // Neovim's `#lua-match?` takes Lua patterns, which the queries
-            // only use where they read the same as regexes.
-            let source = syntax.highlights.concat().replace("#lua-match?", "#match?");
-            let query = Query::new(&grammar, &source).ok()?;
-            let colors = query
+            let query = compile_query(&grammar, syntax.highlights, QueryKind::Highlights).ok()?;
+            let captures = query
                 .capture_names()
                 .iter()
-                .map(|name| SyntaxColor::of(name))
+                .map(|name| CaptureRule::of(name))
                 .collect();
             let injections = if syntax.injections.is_empty() {
                 None
             } else {
-                let query = Query::new(&grammar, &syntax.injections.concat()).ok()?;
+                let query =
+                    compile_query(&grammar, syntax.injections, QueryKind::Injections).ok()?;
                 Some(InjectionQuery {
                     content: query.capture_index_for_name("injection.content")?,
                     language: query.capture_index_for_name("injection.language"),
@@ -112,11 +134,73 @@ fn grammar_of(language: &'static Language) -> Option<Arc<Grammar>> {
             Some(Arc::new(Grammar {
                 language: grammar,
                 query,
-                colors,
+                captures,
                 injections,
             }))
         })
         .clone()
+}
+
+/// Tree-sitter evaluates text predicates itself, but leaves other predicates
+/// and properties to its caller. Reject unknown ones instead of silently
+/// treating their patterns as unconditional. Imported queries must use regex
+/// predicates directly; Lua patterns are not translated at runtime.
+fn compile_query(
+    grammar: &tree_sitter::Language,
+    sources: &[&str],
+    kind: QueryKind,
+) -> Result<Query, String> {
+    let query = Query::new(grammar, &sources.join("\n")).map_err(|e| e.to_string())?;
+    for pattern in 0..query.pattern_count() {
+        if let Some(predicate) = query.general_predicates(pattern).first() {
+            return Err(format!(
+                "pattern {pattern}: unsupported #{}",
+                predicate.operator
+            ));
+        }
+        for (property, positive) in query.property_predicates(pattern) {
+            // No locals query: all identifiers are treated as nonlocal. This
+            // preserves upstream builtin-name highlighting without scope tracking.
+            if !matches!(kind, QueryKind::Highlights)
+                || property.key.as_ref() != "local"
+                || *positive
+                || property.value.is_some()
+                || property.capture_id.is_some()
+            {
+                return Err(format!(
+                    "pattern {pattern}: unsupported property predicate {property:?}"
+                ));
+            }
+        }
+        for property in query.property_settings(pattern) {
+            let supported = property.capture_id.is_none()
+                && match kind {
+                    // cue resolves overlaps by nesting and query order, ignoring
+                    // Neovim's numeric priority annotation deliberately.
+                    QueryKind::Highlights => {
+                        property.key.as_ref() == "priority"
+                            && property
+                                .value
+                                .as_deref()
+                                .is_some_and(|v| v.parse::<u32>().is_ok())
+                    }
+                    QueryKind::Injections => match property.key.as_ref() {
+                        "injection.language" => property.value.is_some(),
+                        "injection.include-children" => property.value.is_none(),
+                        // Each captured node is parsed separately; combined injections
+                        // are an explicit approximation, not concatenated documents.
+                        "injection.combined" => property.value.is_none(),
+                        _ => false,
+                    },
+                };
+            if !supported {
+                return Err(format!(
+                    "pattern {pattern}: unsupported setting {property:?}"
+                ));
+            }
+        }
+    }
+    Ok(query)
 }
 
 /// Parses `text` with `parser`, reusing `old`, the tree of the text before,
@@ -163,10 +247,15 @@ fn query_captures(
     let mut found = Vec::new();
     while let Some((m, i)) = captures.next() {
         let capture = m.captures()[*i];
+        let style = match grammar.captures[capture.index as usize] {
+            CaptureRule::Ignore => continue,
+            CaptureRule::Uncolored => None,
+            CaptureRule::Styled(color) => Some(color),
+        };
         found.push(Capture {
             bytes: capture.node.byte_range(),
             node: capture.node.id(),
-            style: grammar.colors[capture.index as usize],
+            style,
             pattern: m.pattern_index,
         });
         if found.len() == MAX_CAPTURES {
@@ -180,6 +269,8 @@ fn query_captures(
 struct Injection<'tree> {
     language: &'static Language,
     node: Node<'tree>,
+    /// The pattern that found it, in the query's order.
+    pattern: usize,
     /// Whether the node's children are in the language too.
     include_children: bool,
 }
@@ -220,12 +311,19 @@ fn find_injections<'tree>(
         found.push(Injection {
             language,
             node,
+            pattern: m.pattern_index,
             include_children,
         });
         if found.len() == MAX_INJECTIONS {
             break;
         }
     }
+    // Where patterns inject into the same node, as a script as JavaScript
+    // and, with `lang="ts"`, TypeScript, the last one wins, as with
+    // highlights.
+    found.sort_by_key(|injection| (injection.node.id(), Reverse(injection.pattern)));
+    found.dedup_by_key(|injection| injection.node.id());
+    found.sort_by_key(|injection| injection.node.start_byte());
     found
 }
 
@@ -891,8 +989,18 @@ struct Span<S> {
 /// holds even when the theme leaves the last one uncolored.
 fn flatten<S: Copy>(mut captures: Vec<Capture<S>>, within: Range<usize>) -> Vec<Span<S>> {
     // Nodes with the same text, like a node and its only child, come in no
-    // particular order.
-    captures.sort_by_key(|c| (c.bytes.start, Reverse(c.bytes.end), c.node, c.pattern));
+    // particular order. Of a pattern's captures of one node, as in
+    // `@variable @function`, a colored one counts. Helpers were filtered out.
+    captures.sort_by_key(|c| {
+        let colored = c.style.is_some();
+        (
+            c.bytes.start,
+            Reverse(c.bytes.end),
+            c.node,
+            c.pattern,
+            colored,
+        )
+    });
     captures.dedup_by(|later, earlier| {
         let same = later.node == earlier.node;
         if same {
@@ -1079,15 +1187,96 @@ mod tests {
     }
 
     #[test]
-    fn every_highlight_query_compiles() {
+    fn every_query_compiles_and_uses_known_directives() {
+        let mut wrong = Vec::new();
         for language in language::all() {
-            if language.syntax.is_some() {
-                assert!(grammar_of(language).is_some(), "{}", language.name);
+            let Some(syntax) = &language.syntax else {
+                continue;
+            };
+            let grammar = (syntax.grammar)();
+            if let Err(e) = Parser::new().set_language(&grammar) {
+                wrong.push(format!("{}: {e}", language.name));
             }
+            for (label, sources, kind) in [
+                ("highlights", syntax.highlights, QueryKind::Highlights),
+                ("injections", syntax.injections, QueryKind::Injections),
+            ] {
+                if let Err(e) = compile_query(&grammar, sources, kind) {
+                    wrong.push(format!("{} {label}: {e}", language.name));
+                }
+            }
+            if grammar_of(language).is_none() {
+                wrong.push(format!("{}: grammar initialization failed", language.name));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn rejects_unhandled_query_predicates_and_directives() {
+        let grammar = (rust().syntax.as_ref().unwrap().grammar)();
+        for directive in [
+            "(#lua-match? @name \"^%u\")",
+            "(#unknown? @name)",
+            "(#offset! @name 0 1 0 -1)",
+            "(#set! unknown \"value\")",
+            "(#is? local)",
+        ] {
+            let source = format!("((identifier) @name {directive})");
+            Query::new(&grammar, &source).expect("valid tree-sitter query");
+            assert!(
+                compile_query(&grammar, &[&source], QueryKind::Highlights).is_err(),
+                "{directive}"
+            );
+        }
+        let source = "((identifier) @name (#set! injection.language \"rust\"))";
+        assert!(compile_query(&grammar, &[source], QueryKind::Highlights).is_err());
+        assert!(compile_query(&grammar, &[source], QueryKind::Injections).is_ok());
+    }
+
+    #[test]
+    fn helper_captures_preserve_colors_but_uncolored_captures_override_them() {
+        let language = (rust().syntax.as_ref().unwrap().grammar)();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let text = "fn example() {}";
+        let tree = parser.parse(text, None).unwrap();
+        let function = SyntaxColor::of("function").unwrap();
+        for (suffix, expected) in [
+            ("(identifier) @_helper", Some(function)),
+            ("(identifier) @spell @nospell @conceal", Some(function)),
+            ("(identifier) @variable", None),
+            ("(identifier) @variable @function", Some(function)),
+        ] {
+            let query = compile_query(
+                &language,
+                &["(identifier) @function", suffix],
+                QueryKind::Highlights,
+            )
+            .unwrap();
+            let captures = query
+                .capture_names()
+                .iter()
+                .map(|name| CaptureRule::of(name))
+                .collect();
+            let grammar = Grammar {
+                language: language.clone(),
+                query,
+                captures,
+                injections: None,
+            };
+            let captures = query_captures(
+                &grammar,
+                &mut QueryCursor::new(),
+                &tree,
+                text,
+                0..text.len(),
+            );
+            let spans = flatten(captures, 0..text.len());
+            assert_eq!(spans.first().map(|span| span.style), expected, "{suffix}");
         }
     }
 
-    /// A capture of the node with `bytes`, standing in for its id.
     /// The style of the first `needle` in `text`, highlighted as a file
     /// called `name`.
     fn style_of(theme: &Theme, name: &str, text: &str, needle: &str) -> Option<u32> {
@@ -1104,28 +1293,14 @@ mod tests {
 
     #[test]
     fn highlights_every_language() {
-        let _serial = crate::test_serial();
-        let theme = Theme::new().unwrap();
-        // (file, text, what to look at, the capture it should look like)
-        let cases: &[(&str, &str, &str, Option<&str>)] = &[
+        assert_highlights(&[
             ("a.rs", "const MAX: u8 = 1;", "MAX", Some("constant")),
-            // As in tree-sitter's own highlighter: the call pattern comes
-            // after the one for uppercase names.
-            ("a.rs", "let x = Some(1);", "Some", Some("function")),
             ("a.rs", "fn f(v: Vec<u8>) {}", "Vec", Some("type")),
             (
                 "a.toml",
                 "[package]\nname = \"q\" # c",
                 "\"q\"",
                 Some("string"),
-            ),
-            // Keys are `type` inside a `property`: tree-sitter's own
-            // highlighter drops the inner capture, as they start together.
-            (
-                "a.toml",
-                "[package]\nname = \"q\" # c",
-                "name",
-                Some("type"),
             ),
             (
                 "a.toml",
@@ -1134,60 +1309,6 @@ mod tests {
                 Some("comment"),
             ),
             ("a.md", "# Title\n\ntext\n", "Title", Some("text.title")),
-            (
-                "a.md",
-                "text\n\n```\ncode\n```\n",
-                "code",
-                Some("text.literal"),
-            ),
-            // Inline markup, injected into paragraphs, headings, and cells.
-            ("a.md", "a `code` b\n", "code", Some("text.literal")),
-            ("a.md", "a `code` b\n", "`code", Some("text.delimiter")),
-            ("a.md", "a *em* b\n", "em", Some("text.emphasis")),
-            ("a.md", "a **st** b\n", "st", Some("text.strong")),
-            ("a.md", "a ~~del~~ b\n", "del", Some("text.strike")),
-            ("a.md", "[t](http://x)\n", "t]", Some("text.reference")),
-            ("a.md", "[t](http://x)\n", "http", Some("text.uri")),
-            ("a.md", "a <b>hi</b>\n", "b>", Some("tag")),
-            ("a.md", "a\\*b\n", "\\*", Some("string.escape")),
-            // A heading keeps its color around inline markup.
-            ("a.md", "## A `b` c\n", "##", Some("text.title")),
-            ("a.md", "## A `b` c\n", "c\n", Some("text.title")),
-            ("a.md", "## A `b` c\n", "b`", Some("text.literal")),
-            ("a.md", "- [x] a\n", "- ", Some("text.list")),
-            ("a.md", "- [x] a\n", "[x]", Some("text.list")),
-            // Quotes' markers aren't inline markup, though inside it.
-            ("a.md", "> a\n> `b`\n", "> `", Some("text.delimiter")),
-            ("a.md", "> a\n> `b`\n", "b`", Some("text.literal")),
-            ("a.md", "| a |\n|---|\n| `b` |\n", "a ", Some("text.strong")),
-            (
-                "a.md",
-                "| a |\n|---|\n| `b` |\n",
-                "b`",
-                Some("text.literal"),
-            ),
-            // Code blocks in a language cue knows are highlighted as it,
-            // and those in others as code.
-            ("a.md", "```rust\nlet x;\n```\n", "let", Some("keyword")),
-            ("a.md", "```rust\nlet x;\n```\n", "x;", None),
-            (
-                "a.md",
-                "```rust\nlet x;\n```\n",
-                "rust",
-                Some("text.delimiter"),
-            ),
-            ("a.md", "```wat\nlet x;\n```\n", "x;", Some("text.literal")),
-            ("a.md", "---\na: \"b\"\n---\n", "\"b\"", Some("string")),
-            // Injections in injections.
-            (
-                "a.md",
-                "```html\n<script>let x;</script>\n```\n",
-                "let",
-                Some("keyword"),
-            ),
-            ("a.html", "<style>/* c */</style>", "/* c", Some("comment")),
-            // Keys are strings: `@string` comes after `@string.special.key`.
-            ("a.json", "{\"a\": 1, \"b\": true}", "\"a\"", Some("string")),
             ("a.json", "{\"a\": 1, \"b\": true}", "1", Some("number")),
             (
                 "a.json",
@@ -1290,11 +1411,295 @@ mod tests {
                 "\"std\"",
                 Some("string"),
             ),
-            // `#lua-match?` works: lowercase names aren't types.
+            ("a.zig", "pub fn main() void {}", "main", Some("function")),
+            (
+                "a.java",
+                "class A { void m() { m(); } }",
+                "class",
+                Some("keyword"),
+            ),
+            (
+                "a.java",
+                "class A { void m() { m(); } }",
+                "m();",
+                Some("function"),
+            ),
+            (
+                "a.kt",
+                "fun main() { val s = \"hi\" }",
+                "main",
+                Some("function"),
+            ),
+            (
+                "a.kt",
+                "fun main() { val s = \"hi\" }",
+                "\"hi\"",
+                Some("string"),
+            ),
+            (
+                "a.swift",
+                "func f() -> Int { return 1 }",
+                "Int",
+                Some("type"),
+            ),
+            (
+                "a.dart",
+                "void main() { print('hi'); }",
+                "'hi'",
+                Some("string"),
+            ),
+            ("a.rb", "def f\n  puts \"x\"\nend", "def", Some("keyword")),
+            (
+                "a.php",
+                "<p>hi</p><?php echo \"x\"; ?>",
+                "echo",
+                Some("keyword"),
+            ),
+            ("a.pl", "my $x = \"a\"; # c", "my", Some("keyword")),
+            ("a.pl", "my $x = \"a\"; # c", "# c", Some("comment")),
+            ("a.ex", "defmodule A do\nend", "defmodule", Some("keyword")),
+            (
+                "a.hs",
+                "main = putStrLn \"hi\"\nf x = x\n",
+                "putStrLn",
+                Some("function"),
+            ),
+            ("a.r", "f <- function(x) x", "function", Some("keyword")),
+            (
+                "a.sql",
+                "SELECT a FROM t WHERE b = 'x';",
+                "SELECT",
+                Some("keyword"),
+            ),
+            ("a.graphql", "type T { f: Int }", "T ", Some("type")),
+            (
+                "a.ps1",
+                "function F { Write-Host \"x\" }",
+                "Write-Host",
+                Some("function"),
+            ),
+            ("a.clj", "(defn f [x] \"s\")", "defn", Some("keyword")),
+            ("a.clj", "(defn f [x] \"s\")", "f ", Some("function")),
+            ("a.scm", "(define (f x) \"s\")", "define", Some("keyword")),
+            ("a.lisp", "(defun f (x) \"s\")", "defun", Some("keyword")),
+            (
+                "a.gd",
+                "func _ready():\n\tvar x = 1\n",
+                "_ready",
+                Some("function"),
+            ),
+            ("a.vim", "let g:x = 1\n", "let", Some("keyword")),
+            ("a.s", "mov eax, 1 ; c", "; c", Some("comment")),
+            ("Dockerfile", "FROM alpine:3\n", "FROM", Some("keyword")),
+            (
+                "Makefile",
+                "all: b\n\techo hi\n# c\n",
+                "# c",
+                Some("comment"),
+            ),
+            (
+                "Makefile",
+                "all: b\nb:\n\techo hi\n",
+                "b:",
+                Some("function"),
+            ),
+            (
+                "Makefile",
+                "all: b\nb:\n\techo hi\n",
+                "all",
+                Some("constant"),
+            ),
+            ("Makefile", "CC = gcc\n", "CC", Some("constant")),
+            (
+                "CMakeLists.txt",
+                "add_executable(a b.c)",
+                "add_executable",
+                Some("function"),
+            ),
+            (
+                "nginx.conf",
+                "server {\n  listen 80;\n}\n",
+                "listen",
+                Some("keyword"),
+            ),
+            ("a.diff", "--- a\n+++ b\n-x\n+y\n", "-x", Some("diff.minus")),
+            ("a.diff", "--- a\n+++ b\n-x\n+y\n", "+y", Some("diff.plus")),
+            (
+                "requirements.txt",
+                "requests==2.0 # c\n",
+                "# c",
+                Some("comment"),
+            ),
+            (
+                "a.typ",
+                "= Heading\n*bold*\n",
+                "Heading",
+                Some("text.title"),
+            ),
+            ("a.tex", "\\section{Intro} % c", "Intro", Some("text.title")),
+            ("a.tex", "\\section{Intro} % c", "% c", Some("comment")),
+            (
+                "a.bib",
+                "@article{k, title = {T}}",
+                "@article",
+                Some("keyword"),
+            ),
+            (
+                "a.mmd",
+                "flowchart TD\n  A --> B\n",
+                "flowchart",
+                Some("keyword"),
+            ),
+            (
+                "a.cu",
+                "int main() { return 0; }",
+                "return",
+                Some("keyword"),
+            ),
+            ("a.svelte", "<p>hi</p>", "p>", Some("tag")),
+            (
+                "a.frag",
+                "void main() { return; }",
+                "return",
+                Some("keyword"),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn markdown_injections_preserve_markup_and_fallback_colors() {
+        assert_highlights(&[
+            (
+                "a.md",
+                "text\n\n```\ncode\n```\n",
+                "code",
+                Some("text.literal"),
+            ),
+            // Inline markup, injected into paragraphs, headings, and cells.
+            ("a.md", "a `code` b\n", "code", Some("text.literal")),
+            ("a.md", "a `code` b\n", "`code", Some("text.delimiter")),
+            ("a.md", "a *em* b\n", "em", Some("text.emphasis")),
+            ("a.md", "a **st** b\n", "st", Some("text.strong")),
+            ("a.md", "a ~~del~~ b\n", "del", Some("text.strike")),
+            ("a.md", "[t](http://x)\n", "t]", Some("text.reference")),
+            ("a.md", "[t](http://x)\n", "http", Some("text.uri")),
+            ("a.md", "a <b>hi</b>\n", "b>", Some("tag")),
+            ("a.md", "a\\*b\n", "\\*", Some("string.escape")),
+            // A heading keeps its color around inline markup.
+            ("a.md", "## A `b` c\n", "##", Some("text.title")),
+            ("a.md", "## A `b` c\n", "c\n", Some("text.title")),
+            ("a.md", "## A `b` c\n", "b`", Some("text.literal")),
+            ("a.md", "- [x] a\n", "- ", Some("text.list")),
+            ("a.md", "- [x] a\n", "[x]", Some("text.list")),
+            // Quotes' markers aren't inline markup, though inside it.
+            ("a.md", "> a\n> `b`\n", "> `", Some("text.delimiter")),
+            ("a.md", "> a\n> `b`\n", "b`", Some("text.literal")),
+            ("a.md", "| a |\n|---|\n| `b` |\n", "a ", Some("text.strong")),
+            (
+                "a.md",
+                "| a |\n|---|\n| `b` |\n",
+                "b`",
+                Some("text.literal"),
+            ),
+            // Code blocks in a language cue knows are highlighted as it,
+            // and those in others as code.
+            ("a.md", "```rust\nlet x;\n```\n", "let", Some("keyword")),
+            ("a.md", "```rust\nlet x;\n```\n", "x;", None),
+            (
+                "a.md",
+                "```rust\nlet x;\n```\n",
+                "rust",
+                Some("text.delimiter"),
+            ),
+            ("a.md", "```wat\nlet x;\n```\n", "x;", Some("text.literal")),
+            ("a.md", "---\na: \"b\"\n---\n", "\"b\"", Some("string")),
+            // Injections in injections.
+            (
+                "a.md",
+                "```html\n<script>let x;</script>\n```\n",
+                "let",
+                Some("keyword"),
+            ),
+            // Markdown's code blocks, in any of those.
+            (
+                "a.md",
+                "```kotlin\nval x = 1\n```\n",
+                "val",
+                Some("keyword"),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn embedded_languages_use_their_own_highlighting() {
+        assert_highlights(&[
+            ("a.html", "<style>/* c */</style>", "/* c", Some("comment")),
+            // Outside `<?php ?>`, HTML.
+            ("a.php", "<p>hi</p><?php echo \"x\"; ?>", "p>", Some("tag")),
+            // Raw blocks, in the language they name.
+            ("a.typ", "```rust\nfn f() {}\n```\n", "fn", Some("keyword")),
+        ]);
+    }
+
+    #[test]
+    fn svelte_script_language_overrides_the_default_injection() {
+        assert_highlights(&[
+            (
+                "a.svelte",
+                "<script>let x = 1;</script>",
+                "let",
+                Some("keyword"),
+            ),
+            (
+                "a.svelte",
+                "<script lang=\"ts\">let x: number;</script>",
+                "number",
+                Some("type"),
+            ),
+            (
+                "a.svelte",
+                "<style>p { color: red; }</style>",
+                "p ",
+                Some("tag"),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn capture_precedence_preserves_specific_styles() {
+        assert_highlights(&[
+            // As in tree-sitter's own highlighter: the call pattern comes
+            // after the one for uppercase names.
+            ("a.rs", "let x = Some(1);", "Some", Some("function")),
+            // Keys are `type` inside a `property`: tree-sitter's own
+            // highlighter drops the inner capture, as they start together.
+            (
+                "a.toml",
+                "[package]\nname = \"q\" # c",
+                "name",
+                Some("type"),
+            ),
+            // Keys are strings: `@string` comes after `@string.special.key`.
+            ("a.json", "{\"a\": 1, \"b\": true}", "\"a\"", Some("string")),
+            ("a.hs", "main = putStrLn \"hi\"\nf x = x\n", "x\n", None),
+            // GLSL's queries add to C's.
+            ("a.frag", "void main() {}", "main", Some("function")),
+        ]);
+    }
+
+    #[test]
+    fn regex_predicates_distinguish_zig_identifiers() {
+        assert_highlights(&[
+            // Lowercase names do not match the type-name regex.
             ("a.zig", "const std = @import(\"std\");", "std ", None),
             ("a.zig", "const T = struct {};", "T ", Some("type")),
-            ("a.zig", "pub fn main() void {}", "main", Some("function")),
-        ];
+        ]);
+    }
+
+    /// (file, source text, first text to inspect, expected capture style).
+    fn assert_highlights(cases: &[(&str, &str, &str, Option<&str>)]) {
+        let _serial = crate::test_serial();
+        let theme = Theme::new().unwrap();
         let mut wrong = Vec::new();
         for &(name, text, needle, capture) in cases {
             let expected = capture.and_then(|c| theme.capture_style(c));
@@ -1405,6 +1810,9 @@ mod tests {
             capture(9..14, None, 2),
         ];
         assert_eq!(spans(captures, 0..100), [(0..16, 1)]);
+        // Of one pattern's captures of a node, the colored one.
+        let captures = vec![capture(9..14, Some(3), 1), capture(9..14, None, 1)];
+        assert_eq!(spans(captures, 0..100), [(9..14, 3)]);
         // Clipped to where lines are highlighted.
         let captures = vec![capture(0..10, Some(1), 0), capture(12..20, Some(2), 0)];
         assert_eq!(spans(captures, 5..15), [(5..10, 1), (12..15, 2)]);

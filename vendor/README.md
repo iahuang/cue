@@ -74,3 +74,30 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   over the latest OSC 52 clipboard write from the program (Ghostty's
   `clipboard_write` effect; reads and clears aren't forwarded) for the host
   to copy.
+
+## `tree-sitter-latex/`
+
+The LaTeX grammar of [tree-sitter-latex](https://github.com/latex-lsp/tree-sitter-latex),
+v0.6.0 (`7e0ecdc02926c7b9b2e0c76003d4fe7b0944f957`). MIT licensed; see its
+`LICENSE`. Upstream doesn't check in the generated parser, and its Rust
+bindings depend on an older `tree-sitter` than cue's, so `src/` holds the
+parser generated from `grammar.js` at that tag (tree-sitter CLI 0.25.10) and
+the hand-written `scanner.c`, built by a `Cargo.toml`, `build.rs`, and
+`lib.rs` of our own.
+
+To update, in a clone of upstream at the new tag:
+
+```sh
+tree-sitter generate
+```
+
+then copy `src/parser.c`, `src/scanner.c`, and `src/tree_sitter/*.h` over
+these, and update the commit above.
+
+## `tree-sitter-mermaid/`
+
+[tree-sitter-mermaid](https://github.com/monaqa/tree-sitter-mermaid) at
+`90ae195b31933ceb9d079abfa8a3ad0a36fee4cc`: `src/` and
+`queries/highlights.scm` as upstream has them. MIT licensed; see its
+`LICENSE`. Its Rust bindings depend on an older `tree-sitter` than cue's, so
+the `Cargo.toml`, `build.rs`, and `lib.rs` are our own.

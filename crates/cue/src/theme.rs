@@ -25,6 +25,8 @@ const SYNTAX: &[(&str, Option<u8>, Attributes)] = &[
     ("comment", Some(8), Attributes::NONE),
     ("constant", Some(6), Attributes::NONE),
     ("constructor", Some(3), Attributes::NONE),
+    ("diff.minus", Some(1), Attributes::NONE),
+    ("diff.plus", Some(2), Attributes::NONE),
     ("escape", Some(6), Attributes::NONE),
     ("function", Some(4), Attributes::NONE),
     ("function.macro", Some(6), Attributes::NONE),
@@ -48,6 +50,30 @@ const SYNTAX: &[(&str, Option<u8>, Attributes)] = &[
     ("variable.builtin", Some(5), Attributes::NONE),
 ];
 
+/// Captures named differently by different queries, as the [`SYNTAX`]
+/// capture they mean: older Neovim names, and Helix's and newer Neovim's
+/// `markup` for what cue's Markdown query calls `text`.
+const ALIASES: &[(&str, &str)] = &[
+    ("conditional", "keyword"),
+    ("exception", "keyword"),
+    ("float", "number"),
+    ("include", "keyword"),
+    ("markup.bold", "text.strong"),
+    ("markup.heading", "text.title"),
+    ("markup.italic", "text.emphasis"),
+    ("markup.link", "text.reference"),
+    ("markup.link.url", "text.uri"),
+    ("markup.list", "text.list"),
+    ("markup.math", "text.literal"),
+    ("markup.raw", "text.literal"),
+    ("markup.strikethrough", "text.strike"),
+    ("markup.strong", "text.strong"),
+    ("method", "function"),
+    ("preproc", "keyword"),
+    ("repeat", "keyword"),
+    ("storageclass", "keyword"),
+];
+
 /// A syntax color: one of [`SYNTAX`]'s styles. Unlike a style id, it can be
 /// worked out on any thread, and drawn without a `SyntaxStyle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,12 +82,16 @@ pub struct SyntaxColor(u8);
 impl SyntaxColor {
     /// The color for text a highlight query captured as `capture`: its own,
     /// or that of the nearest capture it refines (`function.method` is a
-    /// `function`), or none.
+    /// `function`), or none. Aliases count as what they stand for.
     pub fn of(capture: &str) -> Option<SyntaxColor> {
         let mut name = capture;
         loop {
             if let Some(i) = SYNTAX.iter().position(|&(c, _, _)| c == name) {
                 return Some(SyntaxColor(i as u8));
+            }
+            if let Some(&(_, meant)) = ALIASES.iter().find(|&&(alias, _)| alias == name) {
+                name = meant;
+                continue;
             }
             name = &name[..name.rfind('.')?];
         }
@@ -157,6 +187,19 @@ mod tests {
             theme.capture_style("function")
         );
         assert_eq!(theme.capture_style("punctuation.bracket"), None);
+        // Aliases, and what refines them.
+        assert_eq!(
+            theme.capture_style("repeat"),
+            theme.capture_style("keyword")
+        );
+        assert_eq!(
+            theme.capture_style("markup.heading.2"),
+            theme.capture_style("text.title")
+        );
+        assert_eq!(
+            theme.capture_style("markup.link.url"),
+            theme.capture_style("text.uri")
+        );
         assert_eq!(theme.capture_style("functional"), None);
     }
 }

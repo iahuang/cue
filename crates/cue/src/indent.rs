@@ -29,14 +29,9 @@ impl Default for Indent {
 impl Indent {
     /// How `text` indents, or failing that, `language`'s custom.
     pub fn infer(text: &str, language: Option<&Language>) -> Indent {
-        guess(text).unwrap_or_else(|| match language.map(|l| l.name) {
-            // As gofmt writes it.
-            Some("Go") => Indent::Tabs,
-            Some("YAML" | "JSON" | "HTML" | "CSS" | "JavaScript" | "TypeScript" | "TSX") => {
-                Indent::Spaces(2)
-            }
-            _ => Indent::default(),
-        })
+        guess(text)
+            .or_else(|| language.and_then(|l| l.indent))
+            .unwrap_or_default()
     }
 
     /// Columns one level of indentation takes. A tab counts as four, as
@@ -156,6 +151,12 @@ mod tests {
         assert_eq!(Indent::infer("package main\n", go), Indent::Tabs);
         assert_eq!(Indent::infer("x = 1\n", None), Indent::Spaces(4));
         assert_eq!(Indent::infer("x:\n  y\n", go), Indent::Spaces(2));
+        let make = crate::language::detect(Some(std::path::Path::new("Makefile")), String::new);
+        assert_eq!(
+            Indent::infer("all:\n", make),
+            Indent::Tabs,
+            "make needs tabs"
+        );
     }
 
     #[test]
