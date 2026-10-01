@@ -141,13 +141,13 @@ impl Item {
         }
     }
 
-    /// Terminal `id`, labeled `name` and, dimmed, `detail` (what's running
-    /// in it).
-    pub fn terminal(id: u32, name: &str, running: &str) -> Item {
-        let text = if running.is_empty() {
+    /// Terminal `id`, labeled `name` and, dimmed, `about`, such as what's
+    /// running in it.
+    pub fn terminal(id: u32, name: &str, about: &str) -> Item {
+        let text = if about.is_empty() {
             name.to_string()
         } else {
-            format!("{name} · {running}")
+            format!("{name} · {about}")
         };
         Item {
             dim: name.chars().count()..text.chars().count(),
@@ -1047,8 +1047,8 @@ impl Area {
     }
 }
 
-/// Clears `area` and draws a popup's box around it, with `title` in the top
-/// border and a rule under the first row, which holds the query.
+/// Clears `area` and draws a popup's box around it, with `title`, if any, in
+/// the top border and a rule under the first row, which holds the query.
 pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
     let colors = theme::colors();
     let Area {
@@ -1079,14 +1079,16 @@ pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
             frame.draw_text("│", right, row, colors.border, None, Attributes::NONE);
         }
     }
-    frame.draw_text(
-        &format!(" {title} "),
-        x + 2,
-        y,
-        colors.text,
-        None,
-        Attributes::BOLD,
-    );
+    if !title.is_empty() {
+        frame.draw_text(
+            &format!(" {title} "),
+            x + 2,
+            y,
+            colors.text,
+            None,
+            Attributes::BOLD,
+        );
+    }
 }
 
 /// Draws `status` into the right of a popup's bottom border.

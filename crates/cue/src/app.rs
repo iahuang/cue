@@ -2167,11 +2167,8 @@ impl App {
         let shown = self.shown();
         let terminal_item = |terminal: &Rc<RefCell<Terminal>>| {
             let terminal = terminal.borrow();
-            let running = match terminal.exit() {
-                Some(_) => "exited".to_string(),
-                None => terminal.program().unwrap_or_default(),
-            };
-            Item::terminal(terminal.id(), &terminal.picker_name(), &running)
+            let (name, about) = terminal.label();
+            Item::terminal(terminal.id(), &name, &about)
         };
         let mut items: Vec<Item> = self
             .recent
@@ -4521,7 +4518,19 @@ mod tests {
         );
         let frame = OwnedBuffer::new(120, 30, false, WidthMethod::Unicode, "preview").unwrap();
         app.draw(&frame);
-        assert!(frame.to_text(true).contains("Terminal 1"));
+        // The preview is drawn under the list, untitled until it's named.
+        let preview = app.picker.as_ref().unwrap().preview_area().unwrap();
+        let text = frame.to_text(true);
+        let top: String = text
+            .lines()
+            .nth(preview.y as usize)
+            .unwrap()
+            .chars()
+            .skip(preview.x as usize)
+            .take(preview.width as usize)
+            .collect();
+        let rule = "─".repeat(preview.width as usize - 2);
+        assert_eq!(top, format!("╭{rule}╮"), "{text}");
         assert!(app.active_terminal().is_none());
         assert!(app.ed().path().is_some_and(|p| p.ends_with("a.txt")));
         key(&mut app, KeyCode::Esc);
@@ -4604,7 +4613,7 @@ mod tests {
 
         // The picker lists it first, as the last thing shown: Enter goes back.
         ctrl(&mut app, 'p');
-        assert!(screen(&app).contains("· sleep"), "{}", screen(&app));
+        assert!(screen(&app).contains("│ sleep"), "{}", screen(&app));
         key(&mut app, KeyCode::Enter);
         assert!(app.active_terminal().is_some());
         // And from there, back to the file.
@@ -4698,14 +4707,9 @@ mod tests {
         let shown = palette(&mut app, "rename terminal");
         assert!(shown.contains("Rename Terminal"), "{shown}");
 
-        // Its name is in the status bar. Renaming it asks for another
-        // there, which takes the keys, even from the tree.
+        // Renaming it asks for a name in the status bar, which takes the
+        // keys, even from the tree, and the name is shown there.
         let status_bar = |app: &App| screen(app).lines().last().unwrap().to_string();
-        assert!(
-            status_bar(&app).starts_with(" Terminal 1"),
-            "{}",
-            status_bar(&app)
-        );
         app.run(Command::FocusTree, false);
         app.run(Command::RenameTerminal, false);
         assert_eq!(status_bar(&app).trim_end(), " Rename terminal:");
@@ -4725,7 +4729,7 @@ mod tests {
         assert!(above_status.contains("build"), "{shown}");
         key(&mut app, KeyCode::Esc);
         // Renaming starts from the name; Esc keeps it, and an empty name
-        // goes back to the number.
+        // takes it away.
         app.run(Command::RenameTerminal, false);
         assert_eq!(status_bar(&app).trim_end(), " Rename terminal: build");
         key(&mut app, KeyCode::Esc);
@@ -4740,7 +4744,7 @@ mod tests {
         }
         key(&mut app, KeyCode::Enter);
         assert!(
-            status_bar(&app).starts_with(" Terminal 1"),
+            !status_bar(&app).starts_with(" build"),
             "{}",
             status_bar(&app)
         );
@@ -5800,7 +5804,7 @@ mod tests {
         prefixed_ctrl(&mut app, 'w');
         assert_eq!(app.terminals.len(), 1);
         let text = screen(&app);
-        assert!(text.contains("Close Terminal 1?"), "{text}");
+        assert!(text.contains("Close Terminal?"), "{text}");
         assert!(text.contains("sleep is running in a terminal."), "{text}");
         // The alert has the keyboard, not the terminal.
         key(&mut app, KeyCode::Char('c'));

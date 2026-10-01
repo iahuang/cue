@@ -217,11 +217,24 @@ impl Terminal {
         self.id
     }
 
-    /// What to call it: the name it was given, or "Terminal 2".
+    /// What to call it: the name it was given, or "Terminal".
     pub fn name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| "Terminal".to_string())
+    }
+
+    /// What to call it, and more about it, dimmed after: the name it was
+    /// given and what's running in it, or else what's running in it and
+    /// the title that sets, as tmux names windows (shells set titles such
+    /// as `user@host: ~`).
+    pub fn label(&self) -> (String, String) {
+        if self.exit.is_some() {
+            return (self.name(), "exited".to_string());
+        }
+        let program = self.program().unwrap_or_default();
         match &self.name {
-            Some(name) => name.clone(),
-            None => format!("Terminal {}", self.id),
+            Some(name) => (name.clone(), program),
+            None if program.is_empty() => (self.name(), self.title().trim().to_string()),
+            None => (program, self.title().trim().to_string()),
         }
     }
 
@@ -246,8 +259,8 @@ impl Terminal {
         self.prompt = None;
     }
 
-    /// A key for the rename prompt, while it's open. An empty name goes
-    /// back to the numbered one.
+    /// A key for the rename prompt, while it's open. An empty name takes
+    /// away the one it was given.
     pub fn handle_prompt_key(&mut self, key: Key) {
         let Some(prompt) = &mut self.prompt else {
             return;
@@ -285,22 +298,12 @@ impl Terminal {
         self.vt.title()
     }
 
-    /// A useful default label without asking the user to name each shell.
-    pub fn picker_name(&self) -> String {
-        self.name.clone().unwrap_or_else(|| {
-            self.cwd
-                .file_name()
-                .unwrap_or(self.cwd.as_os_str())
-                .to_string_lossy()
-                .into_owned()
-        })
-    }
-
     /// Draws the existing viewport without changing its size, scroll, or focus.
     pub fn draw_preview(&self, frame: &Buffer, area: crate::picker::Area) {
         let colors = theme::colors();
         frame.with_clip(area.x, area.y, area.width, area.height, || {
-            crate::picker::draw_frame(frame, area, &format!("Terminal {}", self.id));
+            let name = self.name.as_deref().unwrap_or_default();
+            crate::picker::draw_frame(frame, area, name);
             let title = self.title();
             let context = if title.is_empty() {
                 self.cwd.display().to_string()
@@ -823,10 +826,10 @@ impl Terminal {
                 text: format!("{}. Enter starts a new shell.", describe_exit(status)),
                 error: false,
             },
-            None => match self.program() {
-                Some(program) => Status::Terminal(format!("{}  {program}", self.name())),
-                None => Status::Terminal(self.name()),
-            },
+            None => Status::Terminal(match self.label() {
+                (name, about) if about.is_empty() => name,
+                (name, about) => format!("{name} · {about}"),
+            }),
         }
     }
 }

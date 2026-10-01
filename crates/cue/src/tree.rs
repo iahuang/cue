@@ -683,7 +683,7 @@ fn not_ignored(dir: &Path) -> HashSet<PathBuf> {
 }
 
 /// `s` cut to `max` characters, ending in an ellipsis if cut.
-fn truncate(s: &str, max: usize) -> String {
+pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }

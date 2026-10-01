@@ -137,8 +137,6 @@ pub fn draw(
         }
         Status::Info(info) | Status::Terminal(info) | Status::EditorInfo { text: info, .. } => {
             frame.fill_rect(0, y, width, 1, colors.surface);
-            let left = format!(" {info}");
-            frame.draw_text(&left, 0, y, colors.text, None, Attributes::NONE);
             // In a terminal, those keys are the shell's.
             let hints: &[(Command, &str)] = match status {
                 Status::Terminal(_) => &[(Command::TerminalPrefix, "cue keys")],
@@ -157,6 +155,12 @@ pub fn draw(
                 .collect();
             let hints = hints.strip_suffix(' ').unwrap_or(&hints);
             let hints_x = width.saturating_sub(hints.len() as u32);
+            let mut left = format!(" {info}");
+            // The title a shell sets can run long; the hint is worth more.
+            if let Status::Terminal(_) = status {
+                left = crate::tree::truncate(&left, (hints_x as usize).saturating_sub(1));
+            }
+            frame.draw_text(&left, 0, y, colors.text, None, Attributes::NONE);
             if hints_x as usize > left.chars().count() {
                 frame.draw_text(hints, hints_x, y, colors.muted, None, Attributes::NONE);
             }
