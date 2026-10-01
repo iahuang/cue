@@ -14,21 +14,33 @@
 //!
 //! When the shell exits, the terminal keeps its last screen until Enter
 //! starts a new shell.
+//!
+//! The find bar (Cmd+F or Ctrl+Shift+F) finds in the output and the
+//! history above it, as the editor's does in a file, without replacing.
+//! As in other terminals, the next match is the one above: finding starts
+//! from the bottom of the view and goes back through the history. Matches
+//! are found again as output arrives.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use opentui::{
-    Buffer, EmbeddedTerminal, KeyEvent, KeyMods, LineAt, MouseAction, MouseButton as TermButton,
-    MouseEvent,
+    Anchor, Buffer, EmbeddedTerminal, KeyEvent, KeyMods, LineAt, MouseAction,
+    MouseButton as TermButton, MouseEvent,
 };
 
+use crate::editor::CURRENT_MATCH;
+use crate::find::{self, Field, FindBar, Match};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind};
+use crate::keymap::Keymap;
 use crate::layout::Rect;
+use crate::line_edit::Edit;
 use crate::location::{self, Target};
 use crate::pty::Pty;
+use crate::search::Toggle;
 use crate::status::{Prompt, PromptKey, Status};
+use crate::theme::MATCH_BG;
 
 /// Bytes of history kept above the screen.
 const SCROLLBACK: u32 = 10 * 1024 * 1024;
@@ -57,6 +69,36 @@ pub struct Terminal {
     forwarding_mouse: bool,
     /// Where a drag to select text started.
     selecting_from: Option<(u16, u16)>,
+    /// The find bar, while it's open.
+    find: Option<Find>,
+    /// Counts changes to the output, so the find bar knows when to find
+    /// its matches again.
+    epoch: u64,
+}
+
+/// The find bar, and where its matches are.
+struct Find {
+    bar: FindBar,
+    /// Where each match is, to tell it again once the output changes and
+    /// it's found again.
+    anchors: Vec<Anchor>,
+    current: Option<usize>,
+}
+
+impl Find {
+    /// The nearest match on or above `row`, or else the last.
+    fn above(&self, row: u32) -> Option<usize> {
+        let matches = &self.bar.matches;
+        let i = matches.partition_point(|m| m.row <= row);
+        (!matches.is_empty()).then(|| i.checked_sub(1).unwrap_or(matches.len() - 1))
+    }
+
+    /// The nearest match on or below `row`, or else the first.
+    fn below(&self, row: u32) -> Option<usize> {
+        let matches = &self.bar.matches;
+        let i = matches.partition_point(|m| m.row < row);
+        (!matches.is_empty()).then(|| i % matches.len())
+    }
 }
 
 impl Terminal {
@@ -66,6 +108,7 @@ impl Terminal {
         let mut vt = EmbeddedTerminal::new(cols, rows, SCROLLBACK)
             .map_err(|e| io::Error::other(e.to_string()))?;
         vt.set_host_palette(true);
+        vt.set_search_colors((None, MATCH_BG), (CURRENT_MATCH.fg, CURRENT_MATCH.bg));
         let pty = Pty::shell(cwd, cols, rows)?;
         Ok(Terminal {
             id,
@@ -79,6 +122,8 @@ impl Terminal {
             exit: None,
             forwarding_mouse: false,
             selecting_from: None,
+            find: None,
+            epoch: 0,
         })
     }
 
@@ -95,6 +140,7 @@ impl Terminal {
         self.closed = false;
         self.exit = None;
         let _ = self.vt.write(b"\x1bc");
+        self.output_changed();
         Ok(())
     }
 
@@ -111,6 +157,7 @@ impl Terminal {
         self.pty.flush();
         let mut buf = [0u8; 64 * 1024];
         let mut read = 0;
+        let mut output = false;
         while !self.closed && read < READ_BUDGET {
             match self.pty.read(&mut buf) {
                 Ok(0) => break,
@@ -120,9 +167,13 @@ impl Terminal {
                     // terminals do.
                     let _ = self.vt.write(&buf[..n]);
                     changed = true;
+                    output = true;
                 }
                 Err(_) => self.closed = true,
             }
+        }
+        if output {
+            self.output_changed();
         }
         let responses = self.vt.drain_responses();
         if !responses.is_empty() {
@@ -224,6 +275,8 @@ impl Terminal {
         if (cols, rows) != old && self.vt.resize(cols, rows).is_ok() {
             self.pty.resize(cols, rows);
             self.selecting_from = None;
+            // Lines rewrap.
+            self.output_changed();
         }
     }
 
@@ -268,6 +321,7 @@ impl Terminal {
         // Home, erase the screen, then the history, so nothing erased is
         // kept in it.
         let _ = self.vt.write(b"\x1b[H\x1b[2J\x1b[3J");
+        self.output_changed();
         if self.exit.is_none() && !self.pty.is_busy() {
             // Ctrl+L: the shell clears the screen and redraws its prompt.
             self.pty.write(b"\x0c");
@@ -291,6 +345,9 @@ impl Terminal {
     /// A mouse event at screen cell (`mouse.x`, `mouse.y`), in the
     /// terminal or dragged from it.
     pub fn handle_mouse(&mut self, mouse: Mouse) {
+        if self.handle_find_mouse(mouse) {
+            return;
+        }
         let (cols, rows) = size(self.area);
         let x = mouse.x.saturating_sub(self.area.x).min(cols as u32 - 1);
         let y = mouse.y.saturating_sub(self.area.y).min(rows as u32 - 1);
@@ -402,19 +459,277 @@ impl Terminal {
 
     /// Draws the screen in its area, and returns where the terminal cursor
     /// goes if `focused`.
-    pub fn draw(&self, frame: &Buffer, focused: bool) -> Option<(u32, u32)> {
+    pub fn draw(&self, frame: &Buffer, focused: bool, keymap: &Keymap) -> Option<(u32, u32)> {
         let area = self.area;
         self.vt.draw(frame, area.x as i32, area.y as i32);
+        if let Some(find) = &self.find {
+            let (x, width) = self.find_area();
+            let bar = find
+                .bar
+                .draw(frame, (x, area.y, width), find.current, keymap);
+            if let Some(cursor) = bar {
+                return focused.then_some(cursor);
+            }
+        }
         let cursor = self.vt.cursor();
         let (x, y) = cursor.position?;
         (focused && cursor.visible && self.exit.is_none())
             .then_some((area.x + x as u32, area.y + y as u32))
     }
 
+    // --- finding ---------------------------------------------------------------
+
+    /// Opens the find bar with `memory`'s query, or the selection if it's on
+    /// one line, and focuses the query, finding the nearest match above the
+    /// bottom of the view. With the query focused already, it closes the
+    /// bar.
+    pub fn show_find(&mut self, memory: &find::Memory) {
+        if self.find_focused() {
+            return self.close_find();
+        }
+        let selected = self.selected_text().filter(|text| !text.contains('\n'));
+        let bottom = self.bottom_row();
+        let find = self.find.get_or_insert_with(|| Find {
+            bar: find_bar(memory.clone(), bottom),
+            anchors: Vec::new(),
+            current: None,
+        });
+        let bar = &mut find.bar;
+        if let Some(text) = selected {
+            if text != bar.memory.query.text {
+                bar.memory.query.text = text;
+                bar.carets[Field::Find as usize].move_to_end();
+                bar.epoch = None;
+            }
+            bar.origin = bottom;
+        }
+        bar.focus = Some(Field::Find);
+        // Typing replaces the query, as if it were selected.
+        bar.replace_query = !bar.memory.query.text.is_empty();
+        self.sync_find();
+    }
+
+    /// Goes to the next match up, or with `older` false, down, from the
+    /// current one or the view. With the find bar closed, it opens with
+    /// `memory`'s query, keeping the keyboard in the terminal, or if
+    /// there's no query, to type one.
+    pub fn find_step(&mut self, memory: &find::Memory, older: bool) {
+        if self.find.is_none() {
+            if memory.query.text.is_empty() {
+                return self.show_find(memory);
+            }
+            let mut bar = find_bar(memory.clone(), self.bottom_row());
+            bar.focus = None;
+            self.find = Some(Find {
+                bar,
+                anchors: Vec::new(),
+                current: None,
+            });
+        }
+        self.sync_find();
+        let top = self.vt.scroll_position().top;
+        let bottom = self.bottom_row();
+        let Some(find) = &self.find else {
+            return;
+        };
+        let count = find.bar.matches.len();
+        let index = match find.current {
+            Some(i) if older => Some((i + count - 1) % count),
+            Some(i) => Some((i + 1) % count),
+            None if older => find.above(bottom),
+            None => find.below(top),
+        };
+        if let Some(index) = index {
+            self.select_match(index);
+        }
+    }
+
+    /// The find bar's query, while it's open.
+    pub fn find_memory(&self) -> Option<&find::Memory> {
+        self.find.as_ref().map(|find| &find.bar.memory)
+    }
+
+    pub fn find_open(&self) -> bool {
+        self.find.is_some()
+    }
+
+    /// Whether the find bar has the keyboard.
+    pub fn find_focused(&self) -> bool {
+        self.find
+            .as_ref()
+            .is_some_and(|find| find.bar.focus.is_some())
+    }
+
+    /// Gives the keyboard back to the program.
+    pub fn blur_find(&mut self) {
+        if let Some(find) = &mut self.find {
+            find.bar.focus = None;
+        }
+    }
+
+    /// Edits the query: typing, pasting, deleting, or moving the cursor.
+    pub fn find_edit(&mut self, edit: Edit) {
+        if let Some(find) = &mut self.find {
+            find.bar.edit(edit);
+        }
+        self.sync_find();
+    }
+
+    pub fn find_toggle(&mut self, toggle: Toggle) {
+        if let Some(find) = &mut self.find {
+            find.bar.toggle(toggle);
+        }
+        self.sync_find();
+    }
+
+    /// Closes the find bar, leaving the view where it is.
+    pub fn close_find(&mut self) {
+        if self.find.take().is_some() {
+            self.vt.clear_search();
+        }
+    }
+
+    /// Finds the matches again after the output changed.
+    fn output_changed(&mut self) {
+        self.epoch += 1;
+        self.sync_find();
+    }
+
+    /// Finds the matches again if the output or the query changed. New
+    /// output keeps the current match; a new query goes to the nearest
+    /// one above where finding started.
+    fn sync_find(&mut self) {
+        let epoch = self.epoch;
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let bar = &mut find.bar;
+        if bar.epoch == Some(epoch) {
+            return;
+        }
+        let jump = bar.epoch.is_none() && bar.focus == Some(Field::Find);
+        bar.epoch = Some(epoch);
+        let text = self.vt.search_text().unwrap_or_default();
+        let (ranges, truncated) = match find::find(&text, &bar.memory.query) {
+            Ok(found) => {
+                bar.error = None;
+                found
+            }
+            Err(error) => {
+                bar.error = Some(error);
+                (Vec::new(), false)
+            }
+        };
+        bar.truncated = truncated;
+        let found = self.vt.set_search_matches(&ranges).unwrap_or_default();
+        bar.matches = ranges
+            .into_iter()
+            .zip(&found)
+            .map(|(bytes, found)| Match {
+                row: found.row,
+                cols: found.col as u32..found.col as u32,
+                offsets: bytes.start as u32..bytes.end as u32,
+                bytes,
+            })
+            .collect();
+        let current = find.current.map(|i| find.anchors[i]);
+        find.anchors = found.iter().map(|found| found.anchor).collect();
+        find.current = current.and_then(|anchor| find.anchors.iter().position(|&a| a == anchor));
+        self.vt.set_search_current(find.current);
+        if jump {
+            if let Some(index) = find.above(find.bar.origin) {
+                self.select_match(index);
+            }
+        }
+    }
+
+    /// Makes match `index` the current one, scrolling to it if it's out of
+    /// view.
+    fn select_match(&mut self, index: usize) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let Some(row) = find.bar.matches.get(index).map(|m| m.row) else {
+            return;
+        };
+        find.current = Some(index);
+        find.bar.origin = row;
+        self.vt.set_search_current(Some(index));
+        let rows = self.area.height;
+        let top = self.vt.scroll_position().top;
+        // The bar covers the top row.
+        let first = if rows > 2 { top + 1 } else { top };
+        if !(first..top + rows).contains(&row) {
+            self.vt.scroll_to_row(row.saturating_sub(rows / 2));
+        }
+    }
+
+    /// The bottom row of the view, counted from the top of the history.
+    fn bottom_row(&self) -> u32 {
+        let top = self.vt.scroll_position().top;
+        top + self.area.height.saturating_sub(1)
+    }
+
+    /// Where the find bar floats: the top right, a column in from the
+    /// edge, as (screen column, width).
+    fn find_area(&self) -> (u32, u32) {
+        let area = self.area;
+        let width = find::MAX_WIDTH.min(area.width.saturating_sub(1)).max(1);
+        (area.x + area.width.saturating_sub(width + 1), width)
+    }
+
+    /// A mouse event on the find bar, which it handles; returns false if
+    /// it's elsewhere. A press elsewhere gives the program the keyboard.
+    fn handle_find_mouse(&mut self, mouse: Mouse) -> bool {
+        let (x, width) = self.find_area();
+        let area = self.area;
+        let dragging = self.selecting_from.is_some() || self.forwarding_mouse;
+        let Some(find) = &mut self.find else {
+            return false;
+        };
+        let inside = (x..x + width).contains(&mouse.x)
+            && (area.y..area.y + find.bar.rows()).contains(&mouse.y);
+        let press = matches!(mouse.kind, MouseKind::Press(_));
+        if !inside || (dragging && !press) {
+            if press {
+                find.bar.focus = None;
+            }
+            return false;
+        }
+        match mouse.kind {
+            // The wheel scrolls the output under the bar.
+            MouseKind::ScrollUp
+            | MouseKind::ScrollDown
+            | MouseKind::ScrollLeft
+            | MouseKind::ScrollRight => return false,
+            MouseKind::Press(MouseButton::Left) => {}
+            _ => return true,
+        }
+        match find.bar.target(mouse.x, mouse.y - area.y) {
+            find::Target::Field(_) => find.bar.focus = Some(Field::Find),
+            find::Target::Toggle(toggle) => self.find_toggle(toggle),
+            find::Target::Close => self.close_find(),
+            find::Target::Expander | find::Target::Replace | find::Target::ReplaceAll => {}
+        }
+        true
+    }
+
     /// What the status bar shows while this terminal is in the active panel.
     pub fn status(&self) -> Status {
         if let Some(prompt) = &self.prompt {
             return prompt.status();
+        }
+        // While typing a query that isn't a valid regex, why.
+        if let Some(error) = self
+            .find
+            .as_ref()
+            .filter(|find| find.bar.focus.is_some())
+            .and_then(|find| find.bar.error())
+        {
+            return Status::Message {
+                text: format!("Invalid regex: {error}"),
+                error: true,
+            };
         }
         match self.exit {
             Some(status) => Status::Message {
@@ -427,6 +742,13 @@ impl Terminal {
             },
         }
     }
+}
+
+/// A find bar for a terminal: it finds, without replacing.
+fn find_bar(memory: find::Memory, origin: u32) -> FindBar {
+    let mut bar = FindBar::new(memory, origin);
+    bar.replaceable = false;
+    bar
 }
 
 /// "The shell exited", with its code or signal if it failed.
@@ -555,6 +877,7 @@ fn char_code(c: char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::Keymap;
     use std::time::{Duration, Instant};
 
     fn encode(term: &Terminal, key: Key) -> Vec<u8> {
@@ -619,7 +942,7 @@ mod tests {
             "test",
         )
         .unwrap();
-        term.draw(&frame, true);
+        term.draw(&frame, true, &Keymap::default());
         frame.to_text(true)
     }
 
@@ -723,6 +1046,81 @@ mod tests {
         assert!(!history.contains("20"), "{history}");
         let first = history.lines().next().unwrap_or_default();
         assert!(first.trim_end().ends_with("echo kept"), "{history}");
+    }
+
+    #[test]
+    fn finds_in_the_output_and_its_history() {
+        let _serial = crate::test_serial();
+        let root = Path::new("/tmp").canonicalize().unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 70,
+            height: 6,
+        };
+        let mut term = Terminal::new(1, &root, area).unwrap();
+        term.paste("for i in $(seq 1 30); do echo line$i; done; echo do''ne");
+        term.send_key(key(KeyCode::Enter, Mods::NONE));
+        wait_for(&mut term, "done");
+        let bottom = term.vt.scroll_position();
+
+        // line2, and line20 to line29. The nearest above the bottom of the
+        // view is current, and in view already.
+        term.show_find(&find::Memory::default());
+        term.find_edit(Edit::Insert("line2"));
+        assert!(term.find_focused());
+        let find = term.find.as_ref().unwrap();
+        assert_eq!(find.bar.matches.len(), 11);
+        assert_eq!(find.current, Some(10));
+        assert_eq!(term.vt.scroll_position(), bottom);
+        let shown = screen(&term);
+        assert!(
+            shown.lines().next().unwrap().contains("11 of 11"),
+            "{shown}"
+        );
+
+        // The next match is the one above; far enough up, the view follows.
+        let memory = term.find_memory().unwrap().clone();
+        term.find_step(&memory, true);
+        assert_eq!(term.find.as_ref().unwrap().current, Some(9));
+        for _ in 0..9 {
+            term.find_step(&memory, true);
+        }
+        let find = term.find.as_ref().unwrap();
+        assert_eq!(find.current, Some(0));
+        let row = find.bar.matches[0].row;
+        let top = term.vt.scroll_position().top;
+        assert!((top + 1..top + 6).contains(&row), "line2 in view: {top}");
+        let shown = screen(&term);
+        assert!(shown.lines().any(|l| l.trim_end() == "line2"), "{shown}");
+        // Past the first, around to the last.
+        term.find_step(&memory, true);
+        assert_eq!(term.find.as_ref().unwrap().current, Some(10));
+        term.find_step(&memory, false);
+        assert_eq!(term.find.as_ref().unwrap().current, Some(0));
+
+        // New output is found too, keeping the current match.
+        term.blur_find();
+        term.paste("echo line2x");
+        term.send_key(key(KeyCode::Enter, Mods::NONE));
+        wait_for(&mut term, "line2x");
+        // The command and its output, at least: a shell may suggest it
+        // again from its history.
+        let find = term.find.as_ref().unwrap();
+        assert!(find.bar.matches.len() >= 13, "{}", find.bar.matches.len());
+        assert_eq!(find.current, Some(0));
+        assert_eq!(find.bar.matches[0].row, row);
+
+        // A query that isn't a valid regex says why.
+        term.show_find(&memory);
+        term.find_toggle(Toggle::Regex);
+        term.find_edit(Edit::Insert("("));
+        assert!(matches!(term.status(), Status::Message { error: true, .. }));
+        assert!(term.find.as_ref().unwrap().bar.matches.is_empty());
+
+        // Showing it again with the query focused closes it.
+        term.show_find(&memory);
+        assert!(!term.find_open());
     }
 
     /// Polls until the first line on screen ends with `end`.

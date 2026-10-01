@@ -17,12 +17,13 @@ pub const MATCH_BG: Rgba = Rgba::rgb(95, 85, 55);
 /// 16-color palette, so they follow its theme, or none to keep the text's
 /// color, and attributes. A capture not listed takes the style of what it
 /// refines (`keyword.return` is a `keyword`), or stays uncolored, like
-/// punctuation.
+/// punctuation. Comments and Markdown delimiters are the text's color dimmed
+/// rather than slot 8, which some palettes make nearly the background's.
 const SYNTAX: &[(&str, Option<u8>, Attributes)] = &[
     ("attribute", Some(6), Attributes::NONE),
     ("boolean", Some(6), Attributes::NONE),
     ("character", Some(2), Attributes::NONE),
-    ("comment", Some(8), Attributes::NONE),
+    ("comment", None, Attributes::DIM),
     ("constant", Some(6), Attributes::NONE),
     ("constructor", Some(3), Attributes::NONE),
     ("diff.minus", Some(1), Attributes::NONE),
@@ -37,7 +38,7 @@ const SYNTAX: &[(&str, Option<u8>, Attributes)] = &[
     ("string.escape", Some(6), Attributes::NONE),
     ("tag", Some(1), Attributes::NONE),
     // Markdown.
-    ("text.delimiter", Some(8), Attributes::NONE),
+    ("text.delimiter", None, Attributes::DIM),
     ("text.emphasis", None, Attributes::ITALIC),
     ("text.list", Some(3), Attributes::NONE),
     ("text.literal", Some(2), Attributes::NONE),

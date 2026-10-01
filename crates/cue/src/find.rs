@@ -1,12 +1,13 @@
-//! Finding and replacing in the open file (Ctrl+F, Ctrl+H): the find bar,
-//! which floats over the top right of the text as in most editors, and the
-//! matches of its query in the text.
+//! Finding and replacing in the open file (Ctrl+F, Ctrl+H), and finding in
+//! a terminal's output: the find bar, which floats over the top right of
+//! the text as in most editors, and the matches of its query in the text.
 //!
 //! The bar has a row for the query, with the match count, the search
 //! options as toggles, and a close button, and for replacing, a row for the
 //! replacement with buttons to replace one match or all. Every match is
-//! highlighted as you type. The editor selects the current match and does
-//! the replacing; this module finds the matches and draws the bar.
+//! highlighted as you type. The editor or terminal selects the current
+//! match, and the editor does the replacing; this module finds the matches
+//! and draws the bar.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -65,10 +66,11 @@ impl Field {
 pub struct Match {
     /// In the text with `\n` line breaks.
     pub bytes: Range<usize>,
+    /// In a terminal, counted from the top of the scrollback.
     pub row: u32,
     /// Display columns in the row.
     pub cols: Range<u32>,
-    /// Cursor offsets.
+    /// Cursor offsets; in a terminal, `bytes`.
     pub offsets: Range<u32>,
 }
 
@@ -96,6 +98,8 @@ struct Layout {
 
 pub struct FindBar {
     pub memory: Memory,
+    /// Whether the replacement row can show: not for a terminal's output.
+    pub replaceable: bool,
     /// Whether the replacement row shows.
     pub replacing: bool,
     /// The field with the keyboard, or `None` while the text has it.
@@ -114,7 +118,8 @@ pub struct FindBar {
     /// The text version the matches are for; `None` when they need finding
     /// again.
     pub epoch: Option<u64>,
-    /// The cursor offset that typing a query finds the next match from.
+    /// Where typing a query finds the next match from: the cursor offset,
+    /// or in a terminal, the row.
     pub origin: u32,
     /// The buttons as last drawn, as (row, screen columns, target), for
     /// clicks.
@@ -126,6 +131,7 @@ impl FindBar {
         FindBar {
             replace_query: !memory.query.text.is_empty(),
             memory,
+            replaceable: true,
             replacing: false,
             focus: Some(Field::Find),
             carets: Default::default(),
@@ -280,12 +286,15 @@ impl FindBar {
     fn layout(&self, (x, width): (u32, u32), current: Option<usize>, keymap: &Keymap) -> Layout {
         let end = x + width;
         let expander = if self.replacing { " ▾ " } else { " ▸ " };
-        let mut buttons = vec![(
-            0,
-            x..x + EXPANDER_WIDTH,
-            Target::Expander,
-            expander.to_string(),
-        )];
+        let mut buttons = Vec::new();
+        if self.replaceable {
+            buttons.push((
+                0,
+                x..x + EXPANDER_WIDTH,
+                Target::Expander,
+                expander.to_string(),
+            ));
+        }
         let close = end.saturating_sub(4)..end.saturating_sub(1);
         let toggles_x = close
             .start
@@ -305,7 +314,7 @@ impl FindBar {
         let status_width = STATUS_WIDTH.max(status.chars().count() as u32);
         let status_end = toggles_x.saturating_sub(1);
         let status_x = status_end.saturating_sub(status.chars().count() as u32);
-        let fields_x = x + EXPANDER_WIDTH;
+        let fields_x = x + if self.replaceable { EXPANDER_WIDTH } else { 1 };
         let mut fields_end = status_end.saturating_sub(status_width + 1);
         if fields_end < fields_x + MIN_FIELD_WIDTH {
             // Narrow: the count gets only the room it needs.

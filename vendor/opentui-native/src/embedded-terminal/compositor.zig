@@ -5,11 +5,21 @@ const ghostty = @import("ghostty.zig");
 
 pub const Error = std.mem.Allocator.Error || buffer.BufferError;
 
+/// The colors of search matches (cue patch): `fg` null keeps the text's
+/// own color.
+pub const SearchColors = struct {
+    match_fg: ?buffer.RGBA = null,
+    match_bg: buffer.RGBA = .{ 0, 0, 0, 0 },
+    current_fg: ?buffer.RGBA = null,
+    current_bg: buffer.RGBA = .{ 0, 0, 0, 0 },
+};
+
 pub const Options = struct {
     transparent_background: bool = false,
     /// Default and palette colors as the host terminal's own; see
     /// `EmbeddedTerminal.setHostPalette`.
     host_palette: bool = false,
+    search: SearchColors = .{},
 };
 
 pub fn compose(
@@ -36,6 +46,7 @@ pub fn compose(
     const row_dirty = rows.items(.dirty);
     const row_cells = rows.items(.cells);
     const row_selection = rows.items(.selection);
+    const row_highlights = rows.items(.highlights);
     for (0..state.rows) |y| {
         if (dirty == .partial and !row_dirty[y]) continue;
 
@@ -46,6 +57,7 @@ pub fn compose(
                 allocator,
                 row_cells[y].slice(),
                 row_selection[y],
+                row_highlights[y].items,
                 target,
                 origin_x,
                 @intCast(dest_y),
@@ -53,6 +65,7 @@ pub fn compose(
                 default_fg,
                 default_bg,
                 options.host_palette,
+                &options.search,
             );
         }
 
@@ -81,6 +94,7 @@ fn composeRow(
     allocator: std.mem.Allocator,
     cells: anytype,
     selection: ?[2]u16,
+    highlights: []const ghostty.RenderState.Highlight,
     target: *buffer.OptimizedBuffer,
     origin_x: i32,
     dest_y: u32,
@@ -88,6 +102,7 @@ fn composeRow(
     default_fg: buffer.RGBA,
     default_bg: buffer.RGBA,
     host_palette: bool,
+    search: *const SearchColors,
 ) Error!void {
     const raw_items = cells.items(.raw);
     const graphemes = cells.items(.grapheme);
@@ -117,6 +132,12 @@ fn composeRow(
         if (selection) |range| {
             if (x < text_end and x + raw.gridWidth() > range[0] and x <= range[1]) inverse = !inverse;
         }
+        // A search match's colors replace the cell's, and the selection's.
+        var mark: ?u8 = null;
+        for (highlights) |highlight| {
+            if (x >= highlight.range[0] and x <= highlight.range[1]) mark = @max(mark orelse 0, highlight.tag);
+        }
+        if (mark != null) inverse = false;
         var extra_attributes: u32 = 0;
         if (host_palette) {
             fg = switch (style.fg_color) {
@@ -140,6 +161,12 @@ fn composeRow(
             fg = color(style.fg(.{ .default = colors.foreground, .palette = &colors.palette }));
             bg = if (style.bg(&raw, &colors.palette)) |explicit| color(explicit) else default_bg;
             if (inverse) std.mem.swap(@TypeOf(fg), &fg, &bg);
+        }
+
+        if (mark) |tag| {
+            const current = tag > 0;
+            bg = if (current) search.current_bg else search.match_bg;
+            if (if (current) search.current_fg else search.match_fg) |marked_fg| fg = marked_fg;
         }
 
         var stack: [128]u8 = undefined;

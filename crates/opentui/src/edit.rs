@@ -579,6 +579,12 @@ impl EditorView<'_> {
         self.query(sys::editorViewGetVisualCursor)
     }
 
+    /// The cursor relative to the whole document rather than the viewport,
+    /// without scrolling it into view.
+    pub fn visual_cursor_absolute(&self) -> VisualCursor {
+        self.query(sys::editorViewGetVisualCursorAbsolute)
+    }
+
     /// Moves up one wrapped line, keeping the visual column where possible.
     pub fn move_up_visual(&self) {
         unsafe { sys::editorViewMoveUpVisual(self.handle) }

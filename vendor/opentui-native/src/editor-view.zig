@@ -701,6 +701,14 @@ pub const EditorView = struct {
         };
     }
 
+    /// The cursor in document-absolute visual coordinates, without scrolling
+    /// it into view first (cue patch). With a selection the viewport doesn't
+    /// follow the cursor, and `getVisualCursor` clamps a row above the
+    /// viewport to its top.
+    pub fn getVisualCursorAbsolute(self: *EditorView) VisualCursor {
+        return self.getPrimaryVisualCursorAbsolute();
+    }
+
     /// This accounts for line wrapping by finding which virtual line contains the logical position
     /// Returns absolute visual coordinates (document-absolute, not viewport-relative)
     pub fn logicalToVisualCursor(self: *EditorView, logical_row: u32, logical_col: u32) VisualCursor {

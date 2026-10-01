@@ -497,7 +497,7 @@ impl Panel {
                 self.draw_buttons(frame, active);
                 let body = self.body();
                 return frame.with_clip(body.x, body.y, body.width, body.height, || {
-                    terminal.borrow().draw(frame, active)
+                    terminal.borrow().draw(frame, active, keymap)
                 });
             }
             self.draw_header(frame, workspace, active, preview);

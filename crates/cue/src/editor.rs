@@ -50,7 +50,7 @@ const SELECTION: SelectionColors = SelectionColors {
     fg: None,
 };
 /// The find bar's current match, which is selected.
-const CURRENT_MATCH: SelectionColors = SelectionColors {
+pub const CURRENT_MATCH: SelectionColors = SelectionColors {
     bg: Rgba::rgb(249, 226, 175),
     fg: Some(Rgba::rgb(30, 30, 46)),
 };
@@ -304,7 +304,7 @@ impl Editor {
             self.anchor = Some(start);
             self.view.set_selection(start, end, SELECTION);
         }
-        self.reveal(vp, row);
+        self.reveal(vp);
     }
 
     /// Puts the cursor at `position`, as a compiler printed it: the line's
@@ -323,15 +323,13 @@ impl Editor {
         self.select_in_line(row, byte..byte);
     }
 
-    /// Scrolls line `row`, where the cursor moved, a third of the way down
-    /// if it was off screen in `vp`, the viewport before the move.
-    fn reveal(&self, vp: Viewport, row: u32) {
+    /// Scrolls the cursor's row a third of the way down if it was off screen
+    /// in `vp`, the viewport before the cursor moved.
+    fn reveal(&self, vp: Viewport) {
         // Wrapped, lines and rows differ: find the cursor's row among the
-        // wrapped ones.
-        let row = match self.wrap {
-            WrapMode::None => row,
-            _ => self.view.visual_cursor().row + self.view.viewport().y,
-        };
+        // wrapped ones. With a selection, the view doesn't follow the cursor,
+        // so its row relative to the viewport can't be above it.
+        let row = self.view.visual_cursor_absolute().row;
         if !(vp.y..vp.y + vp.height).contains(&row) {
             let max_y = self
                 .view
@@ -1364,7 +1362,7 @@ impl Editor {
         self.anchor = Some(m.offsets.start);
         self.view
             .set_selection(m.offsets.start, m.offsets.end, CURRENT_MATCH);
-        self.reveal(vp, m.row);
+        self.reveal(vp);
         self.keep_clear_of_find();
     }
 
@@ -2578,6 +2576,13 @@ mod tests {
         editor.select_in_line(31, 0..2);
         let _ = screen_lines(&editor, 40, 10);
         assert_eq!(editor.view.viewport().y, top);
+
+        // Above the view, it scrolls back up: the selection keeps the view
+        // from following the cursor there.
+        editor.select_in_line(5, 0..1);
+        let (lines, cursor) = screen_lines(&editor, 40, 10);
+        assert_eq!(cursor.1, 9 / 3, "a third of the way down: {lines:?}");
+        assert!(lines[cursor.1 as usize].contains("6  5 word"), "{lines:?}");
     }
 
     #[test]
@@ -2785,6 +2790,17 @@ mod tests {
 
     /// The color of the first `needle` on screen row `row`.
     fn fg_of(editor: &Editor, width: u32, height: u32, row: u32, needle: &str) -> Option<Rgba> {
+        style_of(editor, width, height, row, needle).map(|(fg, _)| fg)
+    }
+
+    /// The color and attributes of the first `needle` on screen row `row`.
+    fn style_of(
+        editor: &Editor,
+        width: u32,
+        height: u32,
+        row: u32,
+        needle: &str,
+    ) -> Option<(Rgba, Attributes)> {
         let screen = OwnedBuffer::new(width, height, false, WidthMethod::Unicode, "test").unwrap();
         draw(editor, &screen);
         let text = screen.to_text(true).lines().nth(row as usize)?.to_string();
@@ -2794,7 +2810,7 @@ mod tests {
             .chars()
             .map(|c| if c >= '\u{2e80}' { 2 } else { 1 })
             .sum();
-        screen.fg_at(col, row)
+        Some((screen.fg_at(col, row)?, screen.attributes_at(col, row)?))
     }
 
     fn rust_file() -> File {
@@ -2806,7 +2822,8 @@ mod tests {
 
     const KEYWORD: Rgba = Rgba::indexed(5);
     const FUNCTION: Rgba = Rgba::indexed(4);
-    const COMMENT: Rgba = Rgba::indexed(8);
+    /// Comments are the text's color, dimmed.
+    const COMMENT: (Rgba, Attributes) = (theme::TEXT, Attributes::DIM);
     const STRING: Rgba = Rgba::indexed(2);
 
     #[test]
@@ -2831,7 +2848,7 @@ mod tests {
         let mut editor = Editor::new(eb.clone(), rust_file(), theme(), 40, 6).unwrap();
         assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(KEYWORD));
         assert_eq!(fg_of(&editor, 40, 6, 0, "main"), Some(FUNCTION));
-        assert_eq!(fg_of(&editor, 40, 6, 1, "done"), Some(COMMENT));
+        assert_eq!(style_of(&editor, 40, 6, 1, "done"), Some(COMMENT));
         // Punctuation isn't colored: it's the terminal's own text color.
         assert_eq!(fg_of(&editor, 40, 6, 0, "()"), Some(theme::TEXT));
 
@@ -2839,12 +2856,12 @@ mod tests {
         eb.set_cursor(0, 0);
         key(&mut editor, KeyCode::Enter);
         assert_eq!(fg_of(&editor, 40, 6, 1, "fn"), Some(KEYWORD));
-        assert_eq!(fg_of(&editor, 40, 6, 2, "done"), Some(COMMENT));
+        assert_eq!(style_of(&editor, 40, 6, 2, "done"), Some(COMMENT));
 
         // Typing changes what the text is, and undoing changes it back.
         eb.set_cursor(1, 0);
         press(&mut editor, "//");
-        assert_eq!(fg_of(&editor, 40, 6, 1, "main"), Some(COMMENT));
+        assert_eq!(style_of(&editor, 40, 6, 1, "main"), Some(COMMENT));
         ctrl(&mut editor, 'z');
         assert_eq!(fg_of(&editor, 40, 6, 1, "main"), Some(FUNCTION));
         eb.set_cursor(1, 0);
@@ -2866,8 +2883,8 @@ mod tests {
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("/* one\ntwo */ fn a() {}\n\t漢 fn b() {}");
         let editor = Editor::new(eb.clone(), rust_file(), theme(), 40, 6).unwrap();
-        assert_eq!(fg_of(&editor, 40, 6, 0, "one"), Some(COMMENT));
-        assert_eq!(fg_of(&editor, 40, 6, 1, "two"), Some(COMMENT));
+        assert_eq!(style_of(&editor, 40, 6, 0, "one"), Some(COMMENT));
+        assert_eq!(style_of(&editor, 40, 6, 1, "two"), Some(COMMENT));
         assert_eq!(fg_of(&editor, 40, 6, 1, "fn"), Some(KEYWORD));
         assert_eq!(fg_of(&editor, 40, 6, 1, "a()"), Some(FUNCTION));
         // Columns, not bytes: the tab and wide character come before.
@@ -3094,5 +3111,28 @@ mod tests {
         let (_, cursor) = screen_lines(&editor, 100, 10);
         assert_eq!(editor.view.viewport().y, 19, "one row down, below the bar");
         assert_eq!(cursor.1, 0, "the cursor is in the query");
+    }
+
+    #[test]
+    fn stepping_to_a_wrapped_match_above_the_view_scrolls_up_to_it() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let mut lines: Vec<String> = (0..40)
+            .map(|i| format!("{i} {}", "word ".repeat(20)))
+            .collect();
+        lines[5] = format!("5 needle {}", "word ".repeat(20));
+        lines[30] = format!("30 needle {}", "word ".repeat(20));
+        eb.set_text(&lines.join("\n"));
+        eb.set_cursor(20, 0);
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 10).unwrap();
+        find_query(&mut editor, "needle");
+        assert_eq!(eb.cursor().row, 30);
+        let _ = screen_lines(&editor, 40, 10);
+        // From one match to the next, wrapping around to above the view.
+        editor.find_step(&find::Memory::default(), true);
+        assert_eq!(eb.cursor().row, 5);
+        // A third of the way down; the query keeps the cursor.
+        let (lines, _) = screen_lines(&editor, 40, 10);
+        assert!(lines[9 / 3].contains("6  5 needle"), "{lines:?}");
     }
 }

@@ -6,6 +6,10 @@ pub const Coordinate = vt.Coordinate;
 pub const RenderState = vt.RenderState;
 pub const Selection = vt.Selection;
 pub const StringMap = vt.StringMap;
+pub const Screen = vt.Screen;
+pub const PageList = vt.PageList;
+pub const Cell = vt.page.Cell;
+pub const CellCountInt = vt.size.CellCountInt;
 
 // libghostty-vt doesn't export its clipboard module; take the types from
 // the effect's signature.

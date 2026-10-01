@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use opentui::{
     Attributes, CursorStyle, EmbeddedTerminal, KeyEvent, KeyMods, LineAt, MouseAction, MouseButton,
-    MouseEvent, OwnedBuffer, Rgba, WidthMethod,
+    MouseEvent, OwnedBuffer, Rgba, ScrollPosition, WidthMethod,
 };
 
 /// The native core is single-threaded (see `Error::WrongThread`).
@@ -67,6 +67,64 @@ fn line_at_gives_links_and_lines_joined_across_wraps() {
         Some(LineAt::Text { offset: None, .. })
     ));
     assert_eq!(term.line_at(0, 9), None, "off screen");
+}
+
+#[test]
+fn search_reads_the_scrollback_and_highlights_matches() {
+    let _serial = serial();
+    let mut term = EmbeddedTerminal::new(10, 3, 100_000).unwrap();
+    term.set_host_palette(true);
+    let matched = Rgba::rgb(1, 2, 3);
+    let current = (Some(Rgba::rgb(4, 5, 6)), Rgba::rgb(7, 8, 9));
+    term.set_search_colors((None, matched), current);
+    // Five rows: the second wraps onto the third; the top two are history.
+    term.write("alpha\r\n0123456789abc\r\n日本x\r\nlast".as_bytes())
+        .unwrap();
+    let text = term.search_text().unwrap();
+    assert_eq!(text, "alpha\n0123456789abc\n日本x\nlast\n");
+    assert_eq!(term.scroll_position(), ScrollPosition { top: 2, total: 5 });
+
+    let wrapped = text.find("9a").unwrap();
+    let after_wide = text.find('x').unwrap();
+    let found = term
+        .set_search_matches(&[wrapped..wrapped + 2, after_wide..after_wide + 1])
+        .unwrap();
+    assert_eq!((found[0].row, found[0].col), (1, 9));
+    assert_eq!(
+        (found[1].row, found[1].col),
+        (3, 4),
+        "past two wide characters"
+    );
+    term.set_search_current(Some(0));
+
+    let frame = buffer(10, 3);
+    term.draw(&frame, 0, 0);
+    // The end of the wrapped match is on the top row, the other match on
+    // the next; the rest keeps its colors.
+    assert_eq!(frame.bg_at(0, 0), Some(current.1));
+    assert_eq!(frame.fg_at(0, 0), current.0);
+    assert_eq!(frame.bg_at(4, 1), Some(matched));
+    assert!(frame.fg_at(4, 1).unwrap().is_terminal_default());
+    assert_ne!(frame.bg_at(3, 1), Some(matched));
+    assert_ne!(frame.bg_at(1, 0), Some(current.1));
+
+    // Highlights go with their rows.
+    term.scroll_to_row(1);
+    assert_eq!(term.scroll_position().top, 1);
+    let frame = buffer(10, 3);
+    term.draw(&frame, 0, 0);
+    assert_eq!(frame.bg_at(9, 0), Some(current.1));
+    assert_eq!(frame.bg_at(0, 1), Some(current.1));
+    assert_eq!(frame.bg_at(4, 2), Some(matched));
+
+    // Matches are only taken for the text they were found in.
+    term.write(b"!").unwrap();
+    let stale = [wrapped..wrapped + 2, after_wide..after_wide + 1];
+    assert!(term.set_search_matches(&stale).is_err());
+    term.clear_search();
+    let frame = buffer(10, 3);
+    term.draw(&frame, 0, 0);
+    assert_ne!(frame.bg_at(9, 0), Some(current.1));
 }
 
 #[test]

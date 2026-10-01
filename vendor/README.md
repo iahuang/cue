@@ -61,6 +61,10 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   and scroll the viewport straight back.
   `getVisualEOL` (End) treats a line wider than the viewport as one overwide
   grapheme only while wrapping; unwrapped, End did nothing on such lines.
+  `getVisualCursorAbsolute` (`editorViewGetVisualCursorAbsolute`, in
+  `src/lib.zig` too) gives the cursor's row in the whole document without
+  scrolling to it: with a selection the viewport doesn't follow the cursor,
+  and `getVisualCursor` clamps a row above the viewport to its top.
 - `src/embedded-terminal/`, `src/lib.zig`: for cue's terminals.
   `setHostPalette` (`embeddedTerminalSetHostPalette`) composes default and
   palette colors as the host terminal's own (SGR 39/49 and indexed colors)
@@ -77,6 +81,17 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   an OSC 8 hyperlink's URI, or else the cell's line joined across soft wraps
   (Ghostty's `selectLine`) and the byte offset of the cell in it (from the
   selection string's pin map).
+  `src/embedded-terminal/search.zig` finds in the screen and scrollback for
+  the host, which does the matching: `embeddedTerminalBuildSearch` and
+  `embeddedTerminalCopySearchText` give the text a line per line of output
+  (soft wraps joined), `embeddedTerminalSetSearchMatches` turns byte ranges
+  in it into highlights kept by page node and serial (as Ghostty's own
+  search results are), and `compose` adds those on screen to the render
+  state's row highlights, which `compositor.zig` colors
+  (`embeddedTerminalSetSearchColors`, `embeddedTerminalSetSearchCurrent`).
+  `embeddedTerminalGetViewport` and `embeddedTerminalScrollToRow` place the
+  view by row from the top of the scrollback. `write` and `resize` bump a
+  generation so matches are only taken for the text they were found in.
 
 ## `tree-sitter-latex/`
 

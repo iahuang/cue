@@ -13,6 +13,20 @@ pub const Cursor = struct {
     color: ?struct { r: u8, g: u8, b: u8 } = null,
 };
 
+pub const Found = struct {
+    serial: u64 = 0,
+    row: u32 = 0,
+    page_y: u16 = 0,
+    x: u16 = 0,
+};
+
+pub const SearchColors = struct {
+    match_fg: ?buffer.RGBA = null,
+    match_bg: buffer.RGBA = .{ 0, 0, 0, 0 },
+    current_fg: ?buffer.RGBA = null,
+    current_bg: buffer.RGBA = .{ 0, 0, 0, 0 },
+};
+
 pub const EmbeddedTerminal = struct {
     pub fn init(_: anytype, _: anytype, _: anytype) Error!*EmbeddedTerminal {
         return error.Unsupported;
@@ -27,6 +41,22 @@ pub const EmbeddedTerminal = struct {
     }
     pub fn scroll(_: *EmbeddedTerminal, _: i32) void {}
     pub fn scrollToBottom(_: *EmbeddedTerminal) void {}
+    pub fn viewportRow(_: *EmbeddedTerminal) struct { row: usize, total: usize } {
+        return .{ .row = 0, .total = 0 };
+    }
+    pub fn scrollToRow(_: *EmbeddedTerminal, _: usize) void {}
+    pub fn buildSearch(_: *EmbeddedTerminal) Error!usize {
+        return error.Unsupported;
+    }
+    pub fn searchText(_: *EmbeddedTerminal) []const u8 {
+        return "";
+    }
+    pub fn setSearchMatches(_: *EmbeddedTerminal, _: []const [2]u32, _: []Found) Error!void {
+        return error.Unsupported;
+    }
+    pub fn setSearchCurrent(_: *EmbeddedTerminal, _: ?u32) void {}
+    pub fn clearSearch(_: *EmbeddedTerminal) void {}
+    pub fn setSearchColors(_: *EmbeddedTerminal, _: SearchColors) void {}
     pub fn isAlternateScreen(_: *EmbeddedTerminal) bool {
         return false;
     }

@@ -200,6 +200,14 @@ pub const ExternalEmbeddedTerminalKeyOptions = extern struct {
     unshifted_codepoint: u32 = 0,
 };
 
+/// Where a search match starts (see `embedded-terminal/search.zig`).
+pub const ExternalEmbeddedTerminalMatch = extern struct {
+    serial: u64 = 0,
+    row: u32 = 0,
+    page_y: u16 = 0,
+    x: u16 = 0,
+};
+
 fn embeddedTerminalStatus(err: anyerror) i32 {
     return switch (err) {
         error.OutOfMemory => EmbeddedTerminalStatus.out_of_memory,
@@ -264,6 +272,7 @@ inline fn selectionBehavior(value: u8) text_buffer_view.SelectionBehavior {
 comptime {
     std.debug.assert(@sizeOf(ExternalEmbeddedTerminalCursor) == 14);
     std.debug.assert(@sizeOf(ExternalEmbeddedTerminalKeyOptions) == 12);
+    std.debug.assert(@sizeOf(ExternalEmbeddedTerminalMatch) == 16);
     _ = native_span_feed;
     _ = native_audio;
     _ = ghostty_vt.vt;
@@ -430,6 +439,100 @@ export fn embeddedTerminalLineAt(
     out_offset.* = std.math.cast(u32, offset) orelse std.math.maxInt(u32);
     out_is_link.* = @intFromBool(is_link);
     return @intCast(text.len);
+}
+
+/// The viewport's top row, counted from the top of the scrollback, and the
+/// number of rows in all.
+export fn embeddedTerminalGetViewport(handle: NativeHandle, out_row_ptr: ?*u32, out_total_ptr: ?*u32) i32 {
+    const out_row = out_row_ptr orelse return EmbeddedTerminalStatus.invalid;
+    const out_total = out_total_ptr orelse return EmbeddedTerminalStatus.invalid;
+    out_row.* = 0;
+    out_total.* = 0;
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    const viewport = terminal_value.viewportRow();
+    out_row.* = std.math.cast(u32, viewport.row) orelse std.math.maxInt(u32);
+    out_total.* = std.math.cast(u32, viewport.total) orelse std.math.maxInt(u32);
+    return 0;
+}
+
+/// Scrolls the viewport's top to `row`, counted from the top of the
+/// scrollback, or as near as it goes.
+export fn embeddedTerminalScrollToRow(handle: NativeHandle, row: u32) i32 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    terminal_value.scrollToRow(row);
+    return 0;
+}
+
+/// Reads the screen's text, a line per line of output, for searching.
+/// Returns its length; `embeddedTerminalCopySearchText` copies it out.
+export fn embeddedTerminalBuildSearch(handle: NativeHandle) i64 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    const len = terminal_value.buildSearch() catch |err| return embeddedTerminalStatus(err);
+    return std.math.cast(i64, len) orelse EmbeddedTerminalStatus.out_of_memory;
+}
+
+/// Copies the text from the last `embeddedTerminalBuildSearch`. Returns
+/// its length, or `out_of_space`.
+export fn embeddedTerminalCopySearchText(handle: NativeHandle, out_ptr: ?[*]u8, out_len: u32) i64 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    const output = embeddedTerminalOutput(out_ptr, out_len) orelse return EmbeddedTerminalStatus.invalid;
+    const text = terminal_value.searchText();
+    if (text.len > output.len) return EmbeddedTerminalStatus.out_of_space;
+    @memcpy(output[0..text.len], text);
+    return @intCast(text.len);
+}
+
+/// Highlights the matches at `count` byte ranges (start, end pairs, in
+/// order) of the search text, and fills `out` with where each starts.
+/// Fails if the screen changed since the text was read.
+export fn embeddedTerminalSetSearchMatches(
+    handle: NativeHandle,
+    ranges_ptr: ?[*]const u32,
+    count: u32,
+    out_ptr: ?[*]ExternalEmbeddedTerminalMatch,
+) i32 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    if (count > 0 and (ranges_ptr == null or out_ptr == null)) return EmbeddedTerminalStatus.invalid;
+    const ranges: []const [2]u32 = if (count == 0) &.{} else @ptrCast(ranges_ptr.?[0 .. @as(usize, count) * 2]);
+    const found = globalAllocator.alloc(embedded_terminal.Found, count) catch return EmbeddedTerminalStatus.out_of_memory;
+    defer globalAllocator.free(found);
+    terminal_value.setSearchMatches(ranges, found) catch |err| return embeddedTerminalStatus(err);
+    for (found, 0..) |match, i| {
+        out_ptr.?[i] = .{ .serial = match.serial, .row = match.row, .page_y = match.page_y, .x = match.x };
+    }
+    return 0;
+}
+
+/// Highlights match `index` as the current one; -1 for none.
+export fn embeddedTerminalSetSearchCurrent(handle: NativeHandle, index: i32) i32 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    terminal_value.setSearchCurrent(std.math.cast(u32, index));
+    return 0;
+}
+
+export fn embeddedTerminalClearSearch(handle: NativeHandle) i32 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    terminal_value.clearSearch();
+    return 0;
+}
+
+/// The colors of search matches and the current one; a null foreground
+/// keeps the text's own.
+export fn embeddedTerminalSetSearchColors(
+    handle: NativeHandle,
+    match_fg: ?[*]const u16,
+    match_bg: [*]const u16,
+    current_fg: ?[*]const u16,
+    current_bg: [*]const u16,
+) i32 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    terminal_value.setSearchColors(.{
+        .match_fg = optionalPtrToRGBA(match_fg),
+        .match_bg = ptrToRGBA(match_bg),
+        .current_fg = optionalPtrToRGBA(current_fg),
+        .current_bg = ptrToRGBA(current_bg),
+    });
+    return 0;
 }
 
 export fn embeddedTerminalCompose(
@@ -3231,6 +3334,21 @@ export fn editorViewGetVisualCursor(view_handle: NativeHandle, outPtr: *External
         return;
     };
     const vcursor = object_ptr.getVisualCursor();
+    outPtr.* = .{
+        .visual_row = vcursor.visual_row,
+        .visual_col = vcursor.visual_col,
+        .logical_row = vcursor.logical_row,
+        .logical_col = vcursor.logical_col,
+        .offset = vcursor.offset,
+    };
+}
+
+export fn editorViewGetVisualCursorAbsolute(view_handle: NativeHandle, outPtr: *ExternalVisualCursor) void {
+    const object_ptr = acquireEditorView(view_handle) orelse {
+        outPtr.* = std.mem.zeroes(ExternalVisualCursor);
+        return;
+    };
+    const vcursor = object_ptr.getVisualCursorAbsolute();
     outPtr.* = .{
         .visual_row = vcursor.visual_row,
         .visual_col = vcursor.visual_col,

@@ -2,6 +2,10 @@ const std = @import("std");
 const buffer = @import("../buffer.zig");
 const compositor = @import("compositor.zig");
 const ghostty = @import("ghostty.zig");
+const search = @import("search.zig");
+
+pub const Found = search.Found;
+pub const SearchColors = compositor.SearchColors;
 
 pub const Error = error{
     InvalidValue,
@@ -45,6 +49,11 @@ pub const EmbeddedTerminal = struct {
     force_redraw: bool = true,
     transparent_background: bool = false,
     host_palette: bool = false,
+    /// Counts changes to the screen's contents, so search results are only
+    /// taken for the text they were found in.
+    generation: u64 = 0,
+    search: search.Search = .{},
+    search_colors: SearchColors = .{},
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, options: Options) Error!*EmbeddedTerminal {
         if (options.cols == 0 or options.rows == 0) return error.InvalidValue;
@@ -76,6 +85,7 @@ pub const EmbeddedTerminal = struct {
         const allocator = self.allocator;
         self.stream.deinit();
         self.render_state.deinit(allocator);
+        self.search.deinit(allocator);
         self.terminal.deinit(allocator);
         self.responses.deinit(allocator);
         self.clipboard.deinit(allocator);
@@ -83,6 +93,7 @@ pub const EmbeddedTerminal = struct {
     }
 
     pub fn write(self: *EmbeddedTerminal, bytes: []const u8) Error!void {
+        self.generation +%= 1;
         self.stream.handler.semantic_failure = false;
         self.stream.nextSlice(bytes);
         if (self.stream.handler.semantic_failure) return error.ProcessingFailed;
@@ -90,6 +101,7 @@ pub const EmbeddedTerminal = struct {
 
     pub fn resize(self: *EmbeddedTerminal, cols: u16, rows: u16) Error!void {
         if (cols == 0 or rows == 0) return error.InvalidValue;
+        self.generation +%= 1;
         self.stream.handler.resize(.{ .cols = cols, .rows = rows }) catch |err| switch (err) {
             error.InvalidValue => return error.InvalidValue,
             error.OutOfMemory => return error.OutOfMemory,
@@ -105,6 +117,54 @@ pub const EmbeddedTerminal = struct {
 
     pub fn scrollToBottom(self: *EmbeddedTerminal) void {
         self.terminal.scrollViewport(.bottom);
+    }
+
+    /// The viewport's top row, counted from the top of the scrollback, and
+    /// how many rows there are in all.
+    pub fn viewportRow(self: *EmbeddedTerminal) struct { row: usize, total: usize } {
+        const scrollbar = self.terminal.screens.active.pages.scrollbar();
+        return .{ .row = scrollbar.offset, .total = scrollbar.total };
+    }
+
+    /// Scrolls the viewport's top to `row`, counted from the top of the
+    /// scrollback, or as near as it goes.
+    pub fn scrollToRow(self: *EmbeddedTerminal, row: usize) void {
+        self.terminal.scrollViewport(.{ .row = row });
+    }
+
+    /// Reads the screen's text, for the host to search (see `search.zig`).
+    /// Returns its length; `searchText` has it until the screen changes.
+    pub fn buildSearch(self: *EmbeddedTerminal) Error!usize {
+        try self.search.build(self.allocator, self.terminal.screens.active, self.generation);
+        return self.search.text.items.len;
+    }
+
+    pub fn searchText(self: *EmbeddedTerminal) []const u8 {
+        return self.search.text.items;
+    }
+
+    /// Highlights the matches at byte `ranges` of the text from the last
+    /// `buildSearch`, and puts where each starts in `out`. Fails if the
+    /// screen changed since.
+    pub fn setSearchMatches(self: *EmbeddedTerminal, ranges: []const [2]u32, out: []Found) Error!void {
+        self.force_redraw = true;
+        return self.search.setMatches(self.allocator, self.generation, ranges, out);
+    }
+
+    /// Highlights match `index` as the current one, or none.
+    pub fn setSearchCurrent(self: *EmbeddedTerminal, index: ?u32) void {
+        self.search.current = index;
+        self.force_redraw = true;
+    }
+
+    pub fn clearSearch(self: *EmbeddedTerminal) void {
+        self.search.clear(self.allocator);
+        self.force_redraw = true;
+    }
+
+    pub fn setSearchColors(self: *EmbeddedTerminal, colors: SearchColors) void {
+        self.search_colors = colors;
+        self.force_redraw = true;
     }
 
     pub fn isAlternateScreen(self: *EmbeddedTerminal) bool {
@@ -200,6 +260,7 @@ pub const EmbeddedTerminal = struct {
             self.force_redraw = true;
             return err;
         };
+        try self.search.highlight(self.allocator, &self.render_state);
         if (self.force_redraw) {
             self.render_state.dirty = .full;
             self.force_redraw = false;
@@ -207,6 +268,7 @@ pub const EmbeddedTerminal = struct {
         try compositor.compose(self.allocator, &self.render_state, target, x, y, .{
             .transparent_background = self.transparent_background,
             .host_palette = self.host_palette,
+            .search = self.search_colors,
         });
     }
 

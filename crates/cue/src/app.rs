@@ -76,6 +76,7 @@ use crate::location::{Position, Target};
 use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::recovery::{self, Orphan, Recovery};
+use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::status::{self, Prompt, PromptKey};
 use crate::symbols::{self, SymbolIndex};
@@ -454,7 +455,11 @@ impl App {
             return AppAction::Continue;
         }
         let prefixed = std::mem::take(&mut self.terminal_prefix);
-        if let Some(terminal) = self.keyboard_terminal() {
+        // While its find bar has the keyboard, keys are the bar's.
+        if let Some(terminal) = self
+            .keyboard_terminal()
+            .filter(|terminal| !terminal.borrow().find_focused())
+        {
             if terminal.borrow().prompt_open() {
                 terminal.borrow_mut().handle_prompt_key(key);
                 return AppAction::Continue;
@@ -480,6 +485,13 @@ impl App {
                 return AppAction::Continue;
             }
         }
+        // The shortcut that opened a terminal's find bar closes it, though
+        // Ctrl+Shift+F, there, is Find rather than Search Workspace.
+        if self.finding_terminal().is_some()
+            && self.keymap.lookup_terminal(key) == Some(Command::Find)
+        {
+            return self.run(Command::Find, false);
+        }
         let context = match self.focus {
             // Its keys are the picker's.
             _ if self.menu.is_some() => Context::Picker,
@@ -487,6 +499,7 @@ impl App {
             _ if self.dialog.is_some() => Context::Dialog,
             _ if self.picker.is_some() => Context::Picker,
             Focus::Tree => Context::Tree,
+            Focus::Editor if self.finding_terminal().is_some() => Context::Find,
             Focus::Editor => self
                 .editor()
                 .and_then(Editor::find_field)
@@ -516,7 +529,7 @@ impl App {
                 self.run(command, select)
             }
             None if self.menu.is_some() => AppAction::Continue,
-            None if self.query_input().is_some() => {
+            None if self.query_input().is_some() || self.finding_terminal().is_some() => {
                 self.edit_query(key);
                 AppAction::Continue
             }
@@ -585,7 +598,9 @@ impl App {
                 _ => return,
             },
         };
-        if let Some(input) = self.query_input() {
+        if let Some(terminal) = self.finding_terminal() {
+            terminal.borrow_mut().find_edit(edit);
+        } else if let Some(input) = self.query_input() {
             input.edit(edit);
         }
     }
@@ -708,7 +723,10 @@ impl App {
                 self.focus = Focus::Editor;
                 let memory = self.find_memory.clone();
                 let replacing = command == Command::FindReplace;
-                if let Some(editor) = self.editor_mut() {
+                if let Some(terminal) = self.active_terminal() {
+                    // Output can't be replaced; it can be found.
+                    terminal.borrow_mut().show_find(&memory);
+                } else if let Some(editor) = self.editor_mut() {
                     editor.show_find(&memory, replacing);
                 }
             }
@@ -721,8 +739,30 @@ impl App {
             Command::FindNext | Command::FindPrevious => {
                 let memory = self.find_memory.clone();
                 let forward = command == Command::FindNext;
-                if let Some(editor) = self.editor_mut() {
+                if let Some(terminal) = self.active_terminal() {
+                    // As in other terminals, the next match is the one
+                    // above, further back in the output.
+                    terminal.borrow_mut().find_step(&memory, forward);
+                } else if let Some(editor) = self.editor_mut() {
                     editor.find_step(&memory, forward);
+                }
+            }
+            Command::FindClose if self.active_terminal().is_some() => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.borrow_mut().close_find();
+                }
+            }
+            command
+                if Toggle::for_command(command).is_some()
+                    && self.search.is_none()
+                    && self
+                        .active_terminal()
+                        .is_some_and(|terminal| terminal.borrow().find_open()) =>
+            {
+                if let (Some(terminal), Some(toggle)) =
+                    (self.active_terminal(), Toggle::for_command(command))
+                {
+                    terminal.borrow_mut().find_toggle(toggle);
                 }
             }
             command
@@ -1146,7 +1186,11 @@ impl App {
             let terminal = terminal.borrow();
             terminal.prompt_open() || terminal.exit().is_none()
         });
-        if let Some(terminal) = terminal {
+        if let Some(terminal) = self.finding_terminal() {
+            let line = text.split(['\r', '\n']).next().unwrap_or("");
+            terminal.borrow_mut().find_edit(Edit::Insert(line));
+            self.note_find_memory();
+        } else if let Some(terminal) = terminal {
             terminal.borrow_mut().paste(text);
         } else if let Some(input) = self.query_input() {
             // Terminals send newlines in pastes as CR.
@@ -2011,11 +2055,16 @@ impl App {
         });
     }
 
-    /// Keeps the find bar's query for finding in other files.
+    /// Keeps the find bar's query for finding in other files and
+    /// terminals.
     fn note_find_memory(&mut self) {
-        if let Some(memory) = self.editor().and_then(Editor::find_memory) {
-            if *memory != self.find_memory {
-                self.find_memory = memory.clone();
+        let memory = match self.active_terminal() {
+            Some(terminal) => terminal.borrow().find_memory().cloned(),
+            None => self.editor().and_then(Editor::find_memory).cloned(),
+        };
+        if let Some(memory) = memory {
+            if memory != self.find_memory {
+                self.find_memory = memory;
             }
         }
     }
@@ -3263,6 +3312,8 @@ impl App {
                 panel.hide_terminal();
             }
         }
+        // Coming back to a terminal, the keyboard is for the program.
+        terminal.borrow_mut().blur_find();
         self.active_panel_mut().show_terminal(terminal);
         self.focus = Focus::Editor;
         self.prune_documents();
@@ -3288,6 +3339,12 @@ impl App {
     /// The terminal in the active panel, if any.
     fn active_terminal(&self) -> Option<Rc<RefCell<Terminal>>> {
         self.active_panel().terminal().cloned()
+    }
+
+    /// The terminal whose find bar has the keyboard, if any.
+    fn finding_terminal(&self) -> Option<Rc<RefCell<Terminal>>> {
+        self.keyboard_terminal()
+            .filter(|terminal| terminal.borrow().find_focused())
     }
 
     /// The terminal keys go to, if one has the keyboard.
@@ -4223,6 +4280,66 @@ mod tests {
         prefixed_ctrl(&mut app, 'p');
         key(&mut app, KeyCode::Enter);
         assert!(app.ed().path().is_some_and(|path| path.ends_with("a.txt")));
+    }
+
+    #[test]
+    fn a_terminals_find_bar_has_the_keys_while_focused() {
+        let _serial = crate::test_serial();
+        let root = fixture("terminal-find", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('n'), ctrl_shift));
+        type_text(&mut app, "echo Fo''und; echo fo''und");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the shell's output", |app| {
+            screen(app).to_lowercase().matches("found").count() == 2
+        });
+        let terminal = app.active_terminal().unwrap();
+        let shell_line = |app: &App| {
+            screen(app)
+                .lines()
+                .filter(|line| line.contains("echo"))
+                .count()
+        };
+        let before = shell_line(&app);
+
+        // Ctrl+Shift+F, Find from a terminal, opens the bar, which takes
+        // what's typed; the shell gets none of it.
+        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        type_text(&mut app, "found");
+        assert_eq!(terminal.borrow().find_memory().unwrap().query.text, "found");
+        assert!(screen(&app).contains("2 of 2"), "{}", screen(&app));
+        // Enter goes up, Shift+Enter back down.
+        key(&mut app, KeyCode::Enter);
+        assert!(screen(&app).contains("1 of 2"), "{}", screen(&app));
+        app.handle_key(Key::new(KeyCode::Enter, Mods::SHIFT));
+        assert!(screen(&app).contains("2 of 2"));
+        let alt = Mods {
+            alt: true,
+            ..Mods::NONE
+        };
+        app.handle_key(Key::new(KeyCode::Char('c'), alt));
+        assert!(screen(&app).contains("1 of 1"), "{}", screen(&app));
+        assert_eq!(app.find_memory.query.text, "found", "remembered");
+
+        // Clicking the output gives the shell the keyboard, leaving the bar.
+        let area = app.active_panel().body();
+        left_click(&mut app, area.x + 1, area.y + area.height - 1);
+        assert!(app.keyboard_terminal().is_some());
+        assert!(terminal.borrow().find_open());
+        assert!(!terminal.borrow().find_focused());
+        // The shortcut focuses it again, then closes it; so does Esc.
+        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        assert!(terminal.borrow().find_focused());
+        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        assert!(!terminal.borrow().find_open());
+        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        key(&mut app, KeyCode::Esc);
+        assert!(!terminal.borrow().find_open());
+        assert_eq!(shell_line(&app), before, "nothing went to the shell");
     }
 
     #[test]

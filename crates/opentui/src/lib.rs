@@ -53,8 +53,8 @@ pub use image::Image;
 pub use renderer::{Output, RenderStatus, Renderer};
 pub use style::SyntaxStyle;
 pub use terminal::{
-    Cursor, CursorStyle, EmbeddedTerminal, KeyAction, KeyEvent, KeyMods, LineAt, MouseAction,
-    MouseButton, MouseEvent,
+    Anchor, Cursor, CursorStyle, EmbeddedTerminal, Found, KeyAction, KeyEvent, KeyMods, LineAt,
+    MouseAction, MouseButton, MouseEvent, ScrollPosition,
 };
 pub use text::{TextBuffer, TextBufferView, WidthMethod, WrapMode};
 

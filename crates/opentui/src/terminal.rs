@@ -9,11 +9,12 @@
 //! it (replies to queries such as the cursor position).
 
 use std::marker::PhantomData;
-use std::ops::{BitOr, BitOrAssign};
+use std::ops::{BitOr, BitOrAssign, Range};
 
 use opentui_sys as sys;
 
 use crate::buffer::Buffer;
+use crate::color::Rgba;
 use crate::thread::Claim;
 use crate::{ffi_len, Error, Result};
 
@@ -147,6 +148,37 @@ pub enum LineAt {
     Text { text: String, offset: Option<usize> },
 }
 
+/// Where the viewport is in the scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollPosition {
+    /// The viewport's top row, counted from the top of the scrollback.
+    pub top: u32,
+    /// The rows of the scrollback and the screen, in all.
+    pub total: u32,
+}
+
+/// Where a search match starts (see
+/// [`EmbeddedTerminal::set_search_matches`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Found {
+    /// Counted from the top of the scrollback, so it shifts as the oldest
+    /// rows are dropped.
+    pub row: u32,
+    pub col: u16,
+    /// The same for as long as the row is kept, to tell a match found
+    /// before.
+    pub anchor: Anchor,
+}
+
+/// A place in the scrollback that stays put as rows are added and
+/// dropped (a page and a row in it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Anchor {
+    page: u64,
+    page_row: u16,
+    col: u16,
+}
+
 /// A terminal's screen, scrollback, and modes (`EmbeddedTerminal`).
 pub struct EmbeddedTerminal {
     handle: sys::Handle,
@@ -204,6 +236,117 @@ impl EmbeddedTerminal {
     /// Scrolls the view back to the live screen.
     pub fn scroll_to_bottom(&mut self) {
         unsafe { sys::embeddedTerminalScrollToBottom(self.handle) };
+    }
+
+    /// Where the viewport is in the scrollback.
+    pub fn scroll_position(&self) -> ScrollPosition {
+        let (mut top, mut total) = (0, 0);
+        unsafe { sys::embeddedTerminalGetViewport(self.handle, &mut top, &mut total) };
+        ScrollPosition { top, total }
+    }
+
+    /// Scrolls the viewport's top to `row`, counted from the top of the
+    /// scrollback, or as near as it goes.
+    pub fn scroll_to_row(&mut self, row: u32) {
+        unsafe { sys::embeddedTerminalScrollToRow(self.handle, row) };
+    }
+
+    /// The text of the screen and the scrollback, to search: a line per
+    /// line of output, with rows the output wrapped onto joined, and
+    /// blanks at the ends of lines left out. Matches found in it are for
+    /// [`set_search_matches`](EmbeddedTerminal::set_search_matches) until
+    /// the terminal next changes.
+    pub fn search_text(&mut self) -> Result<String> {
+        let len = unsafe { sys::embeddedTerminalBuildSearch(self.handle) };
+        if len < 0 {
+            return Err(Error::CallFailed("terminal search"));
+        }
+        let mut out = vec![0u8; len as usize];
+        let copied = unsafe {
+            sys::embeddedTerminalCopySearchText(
+                self.handle,
+                out.as_mut_ptr(),
+                ffi_len(out.len(), "search text"),
+            )
+        };
+        if copied != len {
+            return Err(Error::CallFailed("terminal search"));
+        }
+        // The terminal writes what it can't encode as U+FFFD.
+        String::from_utf8(out).map_err(|_| Error::CallFailed("terminal search"))
+    }
+
+    /// Highlights the matches at byte `ranges` of the last
+    /// [`search_text`](EmbeddedTerminal::search_text), which are in order
+    /// and not empty, and returns where each starts. Fails if the terminal
+    /// changed since the text was read. The highlights stay on the rows
+    /// they were found on, and go with them.
+    pub fn set_search_matches(&mut self, ranges: &[Range<usize>]) -> Result<Vec<Found>> {
+        let flat: Vec<u32> = ranges
+            .iter()
+            .flat_map(|r| [r.start, r.end])
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+            .collect();
+        let empty = sys::ExternalEmbeddedTerminalMatch {
+            serial: 0,
+            row: 0,
+            page_y: 0,
+            x: 0,
+        };
+        let mut out = vec![empty; ranges.len()];
+        check(
+            unsafe {
+                sys::embeddedTerminalSetSearchMatches(
+                    self.handle,
+                    flat.as_ptr(),
+                    ffi_len(ranges.len(), "search matches"),
+                    out.as_mut_ptr(),
+                )
+            },
+            "terminal search matches",
+        )?;
+        Ok(out
+            .into_iter()
+            .map(|m| Found {
+                row: m.row,
+                col: m.x,
+                anchor: Anchor {
+                    page: m.serial,
+                    page_row: m.page_y,
+                    col: m.x,
+                },
+            })
+            .collect())
+    }
+
+    /// Highlights match `index` as the current one, or none.
+    pub fn set_search_current(&mut self, index: Option<usize>) {
+        let index = index.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1);
+        unsafe { sys::embeddedTerminalSetSearchCurrent(self.handle, index) };
+    }
+
+    /// Drops the search's text and highlights.
+    pub fn clear_search(&mut self) {
+        unsafe { sys::embeddedTerminalClearSearch(self.handle) };
+    }
+
+    /// The colors of search matches, and of the current one, as (text,
+    /// background). Text without a color keeps its own.
+    pub fn set_search_colors(
+        &mut self,
+        matched: (Option<Rgba>, Rgba),
+        current: (Option<Rgba>, Rgba),
+    ) {
+        let fg = |color: &Option<Rgba>| color.as_ref().map_or(std::ptr::null(), Rgba::as_ptr);
+        unsafe {
+            sys::embeddedTerminalSetSearchColors(
+                self.handle,
+                fg(&matched.0),
+                matched.1.as_ptr(),
+                fg(&current.0),
+                current.1.as_ptr(),
+            )
+        };
     }
 
     /// Whether the program switched to the alternate screen, as full-screen
