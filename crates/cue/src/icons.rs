@@ -1,7 +1,8 @@
 //! Nerd Font icons for files, folders, and terminals.
 //!
-//! Off unless `CUE_NERD_FONT` is set (to anything but `0` or nothing), since
-//! without a Nerd Font the glyphs show as boxes. Every icon is one column
+//! Off unless the `ui.nerd_font` setting or `CUE_NERD_FONT` turns them on,
+//! since without a Nerd Font the glyphs show as boxes. `CUE_NERD_FONT` set
+//! to `0` or nothing turns them off. Every icon is one column
 //! wide and drawn with a space after it, which lets terminals that draw
 //! icons wider, as Ghostty and kitty do, spill into the space.
 
@@ -54,10 +55,11 @@ impl Icon {
 /// Whether to show icons.
 #[cfg(not(test))]
 pub fn enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("CUE_NERD_FONT").is_some_and(|value| !value.is_empty() && value != "0")
-    })
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| {
+        std::env::var_os("CUE_NERD_FONT").map(|value| !value.is_empty() && value != "0")
+    });
+    env.unwrap_or_else(|| crate::config::get().nerd_font)
 }
 
 #[cfg(test)]

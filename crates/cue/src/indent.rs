@@ -4,8 +4,9 @@
 //! whichever of tabs or spaces starts more lines wins, and for spaces, the
 //! step between one line's indentation and the next's that comes up most
 //! is the width. A file with no indented lines goes by its language's
-//! custom, or four spaces.
+//! custom, or the `editor.indent` setting.
 
+use crate::config;
 use crate::language::Language;
 
 /// Lines past this many aren't looked at.
@@ -20,25 +21,20 @@ pub enum Indent {
     Spaces(u32),
 }
 
-impl Default for Indent {
-    fn default() -> Indent {
-        Indent::Spaces(4)
-    }
-}
-
 impl Indent {
-    /// How `text` indents, or failing that, `language`'s custom.
+    /// How `text` indents, or failing that, `language`'s custom, or the
+    /// setting.
     pub fn infer(text: &str, language: Option<&Language>) -> Indent {
         guess(text)
             .or_else(|| language.and_then(|l| l.indent))
-            .unwrap_or_default()
+            .unwrap_or_else(|| config::get().indent)
     }
 
-    /// Columns one level of indentation takes. A tab counts as four, as
-    /// the editor shows it.
+    /// Columns one level of indentation takes. A tab counts as the editor
+    /// shows it, `editor.tab_width`.
     pub fn width(self) -> u32 {
         match self {
-            Indent::Tabs => 4,
+            Indent::Tabs => config::get().tab_width,
             Indent::Spaces(n) => n,
         }
     }

@@ -162,6 +162,11 @@ impl Panel {
     }
 
     /// The terminal on screen, if any.
+    /// Every editor it has, shown or not.
+    pub fn editors_mut(&mut self) -> impl Iterator<Item = &mut Editor> {
+        self.editors.iter_mut()
+    }
+
     pub fn terminal(&self) -> Option<&Rc<RefCell<Terminal>>> {
         self.terminal.as_ref()
     }

@@ -21,3 +21,4 @@ curl -fsSL https://s3.ianhuang.dev/cue/install.sh | bash
 - `cue src/main.rs:12:5` opens a file at a line and column
 - unsaved changes survive crashes and dropped ssh sessions, and are offered back next time
 - image viewer (kitty graphics protocol)
+- settings and key bindings in `~/.config/cue/config.toml`; Open Settings in the command palette (`ctrl+k`) makes one with every setting and its default

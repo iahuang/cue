@@ -2,6 +2,7 @@
 
 mod alert;
 mod app;
+mod config;
 mod context_menu;
 mod document;
 mod editor;
@@ -93,9 +94,10 @@ const USAGE: &str = "usage: cue [FOLDER]... [FILE[:LINE[:COLUMN]]]";
 
 /// Usage and every command with its shortcut.
 fn help() -> String {
-    let keymap = Keymap::default();
+    let keymap = Keymap::new(&config::load().0.keys);
     let mut help = format!(
-        "{USAGE}\n\nOpens each FOLDER, or the current folder, with FILE (or a new, unnamed buffer) open,\nat LINE and COLUMN if given, as compilers print them: src/main.rs:12:5.\nShift+movement or the mouse selects.\nSet CUE_NERD_FONT=1 to show file icons, if your terminal uses a Nerd Font.\n\n"
+        "{USAGE}\n\nOpens each FOLDER, or the current folder, with FILE (or a new, unnamed buffer) open,\nat LINE and COLUMN if given, as compilers print them: src/main.rs:12:5.\nShift+movement or the mouse selects.\nSettings are in {}; Open Settings in the command palette makes it.\n\n",
+        config::path().map_or("~/.config/cue/config.toml".into(), |path| path.display().to_string())
     );
     let key = |command| {
         keymap
@@ -142,6 +144,8 @@ extern "C" fn hang_up(_: libc::c_int) {
 }
 
 fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let (config, config_warnings) = config::load();
+    config::set(config);
     // Load before taking over the terminal so errors print normally.
     let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) =
         paths.into_iter().partition(|path| path.is_dir());
@@ -165,6 +169,7 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(position) = position {
         app.go_to(position);
     }
+    app.warn_about_config(&config_warnings);
 
     let mut renderer = Renderer::new(width, height, Output::Stdout)?;
     renderer.setup_terminal(true);

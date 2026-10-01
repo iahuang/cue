@@ -61,6 +61,7 @@ use std::time::Instant;
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::alert::{Alert, AlertAction, Button};
+use crate::config::{self, Config, MIN_TREE_WIDTH};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
 use crate::document::{self, Disk, DiskChange, Document};
 use crate::editor::{Action, Editor};
@@ -94,8 +95,6 @@ const DROP_TINT: Rgba = Rgba::rgba(137, 180, 250, 56);
 /// dragged up or down, to move its panel instead.
 const MOVE_THRESHOLD: u32 = 3;
 
-const DEFAULT_TREE_WIDTH: u32 = 30;
-const MIN_TREE_WIDTH: u32 = 12;
 /// The tree hides rather than leave the panels narrower than this.
 const MIN_EDITOR_WIDTH: u32 = 40;
 /// How many recently shown files and terminals the picker lists first.
@@ -288,6 +287,13 @@ pub struct App {
     find_memory: find::Memory,
     /// Copies of unsaved changes, in case cue exits without quitting.
     recovery: Recovery,
+    /// The settings file Open Settings opens, if there's anywhere for one,
+    /// resolved as documents' paths are.
+    settings: Option<PathBuf>,
+    /// The [`document::content_hash`] of the settings file as last read, or
+    /// `None` if there was none: when an open document of it was saved
+    /// with something else, the settings are read again.
+    settings_hash: Option<u64>,
 }
 
 /// A popup's query line, which typing, pasting, and the editor's cursor
@@ -323,7 +329,8 @@ impl QueryInput for FileDialog {
 
 impl App {
     /// Shows `workspace`, with `file` open, or a new, unnamed buffer. Focus
-    /// starts in the editor when there is a file, in the tree otherwise.
+    /// starts in the editor when there is a file or no tree, in the tree
+    /// otherwise.
     pub fn new(
         workspace: Workspace,
         file: Option<PathBuf>,
@@ -338,7 +345,8 @@ impl App {
         if let Some(file) = &file {
             tree.set_active(Some(file), false);
         }
-        let focus = if file.is_some() {
+        let config = config::get();
+        let focus = if file.is_some() || !config.tree {
             Focus::Editor
         } else {
             Focus::Tree
@@ -365,7 +373,7 @@ impl App {
             watcher: Watcher::new(),
             watching: None,
             workspace,
-            keymap: Keymap::default(),
+            keymap: Keymap::new(&config.keys),
             tree,
             documents: vec![doc.clone()],
             theme,
@@ -381,8 +389,8 @@ impl App {
             clipboard: None,
             copied: None,
             focus,
-            tree_visible: true,
-            tree_width: DEFAULT_TREE_WIDTH,
+            tree_visible: config.tree,
+            tree_width: config.tree_width,
             width,
             height,
             mouse_target: None,
@@ -404,7 +412,17 @@ impl App {
                 true => None,
                 false => Recovery::default_dir(),
             }),
+            settings: match cfg!(test) {
+                true => None,
+                false => config::path().map(|path| document::resolve(&path)),
+            },
+            settings_hash: None,
         };
+        app.settings_hash = app
+            .settings
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
+            .map(|bytes| document::content_hash(&bytes));
         if doc.path().is_none() {
             doc.untitled.set(1);
         }
@@ -674,6 +692,8 @@ impl App {
                 }
             }
             Command::RecoverUnsaved => self.offer_recovery(true),
+            Command::OpenSettings => self.open_settings(),
+            Command::ReloadSettings => self.reload_settings(),
             Command::RenameTab => {
                 let name = self.tab().name.clone().unwrap_or_default();
                 self.tab_prompt = Some(Prompt::new("Rename tab", &name));
@@ -1220,6 +1240,7 @@ impl App {
         self.note_terminal_focus();
         self.watch_folders();
         self.feed_picker();
+        self.follow_settings();
     }
 
     /// Draws the frame and returns where the terminal cursor goes (0-based
@@ -1341,6 +1362,7 @@ impl App {
             // list others.
             self.watching = None;
             self.watch_folders();
+            changed |= self.follow_settings();
         }
         changed
     }
@@ -2505,6 +2527,143 @@ impl App {
         doc.untitled.set(number);
         self.documents.push(doc.clone());
         Some(doc)
+    }
+
+    // --- settings ---------------------------------------------------------------
+
+    /// Says what was wrong with the settings file, if anything: the first
+    /// problem, and how many more.
+    pub fn warn_about_config(&mut self, warnings: &[String]) {
+        let Some(first) = warnings.first() else {
+            return;
+        };
+        let more = match warnings.len() - 1 {
+            0 => String::new(),
+            1 => " (and 1 more problem)".to_string(),
+            n => format!(" (and {n} more problems)"),
+        };
+        let message = format!("Settings: {first}{more}. Open Settings to fix.");
+        self.show_message(message, true);
+    }
+
+    /// Reads the settings again if the settings file is open, and was saved
+    /// or reloaded with something other than what was read last. Returns
+    /// whether it was.
+    fn follow_settings(&mut self) -> bool {
+        let Some(path) = &self.settings else {
+            return false;
+        };
+        let saved = self
+            .documents
+            .iter()
+            .find(|doc| doc.path().as_ref() == Some(path))
+            .and_then(|doc| doc.disk_hash());
+        if saved.is_none() || saved == self.settings_hash {
+            return false;
+        }
+        self.reload_settings();
+        true
+    }
+
+    /// Reads the settings file and puts what it says in use, saying so, or
+    /// what was wrong with it.
+    fn reload_settings(&mut self) {
+        let Some(path) = self.settings.clone() else {
+            self.show_message("There's nowhere for settings: HOME isn't set.", true);
+            return;
+        };
+        let (config, warnings) = match fs::read_to_string(&path) {
+            Ok(text) => {
+                self.settings_hash = Some(document::content_hash(text.as_bytes()));
+                config::parse(&text)
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                self.settings_hash = None;
+                (Config::default(), Vec::new())
+            }
+            Err(err) => {
+                self.show_message(format!("Can't read {}: {err}", path.display()), true);
+                return;
+            }
+        };
+        self.apply_settings(config);
+        if warnings.is_empty() {
+            self.show_message("Settings applied.", false);
+        } else {
+            self.warn_about_config(&warnings);
+        }
+    }
+
+    /// Puts `config` in use, applying what changed to what's open. The
+    /// tree's visibility and width, and wrapping, change only if their
+    /// settings did, since they may have been changed by hand since.
+    /// Terminals already running keep their shell and scrollback.
+    fn apply_settings(&mut self, config: Config) {
+        let old = config::get();
+        config::set(config);
+        let new = config::get();
+        self.keymap = Keymap::new(&new.keys);
+        if new.tree != old.tree {
+            self.tree_visible = new.tree;
+            if !new.tree && self.focus == Focus::Tree {
+                self.focus = Focus::Editor;
+            }
+        }
+        if new.tree_width != old.tree_width {
+            self.tree_width = new.tree_width;
+        }
+        if new.tab_width != old.tab_width {
+            for doc in &self.documents {
+                doc.buffer.set_tab_width(new.tab_width as u8);
+            }
+        }
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            for editor in panel.editors_mut() {
+                editor.follow_settings(&old, &new);
+            }
+        }
+        if new.exclude != old.exclude {
+            self.tree.refresh();
+            self.files = FileIndex::new(&self.workspace);
+            self.symbols = SymbolIndex::new(&self.workspace);
+            self.show_active_in_tree();
+        }
+        self.layout();
+    }
+
+    /// Opens the settings file, made from [`config::TEMPLATE`] if there
+    /// isn't one yet.
+    fn open_settings(&mut self) {
+        let Some(path) = self.settings.clone() else {
+            self.show_message("There's nowhere for settings: HOME isn't set.", true);
+            return;
+        };
+        let made = path
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                io::Write::write_all(&mut file, config::TEMPLATE.as_bytes())?;
+                // It sets nothing: the defaults in use are what it says.
+                self.settings_hash = Some(document::content_hash(config::TEMPLATE.as_bytes()));
+                Ok(())
+            });
+        match made {
+            Err(err) if err.kind() != io::ErrorKind::AlreadyExists => {
+                self.show_message(format!("Can't make {}: {err}", path.display()), true);
+            }
+            _ => {
+                // Its folder may be new.
+                let path = document::resolve(&path);
+                self.settings = Some(path.clone());
+                if self.open(&path, false) {
+                    self.focus = Focus::Editor;
+                }
+            }
+        }
     }
 
     // --- recovery ---------------------------------------------------------------
@@ -4486,7 +4645,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Editor, "focus leaves a hidden tree");
         ctrl(&mut app, 'e');
         assert_eq!(app.focus, Focus::Tree, "focusing the tree shows it");
-        assert_eq!(app.visible_tree_width(), DEFAULT_TREE_WIDTH);
+        assert_eq!(app.visible_tree_width(), config::get().tree_width);
         key(&mut app, KeyCode::Esc);
         assert_eq!(app.focus, Focus::Editor);
 
@@ -6686,5 +6845,123 @@ mod tests {
         assert!(app.alert.is_none());
         assert!(!app.ed().is_modified());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn open_settings_makes_the_file_from_the_template() {
+        let _serial = crate::test_serial();
+        let root = fixture("settings", &[("a.txt", "")]);
+        let path = root.join("config/cue/config.toml");
+        let mut first = app(&root, Some("a.txt"));
+        first.settings = Some(path.clone());
+        first.run(Command::OpenSettings, false);
+        assert_eq!(fs::read_to_string(&path).unwrap(), config::TEMPLATE);
+        assert_eq!(first.ed().path(), Some(path.clone()));
+        assert_eq!(first.focus, Focus::Editor);
+
+        // One already there is opened as it is.
+        fs::write(&path, "[editor]\nwrap = false\n").unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        app.settings = Some(path.clone());
+        app.run(Command::OpenSettings, false);
+        assert_eq!(app.ed().text(), "[editor]\nwrap = false\n");
+    }
+
+    #[test]
+    fn settings_problems_show_in_the_status_bar() {
+        let _serial = crate::test_serial();
+        let root = fixture("settings-warnings", &[("a.txt", "")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.warn_about_config(&[]);
+        assert!(!screen(&app).contains("Settings:"));
+        let warnings = [
+            "There's no setting editor.tabwidth".to_string(),
+            "x".to_string(),
+        ];
+        app.warn_about_config(&warnings);
+        let text = screen(&app);
+        assert!(
+            text.contains("Settings: There's no setting editor.tabwidth (and 1 more"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn saving_settings_applies_them() {
+        let _serial = crate::test_serial();
+        let root = fixture("settings-save", &[("a.txt", "")]);
+        let path = root.join("config/cue/config.toml");
+        let mut app = app(&root, Some("a.txt"));
+        app.settings = Some(path.clone());
+        app.run(Command::OpenSettings, false);
+        assert!(!screen(&app).contains("Settings applied."));
+
+        ctrl(&mut app, 'a');
+        app.paste(
+            "[editor]\ntab_width = 2\nwrap = false\n[ui]\ntree_width = 20\n\
+             [keys]\n\"ctrl+shift+p\" = \"app:command-palette\"\n",
+        );
+        app.after_input();
+        // Not until it's saved.
+        assert_eq!(config::get().tab_width, 4);
+        ctrl(&mut app, 's');
+        assert_eq!(config::get().tab_width, 2);
+        let text = screen(&app);
+        assert!(text.contains("Settings applied."), "{text}");
+        app.active_panel_mut().clear_message();
+        let text = screen(&app);
+        assert!(text.contains("nowrap"), "{text}");
+        assert_eq!(app.visible_tree_width(), 20);
+        let palette = Key::new(
+            KeyCode::Char('p'),
+            Mods {
+                shift: true,
+                ..Mods::CTRL
+            },
+        );
+        assert_eq!(
+            app.keymap.lookup(palette, Context::Editor),
+            Some((Command::Palette, false))
+        );
+
+        // Saved again unchanged, nothing's read.
+        ctrl(&mut app, 's');
+        assert!(!screen(&app).contains("Settings applied."));
+
+        // Mistakes are told of, and what's right still applies.
+        ctrl(&mut app, 'a');
+        app.paste("[editor]\ntab_width = 3\nwrapping = false\n");
+        ctrl(&mut app, 's');
+        assert_eq!(config::get().tab_width, 3);
+        assert_eq!(config::get().tree_width, 30);
+        let text = screen(&app);
+        assert!(
+            text.contains("There's no setting editor.wrapping"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn reload_settings_reads_the_file() {
+        let _serial = crate::test_serial();
+        let root = fixture("settings-reload", &[("a.txt", ""), ("b.txt", "")]);
+        let path = root.join("config.toml");
+        let mut app = app(&root, Some("a.txt"));
+        app.settings = Some(path.clone());
+        assert!(screen(&app).contains("b.txt"));
+
+        fs::write(&path, "[files]\nexclude = [\"b.*\"]\n[ui]\ntree = false\n").unwrap();
+        app.run(Command::ReloadSettings, false);
+        assert_eq!(app.visible_tree_width(), 0);
+        ctrl(&mut app, 'b');
+        let text = screen(&app);
+        assert!(text.contains("a.txt") && !text.contains("b.txt"), "{text}");
+
+        // Gone, it's the defaults again; the tree stays as it was put.
+        fs::remove_file(&path).unwrap();
+        app.run(Command::ReloadSettings, false);
+        assert_eq!(*config::get(), Config::default());
+        assert!(app.visible_tree_width() > 0);
+        assert!(screen(&app).contains("b.txt"));
     }
 }

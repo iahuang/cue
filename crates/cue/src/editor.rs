@@ -21,6 +21,7 @@ use opentui::{
     SelectionColors, Viewport, WrapMode,
 };
 
+use crate::config::{self, Config};
 #[cfg(test)]
 use crate::document::File;
 use crate::document::{Disk, Document};
@@ -58,9 +59,6 @@ pub const CURRENT_MATCH: SelectionColors = SelectionColors {
 const FIND_HIGHLIGHTS: u16 = 1;
 
 const WHEEL_LINES: u32 = 3;
-/// The view keeps the cursor this fraction of its height from its top and
-/// bottom: the native view's default.
-const SCROLL_MARGIN: f32 = 0.15;
 /// Line numbers are hidden when they would leave the text less room than this.
 const MIN_TEXT_WIDTH: u32 = 20;
 
@@ -144,8 +142,10 @@ impl Editor {
         let buffer = doc.buffer.clone();
         let (_, view_w, view_h) = text_area(width, height, buffer.line_count());
         let view = buffer.shared_view(view_w, view_h)?;
-        let wrap = WrapMode::Word;
+        let config = config::get();
+        let wrap = wrap_mode(config.wrap);
         view.set_wrap_mode(wrap);
+        view.set_scroll_margin(config.scroll_margin);
         let mut editor = Editor {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             doc,
@@ -1124,7 +1124,7 @@ impl Editor {
         let vp = self.view.viewport();
         // The cursor, dragged to the last line, stays the scroll margin
         // from the top, or the view would scroll back to it.
-        let margin = ((vp.height as f32 * SCROLL_MARGIN) as u32).max(1);
+        let margin = ((vp.height as f32 * config::get().scroll_margin) as u32).max(1);
         let max_y = self
             .view
             .total_virtual_line_count()
@@ -1542,6 +1542,16 @@ impl Editor {
         }
     }
 
+    /// Takes up the `editor.wrap` and `editor.scroll_margin` settings,
+    /// changed from `old`. Wrapping changes only if its setting did, since
+    /// Toggle Word Wrap may have set it here.
+    pub fn follow_settings(&mut self, old: &Config, new: &Config) {
+        if new.wrap != old.wrap {
+            self.set_wrap(wrap_mode(new.wrap));
+        }
+        self.view.set_scroll_margin(new.scroll_margin);
+    }
+
     fn toggle_wrap(&mut self) {
         self.set_wrap(match self.wrap {
             WrapMode::None => WrapMode::Word,
@@ -1556,6 +1566,14 @@ impl Editor {
 
     fn page(&self) -> u32 {
         self.text_area().2.saturating_sub(1).max(1)
+    }
+}
+
+/// How the `editor.wrap` setting wraps lines.
+fn wrap_mode(wrap: bool) -> WrapMode {
+    match wrap {
+        true => WrapMode::Word,
+        false => WrapMode::None,
     }
 }
 

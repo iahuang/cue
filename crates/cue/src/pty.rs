@@ -47,11 +47,14 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Starts the user's shell (`$SHELL`) as a login shell, in `cwd`, as
-    /// terminals do.
+    /// Starts the user's shell (the `terminal.shell` setting, or `$SHELL`)
+    /// as a login shell, in `cwd`, as terminals do.
     pub fn shell(cwd: &Path, cols: u16, rows: u16) -> io::Result<Pty> {
-        let shell = std::env::var_os("SHELL")
-            .filter(|shell| !shell.is_empty())
+        let shell = crate::config::get()
+            .shell
+            .clone()
+            .map(OsString::from)
+            .or_else(|| std::env::var_os("SHELL").filter(|shell| !shell.is_empty()))
             .unwrap_or_else(|| "/bin/sh".into());
         let name = Path::new(&shell).file_name().unwrap_or(shell.as_ref());
         let mut command = Command::new(&shell);

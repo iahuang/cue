@@ -30,6 +30,7 @@ use opentui::{
     MouseButton as TermButton, MouseEvent,
 };
 
+use crate::config;
 use crate::editor::CURRENT_MATCH;
 use crate::find::{self, Field, FindBar, Match};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind};
@@ -42,8 +43,6 @@ use crate::search::Toggle;
 use crate::status::{Prompt, PromptKey, Status};
 use crate::theme::MATCH_BG;
 
-/// Bytes of history kept above the screen.
-const SCROLLBACK: u32 = 10 * 1024 * 1024;
 /// At most this much output is read per poll, so a flood of it can't keep
 /// the screen from being drawn, or keys from being read.
 const READ_BUDGET: usize = 256 * 1024;
@@ -105,7 +104,7 @@ impl Terminal {
     /// Starts a shell in `cwd`, on a screen the size of `area`.
     pub fn new(id: u32, cwd: &Path, area: Rect) -> io::Result<Terminal> {
         let (cols, rows) = size(area);
-        let mut vt = EmbeddedTerminal::new(cols, rows, SCROLLBACK)
+        let mut vt = EmbeddedTerminal::new(cols, rows, config::get().scrollback)
             .map_err(|e| io::Error::other(e.to_string()))?;
         vt.set_host_palette(true);
         vt.set_search_colors((None, MATCH_BG), (CURRENT_MATCH.fg, CURRENT_MATCH.bg));

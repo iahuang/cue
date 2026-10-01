@@ -22,6 +22,7 @@ use std::time::SystemTime;
 
 use opentui::{EditBuffer, WidthMethod};
 
+use crate::config;
 use crate::history::{EditKind, History};
 use crate::indent::Indent;
 use crate::language::{self, Language};
@@ -62,14 +63,20 @@ pub struct Stamp {
     hash: u64,
 }
 
+/// A hash of a file's contents, as documents keep of what's on disk (see
+/// [`Document::disk_hash`]).
+pub fn content_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 impl Stamp {
     fn new(meta: &fs::Metadata, bytes: &[u8]) -> Stamp {
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
         Stamp {
             modified: meta.modified().ok(),
             len: meta.len(),
-            hash: hasher.finish(),
+            hash: content_hash(bytes),
         }
     }
 
@@ -164,7 +171,7 @@ impl Document {
             None => None,
         };
         let buffer = Rc::new(EditBuffer::new(WidthMethod::Unicode).map_err(|e| e.to_string())?);
-        buffer.set_tab_width(4);
+        buffer.set_tab_width(config::get().tab_width as u8);
         let mut file = File {
             path,
             line_ending: Default::default(),
@@ -377,6 +384,12 @@ impl Document {
     /// How the file on disk compared with the document when last checked.
     pub fn disk(&self) -> Disk {
         self.on_disk.borrow().disk
+    }
+
+    /// The [`content_hash`] of the file as last read or written, if there
+    /// was one.
+    pub fn disk_hash(&self) -> Option<u64> {
+        self.on_disk.borrow().stamp.map(|stamp| stamp.hash)
     }
 
     /// Catches up with the file on disk, which something else may have

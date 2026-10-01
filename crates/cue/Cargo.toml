@@ -65,6 +65,7 @@ tree-sitter-latex = { package = "tree-sitter-latex-vendored", path = "../../vend
 tree-sitter-mermaid = { package = "tree-sitter-mermaid-vendored", path = "../../vendor/tree-sitter-mermaid" }
 trash = "5"
 notify = "8.2.0"
+toml = { version = "1.1.6", features = ["preserve_order"] }
 
 
 # musl's allocator is slow under contention (parallel search, file indexing).

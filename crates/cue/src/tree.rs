@@ -38,12 +38,16 @@ const STICKY_BG: Rgba = Rgba::rgb(36, 37, 52);
 /// Rows the mouse wheel scrolls.
 const WHEEL_ROWS: usize = 3;
 
-/// Entries never shown, here or in the file picker and workspace search.
+/// Entries never shown, here or in the file picker and workspace search,
+/// with those the `files.exclude` setting names.
 const HIDDEN: &[&str] = &[".git", ".DS_Store"];
 
 /// Whether an entry named `name` is never shown.
 pub fn is_hidden(name: &std::ffi::OsStr) -> bool {
     HIDDEN.iter().any(|&hidden| name == hidden)
+        || name
+            .to_str()
+            .is_some_and(|name| crate::config::get().excludes(name))
 }
 
 /// Whether a file named `name` says which entries are ignored.

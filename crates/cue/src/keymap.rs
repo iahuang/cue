@@ -5,6 +5,7 @@
 //! by name, and shown with its shortcut.
 
 use std::fmt;
+use std::str::FromStr;
 
 use crate::input::{Key, KeyCode, Mods};
 
@@ -30,6 +31,14 @@ macro_rules! commands {
                     $(Command::$variant => $title),*
                 }
             }
+
+            /// The command named `id`, as in `editor:copy`.
+            pub fn from_id(id: &str) -> Option<Command> {
+                match id {
+                    $($id => Some(Command::$variant),)*
+                    _ => None,
+                }
+            }
         }
     };
 }
@@ -37,6 +46,8 @@ macro_rules! commands {
 commands! {
     Quit => "app:quit", "Quit";
     Palette => "app:command-palette", "Show Command Palette";
+    OpenSettings => "app:open-settings", "Open Settings";
+    ReloadSettings => "app:reload-settings", "Reload Settings";
     Save => "file:save", "Save";
     SaveAs => "file:save-as", "Save As…";
     NewFile => "file:new", "New File";
@@ -198,6 +209,12 @@ impl Context {
             _ => &[],
         }
     }
+
+    /// Whether a key's binding here is looked up before, or instead of,
+    /// its binding in `other`: here is `other`, or comes before it.
+    fn precedes(self, other: Context) -> bool {
+        self == other || other == Context::Global || self.parents().contains(&other)
+    }
 }
 
 impl Command {
@@ -205,14 +222,16 @@ impl Command {
     pub fn context(self) -> Context {
         use Command::*;
         match self {
-            Quit | Palette | Save | SaveAs | NewFile | CreateFile | OpenFile | GoToFile
-            | GoToLine | GoToSymbol | GoToWorkspaceSymbol | GoToTerminal | RecoverUnsaved
-            | SearchWorkspace | Find | FindReplace | FindNext | FindPrevious | ToggleTree
-            | FocusTree | FocusEditor | SplitRight | SplitDown | ClosePanel | GoBack
-            | GoForward | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown
-            | NewTerminal | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
-            | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5
-            | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder => Context::Global,
+            Quit | Palette | OpenSettings | ReloadSettings | Save | SaveAs | NewFile
+            | CreateFile | OpenFile | GoToFile | GoToLine | GoToSymbol | GoToWorkspaceSymbol
+            | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext
+            | FindPrevious | ToggleTree | FocusTree | FocusEditor | SplitRight | SplitDown
+            | ClosePanel | GoBack | GoForward | FocusPanelLeft | FocusPanelRight | FocusPanelUp
+            | FocusPanelDown | NewTerminal | NewTab | CloseTab | NextTab | PreviousTab
+            | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3
+            | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder => {
+                Context::Global
+            }
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu
             | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate
@@ -559,6 +578,32 @@ impl Default for Keymap {
 }
 
 impl Keymap {
+    /// The default bindings, and `user`'s, which come first: each binds a
+    /// key to a command, or with none, unbinds it. A key bound does what
+    /// it's bound to: its default bindings that would be looked up first
+    /// go, as do all of them for a key unbound. Of a key bound twice, the
+    /// later binding wins.
+    pub fn new(user: &[(Key, Option<Command>)]) -> Keymap {
+        let mut keymap = Keymap::default();
+        let mut bound: Vec<Binding> = Vec::new();
+        for &(key, command) in user {
+            let key = normalize(key);
+            keymap.bindings.retain(|b| {
+                b.key != key || command.is_some_and(|c| !b.context.precedes(c.context()))
+            });
+            bound.retain(|b| b.key != key);
+            if let Some(command) = command {
+                bound.push(Binding {
+                    key,
+                    command,
+                    context: command.context(),
+                });
+            }
+        }
+        bound.append(&mut keymap.bindings);
+        Keymap { bindings: bound }
+    }
+
     /// The command bound to `key` where `context` has focus, and whether
     /// Shift should extend the selection. Bindings for the focused context
     /// win over its parent's, which win over global ones. A key with Shift held falls back to its
@@ -719,6 +764,67 @@ impl fmt::Display for Key {
     }
 }
 
+/// Reads shortcuts as [`Display`](fmt::Display) writes them, ignoring
+/// case: `Ctrl+Shift+Z`, `alt+left`, `cmd+backspace`, `f2`, `ctrl++`.
+/// Cmd, Command, and Super are the same modifier, as are Alt, Option, and
+/// Opt.
+impl FromStr for Key {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Key, String> {
+        let (mods, code) = match s.strip_suffix("++") {
+            Some(mods) => (Some(mods), "+"),
+            None if s.trim() == "+" => (None, "+"),
+            None => match s.rsplit_once('+') {
+                Some((mods, code)) => (Some(mods), code),
+                None => (None, s),
+            },
+        };
+        let mut key = Key::new(code_named(code.trim())?, Mods::NONE);
+        for name in mods.into_iter().flat_map(|mods| mods.split('+')) {
+            let held = match name.trim().to_lowercase().as_str() {
+                "ctrl" | "control" => &mut key.mods.ctrl,
+                "alt" | "option" | "opt" => &mut key.mods.alt,
+                "shift" => &mut key.mods.shift,
+                "cmd" | "command" | "super" => &mut key.mods.sup,
+                _ => return Err(format!("there's no modifier \"{}\"", name.trim())),
+            };
+            *held = true;
+        }
+        Ok(key)
+    }
+}
+
+/// The key named `name`: a character, or a name such as `Enter` or `F2`.
+fn code_named(name: &str) -> Result<KeyCode, String> {
+    let mut chars = name.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        return Ok(KeyCode::Char(c.to_lowercase().next().unwrap_or(c)));
+    }
+    let lower = name.to_lowercase();
+    Ok(match lower.as_str() {
+        "space" => KeyCode::Char(' '),
+        "enter" | "return" => KeyCode::Enter,
+        "tab" => KeyCode::Tab,
+        "backspace" => KeyCode::Backspace,
+        "delete" | "del" => KeyCode::Delete,
+        "insert" | "ins" => KeyCode::Insert,
+        "esc" | "escape" => KeyCode::Esc,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" | "pgup" => KeyCode::PageUp,
+        "pagedown" | "pgdn" => KeyCode::PageDown,
+        _ => match lower.strip_prefix('f').and_then(|n| n.parse().ok()) {
+            Some(n @ 1..=12) => KeyCode::F(n),
+            _ => return Err(format!("there's no key \"{name}\"")),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +859,8 @@ mod tests {
         const UNBOUND: &[Command] = &[
             // `$` in the file picker gets there too.
             Command::GoToTerminal,
+            Command::OpenSettings,
+            Command::ReloadSettings,
             Command::ToggleWrap,
             Command::CloseFile,
             Command::ClearTerminal,
@@ -1012,6 +1120,80 @@ mod tests {
         assert_eq!(
             lookup(Key::new(KeyCode::Left, mods(false, false, false, true))),
             None
+        );
+    }
+
+    #[test]
+    fn shortcuts_read_as_they_are_written() {
+        for binding in &Keymap::default().bindings {
+            let label = binding.key.to_string();
+            assert_eq!(label.parse(), Ok(binding.key), "{label}");
+        }
+        let parse = |s: &str| s.parse::<Key>();
+        let ctrl = |code| Ok(Key::new(code, Mods::CTRL));
+        assert_eq!(parse("ctrl+k"), ctrl(KeyCode::Char('k')));
+        assert_eq!(parse("Control + K"), ctrl(KeyCode::Char('k')));
+        assert_eq!(parse("ctrl++"), ctrl(KeyCode::Char('+')));
+        assert_eq!(parse("ctrl+-"), ctrl(KeyCode::Char('-')));
+        assert_eq!(parse("ctrl+pgdn"), ctrl(KeyCode::PageDown));
+        assert_eq!(
+            parse("option+command+F12"),
+            Ok(Key::new(KeyCode::F(12), mods(false, true, false, true)))
+        );
+        assert_eq!(parse("+"), Ok(Key::new(KeyCode::Char('+'), Mods::NONE)));
+        assert_eq!(parse("space"), Ok(Key::new(KeyCode::Char(' '), Mods::NONE)));
+        assert_eq!(parse("f13"), Err("there's no key \"f13\"".to_string()));
+        assert_eq!(parse("ctrl+"), Err("there's no key \"\"".to_string()));
+        assert_eq!(
+            parse("meta+k"),
+            Err("there's no modifier \"meta\"".to_string())
+        );
+    }
+
+    #[test]
+    fn user_bindings_come_first() {
+        let key = |s: &str| s.parse::<Key>().unwrap();
+        let keymap = Keymap::new(&[
+            (key("ctrl+shift+p"), Some(Command::Palette)),
+            // The editor's Alt+Up moves lines.
+            (key("alt+up"), Some(Command::FocusPanelUp)),
+            (key("ctrl+q"), None),
+            (key("a"), Some(Command::TreeNewFile)),
+            // In the tree, but not the editor.
+            (key("ctrl+p"), Some(Command::TreeUp)),
+        ]);
+        let lookup = |s, context| keymap.lookup(key(s), context).map(|(c, _)| c);
+        assert_eq!(
+            lookup("ctrl+shift+p", Context::Editor),
+            Some(Command::Palette)
+        );
+        assert_eq!(keymap.shortcut(Command::Palette), Some(key("ctrl+shift+p")));
+        assert_eq!(lookup("ctrl+k", Context::Editor), Some(Command::Palette));
+        assert_eq!(
+            lookup("alt+up", Context::Editor),
+            Some(Command::FocusPanelUp)
+        );
+        assert_eq!(
+            lookup("alt+up", Context::Dialog),
+            Some(Command::FocusPanelUp)
+        );
+        assert_eq!(keymap.shortcut(Command::MoveLinesUp), None);
+        assert_eq!(lookup("ctrl+q", Context::Editor), None);
+        assert_eq!(lookup("cmd+q", Context::Editor), Some(Command::Quit));
+        assert_eq!(lookup("a", Context::Tree), Some(Command::TreeNewFile));
+        assert_eq!(lookup("a", Context::Editor), None);
+        assert_eq!(lookup("ctrl+p", Context::Tree), Some(Command::TreeUp));
+        assert_eq!(lookup("ctrl+p", Context::Editor), Some(Command::GoToFile));
+        assert_eq!(keymap.lookup_terminal(key("ctrl+q")), None);
+
+        // A later binding of a key wins.
+        let keymap = Keymap::new(&[
+            (key("ctrl+alt+t"), Some(Command::NewTerminal)),
+            (key("Ctrl+Alt+T"), Some(Command::NewTab)),
+        ]);
+        assert_eq!(
+            keymap.lookup_terminal(key("ctrl+alt+t")),
+            Some(Command::NewTab)
         );
     }
 }
