@@ -92,57 +92,39 @@ pub const MIN_TREE_WIDTH: u32 = 12;
 
 /// What Open Settings creates when there's no file yet: every setting, at
 /// its default, commented out.
-pub const TEMPLATE: &str = r#"# cue settings. Uncomment a line to change it; the rest keep their defaults.
-# Saving this file in cue applies it; after changing it elsewhere, run Reload
-# Settings. Terminals already open keep their shell and scrollback.
+pub const TEMPLATE: &str = r#"# Uncomment to customize. Save in cue to apply, or run Reload Settings.
 
 [editor]
-# Columns a tab takes.
 # tab_width = 4
-# What Tab inserts in files whose indentation can't be told: a number of
-# spaces, or "tabs".
-# indent = 4
-# Whether long lines wrap. Toggle Word Wrap changes it for one editor.
+# indent = 4                  # Fallback indentation: spaces or "tabs".
 # wrap = true
-# The part of the view, from 0 to 0.5, kept between the cursor and its edges.
-# scroll_margin = 0.15
+# scroll_margin = 0.15        # Cursor margin as a fraction of the view (0–0.5).
 
 [ui]
-# The colors. "Terminal" is the terminal's own; Select Theme in the command
-# palette shows the rest. A theme for a dark terminal and one for a light:
-# theme = { dark = "Cue Dark", light = "GitHub Light" }
+# Browse themes with Select Theme in the command palette.
 # theme = "Terminal"
-# Whether a theme other than Terminal makes the terminal's own background
-# its own, so the window's padding matches, and back when cue quits.
-# terminal_background = true
-# Whether a theme other than Terminal colors the cursor.
-# cursor_color = true
-# File icons. They need a Nerd Font; CUE_NERD_FONT=1 turns them on too.
-# nerd_font = false
-# Whether the file tree shows at first, and how wide.
+# theme = { dark = "Cue Dark", light = "GitHub Light" }
+# terminal_background = true # Match terminal padding to the theme.
+# cursor_color = true        # Use the theme's cursor color.
+# nerd_font = false          # File icons; requires a Nerd Font.
 # tree = true
 # tree_width = 30
 
 [terminal]
-# The program terminals run, as a login shell. By default, $SHELL.
-# shell = "/bin/zsh"
-# History kept above the screen, as "512KB", "10MB", or a number of bytes.
-# scrollback = "10MB"
+# Changes apply to new terminals.
+# shell = "/bin/zsh"         # Login shell; defaults to $SHELL.
+# scrollback = "10MB"        # Bytes, or a size like "512KB".
 
 [files]
-# Names of files and folders never shown, besides .git and .DS_Store, in the
-# tree, Go to File, and workspace search. * matches any run of characters.
+# Hide names from the tree, file picker, and search. Supports * wildcards.
 # exclude = ["node_modules", "*.pyc"]
 
 [keys]
-# Shortcuts, as "key" = "command", with the commands' names that cue --help
-# lists. A key bound here does only what it's bound to, and "none" unbinds
-# one. Ctrl and Cmd are different keys: bind both to use either.
+# Commands: cue --help. "none" unbinds a key. Ctrl and Cmd are separate.
 # "ctrl+shift+p" = "app:command-palette"
 # "cmd+shift+p" = "app:command-palette"
 # "ctrl+q" = "none"
-# Keys without Ctrl, Alt, or Cmd type text, except in the file tree.
-# "a" = "tree:new-file"
+# "a" = "tree:new-file"      # Unmodified keys only bind in the file tree.
 "#;
 
 #[cfg(not(test))]

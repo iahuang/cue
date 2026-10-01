@@ -330,7 +330,7 @@ impl Picker {
                     text: id.name().to_string(),
                     dim: 0..0,
                     detail: match id.light() {
-                        None => "the terminal's colors",
+                        None => "",
                         Some(true) => "light",
                         Some(false) => "dark",
                     }

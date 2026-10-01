@@ -174,6 +174,7 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut renderer = Renderer::new(width, height, Output::Stdout)?;
     renderer.setup_terminal(true);
+    renderer.set_cursor_style(opentui::CursorShape::Line, false);
     // Zooming into a large image sends it whole: tens of megabytes as
     // base64 through the terminal otherwise.
     renderer.use_kitty_image_files();

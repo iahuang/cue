@@ -50,7 +50,7 @@ pub use edit::{
 };
 pub use error::{Error, Result};
 pub use image::Image;
-pub use renderer::{Output, RenderStatus, Renderer};
+pub use renderer::{CursorShape, Output, RenderStatus, Renderer};
 pub use style::SyntaxStyle;
 pub use terminal::{
     Anchor, Cursor, CursorStyle, EmbeddedTerminal, Found, KeyAction, KeyEvent, KeyMods, LineAt,

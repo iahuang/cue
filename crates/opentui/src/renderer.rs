@@ -17,6 +17,16 @@ pub enum Output {
     Memory,
 }
 
+/// The shape of the terminal cursor drawn by a [`Renderer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CursorShape {
+    Block = 0,
+    Line = 1,
+    Underline = 2,
+    Default = 3,
+}
+
 /// The result of [`Renderer::render`] (`renderer.RenderStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderStatus {
@@ -180,6 +190,18 @@ impl Renderer {
     /// terminal's own.
     pub fn set_cursor_color(&mut self, color: Rgba) {
         unsafe { sys::setCursorColor(self.handle, color.as_ptr()) }
+    }
+
+    /// Sets the cursor's shape and blinking. Reset when the renderer is dropped.
+    pub fn set_cursor_style(&mut self, shape: CursorShape, blinking: bool) {
+        let options = sys::CursorStyleOptions {
+            style: shape as u8,
+            blinking: u8::from(blinking),
+            color: ptr::null(),
+            // Leave the mouse pointer's style unchanged.
+            cursor: u8::MAX,
+        };
+        unsafe { sys::setCursorStyleOptions(self.handle, &options) }
     }
 
     /// Positions the terminal cursor (1-based, like the native API).
