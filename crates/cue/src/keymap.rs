@@ -420,13 +420,11 @@ impl Default for Keymap {
             bindings.push((key(code, CTRL_ALT), command));
             bindings.push((key(code, SUPER_ALT), command));
         }
-        // As in VS Code on macOS. Legacy terminals send Ctrl+- as Ctrl+_;
-        // some report Ctrl+Shift+- as Ctrl+Shift+_. In a terminal, Ctrl+-
+        // Legacy terminals send Ctrl+- as Ctrl+_. In a terminal, Ctrl+-
         // is the shell's (undo, in readline).
         bindings.push((key(Char('-'), Mods::CTRL), GoBack));
         bindings.push((key(Char('_'), Mods::CTRL), GoBack));
-        bindings.push((key(Char('-'), CTRL_SHIFT), GoForward));
-        bindings.push((key(Char('_'), CTRL_SHIFT), GoForward));
+        bindings.push((key(Char('='), Mods::CTRL), GoForward));
         // As in VS Code and browsers. In a terminal, the shell has them.
         bindings.push((key(PageDown, Mods::CTRL), NextTab));
         bindings.push((key(PageUp, Mods::CTRL), PreviousTab));

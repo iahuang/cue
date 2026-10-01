@@ -13,7 +13,7 @@
 //! something.
 //!
 //! Like a browser tab, a panel keeps a history of what it showed, to go
-//! back and forward through (Ctrl+- and Ctrl+Shift+-).
+//! back and forward through (Ctrl+- and Ctrl+=).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};

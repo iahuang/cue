@@ -4394,7 +4394,7 @@ mod tests {
             shift: true,
             ..Mods::CTRL
         };
-        let forward = |app: &mut App| app.handle_key(Key::new(KeyCode::Char('-'), ctrl_shift));
+        let forward = |app: &mut App| ctrl(app, '=');
         app.open(&root.join("b.txt"), false);
         app.open(&root.join("c.txt"), false);
         ctrl(&mut app, '-');
@@ -5084,11 +5084,7 @@ mod tests {
         // Back to the file, and forward to the image again.
         ctrl(&mut app, '-');
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
-        let forward = Mods {
-            shift: true,
-            ..Mods::CTRL
-        };
-        app.handle_key(Key::new(KeyCode::Char('-'), forward));
+        ctrl(&mut app, '=');
         assert!(app.active_panel().image().is_some());
 
         // It follows the file when it's renamed.
