@@ -38,10 +38,9 @@ use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::{Caret, Edit};
-use crate::picker::{self, Area, DIM, FG, MATCH_FG, SELECTED_BG};
+use crate::picker::{self, Area};
+use crate::theme;
 use crate::tree;
-
-const ERROR: Rgba = Rgba::rgb(243, 139, 168);
 
 /// The widest the popup gets, in columns.
 const MAX_WIDTH: u32 = 90;
@@ -676,6 +675,7 @@ impl FileDialog {
     }
 
     fn draw_popup(&self, frame: &Buffer, area: Area) -> (u32, u32) {
+        let colors = theme::colors();
         let Area {
             x,
             y,
@@ -688,8 +688,11 @@ impl FileDialog {
         picker::draw_status(frame, area, &status);
         let room_below = width.saturating_sub(status.chars().count() as u32 + 6) as usize;
         let (note, fg) = match &self.message {
-            Some((text, error)) => (format!(" {text} "), if *error { ERROR } else { FG }),
-            None => (self.hints.clone(), DIM),
+            Some((text, error)) => (
+                format!(" {text} "),
+                if *error { colors.error } else { colors.text },
+            ),
+            None => (self.hints.clone(), colors.muted),
         };
         let note: String = note.chars().take(room_below).collect();
         frame.draw_text(&note, x + 2, bottom, fg, None, Attributes::NONE);
@@ -705,10 +708,24 @@ impl FileDialog {
             shown.chars().take(folder).collect(),
             shown.chars().skip(folder).collect(),
         );
-        frame.draw_text(&dir_part, text_x, y + 1, DIM, None, Attributes::NONE);
+        frame.draw_text(
+            &dir_part,
+            text_x,
+            y + 1,
+            colors.muted,
+            None,
+            Attributes::NONE,
+        );
         let name_x = text_x + dir_part.chars().count() as u32;
-        let name_bg = self.name_selected.then_some(SELECTED_BG);
-        frame.draw_text(&name_part, name_x, y + 1, FG, name_bg, Attributes::NONE);
+        let name_bg = self.name_selected.then_some(colors.selected);
+        frame.draw_text(
+            &name_part,
+            name_x,
+            y + 1,
+            colors.text,
+            name_bg,
+            Attributes::NONE,
+        );
 
         let list = y + 3;
         if let Some(empty) = self.empty_text() {
@@ -719,7 +736,7 @@ impl FileDialog {
         let visible = self.rows.iter().enumerate().skip(self.scroll);
         for ((index, &row), screen_y) in visible.zip(list..bottom) {
             if self.selected == Some(index) {
-                frame.fill_rect(x + 1, screen_y, width.saturating_sub(2), 1, SELECTED_BG);
+                frame.fill_rect(x + 1, screen_y, width.saturating_sub(2), 1, colors.selected);
             }
             self.draw_row(frame, row, text_x, screen_y, room);
         }
@@ -728,6 +745,7 @@ impl FileDialog {
 
     /// What to show when nothing's listed, and its color.
     fn empty_text(&self) -> Option<(String, Rgba)> {
+        let colors = theme::colors();
         if let Some(error) = self.listing.error {
             let text = match (error, self.purpose) {
                 (io::ErrorKind::NotFound, Purpose::Open | Purpose::AddFolder) => {
@@ -738,9 +756,9 @@ impl FileDialog {
                 (error, _) => format!("Can't read this folder: {}.", io::Error::from(error)),
             };
             let fg = if self.purpose.names_a_new_file() && error == io::ErrorKind::NotFound {
-                DIM
+                colors.muted
             } else {
-                ERROR
+                colors.error
             };
             return Some((text, fg));
         }
@@ -759,7 +777,7 @@ impl FileDialog {
             Purpose::Move => format!("Enter moves it to {}.", self.name()),
             Purpose::Duplicate => format!("Enter copies it to {}.", self.name()),
         };
-        Some((text, DIM))
+        Some((text, colors.muted))
     }
 
     /// The count for the bottom border.
@@ -780,6 +798,7 @@ impl FileDialog {
     /// matched highlighted, a folder's ending in `/`, and a file's size on
     /// the right.
     fn draw_row(&self, frame: &Buffer, row: Row, x: u32, y: u32, room: usize) {
+        let colors = theme::colors();
         let entry = match row {
             Row::Entry(i) => Some(&self.listing.entries[i]),
             Row::Parent => None,
@@ -789,20 +808,20 @@ impl FileDialog {
                 Some(entry) if !entry.is_dir => icons::file(&entry.name),
                 _ => icons::folder(false),
             };
-            let dim = entry.is_none().then_some(DIM);
+            let dim = entry.is_none().then_some(colors.muted);
             (icon.draw(frame, x, y, dim), room - icons::WIDTH as usize)
         } else {
             (x, room)
         };
         let Some(entry) = entry else {
-            frame.draw_text("../", x, y, DIM, None, Attributes::NONE);
+            frame.draw_text("../", x, y, colors.muted, None, Attributes::NONE);
             return;
         };
         let size = entry.size.map(human_size).unwrap_or_default();
         let size_width = size.chars().count();
         let room = if size_width > 0 && size_width + 2 < room {
             let size_x = x + (room - size_width) as u32;
-            frame.draw_text(&size, size_x, y, DIM, None, Attributes::NONE);
+            frame.draw_text(&size, size_x, y, colors.muted, None, Attributes::NONE);
             room - size_width - 2
         } else {
             room
@@ -827,19 +846,19 @@ impl FileDialog {
         let mut x = x;
         for (i, &c) in chars[..shown].iter().enumerate() {
             let (fg, attributes) = if highlights.contains(&(i as u32)) {
-                (MATCH_FG, Attributes::BOLD)
+                (colors.accent, Attributes::BOLD)
             } else {
-                (FG, Attributes::NONE)
+                (colors.text, Attributes::NONE)
             };
             frame.draw_text(c.encode_utf8(&mut [0; 4]), x, y, fg, None, attributes);
             x += 1;
         }
         if cut {
-            frame.draw_text("…", x, y, DIM, None, Attributes::NONE);
+            frame.draw_text("…", x, y, colors.muted, None, Attributes::NONE);
             x += 1;
         }
         if entry.is_dir {
-            frame.draw_text("/", x, y, DIM, None, Attributes::NONE);
+            frame.draw_text("/", x, y, colors.muted, None, Attributes::NONE);
         }
     }
 }

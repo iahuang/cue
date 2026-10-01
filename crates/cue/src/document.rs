@@ -198,7 +198,7 @@ impl Document {
     /// A document of `buffer`'s text, saved to `file`.
     pub fn new(buffer: Rc<EditBuffer>, file: File, theme: Rc<Theme>) -> Document {
         buffer.set_syntax_style(Some(theme.syntax_style()));
-        buffer.set_default_fg(Some(theme::TEXT));
+        buffer.set_default_fg(Some(theme::colors().text));
         let language = detect_language(&buffer, file.path.as_deref());
         let syntax = language.and_then(|language| Highlighter::new(language, &theme));
         let indent = Indent::infer(&buffer.text(), language);

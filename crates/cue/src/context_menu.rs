@@ -10,7 +10,8 @@ use opentui::{Attributes, Buffer};
 
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
-use crate::picker::{Area, BG, BORDER, DIM, FG, SELECTED_BG};
+use crate::picker::Area;
+use crate::theme;
 
 /// A row of the menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,33 +247,34 @@ impl ContextMenu {
     }
 
     fn draw_menu(&self, frame: &Buffer, area: Area) {
+        let colors = theme::colors();
         let Area {
             x,
             y,
             width,
             height,
         } = area;
-        frame.fill_rect(x, y, width, height, BG);
+        frame.fill_rect(x, y, width, height, colors.bg);
         let inner = width.saturating_sub(2) as usize;
         let rule = "─".repeat(inner);
         let text =
             |s: &str, x: u32, y: u32, fg| frame.draw_text(s, x, y, fg, None, Attributes::NONE);
-        text(&format!("╭{rule}╮"), x, y, BORDER);
-        text(&format!("╰{rule}╯"), x, y + height - 1, BORDER);
+        text(&format!("╭{rule}╮"), x, y, colors.border);
+        text(&format!("╰{rule}╯"), x, y + height - 1, colors.border);
         let rows = self.items.iter().zip(&self.shortcuts).enumerate();
         for ((index, (item, shortcut)), row) in rows.zip(y + 1..y + height - 1) {
             let MenuItem::Command(_, label) = item else {
-                text(&format!("├{rule}┤"), x, row, BORDER);
+                text(&format!("├{rule}┤"), x, row, colors.border);
                 continue;
             };
-            text("│", x, row, BORDER);
-            text("│", x + width - 1, row, BORDER);
+            text("│", x, row, colors.border);
+            text("│", x + width - 1, row, colors.border);
             if self.selected == Some(index) {
-                frame.fill_rect(x + 1, row, width - 2, 1, SELECTED_BG);
+                frame.fill_rect(x + 1, row, width - 2, 1, colors.selected);
             }
-            text(label, x + 2, row, FG);
+            text(label, x + 2, row, colors.text);
             let shortcut_x = (x + width).saturating_sub(shortcut.chars().count() as u32 + 2);
-            text(shortcut, shortcut_x, row, DIM);
+            text(shortcut, shortcut_x, row, colors.muted);
         }
     }
 }

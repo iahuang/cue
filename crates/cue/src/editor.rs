@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use opentui::{
-    Attributes, Buffer, EditBuffer, EditorView, Highlight, Rgba, SelectionBehavior,
-    SelectionColors, Viewport, WrapMode,
+    Attributes, Buffer, EditBuffer, EditorView, Highlight, SelectionBehavior, SelectionColors,
+    Viewport, WrapMode,
 };
 
 use crate::config::{self, Config};
@@ -34,27 +34,27 @@ use crate::line_edit::Edit;
 use crate::location::Position;
 use crate::search::Toggle;
 use crate::status::Status;
+use crate::theme;
 #[cfg(test)]
 use crate::theme::Theme;
 use crate::words;
 
-pub const STATUS_BG: Rgba = Rgba::rgb(49, 50, 68);
-pub const STATUS_FG: Rgba = Rgba::rgb(205, 214, 244);
-pub const STATUS_DIM: Rgba = Rgba::rgb(147, 153, 178);
-/// The header of a panel the keyboard isn't in.
-pub const INACTIVE_STATUS_BG: Rgba = Rgba::rgb(36, 37, 52);
-pub const STATUS_ERROR_BG: Rgba = Rgba::rgb(180, 60, 80);
-const LINE_NUMBER: Rgba = Rgba::rgb(108, 112, 134);
-const LINE_NUMBER_CURRENT: Rgba = Rgba::rgb(205, 214, 244);
-const SELECTION: SelectionColors = SelectionColors {
-    bg: Rgba::rgb(69, 71, 110),
-    fg: None,
-};
+/// Selected text's colors, in the theme in use.
+fn selection_colors() -> SelectionColors {
+    SelectionColors {
+        bg: theme::colors().selection,
+        fg: None,
+    }
+}
+
 /// The find bar's current match, which is selected.
-pub const CURRENT_MATCH: SelectionColors = SelectionColors {
-    bg: Rgba::rgb(249, 226, 175),
-    fg: Some(Rgba::rgb(30, 30, 46)),
-};
+pub fn current_match() -> SelectionColors {
+    let colors = theme::colors();
+    SelectionColors {
+        bg: colors.current_match_bg,
+        fg: Some(colors.current_match_fg),
+    }
+}
 /// Tags the find bar's highlights.
 const FIND_HIGHLIGHTS: u16 = 1;
 
@@ -302,7 +302,7 @@ impl Editor {
         let end = step_bytes(eb, range.end.saturating_sub(range.start));
         if start != end {
             self.anchor = Some(start);
-            self.view.set_selection(start, end, SELECTION);
+            self.view.set_selection(start, end, selection_colors());
         }
         self.reveal(vp);
     }
@@ -494,8 +494,13 @@ impl Editor {
                 };
                 self.anchor = None;
                 self.view.clear_selection();
-                self.view
-                    .set_local_selection(cell(at), cell(at), behavior, true, SELECTION);
+                self.view.set_local_selection(
+                    cell(at),
+                    cell(at),
+                    behavior,
+                    true,
+                    selection_colors(),
+                );
                 self.drag = Some(Drag {
                     origin: at,
                     focus: at,
@@ -510,7 +515,7 @@ impl Editor {
                         cell(at),
                         drag.behavior,
                         true,
-                        SELECTION,
+                        selection_colors(),
                     );
                 }
             }
@@ -626,6 +631,7 @@ impl Editor {
     /// Numbers the first row of each visible line in the `gutter` columns
     /// left of the text, highlighting the cursor's line.
     fn draw_line_numbers(&self, frame: &Buffer, gutter: u32) {
+        let colors = theme::colors();
         if gutter == 0 {
             return;
         }
@@ -636,9 +642,9 @@ impl Editor {
                 continue;
             }
             let (fg, attributes) = if row.line == current {
-                (LINE_NUMBER_CURRENT, Attributes::BOLD)
+                (colors.line_number_current, Attributes::BOLD)
             } else {
-                (LINE_NUMBER, Attributes::NONE)
+                (colors.faint, Attributes::NONE)
             };
             let number = format!("{:>digits$}", row.line + 1);
             frame.draw_text(&number, self.x + 1, self.y + y as u32, fg, None, attributes);
@@ -838,7 +844,7 @@ impl Editor {
                 let cursor = shift(at_cursor);
                 self.view.set_cursor_by_offset(cursor);
                 self.view
-                    .set_selection(anchor.min(cursor), anchor.max(cursor), SELECTION);
+                    .set_selection(anchor.min(cursor), anchor.max(cursor), selection_colors());
                 self.anchor = Some(anchor);
             }
             None => {
@@ -910,7 +916,7 @@ impl Editor {
             let (start, end) = (shift(start), shift(end));
             let start = eb.position_to_offset(start.0, start.1);
             let end = eb.position_to_offset(end.0, end.1);
-            self.view.set_selection(start, end, SELECTION);
+            self.view.set_selection(start, end, selection_colors());
             self.anchor = Some(if anchor_is_start { start } else { end });
         }
     }
@@ -1063,7 +1069,7 @@ impl Editor {
         if cursor == anchor {
             self.view.clear_selection();
         } else {
-            self.view.set_selection(anchor, cursor, SELECTION);
+            self.view.set_selection(anchor, cursor, selection_colors());
         }
     }
 
@@ -1075,8 +1081,13 @@ impl Editor {
         };
         self.anchor = Some(anchor);
         // A zero-width local selection just moves the cursor.
-        self.view
-            .set_local_selection(cell(at), cell(at), SelectionBehavior::Cell, true, SELECTION);
+        self.view.set_local_selection(
+            cell(at),
+            cell(at),
+            SelectionBehavior::Cell,
+            true,
+            selection_colors(),
+        );
         self.select_to_cursor(anchor);
     }
 
@@ -1095,7 +1106,7 @@ impl Editor {
             (start, end)
         };
         self.view.set_cursor_by_offset(cursor);
-        self.view.set_selection(start, end, SELECTION);
+        self.view.set_selection(start, end, selection_colors());
         self.anchor = Some(anchor);
     }
 
@@ -1254,7 +1265,7 @@ impl Editor {
         }
         self.buffer.remove_highlights(FIND_HIGHLIGHTS);
         if let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) {
-            self.view.set_selection(start, end, SELECTION);
+            self.view.set_selection(start, end, selection_colors());
         }
     }
 
@@ -1361,7 +1372,7 @@ impl Editor {
         self.view.set_cursor_by_offset(m.offsets.end);
         self.anchor = Some(m.offsets.start);
         self.view
-            .set_selection(m.offsets.start, m.offsets.end, CURRENT_MATCH);
+            .set_selection(m.offsets.start, m.offsets.end, current_match());
         self.reveal(vp);
         self.keep_clear_of_find();
     }
@@ -1545,6 +1556,18 @@ impl Editor {
     /// Takes up the `editor.wrap` and `editor.scroll_margin` settings,
     /// changed from `old`. Wrapping changes only if its setting did, since
     /// Toggle Word Wrap may have set it here.
+    /// Recolors the selection, in the theme in use.
+    pub fn restyle(&mut self) {
+        let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) else {
+            return;
+        };
+        let colors = match self.current_match() {
+            Some(_) => current_match(),
+            None => selection_colors(),
+        };
+        self.view.set_selection(start, end, colors);
+    }
+
     pub fn follow_settings(&mut self, old: &Config, new: &Config) {
         if new.wrap != old.wrap {
             self.set_wrap(wrap_mode(new.wrap));
@@ -1633,8 +1656,7 @@ mod tests {
     use crate::input::Mods;
     use crate::keymap::Context;
     use crate::theme;
-    use crate::theme::MATCH_BG;
-    use opentui::{OwnedBuffer, WidthMethod};
+    use opentui::{OwnedBuffer, Rgba, WidthMethod};
     use std::fs;
     use std::sync::MutexGuard;
     use std::time::Duration;
@@ -2723,6 +2745,7 @@ mod tests {
 
     #[test]
     fn find_highlights_matches_and_selects_as_you_type() {
+        let colors = theme::colors();
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         // A tab and a wide character before a match: highlights are in columns.
@@ -2733,16 +2756,16 @@ mod tests {
         editor.find_edit(Edit::Insert("b"));
         assert_eq!(editor.selected_text().as_deref(), Some("ab"));
         assert_eq!(pos(&eb), (0, 6), "the first match after the cursor");
-        let (text, current) = row_with_bg(&editor, 100, 6, 0, CURRENT_MATCH.bg);
+        let (text, current) = row_with_bg(&editor, 100, 6, 0, current_match().bg);
         assert!(text.starts_with(" 1  ab  ab 漢ab "), "{text}");
         assert_eq!(current, "        ##");
-        let (_, others) = row_with_bg(&editor, 100, 6, 0, MATCH_BG);
+        let (_, others) = row_with_bg(&editor, 100, 6, 0, colors.match_bg);
         assert_eq!(others, "    ##       ##");
         // The bar floats at the top right, a column in from the edge.
         let bar = &text[text.find(" ▸ ").unwrap()..];
         assert!(bar.starts_with(" ▸  ab"), "{bar}");
         assert!(bar.ends_with("2 of 4  Aa  ab  .*  ×"), "{bar}");
-        let (_, bar_cells) = row_with_bg(&editor, 100, 6, 0, STATUS_BG);
+        let (_, bar_cells) = row_with_bg(&editor, 100, 6, 0, colors.surface);
         assert_eq!(bar_cells.find('#'), Some(100 - 61));
         assert_eq!(bar_cells.len(), 99);
 
@@ -2760,7 +2783,7 @@ mod tests {
         editor.find_edit(Edit::Insert("zz"));
         assert_eq!(editor.selected_text(), None);
         assert_eq!(pos(&eb), (2, 1));
-        assert!(row_with_bg(&editor, 100, 6, 0, MATCH_BG)
+        assert!(row_with_bg(&editor, 100, 6, 0, colors.match_bg)
             .0
             .contains("no matches"));
         editor.find_edit(Edit::DeleteBackward);
@@ -2771,13 +2794,14 @@ mod tests {
         editor.run(Command::FindClose, false, &mut None);
         assert!(!editor.find_open());
         assert_eq!(editor.selected_text().as_deref(), Some("ab"));
-        let (text, others) = row_with_bg(&editor, 100, 6, 0, MATCH_BG);
+        let (text, others) = row_with_bg(&editor, 100, 6, 0, colors.match_bg);
         assert_eq!(others, "");
         assert!(!text.contains('▸'), "{text}");
     }
 
     #[test]
     fn find_matches_keep_the_color_of_highlighted_text() {
+        let colors = theme::colors();
         const KEYWORD: Rgba = Rgba::rgb(200, 100, 250);
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
@@ -2798,7 +2822,7 @@ mod tests {
         let screen = OwnedBuffer::new(100, 4, false, WidthMethod::Unicode, "test").unwrap();
         draw(&editor, &screen);
         let matched: Vec<u32> = (0..100)
-            .filter(|&x| screen.bg_at(x, 0) == Some(MATCH_BG))
+            .filter(|&x| screen.bg_at(x, 0) == Some(colors.match_bg))
             .collect();
         assert_eq!(matched.len(), 2, "{matched:?}");
         for x in matched {
@@ -2841,7 +2865,10 @@ mod tests {
     const KEYWORD: Rgba = Rgba::indexed(5);
     const FUNCTION: Rgba = Rgba::indexed(4);
     /// Comments are the text's color, dimmed.
-    const COMMENT: (Rgba, Attributes) = (theme::TEXT, Attributes::DIM);
+    /// Comments, as Terminal colors them: the text's color, dimmed.
+    fn comment() -> (Rgba, Attributes) {
+        (theme::colors().text, Attributes::DIM)
+    }
     const STRING: Rgba = Rgba::indexed(2);
 
     #[test]
@@ -2850,12 +2877,12 @@ mod tests {
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("fn main() {}");
         let editor = Editor::new(eb, unnamed(), theme(), 40, 6).unwrap();
-        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(theme::TEXT));
+        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(theme::colors().text));
         let rust = crate::language::all().find(|language| language.name == "Rust");
         editor.document().set_language(rust);
         assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(KEYWORD));
         editor.document().set_language(None);
-        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(theme::TEXT));
+        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(theme::colors().text));
     }
 
     #[test]
@@ -2866,20 +2893,20 @@ mod tests {
         let mut editor = Editor::new(eb.clone(), rust_file(), theme(), 40, 6).unwrap();
         assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(KEYWORD));
         assert_eq!(fg_of(&editor, 40, 6, 0, "main"), Some(FUNCTION));
-        assert_eq!(style_of(&editor, 40, 6, 1, "done"), Some(COMMENT));
+        assert_eq!(style_of(&editor, 40, 6, 1, "done"), Some(comment()));
         // Punctuation isn't colored: it's the terminal's own text color.
-        assert_eq!(fg_of(&editor, 40, 6, 0, "()"), Some(theme::TEXT));
+        assert_eq!(fg_of(&editor, 40, 6, 0, "()"), Some(theme::colors().text));
 
         // A new line above: the colors move down with their text.
         eb.set_cursor(0, 0);
         key(&mut editor, KeyCode::Enter);
         assert_eq!(fg_of(&editor, 40, 6, 1, "fn"), Some(KEYWORD));
-        assert_eq!(style_of(&editor, 40, 6, 2, "done"), Some(COMMENT));
+        assert_eq!(style_of(&editor, 40, 6, 2, "done"), Some(comment()));
 
         // Typing changes what the text is, and undoing changes it back.
         eb.set_cursor(1, 0);
         press(&mut editor, "//");
-        assert_eq!(style_of(&editor, 40, 6, 1, "main"), Some(COMMENT));
+        assert_eq!(style_of(&editor, 40, 6, 1, "main"), Some(comment()));
         ctrl(&mut editor, 'z');
         assert_eq!(fg_of(&editor, 40, 6, 1, "main"), Some(FUNCTION));
         eb.set_cursor(1, 0);
@@ -2892,7 +2919,7 @@ mod tests {
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("fn main() {}");
         let editor = Editor::new(eb, unnamed(), theme(), 40, 6).unwrap();
-        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(theme::TEXT));
+        assert_eq!(fg_of(&editor, 40, 6, 0, "fn"), Some(theme::colors().text));
     }
 
     #[test]
@@ -2901,8 +2928,8 @@ mod tests {
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("/* one\ntwo */ fn a() {}\n\t漢 fn b() {}");
         let editor = Editor::new(eb.clone(), rust_file(), theme(), 40, 6).unwrap();
-        assert_eq!(style_of(&editor, 40, 6, 0, "one"), Some(COMMENT));
-        assert_eq!(style_of(&editor, 40, 6, 1, "two"), Some(COMMENT));
+        assert_eq!(style_of(&editor, 40, 6, 0, "one"), Some(comment()));
+        assert_eq!(style_of(&editor, 40, 6, 1, "two"), Some(comment()));
         assert_eq!(fg_of(&editor, 40, 6, 1, "fn"), Some(KEYWORD));
         assert_eq!(fg_of(&editor, 40, 6, 1, "a()"), Some(FUNCTION));
         // Columns, not bytes: the tab and wide character come before.
@@ -2935,6 +2962,7 @@ mod tests {
 
     #[test]
     fn find_follows_edits_and_undo() {
+        let colors = theme::colors();
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("one x\ntwo x");
@@ -2949,12 +2977,12 @@ mod tests {
         key(&mut editor, KeyCode::Enter);
         press(&mut editor, "x");
         assert_eq!(count(&editor), 3);
-        let (_, marks) = row_with_bg(&editor, 40, 6, 2, MATCH_BG);
+        let (_, marks) = row_with_bg(&editor, 40, 6, 2, colors.match_bg);
         assert_eq!(marks, "        #", "highlights moved down with their line");
         ctrl(&mut editor, 'z');
         ctrl(&mut editor, 'z');
         assert_eq!(count(&editor), 2);
-        let (text, marks) = row_with_bg(&editor, 40, 6, 1, MATCH_BG);
+        let (text, marks) = row_with_bg(&editor, 40, 6, 1, colors.match_bg);
         assert_eq!((text.as_str(), marks.as_str()), (" 2  two x", "        #"));
         // Esc with nothing selected closes the bar.
         key(&mut editor, KeyCode::Esc);
@@ -2963,6 +2991,7 @@ mod tests {
 
     #[test]
     fn replace_one_at_a_time_and_all_at_once() {
+        let colors = theme::colors();
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("a1 a22\nb3 a4");
@@ -2984,9 +3013,9 @@ mod tests {
         editor.run(Command::Replace, false, &mut clipboard);
         assert_eq!(eb.text(), "<1> a22\nb3 a4");
         assert_eq!(editor.selected_text().as_deref(), Some("a22"), "the next");
-        let (bar, _) = row_with_bg(&editor, 40, 8, 0, MATCH_BG);
+        let (bar, _) = row_with_bg(&editor, 40, 8, 0, colors.match_bg);
         assert!(bar.contains("1 of 2"), "{bar}");
-        let (replace_row, _) = row_with_bg(&editor, 40, 8, 1, MATCH_BG);
+        let (replace_row, _) = row_with_bg(&editor, 40, 8, 1, colors.match_bg);
         assert!(
             replace_row.contains("<$1>") && replace_row.contains(" all"),
             "{replace_row}"
@@ -3020,6 +3049,7 @@ mod tests {
 
     #[test]
     fn the_selection_seeds_the_query_and_the_shortcut_toggles_the_bar() {
+        let colors = theme::colors();
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("foo bar foo");
@@ -3050,7 +3080,7 @@ mod tests {
         editor.select_in_line(0, 8..11);
         editor.show_find(&memory, false);
         assert_eq!(editor.find_memory().unwrap().query.text, "foo");
-        let (bar, _) = row_with_bg(&editor, 40, 6, 0, MATCH_BG);
+        let (bar, _) = row_with_bg(&editor, 40, 6, 0, colors.match_bg);
         assert!(bar.contains("2 of 2"), "{bar}");
 
         // An invalid regex says why in the status bar.
@@ -3062,13 +3092,14 @@ mod tests {
             "{}",
             status(&editor)
         );
-        assert!(row_with_bg(&editor, 40, 6, 0, MATCH_BG)
+        assert!(row_with_bg(&editor, 40, 6, 0, colors.match_bg)
             .0
             .contains("invalid regex"));
     }
 
     #[test]
     fn clicks_on_the_find_bar() {
+        let colors = theme::colors();
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         eb.set_text("Foo foo");
@@ -3088,7 +3119,7 @@ mod tests {
             );
         };
         // Clicks land on what was drawn.
-        let (row, _) = row_with_bg(&editor, 40, 6, 0, MATCH_BG);
+        let (row, _) = row_with_bg(&editor, 40, 6, 0, colors.match_bg);
         let column = |row: &str, label: &str| {
             let byte = row.find(label).unwrap();
             row[..byte].chars().count() as u32
@@ -3106,7 +3137,7 @@ mod tests {
         click(&mut editor, column(&row, "▸"), 0);
         assert_eq!(editor.find_field(), Some(Field::Replace));
         editor.find_edit(Edit::Insert("bar"));
-        let (replace_row, _) = row_with_bg(&editor, 40, 6, 1, MATCH_BG);
+        let (replace_row, _) = row_with_bg(&editor, 40, 6, 1, colors.match_bg);
         click(&mut editor, column(&replace_row, "all"), 1);
         assert_eq!(eb.text(), "Foo bar");
         click(&mut editor, column(&row, "×"), 0);

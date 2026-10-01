@@ -1,4 +1,5 @@
 const std = @import("std");
+const ansi = @import("../ansi.zig");
 const buffer = @import("../buffer.zig");
 const compositor = @import("compositor.zig");
 const ghostty = @import("ghostty.zig");
@@ -165,6 +166,27 @@ pub const EmbeddedTerminal = struct {
     pub fn setSearchColors(self: *EmbeddedTerminal, colors: SearchColors) void {
         self.search_colors = colors;
         self.force_redraw = true;
+    }
+
+    /// The colors the program starts with (cue patch): its default text
+    /// and background, and with `palette16`, palette slots 0-15; without, the
+    /// built-in palette. The program can still change them (OSC 4/10/11),
+    /// and asking for them tells it these.
+    pub fn setDefaultColors(self: *EmbeddedTerminal, foreground: buffer.RGBA, background: buffer.RGBA, palette16: ?*const [16]buffer.RGBA) void {
+        const colors = &self.terminal.colors;
+        colors.foreground.default = rgb(foreground);
+        colors.background.default = rgb(background);
+        var palette = ghostty.default_palette;
+        if (palette16) |slots| {
+            for (slots, 0..) |slot, index| palette[index] = rgb(slot);
+        }
+        colors.palette.changeDefault(palette);
+        self.terminal.flags.dirty.palette = true;
+        self.force_redraw = true;
+    }
+
+    fn rgb(color: buffer.RGBA) ghostty.RGB {
+        return .{ .r = ansi.red(color), .g = ansi.green(color), .b = ansi.blue(color) };
     }
 
     pub fn isAlternateScreen(self: *EmbeddedTerminal) bool {

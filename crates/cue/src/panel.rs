@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::Instant;
 
-use opentui::{Attributes, Buffer, Rgba};
+use opentui::{Attributes, Buffer};
 
 use crate::document::{Disk, Document};
-use crate::editor::{Editor, INACTIVE_STATUS_BG, STATUS_BG, STATUS_DIM, STATUS_FG};
+use crate::editor::Editor;
 use crate::icons::{self, Icon};
 use crate::image::ImageView;
 use crate::input::{Mouse, MouseKind};
@@ -31,6 +31,7 @@ use crate::keymap::{Command, Keymap};
 use crate::layout::{PanelId, Rect};
 use crate::status::Status;
 use crate::terminal::{self, Terminal};
+use crate::theme;
 use crate::workspace::Workspace;
 
 /// What an empty panel suggests.
@@ -47,8 +48,6 @@ const BUTTONS: [(HeaderButton, &str); 3] = [
 const BUTTON_WIDTH: u32 = 3;
 /// Headers narrower than this leave the buttons out, for the name.
 const MIN_BUTTONS_WIDTH: u32 = 24;
-/// A button with nothing to do: back or forward with no history that way.
-const BUTTON_DISABLED: Rgba = Rgba::rgb(88, 91, 112);
 
 /// A button at the right end of a panel's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -553,11 +552,12 @@ impl Panel {
     /// Draws the header's buttons over it, in its color, and dimmer where
     /// there's nothing to go back or forward to.
     fn draw_buttons(&self, frame: &Buffer, active: bool) {
-        let fg = if active { STATUS_FG } else { STATUS_DIM };
+        let colors = theme::colors();
+        let fg = if active { colors.text } else { colors.muted };
         for (button, label, x) in self.buttons() {
             let fg = match button {
-                HeaderButton::Back if !self.can_go(true) => BUTTON_DISABLED,
-                HeaderButton::Forward if !self.can_go(false) => BUTTON_DISABLED,
+                HeaderButton::Back if !self.can_go(true) => colors.border,
+                HeaderButton::Forward if !self.can_go(false) => colors.border,
                 _ => fg,
             };
             frame.draw_text(label, x, self.area.y, fg, None, Attributes::NONE);
@@ -567,11 +567,12 @@ impl Panel {
     /// The title the program set, or the program running, then dimmed,
     /// whether the shell exited.
     fn draw_terminal_header(&self, frame: &Buffer, terminal: &Terminal, active: bool) {
+        let colors = theme::colors();
         let area = self.area;
         let (bg, fg) = if active {
-            (STATUS_BG, STATUS_FG)
+            (colors.surface, colors.text)
         } else {
-            (INACTIVE_STATUS_BG, STATUS_DIM)
+            (colors.surface_inactive, colors.muted)
         };
         frame.fill_rect(area.x, area.y, area.width, 1, bg);
         let width = self.title_width();
@@ -590,7 +591,7 @@ impl Panel {
             let note = format!("[{}]", terminal::describe_exit(status).to_lowercase());
             if used + note.chars().count() < width as usize {
                 let x = area.x + used as u32;
-                frame.draw_text(&note, x, area.y, STATUS_DIM, None, Attributes::NONE);
+                frame.draw_text(&note, x, area.y, colors.muted, None, Attributes::NONE);
             }
         }
     }
@@ -599,11 +600,12 @@ impl Panel {
     /// it changed on disk meanwhile or is gone, then dimmed, the folder
     /// it's in. Images have only the name and folder.
     fn draw_header(&self, frame: &Buffer, workspace: &Workspace, active: bool, preview: bool) {
+        let colors = theme::colors();
         let area = self.area;
         let (bg, fg) = if active {
-            (STATUS_BG, STATUS_FG)
+            (colors.surface, colors.text)
         } else {
-            (INACTIVE_STATUS_BG, STATUS_DIM)
+            (colors.surface_inactive, colors.muted)
         };
         frame.fill_rect(area.x, area.y, area.width, 1, bg);
         let width = self.title_width();
@@ -623,7 +625,7 @@ impl Panel {
                     " No file",
                     area.x,
                     area.y,
-                    STATUS_DIM,
+                    colors.muted,
                     None,
                     Attributes::NONE,
                 );
@@ -659,12 +661,13 @@ impl Panel {
         if !folder.is_empty() && room > 1 {
             let folder = truncate_left(&folder, room);
             let x = area.x + used as u32;
-            frame.draw_text(&folder, x, area.y, STATUS_DIM, None, Attributes::NONE);
+            frame.draw_text(&folder, x, area.y, colors.muted, None, Attributes::NONE);
         }
     }
 
     /// Lists shortcuts to open something, centered below the header.
     fn draw_empty(&self, frame: &Buffer, keymap: &Keymap) {
+        let colors = theme::colors();
         let body = self.body();
         let lines: Vec<(&str, String)> = SUGGESTIONS
             .iter()
@@ -687,9 +690,9 @@ impl Panel {
             let y = body.y + (body.height - lines.len() as u32) / 2;
             for (i, (title, key)) in lines.iter().enumerate() {
                 let y = y + i as u32;
-                frame.draw_text(title, x, y, STATUS_DIM, None, Attributes::NONE);
+                frame.draw_text(title, x, y, colors.muted, None, Attributes::NONE);
                 let key_x = x + width - key.len() as u32;
-                frame.draw_text(key, key_x, y, STATUS_FG, None, Attributes::NONE);
+                frame.draw_text(key, key_x, y, colors.text, None, Attributes::NONE);
             }
         }
     }
@@ -703,7 +706,7 @@ fn header_icon(frame: &Buffer, icon: Icon, area: Rect, active: bool) -> u32 {
     if !icons::enabled() || area.width < 1 + 3 * icons::WIDTH {
         return 0;
     }
-    let dim = (!active).then_some(STATUS_DIM);
+    let dim = (!active).then(|| theme::colors().muted);
     icon.draw(frame, area.x + 1, area.y, dim);
     icons::WIDTH
 }

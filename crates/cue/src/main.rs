@@ -37,13 +37,14 @@ mod watch;
 mod words;
 mod workspace;
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use opentui::{Output, Renderer};
+use opentui::{Output, Renderer, Rgba};
 
 #[cfg(target_env = "musl")]
 #[global_allocator]
@@ -179,6 +180,10 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     // Clicks, drags, and the wheel; plain motion isn't needed.
     renderer.enable_mouse(false);
     let mut parser = Parser::new();
+    // What was typed while waiting for the terminal's colors.
+    let mut typed = ask_colors_first(&mut renderer, &mut parser, &mut app)?;
+    // Dropped before the renderer, putting the terminal's background back.
+    let mut host_colors = HostColors { background: None };
     for signal in [libc::SIGHUP, libc::SIGTERM] {
         unsafe {
             libc::signal(
@@ -192,6 +197,8 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     // sequence split across reads.
     let mut last_input = Instant::now();
     loop {
+        app.update_theme();
+        host_colors.apply(&mut renderer, &mut app);
         {
             let frame = renderer.next_buffer()?;
             match app.draw(&frame) {
@@ -205,35 +212,39 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
         // Wait for input, or output in a terminal; after a partial
         // sequence, only briefly.
         let mut changed = false;
-        let mut events = loop {
-            let mut timeout = IDLE_POLL;
-            if parser.has_pending() {
-                timeout = timeout.min(ESC_TIMEOUT.saturating_sub(last_input.elapsed()));
-            }
-            if changed {
-                timeout = timeout.min(FRAME.saturating_sub(drawn.elapsed()));
-            }
-            let bytes = tty::read_input(timeout, &app.watched())?;
-            // Dropping the app copies what's unsaved.
-            if HUNG_UP.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            let events = if !bytes.is_empty() {
-                last_input = Instant::now();
-                parser.feed(&bytes)
-            } else if parser.has_pending() && last_input.elapsed() >= ESC_TIMEOUT {
-                parser.flush()
-            } else {
-                Vec::new()
-            };
-            changed |= app.poll();
-            if let Some(text) = app.take_copied() {
-                renderer.copy_to_clipboard(&text);
-            }
-            changed |= renderer.poll_kitty_image_transport();
-            let resized = tty::size() != (width, height);
-            if !events.is_empty() || resized || (changed && drawn.elapsed() >= FRAME) {
-                break events;
+        let mut events = if !typed.is_empty() {
+            std::mem::take(&mut typed)
+        } else {
+            loop {
+                let mut timeout = IDLE_POLL;
+                if parser.has_pending() {
+                    timeout = timeout.min(ESC_TIMEOUT.saturating_sub(last_input.elapsed()));
+                }
+                if changed {
+                    timeout = timeout.min(FRAME.saturating_sub(drawn.elapsed()));
+                }
+                let bytes = tty::read_input(timeout, &app.watched())?;
+                // Dropping the app copies what's unsaved.
+                if HUNG_UP.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let events = if !bytes.is_empty() {
+                    last_input = Instant::now();
+                    parser.feed(&bytes)
+                } else if parser.has_pending() && last_input.elapsed() >= ESC_TIMEOUT {
+                    parser.flush()
+                } else {
+                    Vec::new()
+                };
+                changed |= app.poll();
+                if let Some(text) = app.take_copied() {
+                    renderer.copy_to_clipboard(&text);
+                }
+                changed |= renderer.poll_kitty_image_transport();
+                let resized = tty::size() != (width, height);
+                if !events.is_empty() || resized || (changed && drawn.elapsed() >= FRAME) {
+                    break events;
+                }
             }
         };
 
@@ -246,9 +257,7 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                     AppAction::Continue
                 }
                 Event::Reply(bytes) => {
-                    if !renderer.process_kitty_image_reply(&bytes) {
-                        renderer.process_capability_response(&bytes);
-                    }
+                    take_reply(&mut renderer, &mut app, &bytes);
                     AppAction::Continue
                 }
             };
@@ -270,6 +279,106 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
             renderer.resize(width, height);
             app.resize(width, height);
         }
+    }
+}
+
+/// How long to wait at startup for the terminal to say what its colors
+/// are, before drawing without them.
+const COLORS_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Asks the terminal what its colors are, the theme's made of or picked
+/// by, and waits for the answer, so the first frame has them. Returns what
+/// was typed meanwhile.
+fn ask_colors_first(
+    renderer: &mut Renderer,
+    parser: &mut Parser,
+    app: &mut App,
+) -> std::io::Result<Vec<Event>> {
+    ask_colors();
+    let asked = Instant::now();
+    let mut typed = Vec::new();
+    while let Some(left) = COLORS_TIMEOUT.checked_sub(asked.elapsed()) {
+        let bytes = tty::read_input(left, &[])?;
+        let mut answered = false;
+        for event in parser.feed(&bytes) {
+            match event {
+                Event::Reply(bytes) => {
+                    answered |= bytes == theme::ASKED_LAST;
+                    take_reply(renderer, app, &bytes);
+                }
+                event => typed.push(event),
+            }
+        }
+        if answered {
+            break;
+        }
+    }
+    Ok(typed)
+}
+
+fn ask_colors() {
+    write_to_terminal(&theme::color_queries());
+}
+
+fn write_to_terminal(text: &str) {
+    let mut stdout = std::io::stdout().lock();
+    // The terminal is gone if this fails, which reading input finds out.
+    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// The terminal's own colors, as the theme and the settings have them: the
+/// cursor's (OSC 12), and the background's (OSC 11), which is put back when
+/// cue exits.
+struct HostColors {
+    /// The background cue gave the terminal, if it did.
+    background: Option<[u8; 3]>,
+}
+
+impl HostColors {
+    fn apply(&mut self, renderer: &mut Renderer, app: &mut App) {
+        let colors = theme::colors();
+        let config = config::get();
+        renderer.set_cursor_color(match config.cursor_color {
+            true => colors.cursor,
+            false => Rgba::terminal_default([255; 3]),
+        });
+        let bg = colors.bg;
+        let background = (config.terminal_background && !bg.is_terminal_default())
+            .then(|| [bg.r(), bg.g(), bg.b()]);
+        if background == self.background {
+            return;
+        }
+        write_to_terminal(&theme::set_background(background));
+        self.background = background;
+        app.set_terminal_background(background.is_some());
+        if background.is_none() {
+            // Its own may have changed meanwhile, as from dark to light.
+            ask_colors();
+        }
+    }
+}
+
+impl Drop for HostColors {
+    fn drop(&mut self) {
+        if self.background.is_some() {
+            write_to_terminal(&theme::set_background(None));
+        }
+    }
+}
+
+/// Takes a terminal's reply to a query: about its colors, for the theme,
+/// or to the renderer's.
+fn take_reply(renderer: &mut Renderer, app: &mut App, bytes: &[u8]) {
+    if theme::appearance_change(bytes).is_some() {
+        // Switched between dark and light: its colors are new.
+        ask_colors();
+    }
+    if app.take_terminal_reply(bytes) {
+        return;
+    }
+    if !renderer.process_kitty_image_reply(bytes) {
+        renderer.process_capability_response(bytes);
     }
 }
 

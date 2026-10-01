@@ -322,6 +322,8 @@ pub const CliRenderer = struct {
     lastCursorStyleTag: ?u8 = null,
     lastCursorBlinking: ?bool = null,
     lastCursorColorRGB: ?[3]u8 = null,
+    /// Whether the cursor was last given the terminal's own color (cue patch).
+    lastCursorColorDefault: bool = false,
     // Cursor diff cache. If nothing changed we avoid emitting cursor restore/show
     // sequences for no-op frames, which removes a major source of visible flicker.
     lastCursorX: ?u32 = null,
@@ -2967,7 +2969,10 @@ pub const CliRenderer = struct {
             const styleTag: u8 = @intFromEnum(cursorStyle.style);
             const styleChanged = (self.lastCursorStyleTag == null or self.lastCursorStyleTag.? != styleTag) or
                 (self.lastCursorBlinking == null or self.lastCursorBlinking.? != cursorStyle.blinking);
-            const colorChanged = (self.lastCursorColorRGB == null or self.lastCursorColorRGB.?[0] != cursorR or self.lastCursorColorRGB.?[1] != cursorG or self.lastCursorColorRGB.?[2] != cursorB);
+            // A cursor color with the default intent is the terminal's own
+            // (cue patch): reset to it rather than set an RGB snapshot.
+            const cursorDefault = ansi.intent(cursorColor) == .default;
+            const colorChanged = (self.lastCursorColorRGB == null or self.lastCursorColorRGB.?[0] != cursorR or self.lastCursorColorRGB.?[1] != cursorG or self.lastCursorColorRGB.?[2] != cursorB) or self.lastCursorColorDefault != cursorDefault;
             const cursorX = cursorPos.x;
             const cursorY = cursorPos.y + self.renderOffset;
             const positionChanged = self.lastCursorX == null or self.lastCursorY == null or self.lastCursorX.? != cursorX or self.lastCursorY.? != cursorY;
@@ -2984,8 +2989,13 @@ pub const CliRenderer = struct {
                 }
 
                 if (colorChanged) {
-                    ansi.ANSI.cursorColorOutputWriter(writer, cursorR, cursorG, cursorB) catch {};
+                    if (cursorDefault) {
+                        writer.writeAll(ansi.ANSI.resetCursorColor) catch {};
+                    } else {
+                        ansi.ANSI.cursorColorOutputWriter(writer, cursorR, cursorG, cursorB) catch {};
+                    }
                     self.lastCursorColorRGB = .{ cursorR, cursorG, cursorB };
+                    self.lastCursorColorDefault = cursorDefault;
                 }
                 if (styleChanged) {
                     writer.writeAll(cursorStyleCode) catch {};

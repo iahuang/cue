@@ -52,10 +52,6 @@
 	- non-UTF-8 files: currently refused outright; latin-1 fallback or read-only lossy view
 	- binary / huge files: guard or warn before opening a 2GB log or a binary
 
-- truecolor theming support
-	- ship a few well known themes
-	- default to a theme based off the terminal's current theme colors. extra granularity (e.g. dimmed text, alternate background colors maybe automatically build variants based off of reported bg/fg colors gathered from terminal reporting)
-
 - git integrations
 	- show staged, unstaged changes
 	- allow commits to be performed

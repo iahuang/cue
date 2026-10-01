@@ -31,7 +31,7 @@ use opentui::{
 };
 
 use crate::config;
-use crate::editor::CURRENT_MATCH;
+use crate::editor::current_match;
 use crate::find::{self, Field, FindBar, Match};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind};
 use crate::keymap::Keymap;
@@ -41,7 +41,7 @@ use crate::location::{self, Target};
 use crate::pty::Pty;
 use crate::search::Toggle;
 use crate::status::{Prompt, PromptKey, Status};
-use crate::theme::MATCH_BG;
+use crate::theme;
 
 /// At most this much output is read per poll, so a flood of it can't keep
 /// the screen from being drawn, or keys from being read.
@@ -100,14 +100,32 @@ impl Find {
     }
 }
 
+/// Gives `vt` the theme's colors: its palette, or the terminal's own.
+fn restyle(vt: &mut EmbeddedTerminal) {
+    let colors = theme::colors();
+    match colors.terminal {
+        Some(palette) => {
+            vt.set_host_palette(palette.ansi.is_none());
+            vt.set_default_colors(palette.fg, palette.bg, palette.ansi.as_ref());
+        }
+        None => vt.set_host_palette(true),
+    }
+    let current = current_match();
+    vt.set_search_colors((None, colors.match_bg), (current.fg, current.bg));
+}
+
 impl Terminal {
+    /// Puts the theme in use.
+    pub fn restyle(&mut self) {
+        restyle(&mut self.vt);
+    }
+
     /// Starts a shell in `cwd`, on a screen the size of `area`.
     pub fn new(id: u32, cwd: &Path, area: Rect) -> io::Result<Terminal> {
         let (cols, rows) = size(area);
         let mut vt = EmbeddedTerminal::new(cols, rows, config::get().scrollback)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        vt.set_host_palette(true);
-        vt.set_search_colors((None, MATCH_BG), (CURRENT_MATCH.fg, CURRENT_MATCH.bg));
+        restyle(&mut vt);
         let pty = Pty::shell(cwd, cols, rows)?;
         Ok(Terminal {
             id,

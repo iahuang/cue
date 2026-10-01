@@ -176,6 +176,12 @@ impl Renderer {
         unsafe { sys::setBackgroundColor(self.handle, color.as_ptr()) }
     }
 
+    /// The cursor's color. One made with [`Rgba::terminal_default`] is the
+    /// terminal's own.
+    pub fn set_cursor_color(&mut self, color: Rgba) {
+        unsafe { sys::setCursorColor(self.handle, color.as_ptr()) }
+    }
+
     /// Positions the terminal cursor (1-based, like the native API).
     pub fn set_cursor_position(&mut self, x: i32, y: i32, visible: bool) {
         unsafe { sys::setCursorPosition(self.handle, x, y, visible) }

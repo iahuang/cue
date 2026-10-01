@@ -424,6 +424,33 @@ test "embedded terminal composes host palette colors as the host terminal's" {
     try std.testing.expectEqual(ansi.ColorIntent.default, ansi.intent(target.get(5, 0).?.bg));
 }
 
+test "embedded terminal starts with the default colors it is given (cue patch)" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    var target = try buffer.OptimizedBuffer.init(std.testing.allocator, 3, 1, .{ .pool = pool });
+    defer target.deinit();
+
+    const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 3, .rows = 1 });
+    defer terminal.deinit();
+    var palette16: [16]buffer.RGBA = undefined;
+    for (&palette16, 0..) |*slot, index| slot.* = ansi.rgbColor(@intCast(index), 0, 0, 255);
+    palette16[1] = ansi.rgbColor(0xff, 0x55, 0x55, 255);
+    terminal.setDefaultColors(ansi.rgbColor(0xf8, 0xf8, 0xf2, 255), ansi.rgbColor(0x28, 0x2a, 0x36, 255), &palette16);
+    try terminal.write("a\x1b[31mb\x1b]11;?\x07");
+    try terminal.compose(target, 0, 0);
+
+    const plain = target.get(0, 0).?;
+    try std.testing.expectEqual(@as(u8, 0xf8), ansi.red(plain.fg));
+    try std.testing.expectEqual(@as(u8, 0x28), ansi.red(plain.bg));
+    const red = target.get(1, 0).?;
+    try std.testing.expectEqual(ansi.ColorIntent.rgb, ansi.intent(red.fg));
+    try std.testing.expectEqual(@as(u8, 0x55), ansi.green(red.fg));
+    // Programs that ask are told the background.
+    var reply: [64]u8 = undefined;
+    const len = try terminal.drainResponses(&reply);
+    try std.testing.expect(std.mem.find(u8, reply[0..len], "rgb:2828/2a2a/3636") != null);
+}
+
 test "embedded terminal composition respects the scissor rect" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

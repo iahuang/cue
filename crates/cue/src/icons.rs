@@ -8,19 +8,20 @@
 
 use opentui::{Attributes, Buffer, Rgba};
 
-// Catppuccin Mocha, like the rest of the interface.
-const BLUE: Rgba = Rgba::rgb(137, 180, 250);
-const SAPPHIRE: Rgba = Rgba::rgb(116, 199, 236);
-const SKY: Rgba = Rgba::rgb(137, 220, 235);
-const TEAL: Rgba = Rgba::rgb(148, 226, 213);
-const GREEN: Rgba = Rgba::rgb(166, 227, 161);
-const YELLOW: Rgba = Rgba::rgb(249, 226, 175);
-const PEACH: Rgba = Rgba::rgb(250, 179, 135);
-const RED: Rgba = Rgba::rgb(243, 139, 168);
-const PINK: Rgba = Rgba::rgb(245, 194, 231);
-const MAUVE: Rgba = Rgba::rgb(203, 166, 247);
-const LAVENDER: Rgba = Rgba::rgb(180, 190, 254);
-const GRAY: Rgba = Rgba::rgb(147, 153, 178);
+use crate::theme::{self, Hue};
+
+const BLUE: Hue = Hue::Blue;
+const SAPPHIRE: Hue = Hue::Sapphire;
+const SKY: Hue = Hue::Sky;
+const TEAL: Hue = Hue::Teal;
+const GREEN: Hue = Hue::Green;
+const YELLOW: Hue = Hue::Yellow;
+const PEACH: Hue = Hue::Peach;
+const RED: Hue = Hue::Red;
+const PINK: Hue = Hue::Pink;
+const MAUVE: Hue = Hue::Mauve;
+const LAVENDER: Hue = Hue::Lavender;
+const GRAY: Hue = Hue::Gray;
 
 /// Columns an icon takes, with the space after it.
 pub const WIDTH: u32 = 2;
@@ -28,11 +29,12 @@ pub const WIDTH: u32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Icon {
     pub glyph: char,
-    pub color: Rgba,
+    /// Its color, in the theme in use.
+    pub color: Hue,
 }
 
 impl Icon {
-    const fn new(glyph: char, color: Rgba) -> Icon {
+    const fn new(glyph: char, color: Hue) -> Icon {
         Icon { glyph, color }
     }
 
@@ -44,7 +46,7 @@ impl Icon {
             &glyph,
             x,
             y,
-            fg.unwrap_or(self.color),
+            fg.unwrap_or_else(|| theme::colors().hue(self.color)),
             None,
             Attributes::NONE,
         );

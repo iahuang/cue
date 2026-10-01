@@ -339,6 +339,24 @@ export fn embeddedTerminalSetHostPalette(handle: NativeHandle, enabled: u8) i32 
     return 0;
 }
 
+/// Sets the colors the program starts with (cue patch): `fg` and `bg`, and
+/// palette slots 0-15 from `ansi_ptr` (16 colors), or the built-in palette
+/// if it's null. Only their RGB is used.
+export fn embeddedTerminalSetDefaultColors(
+    handle: NativeHandle,
+    fg: [*]const u16,
+    bg: [*]const u16,
+    ansi_ptr: ?[*]const u16,
+) i32 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    var palette16: [16]RGBA = undefined;
+    if (ansi_ptr) |slots| {
+        for (&palette16, 0..) |*slot, index| slot.* = ptrToRGBA(slots + index * 4);
+    }
+    terminal_value.setDefaultColors(ptrToRGBA(fg), ptrToRGBA(bg), if (ansi_ptr != null) &palette16 else null);
+    return 0;
+}
+
 export fn embeddedTerminalScrollToBottom(handle: NativeHandle) i32 {
     const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
     terminal_value.scrollToBottom();

@@ -227,6 +227,16 @@ impl EmbeddedTerminal {
         unsafe { sys::embeddedTerminalSetHostPalette(self.handle, enabled as u8) };
     }
 
+    /// The colors the program starts with: its default text and background,
+    /// and palette slots 0-15, or the built-in ones without `ansi`. It can
+    /// change them itself, and asking for them tells it these.
+    pub fn set_default_colors(&mut self, fg: Rgba, bg: Rgba, ansi: Option<&[Rgba; 16]>) {
+        let ansi = ansi.map_or(std::ptr::null(), |colors| colors.as_ptr().cast::<u16>());
+        unsafe {
+            sys::embeddedTerminalSetDefaultColors(self.handle, fg.as_ptr(), bg.as_ptr(), ansi)
+        };
+    }
+
     /// Scrolls the view through the scrollback by `delta` rows, up if
     /// negative.
     pub fn scroll(&mut self, delta: i32) {

@@ -4216,6 +4216,36 @@ test "FeedBackend - failed frame retries unsent terminal controls" {
     try std.testing.expect(std.mem.find(u8, output[0..output_len], "\x1b]22;pointer\x1b\\") != null);
 }
 
+test "a cursor in the terminal's default color resets it (cue patch)" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    _ = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    const feed = try native_span_feed.Stream.create(std.testing.allocator, native_span_feed.defaultOptions());
+    var cli_renderer = try CliRenderer.createWithOptions(std.testing.allocator, 1, 1, pool, .{
+        .remote_mode = .remote,
+        .output = .{ .feed = feed },
+        .clearOnShutdown = false,
+    });
+    defer feed.destroy();
+    defer cli_renderer.destroy();
+
+    cli_renderer.terminal.setCursorPosition(1, 1, true);
+    cli_renderer.terminal.setCursorColor(ansi.defaultColor(255, 255, 255, 255));
+    try std.testing.expectEqual(renderer.RenderStatus.rendered, cli_renderer.render(false));
+    var spans: [8]native_span_feed.SpanInfo = undefined;
+    const count = feed.drainSpans(&spans);
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    for (spans[0..count]) |span| {
+        try output.appendSlice(std.testing.allocator, span.slice());
+        feed.markSpanConsumed(span);
+    }
+    try std.testing.expect(std.mem.find(u8, output.items, ansi.ANSI.resetCursorColor) != null);
+    try std.testing.expect(std.mem.find(u8, output.items, "\x1b]12;#") == null);
+}
+
 test "FeedBackend - failed Sixel frame does not publish an unterminated DCS" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

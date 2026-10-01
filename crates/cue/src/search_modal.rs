@@ -17,13 +17,10 @@ use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::{Caret, Edit};
-use crate::picker::{self, Area, DIM, FG, MATCH_FG, SELECTED_BG};
+use crate::picker::{self, Area};
 use crate::search::{FileMatches, Found, Line, Query, Search, Toggle, CONTEXT_LINES};
+use crate::theme;
 use crate::workspace::Workspace;
-
-const LINE_NUMBER: Rgba = Rgba::rgb(108, 112, 134);
-const MATCH_BG: Rgba = Rgba::rgb(49, 50, 68);
-const ERROR: Rgba = Rgba::rgb(243, 139, 168);
 
 /// The widest the popup gets, in columns.
 const MAX_WIDTH: u32 = 160;
@@ -578,6 +575,7 @@ impl SearchModal {
     // --- drawing ---------------------------------------------------------------
 
     fn draw_popup(&self, frame: &Buffer, area: Area) -> (u32, u32) {
+        let colors = theme::colors();
         let Area { x, y, width, .. } = area;
         picker::draw_frame(frame, area, "Search");
         let bottom = area.y + area.height - 1;
@@ -585,7 +583,14 @@ impl SearchModal {
         picker::draw_status(frame, area, &status);
         let hints_room = width.saturating_sub(status.chars().count() as u32 + 6) as usize;
         if self.hints.chars().count() <= hints_room {
-            frame.draw_text(&self.hints, x + 2, bottom, DIM, None, Attributes::NONE);
+            frame.draw_text(
+                &self.hints,
+                x + 2,
+                bottom,
+                colors.muted,
+                None,
+                Attributes::NONE,
+            );
         }
 
         // The query, the cursor kept in view, and the toggles right of it.
@@ -593,22 +598,36 @@ impl SearchModal {
         let text_x = x + 2;
         let room = toggles[0].1.start.saturating_sub(text_x + 1) as usize;
         let (shown, column) = self.caret.view(&self.query.text, room);
-        let query_bg = self.replace_query.then_some(SELECTED_BG);
-        frame.draw_text(&shown, text_x, y + 1, FG, query_bg, Attributes::NONE);
+        let query_bg = self.replace_query.then_some(colors.selected);
+        frame.draw_text(
+            &shown,
+            text_x,
+            y + 1,
+            colors.text,
+            query_bg,
+            Attributes::NONE,
+        );
         let cursor = (text_x + column as u32, y + 1);
         if self.query.text.is_empty() {
             let hint: String = "Search in files"
                 .chars()
                 .take(room.saturating_sub(1))
                 .collect();
-            frame.draw_text(&hint, cursor.0 + 1, y + 1, DIM, None, Attributes::NONE);
+            frame.draw_text(
+                &hint,
+                cursor.0 + 1,
+                y + 1,
+                colors.muted,
+                None,
+                Attributes::NONE,
+            );
         }
         for (toggle, columns) in toggles {
             let on = toggle.is_on(&self.query);
             let (fg, bg, attributes) = if on {
-                (FG, Some(SELECTED_BG), Attributes::BOLD)
+                (colors.text, Some(colors.selected), Attributes::BOLD)
             } else {
-                (DIM, None, Attributes::NONE)
+                (colors.muted, None, Attributes::NONE)
             };
             let label = format!(" {} ", toggle.label());
             frame.draw_text(&label, columns.start, y + 1, fg, bg, attributes);
@@ -640,7 +659,7 @@ impl SearchModal {
                         "⋯",
                         text_x + 1,
                         screen_y,
-                        LINE_NUMBER,
+                        colors.faint,
                         None,
                         Attributes::NONE,
                     );
@@ -653,8 +672,9 @@ impl SearchModal {
 
     /// What to show instead of results, if anything.
     fn message(&self) -> Option<(String, Rgba)> {
+        let colors = theme::colors();
         if let Some(error) = &self.error {
-            return Some((format!("Invalid regex: {error}"), ERROR));
+            return Some((format!("Invalid regex: {error}"), colors.error));
         }
         if !self.files.is_empty() && !self.query.text.is_empty() {
             return None;
@@ -666,7 +686,7 @@ impl SearchModal {
         } else {
             "No matches."
         };
-        Some((text.to_string(), DIM))
+        Some((text.to_string(), colors.muted))
     }
 
     /// The counts for the bottom border.
@@ -696,10 +716,11 @@ impl SearchModal {
 
     /// A file's path, its folder dimmed, and its match count on the right.
     fn draw_file(&self, frame: &Buffer, file: &FileMatches, x: u32, y: u32, room: u32) {
+        let colors = theme::colors();
         let count = file.match_count.to_string();
         let count_width = count.chars().count() as u32;
         let count_x = x + room.saturating_sub(count_width);
-        frame.draw_text(&count, count_x, y, DIM, None, Attributes::NONE);
+        frame.draw_text(&count, count_x, y, colors.muted, None, Attributes::NONE);
         let mut room = room.saturating_sub(count_width + 2) as usize;
         let mut x = x;
         if icons::enabled() && room > 2 * icons::WIDTH as usize {
@@ -715,7 +736,7 @@ impl SearchModal {
             (&chars[chars.len() + 1 - room.max(1)..], true)
         };
         if cut {
-            frame.draw_text("…", x, y, DIM, None, Attributes::NONE);
+            frame.draw_text("…", x, y, colors.muted, None, Attributes::NONE);
             x += 1;
         }
         let name_start = shown
@@ -724,9 +745,9 @@ impl SearchModal {
             .map_or(0, |slash| slash + 1);
         let folder: String = shown[..name_start].iter().collect();
         let name: String = shown[name_start..].iter().collect();
-        frame.draw_text(&folder, x, y, DIM, None, Attributes::NONE);
+        frame.draw_text(&folder, x, y, colors.muted, None, Attributes::NONE);
         let name_x = x + folder.chars().count() as u32;
-        frame.draw_text(&name, name_x, y, FG, None, Attributes::BOLD);
+        frame.draw_text(&name, name_x, y, colors.text, None, Attributes::BOLD);
     }
 
     /// A line of a file: its number, then its text in its syntax colors with
@@ -743,10 +764,11 @@ impl SearchModal {
         y: u32,
         room: u32,
     ) {
+        let colors = theme::colors();
         let (number_fg, number_attributes) = if selected.is_some() {
-            (FG, Attributes::BOLD)
+            (colors.text, Attributes::BOLD)
         } else {
-            (LINE_NUMBER, Attributes::NONE)
+            (colors.faint, Attributes::NONE)
         };
         let number = format!("{:>digits$}", line.number + 1);
         frame.draw_text(&number, x, y, number_fg, None, number_attributes);
@@ -765,14 +787,14 @@ impl SearchModal {
             let hit = matches.iter().position(|m| m.contains(&byte));
             match hit {
                 Some(index) if Some(index) == selected => {
-                    (BG_TEXT, Some(MATCH_FG), Attributes::BOLD)
+                    (colors.on_accent, Some(colors.accent), Attributes::BOLD)
                 }
-                Some(_) => (MATCH_FG, Some(MATCH_BG), Attributes::BOLD),
+                Some(_) => (colors.accent, Some(colors.surface), Attributes::BOLD),
                 None => match syntax.peek() {
                     Some((bytes, color)) if bytes.start <= byte => {
-                        (color.fg().unwrap_or(FG), None, color.attributes())
+                        (color.fg().unwrap_or(colors.text), None, color.attributes())
                     }
-                    _ => (FG, None, Attributes::NONE),
+                    _ => (colors.text, None, Attributes::NONE),
                 },
             }
         };
@@ -810,7 +832,7 @@ impl SearchModal {
         if shown.is_empty() {
             return;
         }
-        let ellipsis = ('…', (DIM, None, Attributes::NONE));
+        let ellipsis = ('…', (colors.muted, None, Attributes::NONE));
         if shift > 0 || line.start > 0 {
             shown[0] = ellipsis;
         }
@@ -829,9 +851,6 @@ impl SearchModal {
 }
 
 type Style = (Rgba, Option<Rgba>, Attributes);
-
-/// Text on a highlighted background.
-const BG_TEXT: Rgba = Rgba::rgb(30, 30, 46);
 
 /// Files sort by path ignoring case, as in the tree and the file picker.
 fn sort_key(display: &str) -> (String, &str) {

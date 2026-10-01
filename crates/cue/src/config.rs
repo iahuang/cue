@@ -20,6 +20,7 @@ use toml::{Table, Value};
 use crate::indent::Indent;
 use crate::input::{Key, KeyCode};
 use crate::keymap::{Command, Context};
+use crate::theme::{ThemeId, ThemeSetting};
 
 /// The settings, each named as in the file.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +36,16 @@ pub struct Config {
     /// `editor.scroll_margin`: the part of the view, up to half, kept
     /// between the cursor and the view's edges.
     pub scroll_margin: f32,
+    /// `ui.theme`: the colors, by a theme's name, or one for when the
+    /// terminal is dark and one for when it's light.
+    pub theme: ThemeSetting,
+    /// `ui.terminal_background`: whether a theme other than Terminal sets
+    /// the terminal's own background (OSC 11), so what's around the text,
+    /// such as the window's padding, is the theme's too.
+    pub terminal_background: bool,
+    /// `ui.cursor_color`: whether a theme other than Terminal colors the
+    /// cursor (OSC 12), rather than leaving it the terminal's color.
+    pub cursor_color: bool,
     /// `ui.nerd_font`: whether to show file icons, which need a Nerd Font.
     /// `CUE_NERD_FONT` overrides it.
     pub nerd_font: bool,
@@ -62,6 +73,9 @@ impl Default for Config {
             indent: Indent::Spaces(4),
             wrap: true,
             scroll_margin: 0.15,
+            theme: ThemeSetting::default(),
+            terminal_background: true,
+            cursor_color: true,
             nerd_font: false,
             tree: true,
             tree_width: 30,
@@ -94,6 +108,15 @@ pub const TEMPLATE: &str = r#"# cue settings. Uncomment a line to change it; the
 # scroll_margin = 0.15
 
 [ui]
+# The colors. "Terminal" is the terminal's own; Select Theme in the command
+# palette shows the rest. A theme for a dark terminal and one for a light:
+# theme = { dark = "Cue Dark", light = "GitHub Light" }
+# theme = "Terminal"
+# Whether a theme other than Terminal makes the terminal's own background
+# its own, so the window's padding matches, and back when cue quits.
+# terminal_background = true
+# Whether a theme other than Terminal colors the cursor.
+# cursor_color = true
 # File icons. They need a Nerd Font; CUE_NERD_FONT=1 turns them on too.
 # nerd_font = false
 # Whether the file tree shows at first, and how wide.
@@ -252,6 +275,27 @@ impl Config {
                 }
                 self.scroll_margin = margin as f32;
             }
+            "ui.theme" => {
+                const EXPECTED: &str = "a theme's name, as Select Theme lists them, or { dark = \"…\", light = \"…\" }";
+                let named = |value: Option<&Value>| match value {
+                    None => Some(ThemeId::TERMINAL),
+                    Some(value) => ThemeId::named(value.as_str()?),
+                };
+                self.theme = match value {
+                    Value::String(name) => ThemeSetting::one(ThemeId::named(name).ok_or(EXPECTED)?),
+                    Value::Table(table) if table.keys().all(|k| k == "dark" || k == "light") => {
+                        ThemeSetting {
+                            dark: named(table.get("dark")).ok_or(EXPECTED)?,
+                            light: named(table.get("light")).ok_or(EXPECTED)?,
+                        }
+                    }
+                    _ => return Err(Some(EXPECTED)),
+                };
+            }
+            "ui.terminal_background" => {
+                self.terminal_background = value.as_bool().ok_or("true or false")?
+            }
+            "ui.cursor_color" => self.cursor_color = value.as_bool().ok_or("true or false")?,
             "ui.nerd_font" => self.nerd_font = value.as_bool().ok_or("true or false")?,
             "ui.tree" => self.tree = value.as_bool().ok_or("true or false")?,
             "ui.tree_width" => {
@@ -287,6 +331,70 @@ impl Config {
             .iter()
             .any(|pattern| wildcard_match(pattern, name))
     }
+}
+
+/// `text`, a settings file, with `ui.theme` set to `id` in place of what it
+/// was, or added. If it was a theme for a dark terminal and one for a
+/// light, only the one for a `light` terminal or a dark one is.
+pub fn with_theme(text: &str, id: ThemeId, light: bool) -> String {
+    let quoted = |id: ThemeId| format!("\"{}\"", id.name());
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let mut section = String::new();
+    let mut ui = None;
+    let mut found = None;
+    for (i, line) in lines.iter().enumerate() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            section = line.trim_matches(['[', ']']).trim().to_string();
+            if section == "ui" && ui.is_none() {
+                ui = Some(i);
+            }
+            continue;
+        }
+        let key = match section.as_str() {
+            "" => "ui.theme",
+            "ui" => "theme",
+            _ => continue,
+        };
+        let value = line
+            .strip_prefix(key)
+            .and_then(|rest| rest.trim_start().strip_prefix('='));
+        if let Some(value) = value {
+            found = Some((i, key, value.trim().to_string()));
+            break;
+        }
+    }
+    match found {
+        Some((i, key, value)) => {
+            let value = match format!("theme = {value}").parse::<Table>() {
+                Ok(table) if table["theme"].is_table() => {
+                    let mut config = Config::default();
+                    let setting = match config.apply("ui.theme", &table["theme"]) {
+                        Ok(()) => config.theme,
+                        Err(_) => ThemeSetting::default(),
+                    };
+                    let (dark, light) = match light {
+                        true => (setting.dark, id),
+                        false => (id, setting.light),
+                    };
+                    format!("{{ dark = {}, light = {} }}", quoted(dark), quoted(light))
+                }
+                _ => quoted(id),
+            };
+            lines[i] = format!("{key} = {value}");
+        }
+        None => match ui {
+            Some(header) => lines.insert(header + 1, format!("theme = {}", quoted(id))),
+            None => {
+                if lines.last().is_some_and(|line| !line.trim().is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.push("[ui]".to_string());
+                lines.push(format!("theme = {}", quoted(id)));
+            }
+        },
+    }
+    lines.join("\n") + "\n"
 }
 
 /// The shortcut `key` = `value` in `[keys]`: a key, and the id of the
@@ -402,7 +510,10 @@ mod tests {
                 None => Some(line),
             })
             .filter(|line| {
-                !line.starts_with("shell") && !line.starts_with("exclude") && !line.starts_with('"')
+                !line.starts_with("shell")
+                    && !line.starts_with("exclude")
+                    && !line.starts_with("theme = {")
+                    && !line.starts_with('"')
             })
             .map(|line| format!("{line}\n"))
             .collect();
@@ -412,11 +523,14 @@ mod tests {
             &TEMPLATE
                 .replace("# shell", "shell")
                 .replace("# exclude", "exclude")
+                .replace("# theme = {", "theme = {")
                 .replace("# \"", "\""),
         );
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(config.shell, Some(PathBuf::from("/bin/zsh")));
         assert_eq!(config.exclude, ["node_modules", "*.pyc"]);
+        assert_eq!(config.theme.dark.name(), "Cue Dark");
+        assert_eq!(config.theme.light.name(), "GitHub Light");
         assert_eq!(config.keys.len(), 4);
     }
 
@@ -497,6 +611,9 @@ mod tests {
             wrap = false
             scroll_margin = 0
             [ui]
+            theme = "catppuccin mocha"
+            terminal_background = false
+            cursor_color = false
             nerd_font = true
             tree = false
             tree_width = 40
@@ -515,6 +632,9 @@ mod tests {
                 indent: Indent::Tabs,
                 wrap: false,
                 scroll_margin: 0.0,
+                theme: ThemeSetting::one(ThemeId::named("Catppuccin Mocha").unwrap()),
+                terminal_background: false,
+                cursor_color: false,
                 nerd_font: true,
                 tree: false,
                 tree_width: 40,
@@ -541,6 +661,8 @@ mod tests {
             scrollback = "10 parsecs"
             [colors]
             red = "#f00"
+            [ui]
+            theme = "Solarized"
             "##,
         );
         assert_eq!(
@@ -552,6 +674,7 @@ mod tests {
                 "There's no setting editor.tabwidth",
                 "terminal.scrollback should be a size such as \"10MB\", or a number of bytes",
                 "There's no setting colors.red",
+                "ui.theme should be a theme's name, as Select Theme lists them, or { dark = \"…\", light = \"…\" }",
             ]
         );
         assert_eq!(
@@ -570,6 +693,41 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].starts_with("Line 3: "), "{warnings:?}");
         assert!(!warnings[0].contains('\n'));
+    }
+
+    #[test]
+    fn choosing_a_theme_sets_it() {
+        let cue_dark = ThemeId::named("Cue Dark").unwrap();
+        let nord = ThemeId::named("Nord").unwrap();
+        let theme = |text: &str| {
+            let (config, warnings) = parse(text);
+            assert_eq!(warnings, Vec::<String>::new(), "{text}");
+            config.theme
+        };
+        // Added under [ui], where the template has it commented out.
+        let text = with_theme(TEMPLATE, cue_dark, false);
+        assert_eq!(theme(&text), ThemeSetting::one(cue_dark));
+        assert!(text.contains("[ui]\ntheme = \"Cue Dark\"\n"));
+        // Replaced.
+        let text = with_theme(&text, nord, true);
+        assert_eq!(theme(&text), ThemeSetting::one(nord));
+        assert_eq!(text.matches("\ntheme =").count(), 1);
+        // Only the one for the terminal's appearance.
+        let both = "[ui]\ntheme = { dark = \"Nord\", light = \"GitHub Light\" }\n";
+        let text = with_theme(both, cue_dark, false);
+        assert_eq!(
+            theme(&text),
+            ThemeSetting {
+                dark: cue_dark,
+                light: ThemeId::named("GitHub Light").unwrap(),
+            }
+        );
+        // No [ui] at all, or set as a dotted key.
+        let text = with_theme("[editor]\nwrap = false", nord, false);
+        assert_eq!(text, "[editor]\nwrap = false\n\n[ui]\ntheme = \"Nord\"\n");
+        assert_eq!(theme(&text), ThemeSetting::one(nord));
+        let text = with_theme("ui.theme = \"Dracula\"\n[editor]\n", nord, false);
+        assert_eq!(theme(&text), ThemeSetting::one(nord));
     }
 
     #[test]

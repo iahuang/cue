@@ -8,12 +8,10 @@
 
 use opentui::{Attributes, Buffer, Rgba};
 
-use crate::editor::STATUS_BG;
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind};
-use crate::picker::{Area, BG, BORDER, FG, SELECTED_BG};
+use crate::picker::Area;
+use crate::theme;
 
-/// The text of buttons that lose something, such as unsaved changes.
-const DANGER: Rgba = Rgba::rgb(243, 139, 168);
 /// The widest a line of the message gets before wrapping.
 const MAX_TEXT: usize = 56;
 /// Between buttons.
@@ -236,18 +234,19 @@ impl<T: Clone> Alert<T> {
     }
 
     fn draw_alert(&self, frame: &Buffer, area: Area) {
+        let colors = theme::colors();
         let Area {
             x,
             y,
             width,
             height,
         } = area;
-        frame.fill_rect(x, y, width, height, BG);
+        frame.fill_rect(x, y, width, height, colors.bg);
         let inner = width.saturating_sub(2) as usize;
         let text = |s: &str, x: u32, y: u32, fg, bg: Option<Rgba>, attributes| {
             frame.draw_text(s, x, y, fg, bg, attributes)
         };
-        let border = |s: &str, x: u32, y: u32| text(s, x, y, BORDER, None, Attributes::NONE);
+        let border = |s: &str, x: u32, y: u32| text(s, x, y, colors.border, None, Attributes::NONE);
         let rule = "─".repeat(inner);
         border(&format!("╭{rule}╮"), x, y);
         border(&format!("╰{rule}╯"), x, y + height - 1);
@@ -259,7 +258,7 @@ impl<T: Clone> Alert<T> {
             &format!(" {} ", self.title),
             x + 2,
             y,
-            FG,
+            colors.text,
             None,
             Attributes::BOLD,
         );
@@ -270,7 +269,7 @@ impl<T: Clone> Alert<T> {
         let first = y + 1 + padded as u32;
         let buttons_row = y + height - 2;
         for (line, row) in self.lines().iter().zip(first..buttons_row) {
-            text(line, x + 2, row, FG, None, Attributes::NONE);
+            text(line, x + 2, row, colors.text, None, Attributes::NONE);
         }
 
         let buttons = self.buttons.iter().map(|b| (b.mnemonic, b.danger));
@@ -280,8 +279,12 @@ impl<T: Clone> Alert<T> {
             self.labels().zip(buttons).zip(spans).enumerate()
         {
             let selected = index == self.selected;
-            let bg = if selected { SELECTED_BG } else { STATUS_BG };
-            let fg = if danger { DANGER } else { FG };
+            let bg = if selected {
+                colors.selected
+            } else {
+                colors.surface
+            };
+            let fg = if danger { colors.error } else { colors.text };
             let bold = match selected {
                 true => Attributes::BOLD,
                 false => Attributes::NONE,
@@ -366,8 +369,9 @@ mod tests {
     }
 
     fn screen(alert: &Alert<&str>, width: u32, height: u32) -> String {
+        let colors = theme::colors();
         let frame = OwnedBuffer::new(width, height, false, WidthMethod::Unicode, "test").unwrap();
-        frame.clear(BG);
+        frame.clear(colors.bg);
         alert.draw(&frame);
         frame.to_text(true)
     }

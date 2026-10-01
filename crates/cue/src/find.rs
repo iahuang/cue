@@ -16,16 +16,14 @@ use grep_matcher::{Captures, Matcher};
 use grep_regex::RegexMatcher;
 use opentui::{Attributes, Buffer, Rgba};
 
-use crate::editor::STATUS_BG;
 use crate::keymap::{Command, Context, Keymap};
 use crate::line_edit::{Caret, Edit};
-use crate::picker::{BG, DIM, FG, SELECTED_BG};
 use crate::search::{Query, Toggle};
+use crate::theme;
 
 /// Past this many matches, the rest aren't found.
 pub const MAX_MATCHES: usize = 100_000;
 
-const ERROR: Rgba = Rgba::rgb(243, 139, 168);
 /// The widest the bar gets, in columns.
 pub const MAX_WIDTH: u32 = 60;
 /// Left of the fields: the button that shows or hides the replacement.
@@ -225,21 +223,22 @@ impl FindBar {
         current: Option<usize>,
         keymap: &Keymap,
     ) -> Option<(u32, u32)> {
+        let colors = theme::colors();
         let layout = self.layout((x, width), current, keymap);
         *self.drawn.borrow_mut() = layout
             .buttons
             .iter()
             .map(|(row, columns, target, _)| (*row, columns.clone(), *target))
             .collect();
-        frame.fill_rect(x, y, width, self.rows(), STATUS_BG);
+        frame.fill_rect(x, y, width, self.rows(), colors.surface);
         let (status, status_fg, status_x) = &layout.status;
         frame.draw_text(status, *status_x, y, *status_fg, None, Attributes::NONE);
         for (row, columns, target, label) in &layout.buttons {
             let on = matches!(target, Target::Toggle(t) if t.is_on(&self.memory.query));
             let (fg, bg, attributes) = if on {
-                (FG, Some(SELECTED_BG), Attributes::BOLD)
+                (colors.text, Some(colors.selected), Attributes::BOLD)
             } else {
-                (DIM, None, Attributes::NONE)
+                (colors.muted, None, Attributes::NONE)
             };
             frame.draw_text(label, columns.start, y + row, fg, bg, attributes);
         }
@@ -260,11 +259,12 @@ impl FindBar {
         columns: Range<u32>,
         y: u32,
     ) -> Option<(u32, u32)> {
+        let colors = theme::colors();
         let room = columns.len().saturating_sub(2);
         if room == 0 {
             return None;
         }
-        frame.fill_rect(columns.start, y, columns.len() as u32, 1, BG);
+        frame.fill_rect(columns.start, y, columns.len() as u32, 1, colors.bg);
         let (text, placeholder) = match field {
             Field::Find => (&self.memory.query.text, "Find"),
             Field::Replace => (&self.memory.replacement, "Replace"),
@@ -272,11 +272,18 @@ impl FindBar {
         let text_x = columns.start + 1;
         if text.is_empty() {
             let placeholder: String = placeholder.chars().take(room).collect();
-            frame.draw_text(&placeholder, text_x, y, DIM, None, Attributes::NONE);
+            frame.draw_text(
+                &placeholder,
+                text_x,
+                y,
+                colors.muted,
+                None,
+                Attributes::NONE,
+            );
         }
         let (shown, column) = self.carets[field as usize].view(text, room);
-        let bg = (field == Field::Find && self.replace_query).then_some(SELECTED_BG);
-        frame.draw_text(&shown, text_x, y, FG, bg, Attributes::NONE);
+        let bg = (field == Field::Find && self.replace_query).then_some(colors.selected);
+        frame.draw_text(&shown, text_x, y, colors.text, bg, Attributes::NONE);
         (self.focus == Some(field)).then_some((text_x + column as u32, y))
     }
 
@@ -368,19 +375,20 @@ impl FindBar {
 
     /// What the find row says about the matches, and its color.
     fn status(&self, current: Option<usize>) -> (String, Rgba) {
+        let colors = theme::colors();
         if self.error.is_some() {
-            return ("invalid regex".to_string(), ERROR);
+            return ("invalid regex".to_string(), colors.error);
         }
         let count = self.matches.len();
         let more = if self.truncated { "+" } else { "" };
         let text = match (count, current) {
             _ if self.memory.query.text.is_empty() => String::new(),
-            (0, _) => return ("no matches".to_string(), ERROR),
+            (0, _) => return ("no matches".to_string(), colors.error),
             (_, Some(i)) => format!("{} of {count}{more}", i + 1),
             (1, None) => "1 match".to_string(),
             (_, None) => format!("{count}{more} matches"),
         };
-        (text, DIM)
+        (text, colors.muted)
     }
 
     /// What's at screen column `x` of the bar's row `row`, as last drawn.

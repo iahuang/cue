@@ -57,6 +57,7 @@ pub const EmbeddedTerminal = struct {
     pub fn setSearchCurrent(_: *EmbeddedTerminal, _: ?u32) void {}
     pub fn clearSearch(_: *EmbeddedTerminal) void {}
     pub fn setSearchColors(_: *EmbeddedTerminal, _: SearchColors) void {}
+    pub fn setDefaultColors(_: *EmbeddedTerminal, _: buffer.RGBA, _: buffer.RGBA, _: ?*const [16]buffer.RGBA) void {}
     pub fn isAlternateScreen(_: *EmbeddedTerminal) bool {
         return false;
     }

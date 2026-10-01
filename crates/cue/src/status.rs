@@ -5,9 +5,9 @@
 
 use opentui::{Attributes, Buffer};
 
-use crate::editor::{STATUS_BG, STATUS_DIM, STATUS_ERROR_BG, STATUS_FG};
 use crate::input::{Key, KeyCode};
 use crate::keymap::{Command, Keymap};
+use crate::theme;
 
 /// What the status bar shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,29 +104,41 @@ pub fn draw(
     width: u32,
     keymap: &Keymap,
 ) -> Option<(u32, u32)> {
+    let colors = theme::colors();
     match status {
         Status::Prompt { label, input } => {
-            frame.fill_rect(0, y, width, 1, STATUS_BG);
+            frame.fill_rect(0, y, width, 1, colors.surface);
             let label = format!(" {label}: ");
-            frame.draw_text(&label, 0, y, STATUS_DIM, None, Attributes::NONE);
+            frame.draw_text(&label, 0, y, colors.muted, None, Attributes::NONE);
             let x = label.chars().count() as u32;
             // Keep the end of a long path visible.
             let room = width.saturating_sub(x + 1) as usize;
             let chars: Vec<char> = input.chars().collect();
             let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
-            frame.draw_text(&shown, x, y, STATUS_FG, None, Attributes::NONE);
+            frame.draw_text(&shown, x, y, colors.text, None, Attributes::NONE);
             Some((x + shown.chars().count() as u32, y))
         }
         Status::Message { text, error } => {
-            let bg = if *error { STATUS_ERROR_BG } else { STATUS_BG };
+            let bg = if *error {
+                colors.error_bg
+            } else {
+                colors.surface
+            };
             frame.fill_rect(0, y, width, 1, bg);
-            frame.draw_text(&format!(" {text}"), 0, y, STATUS_FG, None, Attributes::BOLD);
+            frame.draw_text(
+                &format!(" {text}"),
+                0,
+                y,
+                colors.text,
+                None,
+                Attributes::BOLD,
+            );
             None
         }
         Status::Info(info) | Status::Terminal(info) | Status::EditorInfo { text: info, .. } => {
-            frame.fill_rect(0, y, width, 1, STATUS_BG);
+            frame.fill_rect(0, y, width, 1, colors.surface);
             let left = format!(" {info}");
-            frame.draw_text(&left, 0, y, STATUS_FG, None, Attributes::NONE);
+            frame.draw_text(&left, 0, y, colors.text, None, Attributes::NONE);
             // In a terminal, those keys are the shell's.
             let hints: &[(Command, &str)] = match status {
                 Status::Terminal(_) => &[(Command::TerminalPrefix, "cue keys")],
@@ -146,7 +158,7 @@ pub fn draw(
             let hints = hints.strip_suffix(' ').unwrap_or(&hints);
             let hints_x = width.saturating_sub(hints.len() as u32);
             if hints_x as usize > left.chars().count() {
-                frame.draw_text(hints, hints_x, y, STATUS_DIM, None, Attributes::NONE);
+                frame.draw_text(hints, hints_x, y, colors.muted, None, Attributes::NONE);
             }
             None
         }

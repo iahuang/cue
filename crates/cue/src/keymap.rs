@@ -48,6 +48,7 @@ commands! {
     Palette => "app:command-palette", "Show Command Palette";
     OpenSettings => "app:open-settings", "Open Settings";
     ReloadSettings => "app:reload-settings", "Reload Settings";
+    SelectTheme => "app:select-theme", "Select Theme";
     Save => "file:save", "Save";
     SaveAs => "file:save-as", "Save As…";
     NewFile => "file:new", "New File";
@@ -222,16 +223,15 @@ impl Command {
     pub fn context(self) -> Context {
         use Command::*;
         match self {
-            Quit | Palette | OpenSettings | ReloadSettings | Save | SaveAs | NewFile
-            | CreateFile | OpenFile | GoToFile | GoToLine | GoToSymbol | GoToWorkspaceSymbol
-            | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext
-            | FindPrevious | ToggleTree | FocusTree | FocusEditor | SplitRight | SplitDown
-            | ClosePanel | GoBack | GoForward | FocusPanelLeft | FocusPanelRight | FocusPanelUp
-            | FocusPanelDown | NewTerminal | NewTab | CloseTab | NextTab | PreviousTab
-            | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3
-            | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder => {
-                Context::Global
-            }
+            Quit | Palette | OpenSettings | ReloadSettings | SelectTheme | Save | SaveAs
+            | NewFile | CreateFile | OpenFile | GoToFile | GoToLine | GoToSymbol
+            | GoToWorkspaceSymbol | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find
+            | FindReplace | FindNext | FindPrevious | ToggleTree | FocusTree | FocusEditor
+            | SplitRight | SplitDown | ClosePanel | GoBack | GoForward | FocusPanelLeft
+            | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal | NewTab | CloseTab
+            | NextTab | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1
+            | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8
+            | GoToTab9 | AddFolder => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu
             | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate
@@ -861,6 +861,7 @@ mod tests {
             Command::GoToTerminal,
             Command::OpenSettings,
             Command::ReloadSettings,
+            Command::SelectTheme,
             Command::ToggleWrap,
             Command::CloseFile,
             Command::ClearTerminal,

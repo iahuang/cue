@@ -35,6 +35,12 @@ impl Rgba {
         pack(r, g, b, 255, INTENT_INDEXED, index)
     }
 
+    /// Palette entry `index`, with `rgb` as what it shows (as the terminal
+    /// reported it), for alpha blending and mixing.
+    pub const fn indexed_as(index: u8, rgb: [u8; 3]) -> Rgba {
+        pack(rgb[0], rgb[1], rgb[2], 255, INTENT_INDEXED, index)
+    }
+
     /// The terminal's configured default color (SGR 39/49). `fallback` is used
     /// for alpha blending.
     pub const fn terminal_default(fallback: [u8; 3]) -> Rgba {

@@ -21,19 +21,8 @@ use opentui::{Attributes, Buffer, Rgba};
 use crate::file_index;
 use crate::icons;
 use crate::keymap::Command;
+use crate::theme;
 use crate::workspace::{deepest_root, root_names};
-
-const FG: Rgba = Rgba::rgb(186, 194, 222);
-const ROOT_FG: Rgba = Rgba::rgb(205, 214, 244);
-const ACTIVE_FG: Rgba = Rgba::rgb(137, 180, 250);
-const ARROW_FG: Rgba = Rgba::rgb(108, 112, 134);
-/// Ignored entries.
-const IGNORED_FG: Rgba = Rgba::rgb(108, 112, 134);
-const SELECTED_BG: Rgba = Rgba::rgb(69, 71, 110);
-/// The selection while the editor has focus.
-const SELECTED_BG_UNFOCUSED: Rgba = Rgba::rgb(49, 50, 68);
-/// Folders stuck to the top.
-const STICKY_BG: Rgba = Rgba::rgb(36, 37, 52);
 
 /// Rows the mouse wheel scrolls.
 const WHEEL_ROWS: usize = 3;
@@ -424,13 +413,20 @@ impl FileTree {
     }
 
     fn draw_rows(&self, frame: &Buffer, x: u32, width: u32, focused: bool) {
+        let colors = theme::colors();
         let sticky = self.sticky();
         let visible = (self.scroll..self.rows.len()).skip(sticky.len());
         for (index, y) in visible.zip(sticky.len() as u32..self.height as u32) {
             self.draw_row(frame, index, (x, y, width), None, focused);
         }
         for (y, &index) in sticky.iter().enumerate() {
-            self.draw_row(frame, index, (x, y as u32, width), Some(STICKY_BG), focused);
+            self.draw_row(
+                frame,
+                index,
+                (x, y as u32, width),
+                Some(colors.surface_inactive),
+                focused,
+            );
         }
     }
 
@@ -443,10 +439,11 @@ impl FileTree {
         bg: Option<Rgba>,
         focused: bool,
     ) {
+        let colors = theme::colors();
         let row = &self.rows[index];
         let bg = match index == self.selected {
-            true if focused => Some(SELECTED_BG),
-            true => Some(SELECTED_BG_UNFOCUSED),
+            true if focused => Some(colors.selected),
+            true => Some(colors.selected_unfocused),
             false => bg,
         };
         if let Some(bg) = bg {
@@ -456,7 +453,7 @@ impl FileTree {
         let open = self.is_open(row);
         if row.is_dir {
             let arrow = if open { "▾" } else { "▸" };
-            frame.draw_text(arrow, indent, y, ARROW_FG, None, Attributes::NONE);
+            frame.draw_text(arrow, indent, y, colors.faint, None, Attributes::NONE);
         }
         let mut name_x = indent + 2;
         if icons::enabled() {
@@ -464,19 +461,19 @@ impl FileTree {
                 true => icons::folder(open),
                 false => icons::file(&row.name),
             };
-            let dim = row.ignored.then_some(IGNORED_FG);
+            let dim = row.ignored.then_some(colors.faint);
             name_x = icon.draw(frame, name_x, y, dim);
         }
         let (fg, attributes) = if row.depth == 0 {
-            (ROOT_FG, Attributes::BOLD)
+            (colors.text, Attributes::BOLD)
         } else if self.active.as_ref() == Some(&row.path) && self.active_preview {
-            (ACTIVE_FG, Attributes::BOLD | Attributes::ITALIC)
+            (colors.accent, Attributes::BOLD | Attributes::ITALIC)
         } else if self.active.as_ref() == Some(&row.path) {
-            (ACTIVE_FG, Attributes::BOLD)
+            (colors.accent, Attributes::BOLD)
         } else if row.ignored {
-            (IGNORED_FG, Attributes::NONE)
+            (colors.faint, Attributes::NONE)
         } else {
-            (FG, Attributes::NONE)
+            (colors.text, Attributes::NONE)
         };
         let room = (x + width).saturating_sub(name_x + 1) as usize;
         frame.draw_text(&truncate(&row.name, room), name_x, y, fg, None, attributes);

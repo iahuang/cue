@@ -11,9 +11,9 @@
 
 use opentui::{Attributes, Buffer};
 
-use crate::editor::{STATUS_BG, STATUS_DIM, STATUS_FG};
 use crate::layout::{Layout, PanelId, Rect};
 use crate::panel::Panel;
+use crate::theme;
 
 /// Names a tab for as long as it's open.
 pub type TabId = u32;
@@ -147,12 +147,13 @@ pub fn bar(tabs: &[Tab], area: Rect) -> Vec<(BarItem, Rect, String)> {
 
 /// Draws the tab bar across `area`, with the tab at `current` on screen.
 pub fn draw_bar(frame: &Buffer, tabs: &[Tab], current: usize, area: Rect) {
+    let colors = theme::colors();
     for (item, rect, text) in bar(tabs, area) {
         let (fg, bg, attributes) = match item {
             BarItem::Tab(index) if index == current => {
-                (STATUS_FG, Some(STATUS_BG), Attributes::BOLD)
+                (colors.text, Some(colors.surface), Attributes::BOLD)
             }
-            _ => (STATUS_DIM, None, Attributes::NONE),
+            _ => (colors.muted, None, Attributes::NONE),
         };
         frame.with_clip(rect.x, rect.y, rect.width, rect.height, || {
             frame.draw_text(&text, rect.x, rect.y, fg, bg, attributes)

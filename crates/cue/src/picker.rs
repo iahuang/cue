@@ -37,17 +37,8 @@ use crate::keymap::{Command, Context, Keymap};
 use crate::line_edit::{Caret, Edit};
 use crate::location::{self, Position};
 use crate::symbols::{self, Symbol};
-use crate::theme::SyntaxColor;
+use crate::theme::{self, SyntaxColor, ThemeId};
 use crate::workspace::Workspace;
-
-/// The terminal's own background, as behind the editor; the border sets
-/// the popup apart.
-pub const BG: Rgba = Rgba::terminal_default([0, 0, 0]);
-pub const BORDER: Rgba = Rgba::rgb(88, 91, 112);
-pub const FG: Rgba = Rgba::rgb(205, 214, 244);
-pub const DIM: Rgba = Rgba::rgb(147, 153, 178);
-pub const MATCH_FG: Rgba = Rgba::rgb(137, 180, 250);
-pub const SELECTED_BG: Rgba = Rgba::rgb(69, 71, 110);
 
 /// The widest the popup gets, in columns.
 const MAX_WIDTH: u32 = 90;
@@ -63,6 +54,7 @@ pub enum Mode {
     Files,
     Commands,
     Languages,
+    Themes,
     /// A line in the file on screen.
     Line,
     /// The symbols the file on screen defines.
@@ -77,7 +69,7 @@ impl Mode {
     /// The character that starts a query for this mode.
     fn prefix(self) -> Option<char> {
         match self {
-            Mode::Files | Mode::Languages => None,
+            Mode::Files | Mode::Languages | Mode::Themes => None,
             Mode::Commands => Some('>'),
             Mode::Line => Some(':'),
             Mode::Symbols => Some('@'),
@@ -101,6 +93,7 @@ pub enum Choice {
     Symbol(Option<PathBuf>, u32, Range<usize>),
     Command(Command),
     Language(Option<&'static str>),
+    Theme(ThemeId),
     /// A terminal, by its id.
     Terminal(u32),
     /// An untitled file, by its number.
@@ -251,7 +244,9 @@ pub struct Picker {
     close_hint: String,
     commands: Vec<Item>,
     languages: Vec<Item>,
-    language_mode: bool,
+    themes: Vec<Item>,
+    /// The mode it's in when that isn't what the query starts with.
+    fixed_mode: Option<Mode>,
     /// The symbols the file on screen defines, once given.
     outline: Option<Vec<Item>>,
     /// The workspace's symbols, from the app's symbol index.
@@ -330,7 +325,21 @@ impl Picker {
                     color: None,
                 })
                 .collect(),
-            language_mode: false,
+            themes: ThemeId::all()
+                .map(|id| Item {
+                    text: id.name().to_string(),
+                    dim: 0..0,
+                    detail: match id.light() {
+                        None => "the terminal's colors",
+                        Some(true) => "light",
+                        Some(false) => "dark",
+                    }
+                    .to_string(),
+                    choice: Choice::Theme(id),
+                    color: None,
+                })
+                .collect(),
+            fixed_mode: None,
             outline: None,
             workspace_symbols: Rc::new(Vec::new()),
             indexing: false,
@@ -351,8 +360,8 @@ impl Picker {
     }
 
     pub fn mode(&self) -> Mode {
-        if self.language_mode {
-            return Mode::Languages;
+        if let Some(mode) = self.fixed_mode {
+            return mode;
         }
         let first = self.query.chars().next();
         [
@@ -370,7 +379,7 @@ impl Picker {
     /// Switches to listing `mode`, keeping what was typed.
     pub fn set_mode(&mut self, mode: Mode) {
         let needle = self.needle().to_string();
-        self.language_mode = mode == Mode::Languages;
+        self.fixed_mode = matches!(mode, Mode::Languages | Mode::Themes).then_some(mode);
         self.query = match mode.prefix() {
             Some(prefix) => format!("{prefix}{needle}"),
             None => needle,
@@ -585,6 +594,7 @@ impl Picker {
             Mode::Files => (&self.recent, &self.files),
             Mode::Commands => (&self.commands, &[]),
             Mode::Languages => (&self.languages, &[]),
+            Mode::Themes => (&self.themes, &[]),
             Mode::Line => (&self.line, &[]),
             Mode::Symbols => (self.outline.as_deref().unwrap_or_default(), &[]),
             Mode::WorkspaceSymbols => (&self.workspace_symbols, &[]),
@@ -603,6 +613,16 @@ impl Picker {
 
     fn selected_item(&self) -> Option<&Item> {
         self.matches.get(self.selected).map(|&i| self.item(i))
+    }
+
+    /// What's selected, as Enter would pick it.
+    pub fn selected_choice(&self) -> Option<&Choice> {
+        self.selected_item().map(|item| &item.choice)
+    }
+
+    /// Selects the item with the text `text`, if it's listed.
+    pub fn select_text(&mut self, text: &str) {
+        self.refilter(Some(text.to_string()));
     }
 
     /// Matches the query against every item, selecting the item with the
@@ -709,6 +729,7 @@ impl Picker {
     }
 
     fn draw_popup(&self, frame: &Buffer, area: Area) -> (u32, u32) {
+        let colors = theme::colors();
         let Area {
             x,
             y,
@@ -719,6 +740,7 @@ impl Picker {
             Mode::Files => ("Go to File", "files"),
             Mode::Commands => ("Commands", "commands"),
             Mode::Languages => ("Syntax Highlighting", "languages"),
+            Mode::Themes => ("Select Theme", "themes"),
             Mode::Line => ("Go to Line", "lines"),
             Mode::Symbols => ("Go to Symbol in File", "symbols"),
             Mode::WorkspaceSymbols => ("Go to Symbol in Workspace", "symbols"),
@@ -735,7 +757,14 @@ impl Picker {
         };
         if closable && self.close_hint.chars().count() <= room {
             let bottom = y + height - 1;
-            frame.draw_text(&self.close_hint, x + 2, bottom, DIM, None, Attributes::NONE);
+            frame.draw_text(
+                &self.close_hint,
+                x + 2,
+                bottom,
+                colors.muted,
+                None,
+                Attributes::NONE,
+            );
         }
 
         // The query, the cursor kept in view.
@@ -743,7 +772,7 @@ impl Picker {
         let room = width.saturating_sub(4) as usize;
         let (shown, column) = self.caret.view(&self.query, room);
         let shown_width = shown.chars().count();
-        frame.draw_text(&shown, text_x, y + 1, FG, None, Attributes::NONE);
+        frame.draw_text(&shown, text_x, y + 1, colors.text, None, Attributes::NONE);
         let cursor = (text_x + column as u32, y + 1);
         if self.needle().is_empty() {
             let hint = match self.mode() {
@@ -752,6 +781,7 @@ impl Picker {
                 }
                 Mode::Commands => "Search commands",
                 Mode::Languages => "Search languages",
+                Mode::Themes => "Search themes",
                 Mode::Line => "Type a line number, or line:column",
                 Mode::Symbols => "Search symbols in this file",
                 Mode::WorkspaceSymbols => "Search symbols in the workspace",
@@ -762,7 +792,7 @@ impl Picker {
                 .take(room.saturating_sub(shown_width + 1))
                 .collect();
             let hint_x = text_x + shown_width as u32 + 1;
-            frame.draw_text(&hint, hint_x, y + 1, DIM, None, Attributes::NONE);
+            frame.draw_text(&hint, hint_x, y + 1, colors.muted, None, Attributes::NONE);
         }
 
         let list = y + 3;
@@ -780,12 +810,12 @@ impl Picker {
                 _ if first.is_empty() && rest.is_empty() => format!("No {noun}"),
                 _ => format!("No matching {noun}"),
             };
-            frame.draw_text(&empty, text_x, list, DIM, None, Attributes::NONE);
+            frame.draw_text(&empty, text_x, list, colors.muted, None, Attributes::NONE);
         }
         let visible = self.matches.iter().enumerate().skip(self.scroll);
         for ((index, &item), row) in visible.zip(list..y + height - 1) {
             if index == self.selected {
-                frame.fill_rect(x + 1, row, width.saturating_sub(2), 1, SELECTED_BG);
+                frame.fill_rect(x + 1, row, width.saturating_sub(2), 1, colors.selected);
             }
             self.draw_item(frame, self.item(item), text_x, row, room);
         }
@@ -827,6 +857,7 @@ impl Picker {
     /// characters highlighted, and its detail on the right. A long file path
     /// is cut on the left, to keep its name.
     fn draw_item(&self, frame: &Buffer, item: &Item, x: u32, y: u32, room: usize) {
+        let colors = theme::colors();
         let icon = match &item.choice {
             Choice::File(path) => Some(icons::file(
                 &path.file_name().unwrap_or_default().to_string_lossy(),
@@ -843,7 +874,14 @@ impl Picker {
         let detail = item.detail.chars().count();
         if detail > 0 && detail + 2 < room {
             let detail_x = x + (room - detail) as u32;
-            frame.draw_text(&item.detail, detail_x, y, DIM, None, Attributes::NONE);
+            frame.draw_text(
+                &item.detail,
+                detail_x,
+                y,
+                colors.muted,
+                None,
+                Attributes::NONE,
+            );
         }
         let room = if detail > 0 && detail + 2 < room {
             room - detail - 2
@@ -873,17 +911,17 @@ impl Picker {
         // could be the name's own.
         let color = item
             .color
-            .map(|color| (color.fg().unwrap_or(FG), color.attributes()));
+            .map(|color| (color.fg().unwrap_or(colors.text), color.attributes()));
         let style = |i: usize| {
             let dim = item.dim.contains(&i);
             match (highlights.contains(&i), color.filter(|_| !dim)) {
                 (true, Some((fg, attributes))) => {
                     (fg, attributes | Attributes::BOLD | Attributes::UNDERLINE)
                 }
-                (true, None) => (MATCH_FG, Attributes::BOLD),
-                (false, _) if dim => (DIM, Attributes::NONE),
+                (true, None) => (colors.accent, Attributes::BOLD),
+                (false, _) if dim => (colors.muted, Attributes::NONE),
                 (false, Some(style)) => style,
-                (false, None) => (FG, Attributes::NONE),
+                (false, None) => (colors.text, Attributes::NONE),
             }
         };
         let mut draw = |text: &str, (fg, attributes): (Rgba, Attributes)| {
@@ -892,7 +930,7 @@ impl Picker {
         };
         let cut_left = shown.start > 0;
         if cut_left {
-            draw(ellipsis, (DIM, Attributes::NONE));
+            draw(ellipsis, (colors.muted, Attributes::NONE));
         }
         // Runs of characters with the same style.
         let mut run = String::new();
@@ -910,7 +948,7 @@ impl Picker {
             draw(&run, style);
         }
         if !cut_left && shown.end < chars.len() {
-            draw(ellipsis, (DIM, Attributes::NONE));
+            draw(ellipsis, (colors.muted, Attributes::NONE));
         }
     }
 }
@@ -960,6 +998,7 @@ impl Area {
 /// Clears `area` and draws a popup's box around it, with `title` in the top
 /// border and a rule under the first row, which holds the query.
 pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
+    let colors = theme::colors();
     let Area {
         x,
         y,
@@ -967,14 +1006,14 @@ pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
         height,
     } = area;
     let right = x + width - 1;
-    frame.fill_rect(x, y, width, height, BG);
+    frame.fill_rect(x, y, width, height, colors.bg);
     let rule = "─".repeat(width.saturating_sub(2) as usize);
     let border = |left: &str, right_end: &str, y: u32| {
         frame.draw_text(
             &format!("{left}{rule}{right_end}"),
             x,
             y,
-            BORDER,
+            colors.border,
             None,
             Attributes::NONE,
         );
@@ -984,18 +1023,26 @@ pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
     border("╰", "╯", y + height - 1);
     for row in y + 1..y + height - 1 {
         if row != y + 2 {
-            frame.draw_text("│", x, row, BORDER, None, Attributes::NONE);
-            frame.draw_text("│", right, row, BORDER, None, Attributes::NONE);
+            frame.draw_text("│", x, row, colors.border, None, Attributes::NONE);
+            frame.draw_text("│", right, row, colors.border, None, Attributes::NONE);
         }
     }
-    frame.draw_text(&format!(" {title} "), x + 2, y, FG, None, Attributes::BOLD);
+    frame.draw_text(
+        &format!(" {title} "),
+        x + 2,
+        y,
+        colors.text,
+        None,
+        Attributes::BOLD,
+    );
 }
 
 /// Draws `status` into the right of a popup's bottom border.
 pub fn draw_status(frame: &Buffer, area: Area, status: &str) {
+    let colors = theme::colors();
     let x = (area.x + area.width).saturating_sub(status.chars().count() as u32 + 2);
     let y = area.y + area.height - 1;
-    frame.draw_text(status, x, y, DIM, None, Attributes::NONE);
+    frame.draw_text(status, x, y, colors.muted, None, Attributes::NONE);
 }
 
 #[cfg(test)]
@@ -1279,6 +1326,7 @@ mod tests {
 
     #[test]
     fn symbols_are_colored_by_kind() {
+        let colors = theme::colors();
         let _serial = crate::test_serial();
         let root = fixture("symbol-colors", &["a.rs"]);
         let (_, index) = index(&root);
@@ -1333,8 +1381,8 @@ mod tests {
         let norm = at("norm");
         assert_eq!(fg(norm), SyntaxColor::of("function").unwrap().fg().unwrap());
         // What it's in is dimmed, not colored.
-        assert_eq!(fg((norm.0 + 5, norm.1)), DIM);
-        assert_eq!(fg(at("geometry")), FG);
+        assert_eq!(fg((norm.0 + 5, norm.1)), colors.muted);
+        assert_eq!(fg(at("geometry")), colors.text);
 
         // A match keeps the name's color, bold and underlined.
         picker.edit(Edit::Insert("no"));

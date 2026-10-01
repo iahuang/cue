@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
-use opentui::{Attributes, Buffer, Rgba};
+use opentui::{Attributes, Buffer};
 
 use crate::alert::{Alert, AlertAction, Button};
 use crate::config::{self, Config, MIN_TREE_WIDTH};
@@ -83,14 +83,11 @@ use crate::status::{self, Prompt, PromptKey};
 use crate::symbols::{self, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
-use crate::theme::Theme;
+use crate::theme::{self, TerminalColors, Theme, ThemeId, ThemeSetting};
 use crate::tree::{Entry, FileTree, TreeAction};
 use crate::watch::{Changes, Watcher};
 use crate::workspace::Workspace;
 
-const DIVIDER: Rgba = Rgba::rgb(69, 71, 90);
-/// Tints where a panel dragged by its header would land.
-const DROP_TINT: Rgba = Rgba::rgba(137, 180, 250, 56);
 /// How far sideways a header that resizes a split is dragged, before it's
 /// dragged up or down, to move its panel instead.
 const MOVE_THRESHOLD: u32 = 3;
@@ -215,6 +212,13 @@ pub struct App {
     documents: Vec<Rc<Document>>,
     /// The styles every editor's highlights use.
     theme: Rc<Theme>,
+    /// What the terminal says its colors are, which Terminal is made of,
+    /// and which pick between a dark theme and a light one.
+    terminal_colors: TerminalColors,
+    /// The theme last put in use, if any, and whether it needs working out
+    /// again, as the terminal's colors changed.
+    theme_shown: Option<ThemeId>,
+    theme_stale: bool,
     /// Running terminals, and exited ones still shown, in the order they
     /// were started.
     terminals: Vec<Rc<RefCell<Terminal>>>,
@@ -377,6 +381,9 @@ impl App {
             tree,
             documents: vec![doc.clone()],
             theme,
+            terminal_colors: TerminalColors::default(),
+            theme_shown: None,
+            theme_stale: true,
             terminals: Vec::new(),
             next_terminal: 1,
             terminal_prefix: false,
@@ -694,6 +701,13 @@ impl App {
             Command::RecoverUnsaved => self.offer_recovery(true),
             Command::OpenSettings => self.open_settings(),
             Command::ReloadSettings => self.reload_settings(),
+            Command::SelectTheme => {
+                self.show_picker(Mode::Themes);
+                let shown = self.theme_shown.unwrap_or(ThemeId::TERMINAL);
+                if let Some(picker) = &mut self.picker {
+                    picker.select_text(shown.name());
+                }
+            }
             Command::RenameTab => {
                 let name = self.tab().name.clone().unwrap_or_default();
                 self.tab_prompt = Some(Prompt::new("Rename tab", &name));
@@ -1246,14 +1260,15 @@ impl App {
     /// Draws the frame and returns where the terminal cursor goes (0-based
     /// column, row), or `None` to hide it.
     pub fn draw(&self, frame: &Buffer) -> Option<(u32, u32)> {
-        frame.clear(Rgba::terminal_default([0, 0, 0]));
+        let colors = theme::colors();
+        frame.clear(colors.bg);
         let tree_width = self.visible_tree_width();
         let main = self.main_area();
         if tree_width > 0 {
             self.tree
                 .draw(frame, 0, tree_width, self.focus == Focus::Tree);
             for y in 0..self.height.saturating_sub(1) {
-                frame.draw_text("│", tree_width, y, DIVIDER, None, Attributes::NONE);
+                frame.draw_text("│", tree_width, y, colors.divider, None, Attributes::NONE);
             }
         }
         if self.bar_height() > 0 {
@@ -1283,13 +1298,13 @@ impl App {
             if handle.axis == Axis::Horizontal {
                 let rect = handle.rect;
                 for y in rect.y..rect.y + rect.height {
-                    frame.draw_text("│", rect.x, y, DIVIDER, None, Attributes::NONE);
+                    frame.draw_text("│", rect.x, y, colors.divider, None, Attributes::NONE);
                 }
             }
         }
         if let Some(drop) = self.header_drag.as_ref().and_then(|drag| drag.drop) {
             let rect = drop.rect;
-            frame.fill_rect(rect.x, rect.y, rect.width, rect.height, DROP_TINT);
+            frame.fill_rect(rect.x, rect.y, rect.width, rect.height, colors.drop_tint);
         }
         let cursor = self.draw_popups(frame, cursor);
         match &self.alert {
@@ -1786,6 +1801,7 @@ impl App {
                             self.focus = Focus::Editor;
                         }
                     }
+                    Choice::Theme(id) => self.choose_theme(id),
                     Choice::Language(name) => {
                         if let Some(editor) = self.editor() {
                             let language = name.and_then(|name| {
@@ -2266,7 +2282,8 @@ impl App {
             | Choice::Line(_)
             | Choice::Symbol(..)
             | Choice::Command(_)
-            | Choice::Language(_) => {}
+            | Choice::Language(_)
+            | Choice::Theme(_) => {}
         }
     }
 
@@ -2629,6 +2646,131 @@ impl App {
             self.show_active_in_tree();
         }
         self.layout();
+    }
+
+    /// Takes in the terminal's answer to one of [`theme::color_queries`].
+    /// Returns false if `reply` isn't one.
+    pub fn take_terminal_reply(&mut self, reply: &[u8]) -> bool {
+        if let Some(light) = theme::appearance_change(reply) {
+            // Its colors are asked for again, but while its background is
+            // cue's, this is what says which it is.
+            self.terminal_colors.switched_light = Some(light);
+            self.theme_stale = true;
+            return false;
+        }
+        let taken = self.terminal_colors.take_reply(reply);
+        self.theme_stale |= taken;
+        taken
+    }
+
+    /// Says whether the terminal's background is cue's (see
+    /// [`theme::set_background`]), so what it says it is isn't taken in.
+    pub fn set_terminal_background(&mut self, set: bool) {
+        self.terminal_colors.background_set = set;
+    }
+
+    /// Puts the theme in use, if it isn't already: the one Select Theme
+    /// has selected, or the setting's, for the terminal's colors. Returns
+    /// whether the colors changed.
+    pub fn update_theme(&mut self) -> bool {
+        let previewed = self
+            .picker
+            .as_ref()
+            .filter(|picker| picker.mode() == Mode::Themes)
+            .and_then(|picker| match picker.selected_choice() {
+                Some(&Choice::Theme(id)) => Some(id),
+                _ => None,
+            });
+        let id = previewed.unwrap_or_else(|| config::get().theme.pick(&self.terminal_colors));
+        if !self.theme_stale && self.theme_shown == Some(id) {
+            return false;
+        }
+        self.theme_stale = false;
+        self.theme_shown = Some(id);
+        let colors = id.colors(&self.terminal_colors);
+        if *theme::colors() == colors {
+            return false;
+        }
+        theme::set(colors);
+        self.theme.restyle();
+        let text = theme::colors().text;
+        for doc in &self.documents {
+            doc.buffer.set_default_fg(Some(text));
+        }
+        for terminal in &self.terminals {
+            terminal.borrow_mut().restyle();
+        }
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            for editor in panel.editors_mut() {
+                editor.restyle();
+            }
+        }
+        true
+    }
+
+    /// Puts the theme `id` in use, and in the settings file, for next time.
+    /// With a theme for a dark terminal and one for a light, it's the one
+    /// for the terminal now.
+    fn choose_theme(&mut self, id: ThemeId) {
+        let name = id.name();
+        let light = self.terminal_colors.light() == Some(true);
+        let mut setting = config::get().theme;
+        match (setting.dark == setting.light, light) {
+            (true, _) => setting = ThemeSetting::one(id),
+            (false, true) => setting.light = id,
+            (false, false) => setting.dark = id,
+        }
+        let unsaved = self.settings.as_ref().is_some_and(|path| {
+            self.documents
+                .iter()
+                .any(|doc| doc.path().as_ref() == Some(path) && doc.is_modified())
+        });
+        let path = match &self.settings {
+            Some(path) if !unsaved => path.clone(),
+            _ => {
+                self.use_theme_setting(setting);
+                let why = match unsaved {
+                    true => "the settings file has unsaved changes",
+                    false => "there's nowhere for settings",
+                };
+                self.show_message(format!("Using {name} until cue quits: {why}."), false);
+                return;
+            }
+        };
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => config::TEMPLATE.to_string(),
+            Err(err) => {
+                self.use_theme_setting(setting);
+                self.show_message(format!("Can't read {}: {err}", path.display()), true);
+                return;
+            }
+        };
+        let text = config::with_theme(&text, id, light);
+        let written = path
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| fs::write(&path, &text));
+        if let Err(err) = written {
+            self.use_theme_setting(setting);
+            self.show_message(format!("Can't save {}: {err}", path.display()), true);
+            return;
+        }
+        self.settings_hash = Some(document::content_hash(text.as_bytes()));
+        let (config, warnings) = config::parse(&text);
+        self.apply_settings(config);
+        if warnings.is_empty() {
+            self.show_message(format!("Using {name}."), false);
+        } else {
+            self.warn_about_config(&warnings);
+        }
+    }
+
+    /// Puts `setting` in use until cue quits, keeping the other settings.
+    fn use_theme_setting(&mut self, setting: ThemeSetting) {
+        let mut config = (*config::get()).clone();
+        config.theme = setting;
+        self.apply_settings(config);
     }
 
     /// Opens the settings file, made from [`config::TEMPLATE`] if there
@@ -5776,7 +5918,7 @@ mod tests {
         let tinted = |app: &App, x, y| {
             let frame = OwnedBuffer::new(80, 10, false, WidthMethod::Unicode, "t").unwrap();
             app.draw(&frame);
-            frame.bg_at(x, y) != Some(Rgba::terminal_default([0, 0, 0]))
+            frame.bg_at(x, y) != Some(theme::colors().bg)
         };
 
         // Dropped in the middle of the other panel, they swap. Over itself,
@@ -6865,6 +7007,44 @@ mod tests {
         app.settings = Some(path.clone());
         app.run(Command::OpenSettings, false);
         assert_eq!(app.ed().text(), "[editor]\nwrap = false\n");
+    }
+
+    #[test]
+    fn select_theme_shows_each_theme_and_saves_the_one_picked() {
+        let _serial = crate::test_serial();
+        let root = fixture("select-theme", &[("a.txt", "")]);
+        let path = root.join("config/cue/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "[editor]\nwrap = false\n").unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        app.settings = Some(path.clone());
+        app.update_theme();
+        assert_eq!(theme::colors().name, "Terminal");
+
+        // Moving through the list shows each theme, on the theme in use first.
+        app.run(Command::SelectTheme, false);
+        assert!(!app.update_theme());
+        key(&mut app, KeyCode::Down);
+        assert!(app.update_theme());
+        assert_eq!(theme::colors().name, "Cue Dark");
+        assert!(!theme::colors().bg.is_terminal_default());
+        // Escape goes back.
+        key(&mut app, KeyCode::Esc);
+        assert!(app.update_theme());
+        assert_eq!(theme::colors().name, "Terminal");
+
+        // Picked, it's saved with the rest of the settings.
+        app.run(Command::SelectTheme, false);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        app.update_theme();
+        assert_eq!(theme::colors().name, "Cue Dark");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[editor]\nwrap = false\n\n[ui]\ntheme = \"Cue Dark\"\n"
+        );
+        assert!(!config::get().wrap);
+        assert!(screen(&app).contains("Using Cue Dark."));
     }
 
     #[test]
