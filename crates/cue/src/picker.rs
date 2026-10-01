@@ -147,12 +147,12 @@ impl Item {
         let text = if running.is_empty() {
             name.to_string()
         } else {
-            format!("{name} {running}")
+            format!("{name} · {running}")
         };
         Item {
             dim: name.chars().count()..text.chars().count(),
             text,
-            detail: "terminal".to_string(),
+            detail: format!("#{id}"),
             choice: Choice::Terminal(id),
             color: None,
         }
@@ -511,6 +511,12 @@ impl Picker {
     pub fn handle_mouse(&mut self, mouse: Mouse) -> PickerAction {
         let area = self.area();
         let inside = area.contains(mouse.x, mouse.y);
+        if self
+            .preview_area()
+            .is_some_and(|area| area.contains(mouse.x, mouse.y))
+        {
+            return PickerAction::Continue;
+        }
         match mouse.kind {
             MouseKind::Press(_) if !inside => PickerAction::Close,
             MouseKind::Press(MouseButton::Left) => {
@@ -524,6 +530,20 @@ impl Picker {
                 }
                 self.selected = index;
                 self.accept()
+            }
+            MouseKind::Move if inside => {
+                let list = area.y + 3;
+                if mouse.y >= list && mouse.y + 1 < area.y + area.height {
+                    let index = self.scroll + (mouse.y - list) as usize;
+                    if self
+                        .matches
+                        .get(index)
+                        .is_some_and(|&i| matches!(self.item(i).choice, Choice::Terminal(_)))
+                    {
+                        self.selected = index;
+                    }
+                }
+                PickerAction::Continue
             }
             MouseKind::ScrollUp if inside => {
                 self.scroll = self.scroll.saturating_sub(WHEEL_ROWS);
@@ -710,7 +730,10 @@ impl Picker {
     /// matches"), up to what fits below the query.
     fn rows(&self) -> u32 {
         // The row above, the borders, the query, and the rule under it.
-        let room = self.screen_height.saturating_sub(5);
+        let mut room = self.screen_height.saturating_sub(5);
+        if self.has_preview_space() {
+            room = room.saturating_sub(self.preview_height() + 1);
+        }
         (self.matches.len() as u32).clamp(1, MAX_ROWS).min(room)
     }
 
@@ -726,6 +749,35 @@ impl Picker {
             width,
             height: (self.rows() + 4).min(self.screen_height),
         }
+    }
+
+    // Reserve vertical space only when the selected result has a preview.
+    fn has_preview_space(&self) -> bool {
+        matches!(self.mode(), Mode::Files | Mode::Terminals)
+            && !self.terminals.is_empty()
+            && self.screen_width >= 32
+            && self.screen_height >= 16
+            && matches!(self.selected_choice(), Some(Choice::Terminal(_)))
+    }
+
+    fn preview_height(&self) -> u32 {
+        (self.screen_height / 2 + 3)
+            .min(18)
+            .min(self.screen_height.saturating_sub(8))
+    }
+
+    /// A separate, read-only viewport for the selected terminal.
+    pub fn preview_area(&self) -> Option<Area> {
+        if !self.has_preview_space() {
+            return None;
+        }
+        let list = self.area();
+        Some(Area {
+            x: list.x,
+            y: list.y + list.height + 1,
+            width: list.width,
+            height: self.preview_height(),
+        })
     }
 
     fn draw_popup(&self, frame: &Buffer, area: Area) -> (u32, u32) {
@@ -1190,6 +1242,36 @@ mod tests {
     }
 
     #[test]
+    fn terminal_previews_fit_and_leave_clicks_in_the_preview_alone() {
+        let root = fixture("terminal-preview", &[]);
+        let mut picker = picker(&root, Mode::Terminals, Vec::new());
+        picker.set_recent((1..20).map(|id| Item::terminal(id, "cue", "zsh")).collect());
+        for (width, height) in [(80, 24), (120, 24), (160, 40), (32, 16)] {
+            picker.set_size(width, height);
+            let list = picker.area();
+            let preview = picker.preview_area().unwrap();
+            assert!(preview.x + preview.width <= width);
+            assert!(preview.y + preview.height <= height);
+            assert!(!list.contains(preview.x, preview.y));
+            let choice = picker.selected_choice().cloned();
+            assert_eq!(
+                picker.handle_mouse(Mouse {
+                    kind: MouseKind::Press(MouseButton::Left),
+                    x: preview.x + 2,
+                    y: preview.y + 3,
+                    mods: crate::input::Mods::NONE,
+                }),
+                PickerAction::Continue
+            );
+            assert_eq!(picker.selected_choice(), choice.as_ref());
+            picker.run(Command::PickerDown);
+            assert_ne!(picker.selected_choice(), choice.as_ref());
+        }
+        picker.set_size(30, 10);
+        assert!(picker.preview_area().is_none());
+    }
+
+    #[test]
     fn a_leading_dollar_lists_only_terminals() {
         let root = fixture("terminals", &["build.rs", "a.rs"]);
         let (workspace, index) = index(&root);
@@ -1210,10 +1292,10 @@ mod tests {
         );
         picker.edit(Edit::Insert("$"));
         assert_eq!(picker.mode(), Mode::Terminals);
-        assert_eq!(listed(&picker), ["shell cargo build", "server"]);
+        assert_eq!(listed(&picker), ["shell · cargo build", "server"]);
         // What's running in it matches too, but files don't.
         picker.edit(Edit::Insert("build"));
-        assert_eq!(listed(&picker), ["shell cargo build"]);
+        assert_eq!(listed(&picker), ["shell · cargo build"]);
         assert_eq!(
             picker.run(Command::PickerAccept),
             PickerAction::Accept(Choice::Terminal(1))

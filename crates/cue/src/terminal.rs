@@ -285,6 +285,76 @@ impl Terminal {
         self.vt.title()
     }
 
+    /// A useful default label without asking the user to name each shell.
+    pub fn picker_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| {
+            self.cwd
+                .file_name()
+                .unwrap_or(self.cwd.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    /// Draws the existing viewport without changing its size, scroll, or focus.
+    pub fn draw_preview(&self, frame: &Buffer, area: crate::picker::Area) {
+        let colors = theme::colors();
+        frame.with_clip(area.x, area.y, area.width, area.height, || {
+            crate::picker::draw_frame(frame, area, &format!("Terminal {}", self.id));
+            let title = self.title();
+            let context = if title.is_empty() {
+                self.cwd.display().to_string()
+            } else {
+                title
+            };
+            frame.with_clip(
+                area.x + 2,
+                area.y + 1,
+                area.width.saturating_sub(4),
+                1,
+                || {
+                    frame.draw_text(
+                        &context,
+                        area.x + 2,
+                        area.y + 1,
+                        colors.muted,
+                        None,
+                        opentui::Attributes::NONE,
+                    );
+                },
+            );
+            let height = area.height.saturating_sub(4);
+            // Keep the prompt and recent output visible. Alternate screens
+            // are anchored at the top, where full-screen apps put their header.
+            let offset = if self.vt.is_alternate_screen() {
+                0
+            } else {
+                // Compose without painting to refresh the cursor even when
+                // this terminal hasn't been displayed since output arrived.
+                frame.with_clip(0, 0, 0, 0, || self.vt.draw(frame, 0, 0));
+                let row = self
+                    .vt
+                    .cursor()
+                    .position
+                    .map_or(self.area.height.saturating_sub(1), |(_, y)| u32::from(y));
+                (row + 1).min(self.area.height).saturating_sub(height)
+            };
+            frame.with_clip(
+                area.x + 1,
+                area.y + 3,
+                area.width.saturating_sub(2),
+                height,
+                || {
+                    self.vt.draw(
+                        frame,
+                        (area.x + 1) as i32,
+                        (area.y + 3) as i32 - offset as i32,
+                    );
+                },
+            );
+        });
+    }
+
     pub fn set_area(&mut self, area: Rect) {
         let old = size(self.area);
         self.area = area;
@@ -903,6 +973,61 @@ mod tests {
 
     fn key(code: KeyCode, mods: Mods) -> Key {
         Key::new(code, mods)
+    }
+
+    #[test]
+    fn preview_clips_recent_output_without_changing_the_terminal() {
+        let _serial = crate::test_serial();
+        let mut term = Terminal::new(
+            1,
+            &std::env::temp_dir(),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 20,
+            },
+        )
+        .unwrap();
+        // Feed the emulator directly so shell startup cannot affect this test.
+        term.vt
+            .write(b"\x1b[2J\x1b[18;1Hrecent-output\r\nprompt> ")
+            .unwrap();
+        let frame =
+            opentui::OwnedBuffer::new(60, 30, false, opentui::WidthMethod::Unicode, "preview-test")
+                .unwrap();
+        let area = crate::picker::Area {
+            x: 5,
+            y: 3,
+            width: 30,
+            height: 10,
+        };
+        let before = term.vt.scroll_position();
+        term.draw_preview(&frame, area);
+        let output = frame.to_text(true);
+        assert!(output.contains("recent-output"), "{output}");
+        assert!(output.contains("prompt>"), "{output}");
+        assert_eq!(term.area.width, 40);
+        assert_eq!(term.area.height, 20);
+        assert_eq!(term.vt.scroll_position(), before);
+        let cells: Vec<char> = output.chars().filter(|&c| c != '\n').collect();
+        for (row, cells) in cells.chunks(60).enumerate() {
+            let line: String = cells.iter().collect();
+            if row < area.y as usize || row >= (area.y + area.height) as usize {
+                assert!(line.trim().is_empty(), "{output}");
+            } else {
+                assert!(line.chars().take(area.x as usize).all(|c| c == ' '));
+                assert!(line
+                    .chars()
+                    .skip((area.x + area.width) as usize)
+                    .all(|c| c == ' '));
+            }
+        }
+        term.vt
+            .write(b"\x1b[?1049h\x1b[Hfull-screen-header")
+            .unwrap();
+        term.draw_preview(&frame, area);
+        assert!(frame.to_text(true).contains("full-screen-header"));
     }
 
     #[test]

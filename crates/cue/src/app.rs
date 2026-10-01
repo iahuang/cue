@@ -1328,6 +1328,13 @@ impl App {
             return search.draw(frame);
         }
         if let Some(picker) = &self.picker {
+            if let (Some(area), Some(Choice::Terminal(id))) =
+                (picker.preview_area(), picker.selected_choice())
+            {
+                if let Some(terminal) = self.terminals.iter().find(|t| t.borrow().id() == *id) {
+                    terminal.borrow().draw_preview(frame, area);
+                }
+            }
             return picker.draw(frame);
         }
         if let Some(dialog) = &self.dialog {
@@ -2164,7 +2171,7 @@ impl App {
                 Some(_) => "exited".to_string(),
                 None => terminal.program().unwrap_or_default(),
             };
-            Item::terminal(terminal.id(), &terminal.name(), &running)
+            Item::terminal(terminal.id(), &terminal.picker_name(), &running)
         };
         let mut items: Vec<Item> = self
             .recent
@@ -4499,6 +4506,33 @@ mod tests {
     }
 
     #[test]
+    fn terminal_picker_previews_without_switching_until_accepted() {
+        let _serial = crate::test_serial();
+        let root = fixture("terminal-preview", &[("a.txt", "original editor")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.resize(120, 30);
+        app.run(Command::NewTerminal, false);
+        let id = app.active_terminal().unwrap().borrow().id();
+        app.open(&root.join("a.txt"), false);
+        app.show_picker(Mode::Terminals);
+        assert_eq!(
+            app.picker.as_ref().unwrap().selected_choice(),
+            Some(&Choice::Terminal(id))
+        );
+        let frame = OwnedBuffer::new(120, 30, false, WidthMethod::Unicode, "preview").unwrap();
+        app.draw(&frame);
+        assert!(frame.to_text(true).contains("Terminal 1"));
+        assert!(app.active_terminal().is_none());
+        assert!(app.ed().path().is_some_and(|p| p.ends_with("a.txt")));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none());
+        assert!(app.active_terminal().is_none());
+        app.show_picker(Mode::Terminals);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_terminal().unwrap().borrow().id(), id);
+    }
+
+    #[test]
     fn terminals_take_the_keyboard_and_outlive_their_panel() {
         let _serial = crate::test_serial();
         let root = fixture("terminal", &[("a.txt", "alpha")]);
@@ -4570,11 +4604,7 @@ mod tests {
 
         // The picker lists it first, as the last thing shown: Enter goes back.
         ctrl(&mut app, 'p');
-        assert!(
-            screen(&app).contains("Terminal 1 sleep"),
-            "{}",
-            screen(&app)
-        );
+        assert!(screen(&app).contains("· sleep"), "{}", screen(&app));
         key(&mut app, KeyCode::Enter);
         assert!(app.active_terminal().is_some());
         // And from there, back to the file.
