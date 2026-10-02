@@ -97,6 +97,12 @@ impl<T: Clone> Alert<T> {
         }
     }
 
+    /// Puts `button` before the others, selected.
+    pub fn add_first(&mut self, button: Button<T>) {
+        self.buttons.insert(0, button);
+        self.selected = 0;
+    }
+
     pub fn set_size(&mut self, width: u32, height: u32) {
         self.screen_width = width;
         self.screen_height = height;

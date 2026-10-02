@@ -20,8 +20,14 @@
 //! As in other terminals, the next match is the one above: finding starts
 //! from the bottom of the view and goes back through the history. Matches
 //! are found again as output arrives.
+//!
+//! A session keeps what a terminal shows (see [`Terminal::screen`]). Brought
+//! back, it starts a new shell below that, in the folder the last one was
+//! in; or when a new cue takes over from this one in its process, it
+//! adopts the shell, still running, with the screen as it was.
 
 use std::io;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
@@ -48,6 +54,9 @@ use crate::theme;
 const READ_BUDGET: usize = 256 * 1024;
 /// Rows the wheel scrolls.
 const WHEEL_ROWS: i32 = 3;
+/// How much of a terminal's text a session keeps, at most, to show again
+/// when it's restored: the end of it.
+const MAX_SAVED_TEXT: usize = 1024 * 1024;
 
 pub struct Terminal {
     /// Numbers terminals, from 1, in the order they were started.
@@ -127,7 +136,73 @@ impl Terminal {
             .map_err(|e| io::Error::other(e.to_string()))?;
         restyle(&mut vt);
         let pty = Pty::shell(cwd, cols, rows)?;
-        Ok(Terminal {
+        Ok(Terminal::with(id, vt, pty, cwd, area))
+    }
+
+    /// A terminal of a session saved before: `screen`, the text it showed
+    /// `cols` wide (see [`Terminal::screen`]), then below a line saying it
+    /// was saved at `saved` (seconds since the epoch), a new shell in `cwd`.
+    pub fn restore(
+        id: u32,
+        cwd: &Path,
+        area: Rect,
+        screen: Option<&[u8]>,
+        cols: u16,
+        saved: u64,
+    ) -> io::Result<Terminal> {
+        let (width, rows) = size(area);
+        let mut vt = EmbeddedTerminal::new(cols.max(1), rows, config::get().scrollback)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        restyle(&mut vt);
+        if let Some(screen) = screen {
+            let _ = vt.write(screen);
+            let note = format!(
+                "\x1b[0;2m── restored session from {} ──\x1b[0m\r\n",
+                local_time(saved)
+            );
+            let _ = vt.write(note.as_bytes());
+            vt.drain_responses();
+        }
+        let _ = vt.resize(width, rows);
+        let pty = Pty::shell(cwd, width, rows)?;
+        Ok(Terminal::with(id, vt, pty, cwd, area))
+    }
+
+    /// A terminal whose shell a process this one replaced left running:
+    /// on the pty whose master is `fd`, as process `pid`, showing what
+    /// [`Terminal::screen`] took in full `cols` by `rows`.
+    pub fn adopt(
+        id: u32,
+        cwd: &Path,
+        area: Rect,
+        (fd, pid): (RawFd, libc::pid_t),
+        screen: &[u8],
+        (cols, rows): (u16, u16),
+    ) -> io::Result<Terminal> {
+        let mut vt = EmbeddedTerminal::new(cols.max(1), rows.max(1), config::get().scrollback)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        restyle(&mut vt);
+        let _ = vt.write(screen);
+        // What it answered for the snapshot's queries isn't the program's.
+        vt.drain_responses();
+        let pty = Pty::adopt(fd, pid)?;
+        let full_screen = vt.is_alternate_screen();
+        let mut terminal = Terminal::with(id, vt, pty, cwd, Rect::default());
+        terminal.area = Rect {
+            width: cols as u32,
+            height: rows as u32,
+            ..area
+        };
+        terminal.set_area(area);
+        if full_screen {
+            // Bytes it was in the middle of may have been lost.
+            terminal.pty.ask_to_redraw();
+        }
+        Ok(terminal)
+    }
+
+    fn with(id: u32, vt: EmbeddedTerminal, pty: Pty, cwd: &Path, area: Rect) -> Terminal {
+        Terminal {
             id,
             name: None,
             prompt: None,
@@ -141,12 +216,73 @@ impl Terminal {
             selecting_from: None,
             find: None,
             epoch: 0,
-        })
+        }
+    }
+
+    /// What a session keeps of it: with `full`, everything a new terminal
+    /// needs to look like it (for [`Terminal::adopt`]), or else its text
+    /// (for [`Terminal::restore`]), with the size it's at.
+    pub fn screen(&mut self, full: bool) -> Option<(Vec<u8>, (u16, u16))> {
+        let mut screen = self.vt.snapshot(full).ok()?;
+        if !full && screen.len() > MAX_SAVED_TEXT {
+            // From the first line in the last of it.
+            let start = screen.len() - MAX_SAVED_TEXT;
+            let cut = screen[start..]
+                .windows(2)
+                .position(|pair| pair == b"\r\n")
+                .map_or(start, |at| start + at + 2);
+            screen.drain(..cut);
+        }
+        if full {
+            let title = self.vt.title();
+            if !title.is_empty() && !title.contains(['\x1b', '\x07']) {
+                screen.extend_from_slice(format!("\x1b]2;{title}\x1b\\").as_bytes());
+            }
+        }
+        Some((screen, size(self.area)))
+    }
+
+    /// Lets go of the shell without hanging up on it, for a process that
+    /// replaces this one to adopt: the pty's master, kept open across
+    /// `exec`, and the shell's process id.
+    pub fn release(self) -> (RawFd, libc::pid_t) {
+        self.pty.release()
+    }
+
+    /// Gives it a name, or none.
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+    }
+
+    /// The name it was given, if it was renamed.
+    pub fn given_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Its screen's size, in columns and rows.
+    pub fn screen_size(&self) -> (u16, u16) {
+        size(self.area)
+    }
+
+    /// Counts changes to its output.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The folder it started in.
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// The folder its shell is in now, or else the one it started in.
+    pub fn current_folder(&self) -> PathBuf {
+        match self.exit {
+            None => self
+                .pty
+                .working_folder()
+                .unwrap_or_else(|| self.cwd.clone()),
+            Some(_) => self.cwd.clone(),
+        }
     }
 
     /// Starts a new shell, after the last one exited, on a clear screen
@@ -850,6 +986,22 @@ pub fn describe_exit(status: ExitStatus) -> String {
         (None, Some(signal)) => format!("The shell was ended by signal {signal}"),
         (None, None) => "The shell exited".to_string(),
     }
+}
+
+/// `secs` since the epoch as the local time, as `Oct 2 14:03`.
+fn local_time(secs: u64) -> String {
+    // Named, `time_t` is deprecated on musl, whose is changing size.
+    let time = secs as _;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+        return String::new();
+    }
+    let mut out = [0u8; 64];
+    let format = c"%b %e %H:%M";
+    let len = unsafe { libc::strftime(out.as_mut_ptr().cast(), out.len(), format.as_ptr(), &tm) };
+    let text = String::from_utf8_lossy(&out[..len]);
+    // `%e` pads the day with a space.
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn size(area: Rect) -> (u16, u16) {

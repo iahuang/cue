@@ -195,6 +195,20 @@ impl Document {
         Ok((Rc::new(doc), notice))
     }
 
+    /// Restores saved edits when the file on disk cannot be read. Keep
+    /// its path, but never treat the empty starting buffer as saved.
+    pub fn from_unsaved(
+        path: PathBuf,
+        text: &str,
+        theme: Rc<Theme>,
+    ) -> Result<Rc<Document>, String> {
+        let (doc, _) = Self::open(None, theme)?;
+        doc.restore_text(text);
+        doc.rename(path);
+        doc.history.borrow_mut().mark_unsaved();
+        Ok(doc)
+    }
+
     /// A document of `buffer`'s text, saved to `file`.
     pub fn new(buffer: Rc<EditBuffer>, file: File, theme: Rc<Theme>) -> Document {
         buffer.set_syntax_style(Some(theme.syntax_style()));

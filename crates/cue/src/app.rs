@@ -48,6 +48,13 @@
 //! can be shown in panels in several, and a terminal, in one panel anywhere,
 //! moves to the tab it's shown in. Closing a tab closes what its panels
 //! show, as closing each of them would.
+//!
+//! A cue can be a session (see [`crate::session`]), kept to come back to:
+//! Keep Session makes it one, as does quitting with unsaved changes or
+//! programs running and answering Keep Session, or the terminal going away
+//! then. A session saves its tabs, files, unsaved changes, and terminals as
+//! they change; quitting it detaches while programs run in its terminals,
+//! and otherwise leaves it saved. End Session lets it go.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -55,8 +62,8 @@ use std::fs;
 use std::io;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::time::Instant;
+use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use opentui::{Attributes, Buffer};
 
@@ -79,6 +86,7 @@ use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::recovery::{self, Orphan, Recovery};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
+use crate::session::{self, Session, Shown};
 use crate::status::{self, Prompt, PromptKey};
 use crate::symbols::{self, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
@@ -96,6 +104,10 @@ const MOVE_THRESHOLD: u32 = 3;
 const MIN_EDITOR_WIDTH: u32 = 40;
 /// How many recently shown files and terminals the picker lists first.
 const RECENT_FILES: usize = 50;
+/// A session saves itself at most this often, as it changes.
+const SESSION_INTERVAL: Duration = Duration::from_secs(1);
+/// And its terminals' screens at most this often, but when it's left.
+const SCREENS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Something a panel showed, for the picker to list first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +149,8 @@ enum Answer {
     Recover(Vec<Orphan>),
     /// Let those changes go.
     DiscardRecovered(Vec<Orphan>),
+    /// Keep everything as a session, then quit.
+    KeepSession,
 }
 
 /// What's left of saving files and then going ahead, while one that
@@ -153,6 +167,23 @@ pub enum AppAction {
     Quit,
     /// Put this text on the system clipboard.
     Copy(String),
+    /// Go on in the background, a session, with the terminal let go.
+    Detach,
+    /// Start cue again in this process, from its binary as it is now,
+    /// keeping everything (see [`App::hand_over`]).
+    Restart,
+}
+
+/// A terminal a process this one replaced left running, to adopt.
+pub struct Adopted {
+    pub id: u32,
+    /// The pty's master.
+    pub fd: RawFd,
+    /// The shell's process id.
+    pub pid: libc::pid_t,
+    /// Its screen, in full (see [`Terminal::screen`]), and the size then.
+    pub screen: Vec<u8>,
+    pub size: (u16, u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +329,18 @@ pub struct App {
     /// `None` if there was none: when an open document of it was saved
     /// with something else, the settings are read again.
     settings_hash: Option<u64>,
+    /// Where sessions are kept, if anywhere.
+    sessions: Option<PathBuf>,
+    /// The session this cue is, if it is one.
+    session: Option<Session>,
+    /// When it was last saved, and its terminals' screens.
+    session_saved: Option<Instant>,
+    screens_saved: Option<Instant>,
+    /// Each terminal's screen as last saved: its name in the session, and
+    /// the terminal's output epoch then.
+    screens: HashMap<u32, (String, u64)>,
+    /// A terminal shows cue: it isn't detached.
+    attached: bool,
 }
 
 /// A popup's query line, which typing, pasting, and the editor's cursor
@@ -424,6 +467,16 @@ impl App {
                 false => config::path().map(|path| document::resolve(&path)),
             },
             settings_hash: None,
+            // Tests keep none; those of sessions set a folder of their own.
+            sessions: match cfg!(test) {
+                true => None,
+                false => session::default_dir(),
+            },
+            session: None,
+            session_saved: None,
+            screens_saved: None,
+            screens: HashMap::new(),
+            attached: true,
         };
         app.settings_hash = app
             .settings
@@ -634,6 +687,25 @@ impl App {
     pub fn run(&mut self, command: Command, select: bool) -> AppAction {
         match command {
             Command::Quit => return self.quit(),
+            Command::Restart => return AppAction::Restart,
+            Command::KeepSession if self.session.is_some() => self.show_message(
+                "This is a session already: quitting keeps it, and End Session lets it go.",
+                false,
+            ),
+            Command::KeepSession => {
+                self.keep_session(true);
+            }
+            Command::Detach => {
+                if self.session.is_none() && !self.keep_session(false) {
+                    return AppAction::Continue;
+                }
+                return if self.save_session(true) {
+                    AppAction::Detach
+                } else {
+                    AppAction::Continue
+                };
+            }
+            Command::EndSession => return self.end_session(),
             Command::ToggleTree => {
                 self.tree_visible = !self.tree_visible;
                 if self.tree_visible {
@@ -1374,6 +1446,11 @@ impl App {
         }
         self.recovery
             .sync(&self.documents, self.workspace.roots(), false);
+        let due = |at: Option<Instant>, every| at.is_none_or(|at| at.elapsed() >= every);
+        if self.session.is_some() && due(self.session_saved, SESSION_INTERVAL) {
+            let screens = due(self.screens_saved, SCREENS_INTERVAL);
+            self.save_session(screens);
+        }
         if let Some(changes) = self.watcher.poll() {
             changed |= self.disk_changed(changes);
             // Folders may have come back for open files, and the tree may
@@ -1780,10 +1857,16 @@ impl App {
                     self.files.refresh();
                 }
                 let recent = self.recent_items();
-                // Terminal commands, for the terminal on screen.
+                // Terminal commands, for the terminal on screen, and
+                // session commands as it is one or not.
                 let terminal = self.active_terminal().is_some();
-                let available =
-                    |command: Command| command.context() != Context::Terminal || terminal;
+                let session = self.session.is_some();
+                let available = |command: Command| match command {
+                    Command::KeepSession => !session && self.sessions.is_some(),
+                    Command::EndSession => session,
+                    Command::Detach => self.sessions.is_some(),
+                    command => command.context() != Context::Terminal || terminal,
+                };
                 self.picker = Some(Picker::new(
                     mode,
                     &self.keymap,
@@ -2424,6 +2507,12 @@ impl App {
                 recovery::remove(&orphans);
                 return AppAction::Continue;
             }
+            Answer::KeepSession => {
+                return match self.keep_session(false) {
+                    true => self.leave_session(),
+                    false => AppAction::Continue,
+                };
+            }
             Answer::Save(docs, redo) => Saving { docs, redo },
             Answer::Overwrite(doc, saving) => {
                 let action = self.overwrite(&doc);
@@ -2941,6 +3030,552 @@ impl App {
         }
     }
 
+    // --- sessions -----------------------------------------------------------------
+
+    /// The session this cue is, if any.
+    pub fn session(&self) -> Option<&Session> {
+        self.session.as_ref()
+    }
+
+    /// Stops being a session, removing what it kept, as when it was one
+    /// only to restart (see [`App::hand_over`]). Unsaved changes have
+    /// recovery copies again.
+    pub fn forget_session(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.end();
+        }
+        self.recovery = Recovery::new(match cfg!(test) {
+            true => None,
+            false => Recovery::default_dir(),
+        });
+    }
+
+    /// Lets the session go without asking, as `cue --end` does.
+    pub fn end_session_now(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.end();
+        }
+    }
+
+    /// The workspace's folders.
+    pub fn roots(&self) -> &[PathBuf] {
+        self.workspace.roots()
+    }
+
+    /// The programs running in terminals, by name.
+    pub fn running_programs(&self) -> Vec<String> {
+        running_programs(&self.terminals)
+    }
+
+    /// Shows `text` in the status bar, as from outside, after input.
+    pub fn show_message_now(&mut self, text: String, error: bool) {
+        self.show_message(text, error);
+    }
+
+    /// Notes whether a terminal shows cue, for the list of sessions.
+    pub fn set_attached(&mut self, attached: bool) {
+        self.attached = attached;
+        self.save_session(false);
+    }
+
+    /// Makes this cue a session, saved from now on, which keeps its unsaved
+    /// changes instead of recovery copies. Returns false, with a message,
+    /// if it can't. With `announce`, says so.
+    fn keep_session(&mut self, announce: bool) -> bool {
+        let Some(sessions) = self.sessions.clone() else {
+            self.show_message("There's nowhere to keep sessions: HOME isn't set.", true);
+            return false;
+        };
+        match Session::create(&sessions) {
+            Ok(session) => {
+                self.session = Some(session);
+                if !self.save_session(false) {
+                    self.session.take().unwrap().end();
+                    return false;
+                }
+                self.recovery.discard();
+                if announce {
+                    self.show_message(
+                        "Kept as a session: quitting leaves it to come back to with `cue`.",
+                        false,
+                    );
+                }
+                true
+            }
+            Err(err) => {
+                self.show_message(format!("Can't keep a session: {err}"), true);
+                false
+            }
+        }
+    }
+
+    /// Leaves the session to come back to: in the background with its
+    /// terminals, while programs run in them, or else saved, to exit.
+    fn leave_session(&mut self) -> AppAction {
+        if !self.save_session(true) {
+            return AppAction::Continue;
+        }
+        match running_programs(&self.terminals).is_empty() {
+            true => AppAction::Quit,
+            false => AppAction::Detach,
+        }
+    }
+
+    /// Lets the session go and quits, asking first, as quitting does
+    /// otherwise, about unsaved changes and running programs.
+    fn end_session(&mut self) -> AppAction {
+        if self.session.is_none() {
+            self.show_message("This isn't a session; Keep Session makes it one.", false);
+            return AppAction::Continue;
+        }
+        let unsaved = self.unsaved();
+        let running = running_programs(&self.terminals);
+        let redo = Redo::Run(Command::EndSession);
+        if !self.ask_first("End session?".into(), unsaved, &running, "&End", redo) {
+            return AppAction::Continue;
+        }
+        if let Some(session) = self.session.take() {
+            session.end();
+        }
+        AppAction::Quit
+    }
+
+    /// The terminal cue showed in is gone, as when an ssh connection
+    /// drops. With unsaved changes or programs running, cue becomes a
+    /// session, if it isn't one, as if asked when quitting. Returns whether
+    /// to go on in the background: while programs run.
+    pub fn hang_up(&mut self) -> bool {
+        let running = !running_programs(&self.terminals).is_empty();
+        if self.session.is_none() && (running || !self.unsaved().is_empty()) {
+            self.keep_session(false);
+        }
+        if self.session.is_none() {
+            return false;
+        }
+        self.attached = false;
+        let saved = self.save_session(true);
+        running || !saved
+    }
+
+    /// Saves the session, if this is one, as it is now; with `screens`,
+    /// terminals' screens too, where they changed.
+    /// Returns false, with a message, if unsaved text or metadata could
+    /// not be written. Callers leaving the app must keep it open then.
+    pub fn save_session(&mut self, screens: bool) -> bool {
+        if self.session.is_none() {
+            return true;
+        }
+        let result = self.session_state(screens).and_then(|state| {
+            let session = self.session.as_mut().unwrap();
+            session.save(&state)?;
+            // Only the committed metadata decides which copies may go.
+            let texts = state
+                .documents
+                .iter()
+                .filter_map(|doc| doc.unsaved.clone())
+                .collect::<Vec<_>>();
+            session.prune_texts(&texts);
+            Ok(())
+        });
+        self.session_saved = Some(Instant::now());
+        if let Err(err) = result {
+            self.show_message(format!("Can't save session: {err}"), true);
+            return false;
+        }
+        if screens {
+            self.screens_saved = self.session_saved;
+        }
+        true
+    }
+
+    /// Everything the session keeps, writing unsaved changes, and with
+    /// `screens`, terminals' screens, where they changed.
+    fn session_state(&mut self, screens: bool) -> io::Result<session::State> {
+        let Some(session) = &mut self.session else {
+            return Ok(session::State::default());
+        };
+        let documents = self
+            .documents
+            .iter()
+            .filter(|doc| !doc.is_blank())
+            .map(|doc| {
+                let unsaved = session.save_text(doc)?;
+                Ok(session::Doc {
+                    path: doc.path(),
+                    untitled: doc.untitled.get(),
+                    unsaved,
+                    preview: self.preview.as_ref().is_some_and(|p| Rc::ptr_eq(p, doc)),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        let mut terminals = Vec::new();
+        for terminal in &self.terminals {
+            let mut terminal = terminal.borrow_mut();
+            let id = terminal.id();
+            let epoch = terminal.epoch();
+            let saved = self.screens.get(&id).map(|(_, at)| *at);
+            if screens && saved != Some(epoch) {
+                let name = terminal
+                    .screen(false)
+                    .and_then(|(screen, _)| session.save_screen(id, &screen).ok());
+                if let Some(name) = name {
+                    self.screens.insert(id, (name, epoch));
+                }
+            }
+            let (cols, rows) = terminal.screen_size();
+            terminals.push(session::TerminalState {
+                id,
+                name: terminal.given_name().map(str::to_string),
+                cwd: terminal.current_folder(),
+                program: terminal.is_busy().then(|| terminal.program()).flatten(),
+                screen: self.screens.get(&id).map(|(name, _)| name.clone()),
+                size: (cols, rows),
+            });
+        }
+        let ids: Vec<u32> = terminals.iter().map(|terminal| terminal.id).collect();
+        self.screens.retain(|id, _| ids.contains(id));
+        if screens {
+            let kept: Vec<String> = self
+                .screens
+                .values()
+                .map(|(name, _)| name.clone())
+                .collect();
+            session.prune_screens(&kept);
+        }
+
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| session::TabState {
+                name: tab.name.clone(),
+                layout: tab.layout.clone(),
+                active: tab.active,
+                panels: tab
+                    .panels
+                    .iter()
+                    .map(|panel| {
+                        let (back, forward) = panel.history();
+                        session::PanelState {
+                            id: panel.id,
+                            shows: panel.visit().as_ref().and_then(visit_shown),
+                            places: panel
+                                .places()
+                                .filter_map(|(doc, (row, col, top))| {
+                                    Some(session::Place {
+                                        doc: doc_shown(doc)?,
+                                        row,
+                                        col,
+                                        top,
+                                    })
+                                })
+                                .collect(),
+                            back: back.iter().filter_map(visit_shown).collect(),
+                            forward: forward.iter().filter_map(visit_shown).collect(),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        let recent = self
+            .recent
+            .iter()
+            .map(|recent| match recent {
+                Recent::File(path) => Shown::File(path.clone()),
+                Recent::Terminal(id) => Shown::Terminal(*id),
+                Recent::Untitled(number) => Shown::Untitled(*number),
+            })
+            .collect();
+        Ok(session::State {
+            roots: self.workspace.roots().to_vec(),
+            saved: session::now(),
+            tree_visible: self.tree_visible,
+            tree_width: self.tree_width,
+            tree_focused: self.focus == Focus::Tree,
+            tab: self.tab,
+            tabs,
+            documents,
+            terminals,
+            recent,
+            attached: self.attached,
+        })
+    }
+
+    /// Goes back to `session`, as `state` has it: its files, with their
+    /// unsaved changes, its terminals, and its tabs. Terminals `adopted`
+    /// from a process this one replaced go on running; the others start
+    /// new shells, below what they showed.
+    pub fn restore_session(
+        &mut self,
+        mut session: Session,
+        state: session::State,
+        adopted: Vec<Adopted>,
+    ) -> Result<(), String> {
+        self.close_popups();
+        self.tree_visible = state.tree_visible;
+        if state.tree_width > 0 {
+            self.tree_width = state.tree_width.max(MIN_TREE_WIDTH);
+        }
+
+        // Files.
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            panel.clear();
+        }
+        self.documents.clear();
+        self.preview = None;
+        let mut docs: Vec<(Shown, Rc<Document>)> = Vec::new();
+        for saved in &state.documents {
+            let text = saved
+                .unsaved
+                .as_ref()
+                .map(|name| {
+                    session
+                        .text(name)
+                        .map_err(|err| format!("Can't read saved changes {name}: {err}"))
+                })
+                .transpose()?;
+            let opened = match &saved.path {
+                // A file that's gone comes back only with changes to it.
+                Some(path) if !path.exists() && text.is_none() => None,
+                Some(path) => match Document::open(Some(path.clone()), self.theme.clone()) {
+                    Ok(doc) => Some(doc),
+                    Err(err) if text.is_some() => {
+                        self.show_message(
+                            format!(
+                                "Can't open {}: {err}. Restored its saved changes.",
+                                path.display()
+                            ),
+                            true,
+                        );
+                        Some((
+                            Document::from_unsaved(
+                                path.clone(),
+                                text.as_deref().unwrap(),
+                                self.theme.clone(),
+                            )?,
+                            None,
+                        ))
+                    }
+                    Err(_) => None,
+                },
+                None => Some(Document::open(None, self.theme.clone())?),
+            };
+            let Some((doc, _)) = opened else {
+                continue;
+            };
+            if saved.path.is_none() {
+                doc.untitled.set(saved.untitled);
+            }
+            if let (Some(text), Some(name)) = (&text, &saved.unsaved) {
+                doc.restore_text(text);
+                session.note_text(&doc, name);
+            }
+            if saved.preview {
+                self.preview = Some(doc.clone());
+            }
+            let key = match &saved.path {
+                Some(path) => Shown::File(path.clone()),
+                None => Shown::Untitled(saved.untitled),
+            };
+            self.documents.push(doc.clone());
+            docs.push((key, doc));
+        }
+        let find_doc = |shown: &Shown| {
+            docs.iter()
+                .find(|(key, _)| key == shown)
+                .map(|(_, doc)| doc.clone())
+        };
+
+        // Terminals.
+        self.terminals.clear();
+        self.focused_terminal = None;
+        self.screens.clear();
+        let mut adopted = adopted;
+        for saved in &state.terminals {
+            let cwd = match saved.cwd.is_dir() {
+                true => saved.cwd.clone(),
+                false => self.current_root(),
+            };
+            let (cols, rows) = saved.size;
+            let area = Rect {
+                width: cols as u32,
+                height: rows as u32,
+                ..Rect::default()
+            };
+            let terminal = match adopted.iter().position(|a| a.id == saved.id) {
+                Some(index) => {
+                    let a = adopted.remove(index);
+                    Terminal::adopt(saved.id, &cwd, area, (a.fd, a.pid), &a.screen, a.size)
+                }
+                None => {
+                    let screen = saved.screen.as_ref().and_then(|name| session.screen(name));
+                    Terminal::restore(saved.id, &cwd, area, screen.as_deref(), cols, state.saved)
+                }
+            };
+            match terminal {
+                Ok(mut terminal) => {
+                    terminal.set_name(saved.name.clone());
+                    self.terminals.push(Rc::new(RefCell::new(terminal)));
+                }
+                Err(err) => self.show_message(format!("Can't start a shell: {err}"), true),
+            }
+        }
+        // Any left over aren't the session's: they're hung up on.
+        for left in adopted {
+            if let Ok(pty) = crate::pty::Pty::adopt(left.fd, left.pid) {
+                drop(pty);
+            }
+        }
+        self.next_terminal = state
+            .terminals
+            .iter()
+            .map(|terminal| terminal.id + 1)
+            .max()
+            .unwrap_or(1)
+            .max(self.next_terminal);
+
+        // Tabs.
+        if !state.tabs.is_empty() {
+            self.tabs = state
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(index, saved)| Tab {
+                    id: index as TabId,
+                    layout: saved.layout.clone(),
+                    panels: saved
+                        .panels
+                        .iter()
+                        .map(|panel| Panel::new(panel.id))
+                        .collect(),
+                    active: saved.active,
+                    previous: None,
+                    name: saved.name.clone(),
+                })
+                .collect();
+        }
+        self.tab = state.tab.min(self.tabs.len() - 1);
+        self.next_tab = self.tabs.len() as TabId;
+        self.next_panel = tab::all_panels(&self.tabs)
+            .map(|panel| panel.id + 1)
+            .max()
+            .unwrap_or(0);
+        let area = self.main_area();
+        for tab in &mut self.tabs {
+            tab.set_area(area);
+        }
+        let visit = |shown: &Shown| match shown {
+            Shown::File(path) => Some(Visit::File(
+                find_doc(shown).map_or_else(Weak::new, |doc| Rc::downgrade(&doc)),
+                Some(path.clone()),
+            )),
+            Shown::Untitled(_) => Some(Visit::File(Rc::downgrade(&find_doc(shown)?), None)),
+            Shown::Terminal(id) => Some(Visit::Terminal(*id)),
+            Shown::Image(path) => Some(Visit::Image(path.clone())),
+        };
+        for (tab, saved) in self.tabs.iter_mut().zip(&state.tabs) {
+            for saved in &saved.panels {
+                let Some(panel) = tab.panel_mut(saved.id) else {
+                    continue;
+                };
+                for place in &saved.places {
+                    let Some(doc) = find_doc(&place.doc) else {
+                        continue;
+                    };
+                    if panel.show(&doc).is_ok() {
+                        if let Some(editor) = panel.editor_mut() {
+                            editor.set_place(place.row, place.col, place.top);
+                        }
+                    }
+                }
+                let shown = match &saved.shows {
+                    Some(Shown::Terminal(id)) => self
+                        .terminals
+                        .iter()
+                        .find(|terminal| terminal.borrow().id() == *id)
+                        .map(|terminal| panel.show_terminal(terminal.clone()))
+                        .is_some(),
+                    Some(Shown::Image(path)) => ImageView::open(path)
+                        .map(|image| panel.show_image(image))
+                        .is_ok(),
+                    Some(doc) => find_doc(doc).is_some_and(|doc| panel.show(&doc).is_ok()),
+                    None => false,
+                };
+                if !shown {
+                    panel.show_nothing();
+                }
+                panel.set_history(
+                    saved.back.iter().filter_map(visit).collect(),
+                    saved.forward.iter().filter_map(visit).collect(),
+                );
+            }
+        }
+
+        self.recent = state
+            .recent
+            .iter()
+            .map(|shown| match shown {
+                Shown::File(path) | Shown::Image(path) => Recent::File(path.clone()),
+                Shown::Terminal(id) => Recent::Terminal(*id),
+                Shown::Untitled(number) => Recent::Untitled(*number),
+            })
+            .collect();
+        self.prune_terminals();
+        self.focus = match state.tree_focused && self.tree_visible {
+            true => Focus::Tree,
+            false => Focus::Editor,
+        };
+        self.session = Some(session);
+        self.recovery.discard();
+        self.layout();
+        self.show_active_in_tree();
+        self.watching = None;
+        self.watch_folders();
+        Ok(())
+    }
+
+    /// Lets go of everything, for a process that replaces this one to go
+    /// on with (see [`App::restore_session`]): the session saved, made one
+    /// for the while if this isn't one (`true` then), and the terminals,
+    /// their shells still running, each with its screen in full. `None`,
+    /// with a message, if there's nowhere to keep it.
+    pub fn hand_over(&mut self) -> Option<(PathBuf, bool, Vec<Adopted>)> {
+        let ephemeral = self.session.is_none();
+        if ephemeral && !self.keep_session(false) {
+            return None;
+        }
+        if !self.save_session(false) {
+            return None;
+        }
+        let dir = self.session.take()?.dir().to_path_buf();
+        // Nothing else holds the terminals then.
+        self.close_popups();
+        self.focused_terminal = None;
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            panel.hide_terminal();
+        }
+        let mut adopted = Vec::new();
+        for terminal in std::mem::take(&mut self.terminals) {
+            let Ok(terminal) = Rc::try_unwrap(terminal) else {
+                continue;
+            };
+            let mut terminal = terminal.into_inner();
+            let id = terminal.id();
+            let Some((screen, size)) = terminal.screen(true) else {
+                continue;
+            };
+            let (fd, pid) = terminal.release();
+            adopted.push(Adopted {
+                id,
+                fd,
+                pid,
+                screen,
+                size,
+            });
+        }
+        Some((dir, ephemeral, adopted))
+    }
+
     // --- file dialog ------------------------------------------------------------
 
     /// Opens the file dialog for `purpose`, or closes it if it's open for
@@ -3097,19 +3732,32 @@ impl App {
         Ok(AppAction::Continue)
     }
 
+    /// Quits, but for a session, which it leaves to come back to (see
+    /// [`App::leave_session`]). Unsaved changes or running programs ask
+    /// first, offering to keep them as a session.
     fn quit(&mut self) -> AppAction {
-        let unsaved: Vec<Rc<Document>> = self
-            .documents
+        if self.session.is_some() {
+            return self.leave_session();
+        }
+        let unsaved = self.unsaved();
+        let running = running_programs(&self.terminals);
+        let redo = Redo::Run(Command::Quit);
+        if self.ask_first("Quit cue?".into(), unsaved, &running, "&Quit", redo) {
+            return AppAction::Quit;
+        }
+        if let (Some(alert), Some(_)) = (&mut self.alert, &self.sessions) {
+            alert.add_first(Button::new("&Keep Session", Answer::KeepSession));
+        }
+        AppAction::Continue
+    }
+
+    /// The open files with unsaved changes.
+    fn unsaved(&self) -> Vec<Rc<Document>> {
+        self.documents
             .iter()
             .filter(|doc| doc.is_modified())
             .cloned()
-            .collect();
-        let running = running_programs(&self.terminals);
-        let redo = Redo::Run(Command::Quit);
-        match self.ask_first("Quit cue?".into(), unsaved, &running, "&Quit", redo) {
-            true => AppAction::Quit,
-            false => AppAction::Continue,
-        }
+            .collect()
     }
 
     fn tree_action(&mut self, action: TreeAction) {
@@ -3911,6 +4559,25 @@ fn running_programs(terminals: &[Rc<RefCell<Terminal>>]) -> Vec<String> {
         .collect()
 }
 
+/// What a session calls `visit`, if it's still about.
+fn visit_shown(visit: &Visit) -> Option<Shown> {
+    Some(match visit {
+        Visit::File(_, Some(path)) => Shown::File(path.clone()),
+        Visit::File(doc, None) => Shown::Untitled(doc.upgrade()?.untitled.get()),
+        Visit::Terminal(id) => Shown::Terminal(*id),
+        Visit::Image(path) => Shown::Image(path.clone()),
+    })
+}
+
+/// What a session calls `doc`, unless it's an untitled one never typed in.
+fn doc_shown(doc: &Document) -> Option<Shown> {
+    match doc.path() {
+        Some(path) => Some(Shown::File(path)),
+        None if doc.is_blank() => None,
+        None => Some(Shown::Untitled(doc.untitled.get())),
+    }
+}
+
 /// Why going ahead would lose something: the files with `unsaved` changes,
 /// and the programs `running` in terminals.
 fn losing_reasons(unsaved: &[String], running: &[String]) -> String {
@@ -3934,6 +4601,7 @@ impl Drop for App {
     fn drop(&mut self) {
         self.recovery
             .sync(&self.documents, self.workspace.roots(), true);
+        self.save_session(false);
     }
 }
 
@@ -4053,6 +4721,17 @@ mod tests {
 
         fn ed_is_shown(&self) -> bool {
             self.editor().is_some()
+        }
+
+        /// Whether the command palette lists `command`.
+        fn palette_has(&mut self, command: Command) -> bool {
+            self.show_picker(Mode::Commands);
+            let listed = self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.lists_command(command));
+            self.picker = None;
+            listed
         }
     }
 
@@ -7237,5 +7916,321 @@ mod tests {
         assert_eq!(*config::get(), Config::default());
         assert!(app.visible_tree_width() > 0);
         assert!(screen(&app).contains("b.txt"));
+    }
+
+    // --- sessions -------------------------------------------------------------------
+
+    fn sessions_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("cue-sessions-{}", std::process::id()))
+            .join(name);
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A new app going back to the session `app` was, as a cue started
+    /// later does, with terminals `adopted`.
+    fn reopen(app: App, adopted: Vec<Adopted>) -> App {
+        let dir = app.session().expect("a session").dir().to_path_buf();
+        let sessions = app.sessions.clone();
+        drop(app);
+        reopen_dir(&dir, sessions, adopted)
+    }
+
+    fn reopen_dir(dir: &Path, sessions: Option<PathBuf>, adopted: Vec<Adopted>) -> App {
+        let session = Session::open(dir).unwrap();
+        let state = session::read(dir).unwrap();
+        let workspace = Workspace::new(state.roots.clone()).unwrap();
+        let mut app = App::new(workspace, None, 80, 10).unwrap();
+        app.sessions = sessions;
+        app.restore_session(session, state, adopted).unwrap();
+        app
+    }
+
+    fn snapshot_text(terminal: &Rc<RefCell<Terminal>>) -> String {
+        let (screen, _) = terminal.borrow_mut().screen(false).unwrap();
+        String::from_utf8_lossy(&screen).into_owned()
+    }
+
+    #[test]
+    fn sessions_keep_tabs_files_places_and_unsaved_changes() {
+        let _serial = crate::test_serial();
+        let root = fixture("session", &[("a.txt", &numbered(40)), ("b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.sessions = Some(sessions_dir("keep"));
+        app.go_to(Position {
+            line: 19,
+            column: Some(2),
+        });
+        type_text(&mut app, "X");
+        ctrl(&mut app, '\\');
+        assert!(app.open(&root.join("b.txt"), false));
+        let right = app.tab().active;
+        ctrl(&mut app, 't');
+        ctrl(&mut app, 'n');
+        type_text(&mut app, "draft");
+        app.tab_mut().name = Some("notes".into());
+
+        assert!(app.palette_has(Command::KeepSession));
+        app.run(Command::KeepSession, false);
+        assert!(
+            screen(&app).contains("Kept as a session"),
+            "{}",
+            screen(&app)
+        );
+        assert!(!app.palette_has(Command::KeepSession));
+        assert!(app.palette_has(Command::EndSession));
+        let dir = app.session().unwrap().dir().to_path_buf();
+        assert!(dir.join("session.toml").is_file());
+        app.save_session(true);
+
+        let mut app = reopen(app, Vec::new());
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tab, 1);
+        assert_eq!(app.tab().name.as_deref(), Some("notes"));
+        assert_eq!(app.ed().text(), "draft");
+        assert!(app.ed().is_modified());
+        assert!(screen(&app).contains("Untitled-1"), "{}", screen(&app));
+
+        app.switch_tab(0);
+        assert_eq!(app.tab().panels.len(), 2);
+        assert_eq!(app.tab().active, right);
+        assert!(app.ed().path().is_some_and(|path| path.ends_with("b.txt")));
+        app.focus_panel(Direction::Left);
+        let editor = app.ed();
+        assert!(editor.path().is_some_and(|path| path.ends_with("a.txt")));
+        assert!(editor.is_modified());
+        assert!(editor.text().contains("liXne 20"), "{}", editor.text());
+        assert_eq!(editor.place().0, 19, "the cursor's row");
+        // Going back still works from where it was.
+        assert_eq!(app.session().map(Session::dir), Some(dir.as_path()));
+
+        // Nothing running: quitting saves it and exits, keeping it.
+        assert!(matches!(ctrl(&mut app, 'q'), AppAction::Quit));
+        assert!(dir.join("session.toml").is_file());
+        let state = session::read(&dir).unwrap();
+        assert_eq!(
+            state
+                .documents
+                .iter()
+                .filter(|d| d.unsaved.is_some())
+                .count(),
+            2
+        );
+        drop(app);
+        assert!(!session::is_live(&dir));
+    }
+
+    #[test]
+    fn quitting_with_unsaved_changes_offers_to_keep_a_session() {
+        let _serial = crate::test_serial();
+        let root = fixture("session-quit", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        let sessions = sessions_dir("quit");
+        app.sessions = Some(sessions.clone());
+        app.focus = Focus::Editor;
+        type_text(&mut app, "x");
+        assert!(matches!(ctrl(&mut app, 'q'), AppAction::Continue));
+        let text = screen(&app);
+        assert!(text.contains("Keep Session"), "{text}");
+        // Selected first: Enter keeps everything.
+        assert!(matches!(key(&mut app, KeyCode::Enter), AppAction::Quit));
+        let listed = session::list(&sessions);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].state.documents[0].unsaved.as_deref(),
+            Some("1.txt")
+        );
+        drop(app);
+
+        // Ending it asks about the changes it keeps, then lets it go.
+        let mut app = reopen_dir(&listed[0].dir, Some(sessions.clone()), Vec::new());
+        assert_eq!(app.ed().text(), "xalpha");
+        assert!(matches!(
+            app.run(Command::EndSession, false),
+            AppAction::Continue
+        ));
+        assert!(screen(&app).contains("End session?"), "{}", screen(&app));
+        assert!(matches!(key(&mut app, KeyCode::Char('n')), AppAction::Quit));
+        assert!(session::list(&sessions).is_empty());
+        assert!(!listed[0].dir.exists());
+    }
+
+    #[test]
+    fn session_terminals_are_adopted_running_or_start_below_their_screen() {
+        let _serial = crate::test_serial();
+        let root = fixture("session-terminals", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        let sessions = sessions_dir("terminals");
+        app.sessions = Some(sessions.clone());
+        app.run(Command::NewTerminal, false);
+        type_text(&mut app, "echo mark-$((6*7))");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the shell's output", |app| {
+            snapshot_text(&app.terminals[0]).contains("mark-42")
+        });
+        app.run(Command::RenameTerminal, false);
+        type_text(&mut app, "server");
+        key(&mut app, KeyCode::Enter);
+
+        // Taken over by another process: the shell runs on.
+        let (dir, ephemeral, adopted) = app.hand_over().unwrap();
+        assert!(ephemeral, "made a session for the while");
+        assert_eq!(adopted.len(), 1);
+        let pid = adopted[0].pid;
+        drop(app);
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "not hung up on");
+        let mut app = reopen_dir(&dir, Some(sessions), adopted);
+        app.forget_session();
+        assert!(!dir.exists());
+        assert!(app.session().is_none());
+        assert_eq!(app.terminals.len(), 1);
+        assert!(app.active_terminal().is_some(), "still on screen");
+        assert_eq!(app.terminals[0].borrow().given_name(), Some("server"));
+        type_text(&mut app, "echo again-$((1+1))");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the same shell's output", |app| {
+            let text = snapshot_text(&app.terminals[0]);
+            text.contains("mark-42") && text.contains("again-2")
+        });
+
+        // Kept and left: a new shell starts below what it showed.
+        app.run(Command::KeepSession, false);
+        app.save_session(true);
+        let mut app = reopen(app, Vec::new());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "hung up on");
+        assert_eq!(app.terminals.len(), 1);
+        let text = snapshot_text(&app.terminals[0]);
+        assert!(
+            text.contains("again-2") && text.contains("restored session from"),
+            "{text}"
+        );
+        type_text(&mut app, "echo new-$((2+3))");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the new shell's output", |app| {
+            snapshot_text(&app.terminals[0]).contains("new-5")
+        });
+        // With a program running, quitting goes on in the background.
+        type_text(&mut app, "sleep 30");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "sleep to run", |app| {
+            app.terminals[0].borrow().program().as_deref() == Some("sleep")
+        });
+        assert!(matches!(prefixed_ctrl(&mut app, 'q'), AppAction::Detach));
+        app.end_session_now();
+    }
+
+    #[test]
+    fn session_snapshot_failure_preserves_copy_and_blocks_leaving() {
+        let _serial = crate::test_serial();
+        let root = fixture("session-save-failure", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.sessions = Some(sessions_dir("save-failure"));
+        type_text(&mut app, "x");
+        assert!(app.keep_session(false));
+        let dir = app.session().unwrap().dir().to_path_buf();
+        let metadata = fs::read(dir.join("session.toml")).unwrap();
+        // A deterministic write failure, even when tests run as root.
+        fs::create_dir(dir.join("docs/1.tmp")).unwrap();
+        type_text(&mut app, "y");
+        assert!(!app.save_session(false));
+        assert!(screen(&app).contains("Can't save session"));
+        assert!(matches!(app.run(Command::Quit, false), AppAction::Continue));
+        assert!(matches!(
+            app.run(Command::Detach, false),
+            AppAction::Continue
+        ));
+        assert!(app.hand_over().is_none());
+        assert_eq!(
+            fs::read_to_string(dir.join("docs/1.txt")).unwrap(),
+            "xalpha"
+        );
+        assert_eq!(fs::read(dir.join("session.toml")).unwrap(), metadata);
+        assert_eq!(app.ed().text(), "xyalpha");
+        fs::remove_dir(dir.join("docs/1.tmp")).unwrap();
+        assert!(matches!(app.run(Command::Quit, false), AppAction::Quit));
+        let app = reopen(app, Vec::new());
+        assert_eq!(app.ed().text(), "xyalpha");
+    }
+
+    #[test]
+    fn session_metadata_failure_does_not_prune_committed_texts() {
+        let _serial = crate::test_serial();
+        let root = fixture("session-metadata-failure", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.sessions = Some(sessions_dir("metadata-failure"));
+        type_text(&mut app, "x");
+        assert!(app.keep_session(false));
+        let dir = app.session().unwrap().dir().to_path_buf();
+        let metadata = fs::read(dir.join("session.toml")).unwrap();
+        fs::create_dir(dir.join("session.tmp")).unwrap();
+        app.run(Command::Save, false);
+        assert!(!app.save_session(false));
+        assert_eq!(
+            fs::read_to_string(dir.join("docs/1.txt")).unwrap(),
+            "xalpha"
+        );
+        assert_eq!(fs::read(dir.join("session.toml")).unwrap(), metadata);
+        assert!(app.hand_over().is_none());
+        fs::remove_dir(dir.join("session.tmp")).unwrap();
+        assert!(app.save_session(false));
+        assert!(!dir.join("docs/1.txt").exists());
+        assert!(session::read(&dir).unwrap().documents[0].unsaved.is_none());
+    }
+
+    #[test]
+    fn session_restores_edits_when_original_path_cannot_be_read() {
+        let _serial = crate::test_serial();
+        for (name, text) in [("unreadable", "draft"), ("unreadable-empty", "")] {
+            let root = fixture(name, &[("a.txt", "alpha")]);
+            let mut app = app(&root, Some("a.txt"));
+            app.sessions = Some(sessions_dir(name));
+            let doc = app.documents[0].clone();
+            doc.restore_text(text);
+            assert!(app.keep_session(false));
+            let dir = app.session().unwrap().dir().to_path_buf();
+            drop(app);
+            fs::remove_file(root.join("a.txt")).unwrap();
+            fs::create_dir(root.join("a.txt")).unwrap();
+            let mut restored = reopen_dir(&dir, None, Vec::new());
+            assert_eq!(restored.ed().text(), text);
+            assert!(restored.ed().is_modified());
+            assert_eq!(restored.ed().path(), Some(root.join("a.txt")));
+            assert!(restored.save_session(false));
+            assert_eq!(fs::read_to_string(dir.join("docs/1.txt")).unwrap(), text);
+            let restored = reopen(restored, Vec::new());
+            assert_eq!(restored.ed().text(), text);
+            assert!(restored.ed().is_modified());
+        }
+    }
+
+    #[test]
+    fn session_unreadable_snapshot_aborts_restore_without_pruning() {
+        let _serial = crate::test_serial();
+        let root = fixture("session-unreadable-copy", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.sessions = Some(sessions_dir("unreadable-copy"));
+        type_text(&mut app, "x");
+        assert!(app.keep_session(false));
+        let dir = app.session().unwrap().dir().to_path_buf();
+        drop(app);
+        let metadata = fs::read(dir.join("session.toml")).unwrap();
+        fs::rename(dir.join("docs/1.txt"), dir.join("docs/backup.txt")).unwrap();
+        fs::create_dir(dir.join("docs/1.txt")).unwrap();
+        let workspace = Workspace::new([root]).unwrap();
+        let mut restored = App::new(workspace, None, 80, 10).unwrap();
+        assert!(restored
+            .restore_session(
+                Session::open(&dir).unwrap(),
+                session::read(&dir).unwrap(),
+                Vec::new()
+            )
+            .is_err());
+        drop(restored);
+        assert_eq!(fs::read(dir.join("session.toml")).unwrap(), metadata);
+        assert_eq!(
+            fs::read_to_string(dir.join("docs/backup.txt")).unwrap(),
+            "xalpha"
+        );
     }
 }

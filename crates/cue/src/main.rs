@@ -2,6 +2,8 @@
 
 mod alert;
 mod app;
+mod attach;
+mod client;
 mod config;
 mod context_menu;
 mod document;
@@ -25,6 +27,7 @@ mod pty;
 mod recovery;
 mod search;
 mod search_modal;
+mod session;
 mod status;
 mod symbols;
 mod syntax;
@@ -38,7 +41,8 @@ mod words;
 mod workspace;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -51,8 +55,10 @@ use opentui::{Output, Renderer, Rgba};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use app::{App, AppAction};
+use attach::{Control, Request};
 use input::{Event, Parser};
 use keymap::{Command, Keymap};
+use session::Session;
 use workspace::Workspace;
 
 /// How long input must be idle before a lone ESC counts as the Escape key.
@@ -81,12 +87,17 @@ fn main() -> ExitCode {
         let backtrace = std::backtrace::Backtrace::capture();
         *PANIC.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{info}\n{backtrace}"));
     }));
+    // Before the binary can be replaced, as when cue is updated.
+    attach::build();
 
-    let paths = match parse_args() {
-        Ok(paths) => paths,
+    let start = match parse_args() {
+        Ok(Mode::Serve(start)) => start,
+        Ok(Mode::Client(args)) => return client::run(args),
+        Ok(Mode::List) => return client::list(),
+        Ok(Mode::End(id)) => return client::end(id),
         Err(code) => return code,
     };
-    let result = std::panic::catch_unwind(|| run(paths));
+    let result = std::panic::catch_unwind(|| serve(start));
     if let Some(message) = PANIC.lock().unwrap_or_else(|e| e.into_inner()).take() {
         eprintln!("cue crashed: {message}");
         return ExitCode::FAILURE;
@@ -101,13 +112,15 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: cue [FOLDER]... [FILE[:LINE[:COLUMN]]]";
+const USAGE: &str = "usage: cue [FOLDER]... [FILE[:LINE[:COLUMN]]]
+       cue --resume | --fresh [FOLDER]...
+       cue --list | --end [SESSION]";
 
 /// Usage and every command with its shortcut.
 fn help() -> String {
     let keymap = Keymap::new(&config::load().0.keys);
     let mut help = format!(
-        "{USAGE}\n\nOpens each FOLDER, or the current folder, with FILE (or a new, unnamed buffer) open,\nat LINE and COLUMN if given, as compilers print them: src/main.rs:12:5.\nShift+movement or the mouse selects.\nSettings are in {}; Open Settings in the command palette makes it.\n\n",
+        "{USAGE}\n\nOpens each FOLDER, or the current folder, with FILE (or a new, unnamed buffer) open,\nat LINE and COLUMN if given, as compilers print them: src/main.rs:12:5.\nShift+movement or the mouse selects.\nSettings are in {}; Open Settings in the command palette makes it.\n\nSessions keep tabs, files, unsaved changes, and terminals to come back to (Keep Session, or\nquitting with unsaved changes or programs running). Quitting one leaves it running in the\nbackground while programs run in its terminals; End Session lets it go. Without FILE, cue goes\nback to the folder's session, if it has exactly one.\n  -r, --resume   choose among the folder's sessions\n      --fresh    start a new cue, though the folder has a session\n  -l, --list     list every session\n      --end      end SESSION, or the folder's session\n\n",
         config::path().map_or("~/.config/cue/config.toml".into(), |path| path.display().to_string())
     );
     let key = |command| {
@@ -128,36 +141,238 @@ fn help() -> String {
     help
 }
 
-/// The file and folder arguments, or the exit code for `--help`,
+/// What this process is to do.
+enum Mode {
+    /// Be the `cue` the shell ran (see [`client`]).
+    Client(client::Args),
+    /// Do the work, in the terminal the client handed over (see
+    /// [`attach`]).
+    Serve(Start),
+    List,
+    End(Option<String>),
+}
+
+/// What a server starts with.
+enum Start {
+    /// The folders and file named.
+    Paths(Vec<PathBuf>),
+    /// The dormant session in this folder.
+    Restore(PathBuf),
+    /// The session in this folder, from a process this one replaced, and
+    /// its running terminals (see [`attach::exec`]).
+    Adopt(PathBuf),
+}
+
+/// What the command line asks for, or the exit code for `--help`,
 /// `--version`, or bad usage.
-fn parse_args() -> Result<Vec<PathBuf>, ExitCode> {
-    let mut paths = Vec::new();
-    for arg in std::env::args_os().skip(1) {
-        if arg == "-h" || arg == "--help" {
-            print!("{}", help());
-            return Err(ExitCode::SUCCESS);
-        }
-        if arg == "-V" || arg == "--version" {
-            println!("cue {}", env!("CARGO_PKG_VERSION"));
-            return Err(ExitCode::SUCCESS);
-        }
-        paths.push(PathBuf::from(arg));
+fn parse_args() -> Result<Mode, ExitCode> {
+    let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "--serve") {
+        args.next();
+        let folder = |args: &mut dyn Iterator<Item = std::ffi::OsString>| {
+            args.next().map(PathBuf::from).ok_or(ExitCode::FAILURE)
+        };
+        return Ok(Mode::Serve(
+            match args.peek().and_then(|arg| arg.to_str()) {
+                Some("--restore") => {
+                    args.next();
+                    Start::Restore(folder(&mut args)?)
+                }
+                Some("--adopt") => {
+                    args.next();
+                    Start::Adopt(folder(&mut args)?)
+                }
+                _ => Start::Paths(args.map(PathBuf::from).collect()),
+            },
+        ));
     }
-    Ok(paths)
+    let mut client = client::Args::default();
+    let mut options = true;
+    while let Some(arg) = args.next() {
+        match arg.to_str().filter(|_| options) {
+            Some("-h" | "--help") => {
+                print!("{}", help());
+                return Err(ExitCode::SUCCESS);
+            }
+            Some("-V" | "--version") => {
+                println!("cue {}", env!("CARGO_PKG_VERSION"));
+                return Err(ExitCode::SUCCESS);
+            }
+            Some("-r" | "--resume") => client.resume = true,
+            Some("--fresh") => client.fresh = true,
+            Some("-l" | "--list") => return Ok(Mode::List),
+            Some("--end") => {
+                let id = args.next().map(|id| id.to_string_lossy().into_owned());
+                return Ok(Mode::End(id));
+            }
+            Some("--") => options = false,
+            Some(option) if option.starts_with('-') && option.len() > 1 => {
+                eprintln!("cue: there's no option {option}\n{USAGE}");
+                return Err(ExitCode::FAILURE);
+            }
+            _ => client.paths.push(PathBuf::from(arg)),
+        }
+    }
+    // For debugging: no server, and no sessions to go back to.
+    if env_flag("CUE_NO_SERVER") && !client.resume {
+        return Ok(Mode::Serve(Start::Paths(client.paths)));
+    }
+    Ok(Mode::Client(client))
 }
 
-/// Set on SIGHUP, as when an ssh connection drops, or SIGTERM: cue exits,
-/// copying what's unsaved for next time (see [`recovery`]).
+/// Set on SIGHUP: the terminal is gone.
 static HUNG_UP: AtomicBool = AtomicBool::new(false);
+/// Set on SIGTERM: cue is to exit, keeping what a session would.
+static TERMINATED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn hang_up(_: libc::c_int) {
-    HUNG_UP.store(true, Ordering::Relaxed);
+extern "C" fn on_signal(signal: libc::c_int) {
+    match signal {
+        libc::SIGHUP => HUNG_UP.store(true, Ordering::Relaxed),
+        _ => TERMINATED.store(true, Ordering::Relaxed),
+    }
 }
 
-fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+/// Does the work: shows the app in the terminal it was handed, then when
+/// that's let go (see [`Outcome`]), goes on in the background, if it's a
+/// session, until a client attaches.
+fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
+    let mut control = Control::from_env();
     let (config, config_warnings) = config::load();
     config::set(config);
     // Load before taking over the terminal so errors print normally.
+    let (width, height) = tty::size();
+    let mut app = match start {
+        Start::Paths(paths) => open(paths, width, height)?,
+        Start::Restore(dir) => resume(&dir, width, height, Vec::new())?,
+        Start::Adopt(dir) => {
+            let (ephemeral, adopted) =
+                attach::read_manifest(&dir).ok_or("there's nothing to take over")?;
+            let mut app = resume(&dir, width, height, adopted)?;
+            if ephemeral {
+                app.forget_session();
+            }
+            app
+        }
+    };
+    app.warn_about_config(&config_warnings);
+    if let Some(note) = background_sessions(&app) {
+        app.show_message_now(note, false);
+    }
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        unsafe {
+            libc::signal(
+                signal,
+                on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            )
+        };
+    }
+
+    let mut listener: Option<Listener> = None;
+    // What the attached client says the terminal is, if not this process.
+    let mut environment: Option<Vec<(String, String)>> = None;
+    loop {
+        let outcome = attached(
+            &mut app,
+            control.as_mut(),
+            &mut listener,
+            environment.clone(),
+        )?;
+        match outcome {
+            Outcome::Quit => {
+                app.discard_recovery();
+                if let Some(control) = &mut control {
+                    control.send("exit 0");
+                }
+                return Ok(());
+            }
+            Outcome::Restart => {
+                let exe = std::env::current_exe()?;
+                app = restart(app, &exe, control.as_ref(), None, &mut listener)?;
+                continue;
+            }
+            Outcome::Detach => {
+                let Some(mut client) = control.take() else {
+                    // Run without a client, there's nothing to detach from:
+                    // it's left to come back to, as quitting does.
+                    return Ok(());
+                };
+                if let Err(err) = listening(&app, &mut listener) {
+                    app.show_message_now(format!("Can't detach: {err}"), true);
+                    control = Some(client);
+                    continue;
+                }
+                client.send(&format!("detached {}", detached(&app)));
+            }
+            Outcome::HangUp => {
+                control = None;
+                if !app.hang_up() || listening(&app, &mut listener).is_err() {
+                    app.save_session(true);
+                    return Ok(());
+                }
+            }
+            Outcome::Terminate => {
+                app.hang_up();
+                return Ok(());
+            }
+            Outcome::End(requester) => {
+                app.end_session_now();
+                if let Some(control) = &mut control {
+                    control.send("ended");
+                }
+                drop(app);
+                drop(requester);
+                return Ok(());
+            }
+            Outcome::Attach(client, request) => {
+                // Taken over by another terminal.
+                tty::set_nonblocking(false);
+                if let Some(mut old) = control.take() {
+                    old.send("moved");
+                }
+                app = take(
+                    app,
+                    client,
+                    request,
+                    &mut control,
+                    &mut environment,
+                    &mut listener,
+                )?;
+                continue;
+            }
+        }
+
+        // Detached: in the background, until a client attaches.
+        attach::let_go_of_stdio();
+        app.set_attached(false);
+        environment = None;
+        match headless(&mut app, listener.as_ref().map(|l| &l.listener)) {
+            Wake::Attach(client, request) => {
+                app = take(
+                    app,
+                    client,
+                    request,
+                    &mut control,
+                    &mut environment,
+                    &mut listener,
+                )?;
+            }
+            Wake::End(requester) => {
+                app.end_session_now();
+                drop(app);
+                drop(requester);
+                return Ok(());
+            }
+            Wake::Terminate => {
+                app.save_session(true);
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// An app showing `paths`: the folders named, or the current one, with
+/// the file named open, at the line and column given.
+fn open(paths: Vec<PathBuf>, width: u32, height: u32) -> Result<App, Box<dyn std::error::Error>> {
     let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) =
         paths.into_iter().partition(|path| path.is_dir());
     let mut files = files.into_iter();
@@ -175,14 +390,270 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
         true => Workspace::new([std::env::current_dir()?])?,
         false => Workspace::new(folders)?,
     };
-    let (mut width, mut height) = tty::size();
     let mut app = App::new(workspace, file, width, height)?;
     if let Some(position) = position {
         app.go_to(position);
     }
-    app.warn_about_config(&config_warnings);
+    Ok(app)
+}
 
-    let mut renderer = Renderer::new(width, height, Output::Stdout)?;
+/// An app going back to the session in `dir`, with the terminals
+/// `adopted` from a process this one replaced.
+fn resume(
+    dir: &Path,
+    width: u32,
+    height: u32,
+    adopted: Vec<app::Adopted>,
+) -> Result<App, Box<dyn std::error::Error>> {
+    let session = Session::open(dir).map_err(|err| format!("can't open the session: {err}"))?;
+    let state = session::read(dir).ok_or("the session can't be read")?;
+    let roots: Vec<PathBuf> = state
+        .roots
+        .iter()
+        .filter(|root| root.is_dir())
+        .cloned()
+        .collect();
+    if roots.is_empty() {
+        return Err("the session's folders are gone".into());
+    }
+    let mut app = App::new(Workspace::new(roots)?, None, width, height)?;
+    app.restore_session(session, state, adopted)?;
+    Ok(app)
+}
+
+/// A note of the sessions running in the background but `app`'s own, so
+/// that none is forgotten, if there are any.
+fn background_sessions(app: &App) -> Option<String> {
+    let own = app.session().map(Session::id);
+    let running: Vec<String> = session::list(&session::default_dir()?)
+        .into_iter()
+        .filter(|listing| listing.live && !listing.state.attached)
+        .filter(|listing| Some(listing.id.as_str()) != own)
+        .map(|listing| {
+            let folder = listing.state.roots.first().map(|root| client::tilde(root));
+            let folder = folder.unwrap_or_default();
+            match listing.state.programs().as_slice() {
+                [] => folder,
+                programs => format!("{folder} ({})", programs.join(", ")),
+            }
+        })
+        .collect();
+    match running.len() {
+        0 => None,
+        1 => Some(format!(
+            "One session is running in the background: {}. See `cue --list`",
+            running[0]
+        )),
+        n => Some(format!(
+            "{n} sessions is running in the background: {}. See `cue --list`",
+            running.join(", ")
+        )),
+    }
+}
+
+/// What the client that detached says about how to come back.
+fn detached(app: &App) -> String {
+    let folder = app
+        .roots()
+        .first()
+        .map(|root| client::tilde(root))
+        .unwrap_or_default();
+    let running = app.running_programs();
+    let with = match running.as_slice() {
+        [] => String::new(),
+        [program] => format!(", {program} running in it"),
+        programs => format!(", {} running in it", programs.join(", ")),
+    };
+    let id = app.session().map(Session::id).unwrap_or_default();
+    format!("detached session {id}{with}. `cue --resume`")
+}
+
+/// A session's socket, listened on.
+struct Listener {
+    listener: std::os::unix::net::UnixListener,
+    path: PathBuf,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Listens for clients on the session's socket, if `app` is a session and
+/// it isn't yet.
+fn listen(app: &App, listener: &mut Option<Listener>) -> std::io::Result<()> {
+    let (None, Some(session)) = (&listener, app.session()) else {
+        return Ok(());
+    };
+    let path = session.socket();
+    *listener = Some(Listener {
+        listener: attach::listen(&path)?,
+        path,
+    });
+    Ok(())
+}
+
+/// Listens on the session's socket, failing if `app` isn't a session.
+fn listening(app: &App, listener: &mut Option<Listener>) -> std::io::Result<()> {
+    listen(app, listener)?;
+    match listener {
+        Some(_) => Ok(()),
+        None => Err(std::io::Error::other("this isn't a session")),
+    }
+}
+
+/// Shows `app` in the terminal of `request`, a client's, talking to it
+/// over `client` from then on. A client of another build of cue has it
+/// take over from this one (see [`restart`]).
+fn take(
+    app: App,
+    client: Control,
+    request: attach::Attach,
+    control: &mut Option<Control>,
+    environment: &mut Option<Vec<(String, String)>>,
+    listener: &mut Option<Listener>,
+) -> Result<App, Box<dyn std::error::Error>> {
+    if request.build != attach::build() && request.exe.is_file() {
+        *control = Some(client);
+        return restart(
+            app,
+            &request.exe,
+            control.as_ref(),
+            Some(request.stdio),
+            listener,
+        );
+    }
+    attach::take_stdio(request.stdio);
+    *control = Some(client);
+    *environment = Some(request.environment);
+    let mut app = app;
+    app.set_attached(true);
+    Ok(app)
+}
+
+/// Starts the cue at `exe` in this process's place, to go on from where
+/// `app` is (see [`App::hand_over`]): in the terminal `stdio`, if given,
+/// or this process's, with `control` to its client. Returns only if it
+/// can't, going on in this process instead.
+fn restart(
+    mut app: App,
+    exe: &Path,
+    control: Option<&Control>,
+    stdio: Option<[std::os::fd::OwnedFd; 3]>,
+    listener: &mut Option<Listener>,
+) -> Result<App, Box<dyn std::error::Error>> {
+    if let Some(stdio) = stdio {
+        attach::take_stdio(stdio);
+    }
+    let Some((dir, ephemeral, adopted)) = app.hand_over() else {
+        return Ok(app);
+    };
+    let (width, height) = tty::size();
+    let error = match attach::write_manifest(&dir, ephemeral, &adopted) {
+        Ok(()) => {
+            drop(app);
+            // Taken up again by the new process.
+            *listener = None;
+            let error = attach::exec(exe, &dir, control);
+            attach::read_manifest(&dir);
+            error
+        }
+        Err(error) => {
+            drop(app);
+            error
+        }
+    };
+    let mut app = resume(&dir, width, height, adopted)?;
+    if ephemeral {
+        app.forget_session();
+    }
+    app.show_message_now(format!("Can't restart cue: {error}"), true);
+    Ok(app)
+}
+
+/// Why a terminal stopped showing the app.
+enum Outcome {
+    Quit,
+    /// To go on in the background (see [`AppAction::Detach`]).
+    Detach,
+    /// The terminal is gone.
+    HangUp,
+    /// SIGTERM.
+    Terminate,
+    Restart,
+    /// Another client asked to show the app.
+    Attach(Control, attach::Attach),
+    /// A client asked to end the session.
+    End(Control),
+}
+
+/// What woke a detached app.
+enum Wake {
+    Attach(Control, attach::Attach),
+    End(Control),
+    Terminate,
+}
+
+/// How long a detached app waits between looking at its terminals.
+const HEADLESS_POLL: Duration = Duration::from_secs(1);
+
+/// Runs `app` in the background, its terminals' programs running on,
+/// until a client attaches or asks to end it, or SIGTERM.
+fn headless(app: &mut App, listener: Option<&std::os::unix::net::UnixListener>) -> Wake {
+    loop {
+        let mut watched = app.watched();
+        if let Some(listener) = listener {
+            watched.push((listener.as_raw_fd(), false));
+        }
+        tty::wait(&watched, HEADLESS_POLL);
+        if TERMINATED.load(Ordering::Relaxed) {
+            return Wake::Terminate;
+        }
+        HUNG_UP.store(false, Ordering::Relaxed);
+        app.poll();
+        let _ = app.take_copied();
+        let Some(listener) = listener else {
+            continue;
+        };
+        match attach::accept(listener) {
+            Some((client, Request::Attach(request))) => match refuse(client, &request) {
+                Some(client) => return Wake::Attach(client, request),
+                None => {}
+            },
+            Some((client, Request::End)) => return Wake::End(client),
+            None => {}
+        }
+    }
+}
+
+/// `client`, unless `request` comes from one of this process's own
+/// terminals, which would show it in itself: then it's told so.
+fn refuse(mut client: Control, request: &attach::Attach) -> Option<Control> {
+    if request.is_inside(std::process::id()) {
+        client.send("error the session can't be shown in its own terminal");
+        return None;
+    }
+    Some(client)
+}
+
+/// Shows `app` in the terminal on stdin and stdout until it's let go:
+/// quit, detached, gone, and so on (see [`Outcome`]). `control` talks to
+/// the client, if there is one; `environment` is what it says of the
+/// terminal. Clients attaching meanwhile, once the app is a session, take
+/// it from this terminal.
+fn attached(
+    app: &mut App,
+    mut control: Option<&mut Control>,
+    listener: &mut Option<Listener>,
+    environment: Option<Vec<(String, String)>>,
+) -> Result<Outcome, Box<dyn std::error::Error>> {
+    let (mut width, mut height) = tty::size();
+    app.resize(width, height);
+    let mut renderer = match environment {
+        Some(environment) => Renderer::with_environment(width, height, environment)?,
+        None => Renderer::new(width, height, Output::Stdout)?,
+    };
     renderer.setup_terminal(true);
     renderer.set_cursor_style(opentui::CursorShape::Line, false);
     // Zooming into a large image sends it whole: tens of megabytes as
@@ -194,17 +665,11 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     renderer.set_compact_output(env_flag("CUE_COMPACT_OUTPUT"));
     let mut parser = Parser::new();
     // What was typed while waiting for the terminal's colors.
-    let mut typed = ask_colors_first(&mut renderer, &mut parser, &mut app)?;
+    let Ok(mut typed) = ask_colors_first(&mut renderer, &mut parser, app) else {
+        return Ok(Outcome::HangUp);
+    };
     // Dropped before the renderer, putting the terminal's background back.
     let mut host_colors = HostColors { background: None };
-    for signal in [libc::SIGHUP, libc::SIGTERM] {
-        unsafe {
-            libc::signal(
-                signal,
-                hang_up as extern "C" fn(libc::c_int) as libc::sighandler_t,
-            )
-        };
-    }
 
     // When stdin last had input, to tell a lone ESC from the start of a
     // sequence split across reads.
@@ -214,8 +679,10 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let mut dirty = true;
     let mut drawn = Instant::now();
     loop {
+        // Kept as a session meanwhile, it takes clients.
+        let _ = listen(app, listener);
         app.update_theme();
-        host_colors.apply(&mut renderer, &mut app);
+        host_colors.apply(&mut renderer, app);
         if dirty && pacing.ready() {
             {
                 let frame = renderer.next_buffer()?;
@@ -247,10 +714,39 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                 if dirty {
                     timeout = timeout.min(pacing.time_left());
                 }
-                let bytes = tty::read_input(timeout, &app.watched())?;
-                // Dropping the app copies what's unsaved.
-                if HUNG_UP.load(Ordering::Relaxed) {
-                    return Ok(());
+                let mut watched = app.watched();
+                watched.extend(control.as_ref().map(|control| (control.fd(), false)));
+                watched.extend(listener.as_ref().map(|l| (l.listener.as_raw_fd(), false)));
+                let Ok(bytes) = tty::read_input(timeout, &watched) else {
+                    return Ok(Outcome::HangUp);
+                };
+                if TERMINATED.load(Ordering::Relaxed) {
+                    return Ok(Outcome::Terminate);
+                }
+                if HUNG_UP.swap(false, Ordering::Relaxed) {
+                    return Ok(Outcome::HangUp);
+                }
+                // The client goes with the terminal. A resize is noticed
+                // below.
+                if let Some(control) = control.as_deref_mut() {
+                    if control.receive().is_err() {
+                        return Ok(Outcome::HangUp);
+                    }
+                }
+                if let Some(listener) = listener.as_ref() {
+                    match attach::accept(&listener.listener) {
+                        Some((client, Request::Attach(request))) => {
+                            if let Some(client) = refuse(client, &request) {
+                                // Putting this terminal back as it was is
+                                // only worth trying: it may be stuck, as
+                                // over an ssh connection that froze.
+                                tty::set_nonblocking(true);
+                                return Ok(Outcome::Attach(client, request));
+                            }
+                        }
+                        Some((client, Request::End)) => return Ok(Outcome::End(client)),
+                        None => {}
+                    }
                 }
                 let events = if !bytes.is_empty() {
                     last_input = Instant::now();
@@ -290,15 +786,14 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                     AppAction::Continue
                 }
                 Event::Reply(bytes) => {
-                    take_reply(&mut renderer, &mut app, &bytes);
+                    take_reply(&mut renderer, app, &bytes);
                     AppAction::Continue
                 }
             };
             match action {
-                AppAction::Quit => {
-                    app.discard_recovery();
-                    return Ok(());
-                }
+                AppAction::Quit => return Ok(Outcome::Quit),
+                AppAction::Detach => return Ok(Outcome::Detach),
+                AppAction::Restart => return Ok(Outcome::Restart),
                 AppAction::Copy(text) => {
                     renderer.copy_to_clipboard(&text);
                 }

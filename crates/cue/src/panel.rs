@@ -422,6 +422,32 @@ impl Panel {
         }
     }
 
+    /// Every editor's document and place in it (see [`Editor::place`]),
+    /// most recently opened last.
+    pub fn places(&self) -> impl Iterator<Item = (&Rc<Document>, (u32, u32, u32))> {
+        self.editors
+            .iter()
+            .map(|editor| (editor.document(), editor.place()))
+    }
+
+    /// What it showed before, most recent last, and went back from.
+    pub fn history(&self) -> (&[Visit], &[Visit]) {
+        (&self.history.back, &self.history.forward)
+    }
+
+    /// Takes a history kept from before, as [`Panel::history`] gave it.
+    pub fn set_history(&mut self, back: Vec<Visit>, forward: Vec<Visit>) {
+        self.history = History { back, forward };
+    }
+
+    /// Takes whatever it shows off screen, leaving it empty but keeping
+    /// its editors, without noting it in the history.
+    pub fn show_nothing(&mut self) {
+        self.leave_editor();
+        self.terminal = None;
+        self.image = None;
+    }
+
     /// Takes the history out, so that showing a place from it doesn't
     /// count as going somewhere new, until it's put back.
     pub fn take_history(&mut self) -> History {

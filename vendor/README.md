@@ -92,6 +92,14 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   `embeddedTerminalGetViewport` and `embeddedTerminalScrollToRow` place the
   view by row from the top of the scrollback. `write` and `resize` bump a
   generation so matches are only taken for the text they were found in.
+  `embeddedTerminalBuildSnapshot` and `embeddedTerminalCopySnapshot` write
+  VT that a new terminal of the same size replays to look like this one
+  (`writeSnapshot`, from Ghostty's formatter), for cue's sessions: the
+  primary screen's text and scrollback with wrapped lines joined, and in
+  full, the blank rows below it, the alternate screen, the modes but those
+  that switch screens, and each screen's cursor, style, and kitty keyboard
+  flags. The palette is left out, since setting it would mark every slot as
+  the program's own.
 
 ## `tree-sitter-latex/`
 

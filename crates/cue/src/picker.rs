@@ -362,6 +362,14 @@ impl Picker {
         picker
     }
 
+    /// Whether the command palette lists `command`.
+    #[cfg(test)]
+    pub fn lists_command(&self, command: Command) -> bool {
+        self.commands
+            .iter()
+            .any(|item| item.choice == Choice::Command(command))
+    }
+
     pub fn mode(&self) -> Mode {
         if let Some(mode) = self.fixed_mode {
             return mode;

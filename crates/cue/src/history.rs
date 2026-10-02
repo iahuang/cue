@@ -89,6 +89,12 @@ impl History {
         Some(steps)
     }
 
+    /// The disk contents are unknown, so no undo state is known saved.
+    pub fn mark_unsaved(&mut self) {
+        self.saved = None;
+        self.open = None;
+    }
+
     pub fn mark_saved(&mut self) {
         self.saved = Some(self.undo.len());
         self.open = None;

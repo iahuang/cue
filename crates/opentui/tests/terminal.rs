@@ -247,3 +247,83 @@ fn answers_queries_and_reports_state() {
     assert!(term.resize(0, 3).is_err());
     term.resize(20, 4).unwrap();
 }
+
+/// Feeds `snapshot` to a new terminal `cols` by `rows`.
+fn replay(snapshot: &[u8], cols: u16, rows: u16) -> EmbeddedTerminal {
+    let mut term = EmbeddedTerminal::new(cols, rows, 100_000).unwrap();
+    term.write(snapshot).unwrap();
+    term
+}
+
+#[test]
+fn snapshots_replay_to_the_same_screen() {
+    let _serial = serial();
+    let mut term = EmbeddedTerminal::new(10, 4, 100_000).unwrap();
+    // History above the screen, a line wrapped onto the next, colors, and
+    // the cursor in the middle, with blank rows below it.
+    term.write(b"one\r\ntwo\r\nthree\r\n0123456789abc\r\n\x1b[31mred\x1b[0m\r\n\r\n")
+        .unwrap();
+    term.write(b"\x1b[3;2H").unwrap();
+    let full = term.snapshot(true).unwrap();
+    let mut copy = replay(&full, 10, 4);
+    assert_eq!(copy.search_text().unwrap(), term.search_text().unwrap());
+    assert_eq!(copy.scroll_position(), term.scroll_position());
+    let (frame, copied) = (buffer(10, 4), buffer(10, 4));
+    // Drawing places the cursor.
+    term.draw(&frame, 0, 0);
+    copy.draw(&copied, 0, 0);
+    assert_eq!(copy.cursor().position, term.cursor().position);
+    assert_eq!(term.cursor().position, Some((1, 2)));
+    assert_eq!(copied.to_text(true), frame.to_text(true));
+    assert_eq!(copied.fg_at(0, 2), frame.fg_at(0, 2), "red stays red");
+    // The wrapped line wraps again when the screen widens.
+    copy.resize(20, 4).unwrap();
+    assert!(copy.search_text().unwrap().contains("0123456789abc\n"));
+
+    // Only the text, then a line break.
+    let text = term.snapshot(false).unwrap();
+    let mut copy = replay(&text, 10, 4);
+    copy.write(b"next").unwrap();
+    let copied = copy.search_text().unwrap();
+    assert!(copied.ends_with("red\nnext\n"), "{copied:?}");
+}
+
+#[test]
+fn snapshots_keep_the_alternate_screen_and_modes() {
+    let _serial = serial();
+    let mut term = EmbeddedTerminal::new(10, 3, 100_000).unwrap();
+    term.write(b"shell$ vim\r\n").unwrap();
+    // Full screen: application cursor keys, the kitty keyboard protocol,
+    // mouse reports, a hidden cursor.
+    term.write(b"\x1b[?1049h\x1b[?1h\x1b[>1u\x1b[?1000h\x1b[?1006h\x1b[?25l")
+        .unwrap();
+    term.write(b"\x1b[Hfile\r\n~\x1b[1;3H").unwrap();
+    let mut copy = replay(&term.snapshot(true).unwrap(), 10, 3);
+    assert!(copy.is_alternate_screen());
+    let (frame, copied) = (buffer(10, 3), buffer(10, 3));
+    term.draw(&frame, 0, 0);
+    copy.draw(&copied, 0, 0);
+    assert_eq!(copied.to_text(true), frame.to_text(true));
+    let (a, b) = (term.cursor(), copy.cursor());
+    assert_eq!((b.position, b.visible), (a.position, a.visible));
+    assert!(!b.visible);
+    let esc = KeyEvent::press("Escape", KeyMods::NONE, "", None);
+    assert_eq!(copy.encode_key(&esc), b"\x1b[27u");
+    let click = MouseEvent {
+        action: MouseAction::Press,
+        button: Some(MouseButton::Left),
+        mods: KeyMods::NONE,
+        x: 2,
+        y: 1,
+        any_button_pressed: true,
+    };
+    assert_eq!(copy.encode_mouse(&click), b"\x1b[<0;3;2M");
+
+    // Leaving it, the shell's screen is back where it was.
+    copy.write(b"\x1b[<u\x1b[?1049l").unwrap();
+    assert!(!copy.is_alternate_screen());
+    let text = copy.search_text().unwrap();
+    assert!(text.starts_with("shell$ vim\n"), "{text:?}");
+    copy.draw(&buffer(10, 3), 0, 0);
+    assert_eq!(copy.cursor().position, Some((0, 1)));
+}

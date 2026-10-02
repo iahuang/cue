@@ -10,9 +10,9 @@
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
 /// Environment variables that describe the terminal cue runs in, which
 /// would mislead programs in its terminals.
@@ -40,8 +40,11 @@ const HOST_VARIABLES: &[&str] = &[
 
 pub struct Pty {
     master: OwnedFd,
-    /// Taken when dropped, to be reaped in the background.
-    child: Option<Child>,
+    /// The program's process id. It's cue's child, to reap: when dropped,
+    /// in the background.
+    pid: libc::pid_t,
+    /// How it ended, once reaped.
+    exit: Option<ExitStatus>,
     /// Input the program hasn't taken yet.
     unsent: Vec<u8>,
 }
@@ -73,7 +76,10 @@ impl Pty {
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "cue")
-            .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+            .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
+            // So that a cue run in it doesn't show this one there, in
+            // itself (see `crate::attach`).
+            .env(crate::attach::PID_VARIABLE, std::process::id().to_string());
         for variable in HOST_VARIABLES {
             command.env_remove(variable);
         }
@@ -93,16 +99,44 @@ impl Pty {
                 Ok(())
             });
         }
-        let child = command.spawn()?;
+        // Reaped by its id (see `exit_status`), so it can be adopted.
+        let pid = command.spawn()?.id() as libc::pid_t;
         // Closes cue's copies of the terminal end, so reading the master
         // ends once the program's copies are closed too.
         drop(command);
         set_nonblocking(master.as_raw_fd())?;
         Ok(Pty {
             master,
-            child: Some(child),
+            pid,
+            exit: None,
             unsent: Vec::new(),
         })
+    }
+
+    /// The pty whose master is `fd`, with program `pid` running in it,
+    /// which this process started, or a process it replaced (see
+    /// [`Pty::release`]).
+    pub fn adopt(fd: RawFd, pid: libc::pid_t) -> io::Result<Pty> {
+        let master = unsafe { OwnedFd::from_raw_fd(fd) };
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        set_nonblocking(fd)?;
+        Ok(Pty {
+            master,
+            pid,
+            exit: None,
+            unsent: Vec::new(),
+        })
+    }
+
+    /// Lets go of the pty without hanging up, for a process that replaces
+    /// this one to adopt: its master, kept open across `exec`, and the
+    /// program's process id.
+    pub fn release(self) -> (RawFd, libc::pid_t) {
+        // Neither hung up on nor closed.
+        let pty = std::mem::ManuallyDrop::new(self);
+        let fd = pty.master.as_raw_fd();
+        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+        (fd, pty.pid)
     }
 
     /// For polling: readable when the program wrote something, writable
@@ -169,18 +203,26 @@ impl Pty {
 
     /// How the program ended, once it has.
     pub fn exit_status(&mut self) -> Option<ExitStatus> {
-        self.child.as_mut()?.try_wait().ok().flatten()
-    }
-
-    fn pid(&self) -> Option<libc::pid_t> {
-        Some(self.child.as_ref()?.id() as libc::pid_t)
+        if self.exit.is_none() {
+            let mut status = 0;
+            match unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) } {
+                0 => {}
+                // Reaped elsewhere: how it ended is lost.
+                -1 if io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) => {
+                    self.exit = Some(ExitStatus::from_raw(0));
+                }
+                -1 => {}
+                _ => self.exit = Some(ExitStatus::from_raw(status)),
+            }
+        }
+        self.exit
     }
 
     /// Whether a program other than the one started, such as a command
     /// the shell ran, has the terminal.
     pub fn is_busy(&self) -> bool {
         let foreground = unsafe { libc::tcgetpgrp(self.fd()) };
-        foreground > 0 && Some(foreground) != self.pid()
+        foreground > 0 && foreground != self.pid
     }
 
     /// The name of the program that has the terminal, such as `vim`.
@@ -210,13 +252,28 @@ impl Pty {
         None
     }
 
+    /// The folder the program started (the shell) is working in now, if
+    /// it can be found.
+    pub fn working_folder(&self) -> Option<PathBuf> {
+        working_folder(self.pid)
+    }
+
+    /// Tells the program that has the terminal to draw its screen again,
+    /// as it does when the terminal is resized (SIGWINCH).
+    pub fn ask_to_redraw(&self) {
+        let foreground = unsafe { libc::tcgetpgrp(self.fd()) };
+        if foreground > 0 {
+            unsafe { libc::kill(-foreground, libc::SIGWINCH) };
+        }
+    }
+
     /// The folders the program that has the terminal, and the program
     /// started (the shell), are working in now, in that order, as far as
     /// they can be found.
     pub fn working_folders(&self) -> Vec<PathBuf> {
         let foreground = unsafe { libc::tcgetpgrp(self.fd()) };
         let mut folders = Vec::new();
-        for pid in [Some(foreground).filter(|&pid| pid > 0), self.pid()]
+        for pid in [Some(foreground).filter(|&pid| pid > 0), Some(self.pid)]
             .into_iter()
             .flatten()
         {
@@ -274,12 +331,13 @@ impl Drop for Pty {
         if self.exit_status().is_some() {
             return;
         }
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
+        let pid = self.pid;
         // The program leads its session and process group.
-        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGHUP) };
-        std::thread::spawn(move || child.wait());
+        unsafe { libc::kill(-pid, libc::SIGHUP) };
+        std::thread::spawn(move || {
+            let mut status = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+        });
     }
 }
 

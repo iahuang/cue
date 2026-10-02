@@ -30,6 +30,47 @@ pub fn cell_pixels() -> Option<(u32, u32)> {
     })
 }
 
+/// Makes writing to stdout and stderr fail rather than wait, or wait
+/// again: for a terminal that may have stopped reading.
+pub fn set_nonblocking(nonblocking: bool) {
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            continue;
+        }
+        let flags = match nonblocking {
+            true => flags | libc::O_NONBLOCK,
+            false => flags & !libc::O_NONBLOCK,
+        };
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    }
+}
+
+/// Waits up to `timeout` for one of the `watched` file descriptors (fd,
+/// and whether to wait for it to take writes too) to be ready.
+pub fn wait(watched: &[(RawFd, bool)], timeout: Duration) {
+    let mut fds: Vec<libc::pollfd> = watched
+        .iter()
+        .map(|&(fd, write)| libc::pollfd {
+            fd,
+            events: if write {
+                libc::POLLIN | libc::POLLOUT
+            } else {
+                libc::POLLIN
+            },
+            revents: 0,
+        })
+        .collect();
+    // A signal interrupting it is as good as a timeout.
+    unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            fds.len() as libc::nfds_t,
+            timeout.as_millis() as libc::c_int,
+        )
+    };
+}
+
 /// Waits up to `timeout` for input, or for one of the `watched` file
 /// descriptors (fd, and whether to wait for it to take writes too) to be
 /// ready, and returns the input that's available (empty if none).

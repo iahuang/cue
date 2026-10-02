@@ -323,6 +323,25 @@ impl Editor {
         self.select_in_line(row, byte..byte);
     }
 
+    /// Where it is in the file, for a session to keep: the cursor's row
+    /// and column, and the row at the top of the view.
+    pub fn place(&self) -> (u32, u32, u32) {
+        let (row, col) = self.cursor();
+        (row, col, self.view.viewport().y)
+    }
+
+    /// Goes back to a place [`Editor::place`] gave, as near as the text has
+    /// it now.
+    pub fn set_place(&mut self, row: u32, col: u32, top: u32) {
+        self.attach();
+        self.anchor = None;
+        self.view.clear_selection();
+        let row = row.min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(row, col);
+        let max_top = self.view.total_virtual_line_count().saturating_sub(1);
+        self.view.scroll_to(0, top.min(max_top), false);
+    }
+
     /// Scrolls the cursor's row a third of the way down if it was off screen
     /// in `vp`, the viewport before the cursor moved.
     fn reveal(&self, vp: Viewport) {

@@ -16,6 +16,6 @@ curl -fsSL https://s3.ianhuang.dev/cue/install.sh | bash
 - multi panel editing
 - on-keystroke `ripgrep` search
 - terminal buffers
-- image viewer (kitty graphics protocol)
+- resumable sessions including persistent terminals
 - themes
 - customizable keybinds

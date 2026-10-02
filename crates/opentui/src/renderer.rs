@@ -50,6 +50,31 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(width: u32, height: u32, output: Output) -> Result<Renderer> {
+        let renderer = Renderer::create(width, height, output)?;
+        if output == Output::Stdout {
+            renderer.forward_environment(std::env::vars_os());
+        }
+        Ok(renderer)
+    }
+
+    /// A renderer like [`Renderer::new`]'s with stdout as output, for a
+    /// terminal described by `environment` rather than the process's own,
+    /// as when the process outlives the terminal it started in.
+    pub fn with_environment(
+        width: u32,
+        height: u32,
+        environment: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Renderer> {
+        let renderer = Renderer::create(width, height, Output::Stdout)?;
+        renderer.forward_environment(
+            environment
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
+        Ok(renderer)
+    }
+
+    fn create(width: u32, height: u32, output: Output) -> Result<Renderer> {
         let claim = Claim::acquire()?;
         let kind = match output {
             Output::Stdout => 0,
@@ -60,24 +85,23 @@ impl Renderer {
         if handle == sys::INVALID_HANDLE {
             return Err(Error::CreateFailed("renderer"));
         }
-        let renderer = Renderer {
+        Ok(Renderer {
             handle,
             raw_mode: None,
             terminal_is_setup: false,
             _claim: claim,
-        };
-        if output == Output::Stdout {
-            renderer.forward_environment();
-        }
-        Ok(renderer)
+        })
     }
 
-    /// Passes the process environment to the native terminal detection,
-    /// which learns from `TERM`, `COLORTERM`, `TERM_PROGRAM`, and the like
-    /// what the terminal supports. Without it, no palette colors are sent:
-    /// every color goes out as RGB.
-    fn forward_environment(&self) {
-        for (key, value) in std::env::vars_os() {
+    /// Passes `environment` to the native terminal detection, which learns
+    /// from `TERM`, `COLORTERM`, `TERM_PROGRAM`, and the like what the
+    /// terminal supports. Without it, no palette colors are sent: every
+    /// color goes out as RGB.
+    fn forward_environment(
+        &self,
+        environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ) {
+        for (key, value) in environment {
             let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
                 continue;
             };

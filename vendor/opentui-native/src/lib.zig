@@ -500,6 +500,27 @@ export fn embeddedTerminalCopySearchText(handle: NativeHandle, out_ptr: ?[*]u8, 
     return @intCast(text.len);
 }
 
+/// Writes VT that a new terminal of the same size replays to look like
+/// this one: with `full` nonzero, as near as it can be had, modes and all;
+/// without, only the primary screen's text and scrollback. Returns its
+/// length; `embeddedTerminalCopySnapshot` copies it out.
+export fn embeddedTerminalBuildSnapshot(handle: NativeHandle, full: u8) i64 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    const len = terminal_value.buildSnapshot(full != 0) catch |err| return embeddedTerminalStatus(err);
+    return std.math.cast(i64, len) orelse EmbeddedTerminalStatus.out_of_memory;
+}
+
+/// Copies what the last `embeddedTerminalBuildSnapshot` wrote. Returns its
+/// length, or `out_of_space`.
+export fn embeddedTerminalCopySnapshot(handle: NativeHandle, out_ptr: ?[*]u8, out_len: u32) i64 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    const output = embeddedTerminalOutput(out_ptr, out_len) orelse return EmbeddedTerminalStatus.invalid;
+    const bytes = terminal_value.snapshotBytes();
+    if (bytes.len > output.len) return EmbeddedTerminalStatus.out_of_space;
+    @memcpy(output[0..bytes.len], bytes);
+    return @intCast(bytes.len);
+}
+
 /// Highlights the matches at `count` byte ranges (start, end pairs, in
 /// order) of the search text, and fills `out` with where each starts.
 /// Fails if the screen changed since the text was read.

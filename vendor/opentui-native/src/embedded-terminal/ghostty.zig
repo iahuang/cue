@@ -10,6 +10,8 @@ pub const Screen = vt.Screen;
 pub const PageList = vt.PageList;
 pub const Cell = vt.page.Cell;
 pub const CellCountInt = vt.size.CellCountInt;
+pub const formatter = vt.formatter;
+pub const modes = vt.modes;
 
 // libghostty-vt doesn't export its clipboard module; take the types from
 // the effect's signature.

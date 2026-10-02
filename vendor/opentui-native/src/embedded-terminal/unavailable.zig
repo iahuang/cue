@@ -51,6 +51,12 @@ pub const EmbeddedTerminal = struct {
     pub fn searchText(_: *EmbeddedTerminal) []const u8 {
         return "";
     }
+    pub fn buildSnapshot(_: *EmbeddedTerminal, _: bool) Error!usize {
+        return error.Unsupported;
+    }
+    pub fn snapshotBytes(_: *EmbeddedTerminal) []const u8 {
+        return "";
+    }
     pub fn setSearchMatches(_: *EmbeddedTerminal, _: []const [2]u32, _: []Found) Error!void {
         return error.Unsupported;
     }

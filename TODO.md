@@ -30,10 +30,10 @@
 - terminal scrollback search (ctrl+F in a terminal panel)
 	- maybe: send selection to terminal
 
-- save workspace layouts
-	- maybe do this in like a "sessions" format, similar to claude code and others?
-	- to avoid bloat sessions should probably be opt-in
-	- would be nice tbh even to have the option to leave sessions in the background, i.e. their terminals stay alive even when the main process is killed. would be really useful in ssh contexts (avoid having to wrap cue in `tmux` or `screen`. nontrivial UX question though.
+- sessions, follow-ups
+	- a frozen terminal (stuck ssh connection) blocks drawing, so a new `cue` can't take the session over until it unsticks; draw without blocking, dropping frames
+	- shells started after attaching from elsewhere have the first terminal's environment (stale `SSH_AUTH_SOCK`, `DISPLAY`), as in tmux
+	- on Linux, systemd-logind with `KillUserProcesses=yes` kills detached sessions on logout (`loginctl enable-linger`)
 
 # bespoke features (think about these carefully)
 

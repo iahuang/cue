@@ -286,6 +286,31 @@ impl EmbeddedTerminal {
         String::from_utf8(out).map_err(|_| Error::CallFailed("terminal search"))
     }
 
+    /// What a new terminal of the same size replays to look like this one.
+    /// With `full`, as near as it can be had: the primary screen's text
+    /// and scrollback, scrolled as far as it was, the alternate screen if
+    /// it's in use, the modes, the cursor, and the keyboard modes, but not
+    /// the palette. Without, only the primary screen's text and
+    /// scrollback, ending with a line break, to write more below.
+    pub fn snapshot(&mut self, full: bool) -> Result<Vec<u8>> {
+        let len = unsafe { sys::embeddedTerminalBuildSnapshot(self.handle, full as u8) };
+        if len < 0 {
+            return Err(Error::CallFailed("terminal snapshot"));
+        }
+        let mut out = vec![0u8; len as usize];
+        let copied = unsafe {
+            sys::embeddedTerminalCopySnapshot(
+                self.handle,
+                out.as_mut_ptr(),
+                ffi_len(out.len(), "snapshot"),
+            )
+        };
+        if copied != len {
+            return Err(Error::CallFailed("terminal snapshot"));
+        }
+        Ok(out)
+    }
+
     /// Highlights the matches at byte `ranges` of the last
     /// [`search_text`](EmbeddedTerminal::search_text), which are in order
     /// and not empty, and returns where each starts. Fails if the terminal

@@ -55,6 +55,8 @@ pub const EmbeddedTerminal = struct {
     generation: u64 = 0,
     search: search.Search = .{},
     search_colors: SearchColors = .{},
+    /// What the last `buildSnapshot` wrote.
+    snapshot: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, options: Options) Error!*EmbeddedTerminal {
         if (options.cols == 0 or options.rows == 0) return error.InvalidValue;
@@ -90,6 +92,7 @@ pub const EmbeddedTerminal = struct {
         self.terminal.deinit(allocator);
         self.responses.deinit(allocator);
         self.clipboard.deinit(allocator);
+        self.snapshot.deinit(allocator);
         allocator.destroy(self);
     }
 
@@ -187,6 +190,21 @@ pub const EmbeddedTerminal = struct {
 
     fn rgb(color: buffer.RGBA) ghostty.RGB {
         return .{ .r = ansi.red(color), .g = ansi.green(color), .b = ansi.blue(color) };
+    }
+
+    /// Writes what a new terminal of the same size replays to look like
+    /// this one (cue patch; see `writeSnapshot`). Returns its length;
+    /// `snapshotBytes` has it until the next call.
+    pub fn buildSnapshot(self: *EmbeddedTerminal, full: bool) Error!usize {
+        self.snapshot.clearRetainingCapacity();
+        var out: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &self.snapshot);
+        defer self.snapshot = out.toArrayList();
+        writeSnapshot(&self.terminal, &out.writer, full) catch return error.OutOfMemory;
+        return out.written().len;
+    }
+
+    pub fn snapshotBytes(self: *EmbeddedTerminal) []const u8 {
+        return self.snapshot.items;
     }
 
     pub fn isAlternateScreen(self: *EmbeddedTerminal) bool {
@@ -425,3 +443,86 @@ pub const EmbeddedTerminal = struct {
         };
     }
 };
+
+/// Writes VT that a new terminal of `terminal`'s size replays to look like
+/// it: the primary screen's text and colors, its scrollback too, with
+/// wrapped lines joined so they wrap again. With `full`, the rest follows
+/// as near as it can be had: the rows below the text, so the screen scrolls
+/// as far as it had, the alternate screen if it's in use, the modes, and
+/// the cursor, keyboard modes, and the like. The palette is left out:
+/// setting it would mark every slot as the program's own.
+/// Without `full`, the text ends with a line break, to write more below.
+fn writeSnapshot(terminal: *ghostty.Terminal, w: *std.Io.Writer, full: bool) std.Io.Writer.Error!void {
+    const formatter = ghostty.formatter;
+    const opts: formatter.Options = .{ .emit = .vt, .unwrap = true };
+    const primary = terminal.screens.get(.primary) orelse return;
+    var text: formatter.ScreenFormatter = .init(primary, opts);
+    try text.format(w);
+    try w.writeAll("\x1b[0m");
+    if (!full) {
+        if (rowsUsed(primary).used > 0) try w.writeAll("\r\n");
+        return;
+    }
+
+    // The formatter leaves out blank rows at the end.
+    const rows = rowsUsed(primary);
+    for (@max(rows.used, 1)..rows.total) |_| try w.writeAll("\r\n");
+    var state: formatter.ScreenFormatter = .init(primary, opts);
+    state.content = .none;
+    state.extra = .all;
+
+    const alternate = if (terminal.screens.active_key == .alternate)
+        terminal.screens.get(.alternate)
+    else
+        null;
+    if (alternate) |screen| {
+        try state.format(w);
+        // Saves the primary screen's cursor, to go back to.
+        try w.writeAll("\x1b[?1049h\x1b[H");
+        var alt_text: formatter.ScreenFormatter = .init(screen, opts);
+        try alt_text.format(w);
+        try w.writeAll("\x1b[0m");
+        state = .init(screen, opts);
+        state.content = .none;
+        state.extra = .all;
+    }
+
+    // The modes that differ from the defaults, but those that switch
+    // screens, which was done.
+    const modes = ghostty.modes;
+    inline for (@typeInfo(modes.Mode).@"enum".fields) |field| {
+        const mode: modes.Mode = @enumFromInt(field.value);
+        const switches = comptime std.mem.startsWith(u8, field.name, "alt_screen");
+        const current = terminal.modes.get(mode);
+        if (!switches and current != @field(terminal.modes.default, field.name)) {
+            const tag: modes.ModeTag = @bitCast(@intFromEnum(mode));
+            const prefix = if (tag.ansi) "" else "?";
+            const suffix = if (current) "h" else "l";
+            try w.print("\x1b[{s}{d}{s}", .{ prefix, tag.value, suffix });
+        }
+    }
+
+    // The scrolling region, tab stops, and so on, which move the cursor,
+    // then the active screen's cursor, style, and keyboard modes.
+    var rest: formatter.TerminalFormatter = .init(terminal, opts);
+    rest.content = .none;
+    rest.extra = .all;
+    rest.extra.palette = false;
+    rest.extra.modes = false;
+    rest.extra.screen = .none;
+    try rest.format(w);
+    try state.format(w);
+}
+
+/// How many rows `screen` has, from the top of its scrollback, and how many
+/// of those come before its last blank ones.
+fn rowsUsed(screen: *ghostty.Screen) struct { used: usize, total: usize } {
+    var it = screen.pages.rowIterator(.right_down, .{ .screen = .{} }, null);
+    var total: usize = 0;
+    var used: usize = 0;
+    while (it.next()) |pin| {
+        total += 1;
+        if (ghostty.Cell.hasTextAny(pin.cells(.all))) used = total;
+    }
+    return .{ .used = used, .total = total };
+}
