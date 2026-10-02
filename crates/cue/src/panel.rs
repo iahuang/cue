@@ -13,7 +13,8 @@
 //! something.
 //!
 //! Like a browser tab, a panel keeps a history of what it showed, to go
-//! back and forward through (Ctrl+- and Ctrl+=).
+//! back and forward through (Ctrl+- and Ctrl+=). Popping (Ctrl+0) closes
+//! what it shows and goes back, as from the top of a stack.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -353,7 +354,7 @@ impl Panel {
 
     /// What's on screen, as the history keeps it. An unnamed document that
     /// was never typed in isn't worth going back to.
-    fn visit(&self) -> Option<Visit> {
+    pub fn visit(&self) -> Option<Visit> {
         if let Some(terminal) = &self.terminal {
             return Some(Visit::Terminal(terminal.borrow().id()));
         }
@@ -404,6 +405,12 @@ impl Panel {
         };
         to.extend(current);
         Some(visit)
+    }
+
+    /// Drops `visit` from the places to go back to, as when it was closed
+    /// for good.
+    pub fn drop_visit(&mut self, visit: &Visit) {
+        self.history.back.retain(|old| !old.is(visit));
     }
 
     /// Whether there's a place to go back to (or forward to, if not

@@ -668,6 +668,7 @@ impl App {
             Command::SplitRight => self.split(Axis::Horizontal),
             Command::SplitDown => self.split(Axis::Vertical),
             Command::ClosePanel => self.close_panel(),
+            Command::Pop => self.pop(),
             Command::GoBack => self.go_history(true),
             Command::GoForward => self.go_history(false),
             Command::FocusPanelLeft => self.focus_panel(Direction::Left),
@@ -716,11 +717,6 @@ impl App {
             Command::ClearTerminal => {
                 if let Some(terminal) = self.active_terminal() {
                     terminal.borrow_mut().clear();
-                }
-            }
-            Command::CloseTerminal => {
-                if self.active_terminal().is_some() {
-                    self.close_shown(Redo::Run(Command::CloseTerminal));
                 }
             }
             Command::CloseFile => {
@@ -1527,11 +1523,47 @@ impl App {
         self.prune_terminals();
     }
 
+    /// Closes what the active panel shows (see [`App::close_shown`]) and
+    /// shows what it showed before, as going back does, leaving the panel
+    /// empty if there's nothing to go back to. What it closed is gone from
+    /// the panel's history.
+    fn pop(&mut self) {
+        if self.active_panel().is_empty() {
+            self.show_message("Nothing to close.", false);
+            return;
+        }
+        let visit = self.active_panel().visit();
+        if !self.close_shown(Redo::Run(Command::Pop)) {
+            return;
+        }
+        if let Some(visit) = &visit {
+            self.active_panel_mut().drop_visit(visit);
+        }
+        if !self.step_history(true) {
+            self.show_active_in_tree();
+        }
+        self.prune_documents();
+        self.prune_terminals();
+    }
+
+    /// Shows what the active panel showed before what it shows now, or
+    /// with `back` false, what it went back from, or says there's nothing
+    /// to (see [`App::step_history`]).
+    fn go_history(&mut self, back: bool) {
+        if !self.step_history(back) {
+            let message = match back {
+                true => "Nothing to go back to.",
+                false => "Nothing to go forward to.",
+            };
+            self.show_message(message, false);
+        }
+    }
+
     /// Shows what the active panel showed before what it shows now, or
     /// with `back` false, what it went back from. A closed file opens
     /// again; closed terminals, and those another panel shows now, are
-    /// skipped.
-    fn go_history(&mut self, back: bool) {
+    /// skipped. Returns false if there was nowhere to go.
+    fn step_history(&mut self, back: bool) -> bool {
         let active = self.tab().active;
         let elsewhere: Vec<u32> = tab::all_panels(&self.tabs)
             .filter(|panel| panel.id != active)
@@ -1555,12 +1587,7 @@ impl App {
             .active_panel_mut()
             .step_history(back, usable)
         else {
-            let message = match back {
-                true => "Nothing to go back to.",
-                false => "Nothing to go forward to.",
-            };
-            self.show_message(message, false);
-            return;
+            return false;
         };
         let history = self.active_panel_mut().take_history();
         match visit {
@@ -1591,6 +1618,7 @@ impl App {
             }
         }
         self.active_panel_mut().restore_history(history);
+        true
     }
 
     /// Moves the keyboard to the panel next to the active one in
@@ -4390,6 +4418,46 @@ mod tests {
     }
 
     #[test]
+    fn popping_closes_what_a_panel_shows_and_goes_back() {
+        let _serial = crate::test_serial();
+        let root = fixture("pop", &[("a.txt", "a"), ("b.txt", "b")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.open(&root.join("b.txt"), false);
+        app.run(Command::NewTerminal, false);
+        assert!(app.active_terminal().is_some());
+
+        ctrl(&mut app, '0');
+        // The login shell may be running its own startup.
+        if app.alert.is_some() {
+            key(&mut app, KeyCode::Char('c'));
+        }
+        assert!(app.terminals.is_empty());
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        ctrl(&mut app, '0');
+        assert!(app.find_document(&root.join("b.txt")).is_none());
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        // What was popped isn't gone back to.
+        ctrl(&mut app, '-');
+        assert!(screen(&app).contains("Nothing to go back to."));
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        // The last leaves the panel empty.
+        ctrl(&mut app, '0');
+        assert!(app.active_panel().is_empty());
+        assert!(app.documents.is_empty());
+        ctrl(&mut app, '0');
+        assert!(screen(&app).contains("Nothing to close."));
+
+        // A file another panel shows stays open there.
+        app.open(&root.join("b.txt"), false);
+        ctrl(&mut app, '\\');
+        app.open(&root.join("a.txt"), false);
+        app.open(&root.join("b.txt"), false);
+        ctrl(&mut app, '0');
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        assert!(app.find_document(&root.join("b.txt")).is_some());
+    }
+
+    #[test]
     fn panels_go_back_and_forward_through_what_they_showed() {
         let _serial = crate::test_serial();
         let root = fixture("history", &[("a.txt", "a"), ("b.txt", "b"), ("c.txt", "c")]);
@@ -4696,12 +4764,10 @@ mod tests {
         };
         let shown = palette(&mut app, "terminal");
         assert!(shown.contains("New Terminal"), "{shown}");
-        assert!(!shown.contains("Close Terminal"), "{shown}");
         assert!(!shown.contains("Clear Terminal"), "{shown}");
 
         app.run(Command::NewTerminal, false);
         let shown = palette(&mut app, "terminal");
-        assert!(shown.contains("Close Terminal"), "{shown}");
         assert!(shown.contains("Clear Terminal"), "{shown}");
         // More than fit on screen match "terminal".
         let shown = palette(&mut app, "rename terminal");
@@ -4749,22 +4815,20 @@ mod tests {
             status_bar(&app)
         );
 
-        // Closing it asks first, then hangs up on what it's running, and
-        // leaves the panel empty.
+        // Popping it, with Ctrl+0 even from the terminal, asks first, then
+        // hangs up on what it's running, and goes back to the file.
         type_text(&mut app, "sleep 30");
         key(&mut app, KeyCode::Enter);
         // Not only busy: the login shell may be running its own startup.
         wait_until(&mut app, "sleep to run", |app| {
             app.terminals[0].borrow().program().as_deref() == Some("sleep")
         });
-        for _ in 0..2 {
-            assert!(app.active_terminal().is_some());
-            prefixed_ctrl(&mut app, 'k');
-            type_text(&mut app, "close terminal");
-            key(&mut app, KeyCode::Enter);
-        }
+        ctrl(&mut app, '0');
+        assert!(app.active_terminal().is_some());
+        assert!(screen(&app).contains("sleep is running in a terminal."));
+        key(&mut app, KeyCode::Char('c'));
         assert!(app.active_terminal().is_none());
-        assert!(app.editor().is_none());
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         assert!(app.terminals.is_empty());
         assert!(!app.recent.contains(&Recent::Terminal(1)));
         // Nothing to quit over.

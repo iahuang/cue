@@ -325,7 +325,10 @@ impl Picker {
                     color: None,
                 })
                 .collect(),
+            // Terminal, then the dark themes, then the light ones.
             themes: ThemeId::all()
+                .filter(|id| id.light() != Some(true))
+                .chain(ThemeId::all().filter(|id| id.light() == Some(true)))
                 .map(|id| Item {
                     text: id.name().to_string(),
                     dim: 0..0,

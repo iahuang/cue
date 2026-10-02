@@ -106,6 +106,7 @@ commands! {
     SplitRight => "panel:split-right", "Split Panel Right";
     SplitDown => "panel:split-down", "Split Panel Down";
     ClosePanel => "panel:close", "Close Panel";
+    Pop => "panel:pop", "Pop";
     GoBack => "panel:go-back", "Go Back";
     GoForward => "panel:go-forward", "Go Forward";
     FocusPanelLeft => "panel:focus-left", "Focus Panel Left";
@@ -130,7 +131,6 @@ commands! {
     GoToTab9 => "tab:go-to-9", "Go to Tab 9";
     NewTerminal => "terminal:new", "New Terminal";
     ClearTerminal => "terminal:clear", "Clear Terminal";
-    CloseTerminal => "terminal:close", "Close Terminal";
     RenameTerminal => "terminal:rename", "Rename Terminal";
     TerminalPrefix => "terminal:prefix", "Terminal: Send Next Shortcut to cue";
     TreeUp => "tree:up", "File Tree: Select Previous";
@@ -227,7 +227,7 @@ impl Command {
             | NewFile | CreateFile | OpenFile | GoToFile | GoToLine | GoToSymbol
             | GoToWorkspaceSymbol | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find
             | FindReplace | FindNext | FindPrevious | ToggleTree | FocusTree | FocusEditor
-            | SplitRight | SplitDown | ClosePanel | GoBack | GoForward | FocusPanelLeft
+            | SplitRight | SplitDown | ClosePanel | Pop | GoBack | GoForward | FocusPanelLeft
             | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal | NewTab | CloseTab
             | NextTab | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1
             | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8
@@ -242,7 +242,7 @@ impl Command {
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
             DialogParent | DialogComplete => Context::Dialog,
             FindSwitchField | FindClose => Context::Find,
-            ClearTerminal | CloseTerminal | RenameTerminal | TerminalPrefix => Context::Terminal,
+            ClearTerminal | RenameTerminal | TerminalPrefix => Context::Terminal,
             Replace | ReplaceAll => Context::Replace,
             _ => Context::Editor,
         }
@@ -436,6 +436,9 @@ impl Default for Keymap {
             bindings.push((key(Char(n), Mods::CTRL), command));
             bindings.push((key(Char(n), SUPER), command));
         }
+        // Next to them, and likewise only with the kitty protocol.
+        bindings.push((key(Char('0'), Mods::CTRL), Pop));
+        bindings.push((key(Char('0'), SUPER), Pop));
 
         bindings.extend([
             (key(Esc, Mods::NONE), ClearSelection),
@@ -553,12 +556,13 @@ impl Default for Keymap {
         // terminals, Ctrl+Shift copies and pastes. Ctrl+` makes the next
         // shortcut cue's, as in tmux (VS Code's terminal toggle; shells
         // don't use it). Terminals without the kitty keyboard protocol send
-        // it as Ctrl+Space. Ctrl+1 to 9 go to tabs, from terminals too:
-        // shells don't use them either.
+        // it as Ctrl+Space. Ctrl+1 to 9 go to tabs, and Ctrl+0 pops, from
+        // terminals too: shells don't use them either.
         let go_to_tab = ('1'..='9')
             .zip(Command::GO_TO_TAB)
             .map(|(n, command)| (key(Char(n), Mods::CTRL), command));
         for (key, command) in go_to_tab.chain([
+            (key(Char('0'), Mods::CTRL), Pop),
             (key(Char('`'), Mods::CTRL), TerminalPrefix),
             (key(Char('c'), CTRL_SHIFT), Copy),
             (key(Char('c'), SUPER), Copy),
@@ -863,7 +867,6 @@ mod tests {
             Command::ToggleWrap,
             Command::CloseFile,
             Command::ClearTerminal,
-            Command::CloseTerminal,
             Command::RenameTerminal,
             Command::RenameTab,
             Command::TreeNewFile,
