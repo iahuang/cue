@@ -412,6 +412,14 @@ impl EmbeddedTerminal {
         unsafe { sys::embeddedTerminalClearSelection(self.handle) };
     }
 
+    /// Selects the word at a viewport cell.
+    pub fn select_word(&mut self, at: (u16, u16)) -> Result<()> {
+        check(
+            unsafe { sys::embeddedTerminalSelectWord(self.handle, at.0, at.1) },
+            "terminal word selection",
+        )
+    }
+
     /// The selected text, or "" with nothing selected.
     pub fn selected_text(&self) -> String {
         read_sized(|out, len, required| unsafe {

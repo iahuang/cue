@@ -407,6 +407,12 @@ export fn embeddedTerminalClearSelection(handle: NativeHandle) i32 {
     return 0;
 }
 
+export fn embeddedTerminalSelectWord(handle: NativeHandle, x: u16, y: u16) i32 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    terminal_value.selectWord(.{ .x = x, .y = y }) catch |err| return embeddedTerminalStatus(err);
+    return 0;
+}
+
 export fn embeddedTerminalGetSelectedText(
     handle: NativeHandle,
     out_ptr: ?[*]u8,

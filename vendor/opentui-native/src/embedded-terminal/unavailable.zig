@@ -74,6 +74,9 @@ pub const EmbeddedTerminal = struct {
         return error.Unsupported;
     }
     pub fn clearSelection(_: *EmbeddedTerminal) void {}
+    pub fn selectWord(_: *EmbeddedTerminal, _: anytype) Error!void {
+        return error.Unsupported;
+    }
     pub fn selectedText(_: *EmbeddedTerminal) Error![:0]const u8 {
         return error.Unsupported;
     }

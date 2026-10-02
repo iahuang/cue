@@ -227,6 +227,14 @@ pub const EmbeddedTerminal = struct {
         self.terminal.screens.active.clearSelection();
     }
 
+    pub fn selectWord(self: *EmbeddedTerminal, at: ghostty.Coordinate) Error!void {
+        const screen = self.terminal.screens.active;
+        const pin = screen.pages.pin(.{ .viewport = at }) orelse return error.InvalidValue;
+        const boundaries = [_]u21{ 0, ' ', '\t', '\'', '"', '│', '`', '|', ':', ';', ',', '(', ')', '[', ']', '{', '}', '<', '>', '$' };
+        const selection = screen.selectWord(pin, &boundaries) orelse return;
+        try screen.select(selection);
+    }
+
     pub fn selectedText(self: *EmbeddedTerminal) Error![:0]const u8 {
         const screen = self.terminal.screens.active;
         const selection = screen.selection orelse return try self.allocator.dupeZ(u8, "");

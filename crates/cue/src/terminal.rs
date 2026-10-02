@@ -30,6 +30,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::time::Instant;
 
 use opentui::{
     Anchor, Buffer, EmbeddedTerminal, KeyEvent, KeyMods, LineAt, MouseAction,
@@ -39,7 +40,7 @@ use opentui::{
 use crate::config;
 use crate::editor::current_match;
 use crate::find::{self, Field, FindBar, Match};
-use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind};
+use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::Keymap;
 use crate::layout::Rect;
 use crate::line_edit::Edit;
@@ -77,6 +78,7 @@ pub struct Terminal {
     forwarding_mouse: bool,
     /// Where a drag to select text started.
     selecting_from: Option<(u16, u16)>,
+    last_click: Option<((u16, u16), Instant)>,
     /// The find bar, while it's open.
     find: Option<Find>,
     /// Counts changes to the output, so the find bar knows when to find
@@ -214,6 +216,7 @@ impl Terminal {
             exit: None,
             forwarding_mouse: false,
             selecting_from: None,
+            last_click: None,
             find: None,
             epoch: 0,
         }
@@ -539,6 +542,7 @@ impl Terminal {
     /// terminals. A shell at its prompt redraws it, keeping what was typed.
     /// A full-screen program keeps its screen.
     pub fn clear(&mut self) {
+        self.last_click = None;
         self.vt.clear_selection();
         self.vt.scroll_to_bottom();
         if self.vt.is_alternate_screen() {
@@ -559,6 +563,7 @@ impl Terminal {
             return;
         }
         self.vt.clear_selection();
+        self.last_click = None;
         self.vt.scroll_to_bottom();
         self.pty.write(bytes);
     }
@@ -572,6 +577,7 @@ impl Terminal {
     /// terminal or dragged from it.
     pub fn handle_mouse(&mut self, mouse: Mouse) {
         if self.handle_find_mouse(mouse) {
+            self.last_click = None;
             return;
         }
         let (cols, rows) = size(self.area);
@@ -591,10 +597,12 @@ impl Terminal {
         match mouse.kind {
             MouseKind::Press(button) => {
                 self.forwarding_mouse = false;
+                self.selecting_from = None;
                 if offer {
                     let event = event(MouseAction::Press, term_button(button), true);
                     let bytes = self.vt.encode_mouse(&event);
                     if !bytes.is_empty() {
+                        self.last_click = None;
                         self.forwarding_mouse = true;
                         self.pty.write(&bytes);
                         return;
@@ -602,6 +610,19 @@ impl Terminal {
                 }
                 self.vt.clear_selection();
                 self.selecting_from = (button == MouseButton::Left).then_some((x as u16, y as u16));
+                let now = Instant::now();
+                if let Some(at) = self.selecting_from {
+                    if self.last_click.take().is_some_and(|(last, time)| {
+                        last == at && now.duration_since(time) < MULTI_CLICK
+                    }) {
+                        let _ = self.vt.select_word(at);
+                        self.selecting_from = None;
+                    } else {
+                        self.last_click = Some((at, now));
+                    }
+                } else {
+                    self.last_click = None;
+                }
             }
             MouseKind::Drag(button) if self.forwarding_mouse => {
                 let event = event(MouseAction::Motion, term_button(button), true);
@@ -610,6 +631,7 @@ impl Terminal {
             }
             MouseKind::Drag(_) => {
                 if let Some(from) = self.selecting_from {
+                    self.last_click = None;
                     let _ = self.vt.set_selection(from, (x as u16, y as u16));
                 }
             }
@@ -621,6 +643,7 @@ impl Terminal {
             }
             MouseKind::Release(_) => self.selecting_from = None,
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
+                self.last_click = None;
                 let up = mouse.kind == MouseKind::ScrollUp;
                 if offer {
                     let button = if up {
@@ -1131,6 +1154,37 @@ mod tests {
 
     fn key(code: KeyCode, mods: Mods) -> Key {
         Key::new(code, mods)
+    }
+
+    #[test]
+    fn double_click_selects_a_word() {
+        let _serial = crate::test_serial();
+        let area = Rect {
+            x: 4,
+            y: 3,
+            width: 30,
+            height: 5,
+        };
+        let mut term = Terminal::new(1, &std::env::temp_dir(), area).unwrap();
+        term.vt.write(b"\x1b[2J\x1b[Halpha beta gamma").unwrap();
+        let press = Mouse {
+            kind: MouseKind::Press(MouseButton::Left),
+            x: 11,
+            y: 3,
+            mods: Mods::NONE,
+        };
+        term.handle_mouse(press);
+        assert_eq!(term.selected_text(), None);
+        term.handle_mouse(Mouse {
+            kind: MouseKind::Release(MouseButton::Left),
+            ..press
+        });
+        term.handle_mouse(press);
+        assert_eq!(term.selected_text().as_deref(), Some("beta"));
+        term.handle_mouse(press);
+        term.last_click = Some(((7, 0), Instant::now() - MULTI_CLICK));
+        term.handle_mouse(press);
+        assert_eq!(term.selected_text(), None);
     }
 
     #[test]
