@@ -795,7 +795,7 @@ impl FromStr for Key {
                 "alt" | "option" | "opt" => &mut key.mods.alt,
                 "shift" => &mut key.mods.shift,
                 "cmd" | "command" | "super" => &mut key.mods.sup,
-                _ => return Err(format!("there's no modifier \"{}\"", name.trim())),
+                _ => return Err(format!("unknown modifier \"{}\"", name.trim())),
             };
             *held = true;
         }
@@ -828,7 +828,7 @@ fn code_named(name: &str) -> Result<KeyCode, String> {
         "pagedown" | "pgdn" => KeyCode::PageDown,
         _ => match lower.strip_prefix('f').and_then(|n| n.parse().ok()) {
             Some(n @ 1..=12) => KeyCode::F(n),
-            _ => return Err(format!("there's no key \"{name}\"")),
+            _ => return Err(format!("unknown key \"{name}\"")),
         },
     })
 }
@@ -1154,11 +1154,11 @@ mod tests {
         );
         assert_eq!(parse("+"), Ok(Key::new(KeyCode::Char('+'), Mods::NONE)));
         assert_eq!(parse("space"), Ok(Key::new(KeyCode::Char(' '), Mods::NONE)));
-        assert_eq!(parse("f13"), Err("there's no key \"f13\"".to_string()));
-        assert_eq!(parse("ctrl+"), Err("there's no key \"\"".to_string()));
+        assert_eq!(parse("f13"), Err("unknown key \"f13\"".to_string()));
+        assert_eq!(parse("ctrl+"), Err("unknown key \"\"".to_string()));
         assert_eq!(
             parse("meta+k"),
-            Err("there's no modifier \"meta\"".to_string())
+            Err("unknown modifier \"meta\"".to_string())
         );
     }
 

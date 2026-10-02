@@ -688,10 +688,9 @@ impl App {
         match command {
             Command::Quit => return self.quit(),
             Command::Restart => return AppAction::Restart,
-            Command::KeepSession if self.session.is_some() => self.show_message(
-                "This is a session already: quitting keeps it, and End Session lets it go.",
-                false,
-            ),
+            Command::KeepSession if self.session.is_some() => {
+                self.show_message("This is already a session.", false)
+            }
             Command::KeepSession => {
                 self.keep_session(true);
             }
@@ -751,7 +750,7 @@ impl App {
             Command::CloseTab => self.close_tab(self.tab),
             Command::NextTab | Command::PreviousTab if self.tabs.len() == 1 => {
                 let message = format!(
-                    "There's only this tab; {} opens another.",
+                    "No other tabs. Use {} to open a new tab.",
                     self.shortcut(Command::NewTab)
                 );
                 self.show_message(message, false);
@@ -767,7 +766,7 @@ impl App {
                 if index < self.tabs.len() {
                     self.switch_tab(index);
                 } else {
-                    let message = format!("There's no tab {}.", index + 1);
+                    let message = format!("Tab {} doesn't exist.", index + 1);
                     self.show_message(message, false);
                 }
             }
@@ -813,7 +812,7 @@ impl App {
             Command::TerminalPrefix if self.keyboard_terminal().is_some() => {
                 self.terminal_prefix = true;
                 let message = format!(
-                    "Next shortcut goes to cue; {} again sends it to the shell.",
+                    "Next shortcut will go to cue. Press {0} again to send {0} to the shell.",
                     self.shortcut(Command::TerminalPrefix)
                 );
                 self.show_message(message, false);
@@ -1524,7 +1523,7 @@ impl App {
             changed = true;
             if change == DiskChange::Conflict {
                 let message = format!(
-                    "{} changed on disk; saving will ask whether to overwrite it.",
+                    "{} changed on disk. Saving will prompt you to overwrite it.",
                     self.document_name(&doc)
                 );
                 self.show_message(message, false);
@@ -1557,7 +1556,7 @@ impl App {
             Axis::Vertical => area.height >= 2 * layout::MIN_HEIGHT,
         };
         if !room {
-            self.show_message("No room to split this panel.", false);
+            self.show_message("Not enough space to split this panel.", false);
             return;
         }
         let id = self.next_panel;
@@ -2457,10 +2456,7 @@ impl App {
     /// on disk since, or take its text instead, then carry on `saving`.
     fn ask_overwrite(&mut self, doc: Rc<Document>, saving: Option<Saving>) {
         let name = self.document_name(&doc);
-        let message = format!(
-            "{name} changed on disk since it was opened or last saved. Overwrite it \
-             with your changes, or revert to the file on disk and lose them?"
-        );
+        let message = format!("{name} changed on disk since it was opened or last saved.");
         let buttons = vec![
             Button::new("&Overwrite", Answer::Overwrite(doc.clone(), saving.clone())).danger(),
             Button::new("&Revert", Answer::Revert(doc, saving)).danger(),
@@ -2527,7 +2523,7 @@ impl App {
                     self.show_message(format!("Can't revert {name}: {err}"), true);
                     return AppAction::Continue;
                 }
-                self.show_message(format!("Reverted {name} to the file on disk."), false);
+                self.show_message(format!("Reloaded {name} from disk."), false);
                 match saving {
                     Some(saving) => saving,
                     None => return AppAction::Continue,
@@ -2680,7 +2676,7 @@ impl App {
             1 => " (and 1 more problem)".to_string(),
             n => format!(" (and {n} more problems)"),
         };
-        let message = format!("Settings: {first}{more}. Open Settings to fix.");
+        let message = format!("Settings: {first}{more}. Use Open Settings to fix this.");
         self.show_message(message, true);
     }
 
@@ -2707,7 +2703,7 @@ impl App {
     /// what was wrong with it.
     fn reload_settings(&mut self) {
         let Some(path) = self.settings.clone() else {
-            self.show_message("There's nowhere for settings: HOME isn't set.", true);
+            self.show_message("Can't locate settings: HOME isn't set.", true);
             return;
         };
         let (config, warnings) = match fs::read_to_string(&path) {
@@ -2852,9 +2848,12 @@ impl App {
                 self.use_theme_setting(setting);
                 let why = match unsaved {
                     true => "the settings file has unsaved changes",
-                    false => "there's nowhere for settings",
+                    false => "can't locate the settings file",
                 };
-                self.show_message(format!("Using {name} until cue quits: {why}."), false);
+                self.show_message(
+                    format!("Theme applied for this session only: {why}."),
+                    false,
+                );
                 return;
             }
         };
@@ -2898,7 +2897,7 @@ impl App {
     /// isn't one yet.
     fn open_settings(&mut self) {
         let Some(path) = self.settings.clone() else {
-            self.show_message("There's nowhere for settings: HOME isn't set.", true);
+            self.show_message("Can't locate settings: HOME isn't set.", true);
             return;
         };
         let made = path
@@ -2938,7 +2937,7 @@ impl App {
         let orphans = self.recovery.orphans(self.workspace.roots());
         if orphans.is_empty() {
             if asked {
-                self.show_message("There are no unsaved changes to recover.", false);
+                self.show_message("No unsaved changes to recover.", false);
             }
             return;
         }
@@ -2949,11 +2948,7 @@ impl App {
                 None => "an untitled file".to_string(),
             })
             .collect();
-        let message = format!(
-            "cue exited without saving changes to {}. Open them to save or look over, or \
-             discard them?",
-            names.join(", ")
-        );
+        let message = format!("cue exited with unsaved changes to {}.", names.join(", "));
         let buttons = vec![
             Button::new("&Recover", Answer::Recover(orphans.clone())),
             Button::new("&Discard", Answer::DiscardRecovered(orphans)).danger(),
@@ -2999,7 +2994,7 @@ impl App {
                 count => format!("{count} files"),
             };
             self.show_message(
-                format!("Recovered unsaved changes to {files}; save to keep them."),
+                format!("Recovered changes to {files}. Save to keep them."),
                 false,
             );
         }
@@ -3083,7 +3078,7 @@ impl App {
     /// if it can't. With `announce`, says so.
     fn keep_session(&mut self, announce: bool) -> bool {
         let Some(sessions) = self.sessions.clone() else {
-            self.show_message("There's nowhere to keep sessions: HOME isn't set.", true);
+            self.show_message("Can't save sessions: HOME isn't set.", true);
             return false;
         };
         match Session::create(&sessions) {
@@ -3095,15 +3090,12 @@ impl App {
                 }
                 self.recovery.discard();
                 if announce {
-                    self.show_message(
-                        "Kept as a session: quitting leaves it to come back to with `cue`.",
-                        false,
-                    );
+                    self.show_message("Session saved. Run `cue` to resume after quitting.", false);
                 }
                 true
             }
             Err(err) => {
-                self.show_message(format!("Can't keep a session: {err}"), true);
+                self.show_message(format!("Can't create a session: {err}"), true);
                 false
             }
         }
@@ -3125,7 +3117,7 @@ impl App {
     /// otherwise, about unsaved changes and running programs.
     fn end_session(&mut self) -> AppAction {
         if self.session.is_none() {
-            self.show_message("This isn't a session; Keep Session makes it one.", false);
+            self.show_message("No active session. Use Keep Session to create one.", false);
             return AppAction::Continue;
         }
         let unsaved = self.unsaved();
@@ -3342,7 +3334,7 @@ impl App {
                     Err(err) if text.is_some() => {
                         self.show_message(
                             format!(
-                                "Can't open {}: {err}. Restored its saved changes.",
+                                "Can't open {}: {err}. Saved changes restored.",
                                 path.display()
                             ),
                             true,
@@ -3594,7 +3586,7 @@ impl App {
             Purpose::SaveAs => match self.active_panel().document() {
                 Some(doc) => doc.path(),
                 None => {
-                    self.show_message("There's no file here to save.", false);
+                    self.show_message("No file to save.", false);
                     return;
                 }
             },
@@ -3695,10 +3687,11 @@ impl App {
         let current = self.active_panel().document();
         let open = self.find_document(&document::resolve(path));
         if open.is_some_and(|open| !current.is_some_and(|current| Rc::ptr_eq(current, &open))) {
-            return Err(format!("{} is open; close it first.", file_name(path)));
+            return Err(format!("{} is open. Close it first.", file_name(path)));
         }
         if let Some(folder) = path.parent() {
-            fs::create_dir_all(folder).map_err(|err| format!("Can't create its folder: {err}"))?;
+            fs::create_dir_all(folder)
+                .map_err(|err| format!("Can't create the destination folder: {err}"))?;
         }
         let action = match self.editor_mut() {
             Some(editor) => editor.save_as(document::resolve(path)),
@@ -3954,7 +3947,7 @@ impl App {
             Command::TreeRename | Command::TreeTrash => {
                 if let Some(root) = self.roots_in(&target.path).first() {
                     let root = self.workspace.name(root).unwrap_or_default();
-                    let message = format!("{name} has the workspace folder {root} in it.");
+                    let message = format!("{name} contains workspace folder {root}.");
                     self.show_message(message, false);
                     return AppAction::Continue;
                 }
@@ -4004,7 +3997,7 @@ impl App {
             .canonicalize()
             .map_err(|err| format!("Can't add {}: {err}", file_name(path)))?;
         if self.workspace.roots().contains(&root) {
-            return Err(format!("{} is in the workspace already.", file_name(path)));
+            return Err(format!("{} is already in the workspace.", file_name(path)));
         }
         self.workspace
             .add_root(&root)
@@ -4066,7 +4059,8 @@ impl App {
             return Err("Can't move a folder into itself.".to_string());
         }
         if let Some(folder) = to.parent() {
-            fs::create_dir_all(folder).map_err(|err| format!("Can't create its folder: {err}"))?;
+            fs::create_dir_all(folder)
+                .map_err(|err| format!("Can't create the destination folder: {err}"))?;
         }
         fs::rename(from, to).map_err(|err| format!("Can't move {}: {err}", file_name(from)))?;
         // Open files have their paths resolved.
@@ -4119,7 +4113,8 @@ impl App {
             return Err("Can't copy a folder into itself.".to_string());
         }
         if let Some(folder) = to.parent() {
-            fs::create_dir_all(folder).map_err(|err| format!("Can't create its folder: {err}"))?;
+            fs::create_dir_all(folder)
+                .map_err(|err| format!("Can't create the destination folder: {err}"))?;
         }
         copy_all(from, to).map_err(|err| format!("Can't copy {}: {err}", file_name(from)))?;
         self.tree.refresh();
@@ -4135,8 +4130,8 @@ impl App {
         let name = file_name(path);
         if !confirmed {
             let message = match path.is_dir() {
-                true => "The folder and everything in it can be restored from the Trash.",
-                false => "It can be restored from the Trash.",
+                true => "You can restore this folder and its contents from the Trash.",
+                false => "You can restore this file from the Trash.",
             };
             let redo = Redo::Trash(path.to_path_buf());
             let buttons = vec![Button::new("Move to &Trash", Answer::Go(redo)).danger()];
@@ -5323,7 +5318,7 @@ mod tests {
         assert!(screen(&app).contains("^` cue keys"), "{}", screen(&app));
         let prefix = Key::new(KeyCode::Char('`'), Mods::CTRL);
         app.handle_key(prefix);
-        assert!(screen(&app).contains("Next shortcut goes to cue"));
+        assert!(screen(&app).contains("Next shortcut will go to cue"));
         ctrl(&mut app, 'p');
         assert!(app.picker.is_some());
         key(&mut app, KeyCode::Esc);
@@ -5650,7 +5645,7 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Enter);
         assert!(app.dialog.is_some());
-        assert!(screen(&app).contains("a.txt is open; close it first."));
+        assert!(screen(&app).contains("a.txt is open. Close it first."));
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "alpha");
 
         for _ in 0..5 {
@@ -5785,7 +5780,7 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Enter);
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "original");
-        assert!(screen(&app).contains("a.txt is open; close it first."));
+        assert!(screen(&app).contains("a.txt is open. Close it first."));
     }
 
     #[test]
@@ -6788,7 +6783,7 @@ mod tests {
         ctrl(&mut app, '\\');
         assert_eq!(app.tab().panels.len(), 2);
         assert!(
-            screen(&app).contains("No room to split"),
+            screen(&app).contains("Not enough space to split"),
             "{}",
             screen(&app)
         );
@@ -6910,7 +6905,7 @@ mod tests {
         assert_eq!(app.tab, 1);
         ctrl(&mut app, '3');
         assert_eq!(app.tab, 1);
-        assert!(screen(&app).contains("There's no tab 3."));
+        assert!(screen(&app).contains("Tab 3 doesn't exist."));
         ctrl(&mut app, '1');
         assert_eq!(app.tab, 0);
 
@@ -6942,7 +6937,7 @@ mod tests {
         let root = fixture("close-tab", &[("a.txt", "alpha"), ("b.txt", "beta")]);
         let mut app = app(&root, Some("a.txt"));
         with_mods(&mut app, KeyCode::Char(']'), CTRL_ALT);
-        assert!(screen(&app).contains("There's only this tab; Ctrl+T opens another."));
+        assert!(screen(&app).contains("No other tabs. Use Ctrl+T to open a new tab."));
 
         ctrl(&mut app, 't');
         assert!(app.open(&root.join("b.txt"), false));
@@ -7399,7 +7394,7 @@ mod tests {
         app.run(Command::AddFolder, false);
         type_text(&mut app, "two/");
         key(&mut app, KeyCode::Enter);
-        assert!(tall_screen(&app).contains("two is in the workspace already."));
+        assert!(tall_screen(&app).contains("two is already in the workspace."));
         key(&mut app, KeyCode::Esc);
 
         // The menu of a root has it, when there's another.
@@ -7431,10 +7426,7 @@ mod tests {
             app.run(command, false);
             assert!(app.dialog.is_none() && app.alert.is_none());
             let text = tall_screen(&app);
-            assert!(
-                text.contains("has the workspace folder pkg in it"),
-                "{text}"
-            );
+            assert!(text.contains("contains workspace folder pkg"), "{text}");
         }
         assert!(pkg.exists());
 
@@ -7726,7 +7718,7 @@ mod tests {
             .find(|doc| doc.path().is_none() && doc.text() == "notes");
         assert!(untitled.is_some_and(|doc| doc.is_modified()));
         assert!(app.ed().path().is_some_and(|path| path.ends_with("a.txt")));
-        assert!(screen(&app).contains("Recovered unsaved changes to 2 files"));
+        assert!(screen(&app).contains("Recovered changes to 2 files"));
         // Undoing goes back to the file as it is.
         ctrl(&mut app, 'z');
         assert_eq!(a.text(), "alpha");
@@ -7742,7 +7734,7 @@ mod tests {
         // Asked for again, there's nothing more here.
         app.run(Command::RecoverUnsaved, false);
         assert!(app.alert.is_none());
-        assert!(screen(&app).contains("no unsaved changes to recover"));
+        assert!(screen(&app).contains("No unsaved changes to recover"));
     }
 
     #[test]
@@ -7828,13 +7820,13 @@ mod tests {
         app.warn_about_config(&[]);
         assert!(!screen(&app).contains("Settings:"));
         let warnings = [
-            "There's no setting editor.tabwidth".to_string(),
+            "Unknown setting: editor.tabwidth".to_string(),
             "x".to_string(),
         ];
         app.warn_about_config(&warnings);
         let text = screen(&app);
         assert!(
-            text.contains("Settings: There's no setting editor.tabwidth (and 1 more"),
+            text.contains("Settings: Unknown setting: editor.tabwidth (and 1 more"),
             "{text}"
         );
     }
@@ -7888,10 +7880,7 @@ mod tests {
         assert_eq!(config::get().tab_width, 3);
         assert_eq!(config::get().tree_width, 30);
         let text = screen(&app);
-        assert!(
-            text.contains("There's no setting editor.wrapping"),
-            "{text}"
-        );
+        assert!(text.contains("Unknown setting: editor.wrapping"), "{text}");
     }
 
     #[test]
@@ -7973,11 +7962,7 @@ mod tests {
 
         assert!(app.palette_has(Command::KeepSession));
         app.run(Command::KeepSession, false);
-        assert!(
-            screen(&app).contains("Kept as a session"),
-            "{}",
-            screen(&app)
-        );
+        assert!(screen(&app).contains("Session saved."), "{}", screen(&app));
         assert!(!app.palette_has(Command::KeepSession));
         assert!(app.palette_has(Command::EndSession));
         let dir = app.session().unwrap().dir().to_path_buf();

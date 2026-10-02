@@ -959,7 +959,10 @@ impl Terminal {
         }
         match self.exit {
             Some(status) => Status::Message {
-                text: format!("{}. Enter starts a new shell.", describe_exit(status)),
+                text: format!(
+                    "{}. Press Enter to start a new shell.",
+                    describe_exit(status)
+                ),
                 error: false,
             },
             None => Status::Terminal(match self.label() {
@@ -983,7 +986,7 @@ pub fn describe_exit(status: ExitStatus) -> String {
     match (status.code(), status.signal()) {
         (Some(0), _) => "The shell exited".to_string(),
         (Some(code), _) => format!("The shell exited with code {code}"),
-        (None, Some(signal)) => format!("The shell was ended by signal {signal}"),
+        (None, Some(signal)) => format!("The shell terminated with signal {signal}"),
         (None, None) => "The shell exited".to_string(),
     }
 }
@@ -1305,7 +1308,7 @@ mod tests {
         assert_eq!(
             term.status(),
             Status::Message {
-                text: "The shell exited with code 3. Enter starts a new shell.".into(),
+                text: "The shell exited with code 3. Press Enter to start a new shell.".into(),
                 error: false
             }
         );

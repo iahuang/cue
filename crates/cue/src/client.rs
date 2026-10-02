@@ -103,12 +103,12 @@ pub fn list() -> ExitCode {
 /// its programs are hung up on, and what it kept is removed.
 pub fn end(id: Option<String>) -> ExitCode {
     let Some(sessions) = session::default_dir() else {
-        return fail("there's nowhere sessions are kept: HOME isn't set");
+        return fail("Can't locate sessions: HOME isn't set.");
     };
     let listing = match &id {
         Some(id) => match session::find(&sessions, id) {
             Some(listing) => listing,
-            None => return fail(&format!("there's no session {id}")),
+            None => return fail(&format!("Session {id} not found.")),
         },
         None => {
             let folder = match folder(&[]) {
@@ -121,7 +121,7 @@ pub fn end(id: Option<String>) -> ExitCode {
                 0 => return fail(&format!("there are no sessions in {}", tilde(&folder))),
                 _ => {
                     return fail(&format!(
-                        "{} has several sessions; name one (cue --list lists them)",
+                        "Multiple sessions found in {}. Specify a session ID. Run `cue --list` to list sessions.",
                         tilde(&folder)
                     ))
                 }

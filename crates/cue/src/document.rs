@@ -463,7 +463,7 @@ impl Document {
             return Ok(());
         };
         if !self.reload(load(&path)?, false) {
-            return Err(io::Error::other("the file's text couldn't all be taken"));
+            return Err(io::Error::other("Couldn't load the entire file."));
         }
         Ok(())
     }

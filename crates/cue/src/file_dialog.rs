@@ -175,9 +175,9 @@ impl FileDialog {
                 (Command::DialogComplete, "complete"),
                 (Command::DialogParent, "parent folder"),
             ])
-        .filter_map(|&(command, name)| Some(format!("{} {name}", keymap.shortcut(command)?)))
-        .collect::<Vec<_>>()
-        .join(" · ");
+            .filter_map(|&(command, name)| Some(format!("{} {name}", keymap.shortcut(command)?)))
+            .collect::<Vec<_>>()
+            .join(" · ");
         let dir = normalize(dir);
         let mut dialog = FileDialog {
             purpose,
@@ -501,7 +501,7 @@ impl FileDialog {
                     DialogAction::Continue
                 }
                 false => {
-                    self.show_error("There's no such folder.".to_string());
+                    self.show_error("Folder not found.".to_string());
                     DialogAction::Continue
                 }
             };
@@ -519,7 +519,7 @@ impl FileDialog {
             return DialogAction::Continue;
         }
         if self.purpose == Purpose::Open && !path.is_file() {
-            self.show_error(format!("There's no {}.", self.name()));
+            self.show_error(format!("{} not found.", self.name()));
             return DialogAction::Continue;
         }
         self.choose(path)
@@ -561,7 +561,7 @@ impl FileDialog {
                     return DialogAction::Accept(path);
                 }
                 self.message = Some((
-                    format!("{name} already exists. Enter again to replace it."),
+                    format!("{name} already exists. Press Enter again to replace it."),
                     true,
                 ));
                 self.confirm = Some(path);
@@ -749,10 +749,12 @@ impl FileDialog {
         if let Some(error) = self.listing.error {
             let text = match (error, self.purpose) {
                 (io::ErrorKind::NotFound, Purpose::Open | Purpose::AddFolder) => {
-                    "There's no such folder.".to_string()
+                    "Folder not found.".to_string()
                 }
-                (io::ErrorKind::NotFound, _) => "A new folder, created with the file.".to_string(),
-                (io::ErrorKind::NotADirectory, _) => "That's a file, not a folder.".to_string(),
+                (io::ErrorKind::NotFound, _) => {
+                    "This folder will be created with the file.".to_string()
+                }
+                (io::ErrorKind::NotADirectory, _) => "This path is a file.".to_string(),
                 (error, _) => format!("Can't read this folder: {}.", io::Error::from(error)),
             };
             let fg = if self.purpose.names_a_new_file() && error == io::ErrorKind::NotFound {
@@ -767,15 +769,17 @@ impl FileDialog {
         }
         let text = match self.purpose {
             Purpose::AddFolder if self.filter().is_empty() => {
-                "No folders in it. Enter adds it.".to_string()
+                "No subfolders. Press Enter to add this folder.".to_string()
             }
-            _ if self.filter().is_empty() => "An empty folder.".to_string(),
+            _ if self.filter().is_empty() => "Empty folder.".to_string(),
             Purpose::Open => "No matching files.".to_string(),
             Purpose::AddFolder => "No matching folders.".to_string(),
-            Purpose::SaveAs => format!("Enter saves as {}.", self.name()),
-            Purpose::Create | Purpose::CreateFolder => format!("Enter creates {}.", self.name()),
-            Purpose::Move => format!("Enter moves it to {}.", self.name()),
-            Purpose::Duplicate => format!("Enter copies it to {}.", self.name()),
+            Purpose::SaveAs => format!("Press Enter to save as {}.", self.name()),
+            Purpose::Create | Purpose::CreateFolder => {
+                format!("Press Enter to create {}.", self.name())
+            }
+            Purpose::Move => format!("Press Enter to move to {}.", self.name()),
+            Purpose::Duplicate => format!("Press Enter to copy to {}.", self.name()),
         };
         Some((text, colors.muted))
     }
@@ -1078,7 +1082,7 @@ mod tests {
         let mut dialog = dialog(Purpose::Open, &root, "");
         type_text(&mut dialog, "zzz");
         assert_eq!(dialog.run(Command::PickerAccept), DialogAction::Continue);
-        assert_eq!(dialog.message, Some(("There's no zzz.".to_string(), true)));
+        assert_eq!(dialog.message, Some(("zzz not found.".to_string(), true)));
         // A full path, pasted, replaces the one there.
         let pasted = root.join("a.rs").display().to_string();
         dialog.edit(Edit::Insert(&pasted));

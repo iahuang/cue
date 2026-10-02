@@ -840,15 +840,15 @@ impl Picker {
         if self.needle().is_empty() {
             let hint = match self.mode() {
                 Mode::Files => {
-                    "Search files by name, or type > for commands, @ for symbols, $ for terminals"
+                    "Search files by name. Type > for commands, @ for symbols, or $ for terminals."
                 }
                 Mode::Commands => "Search commands",
                 Mode::Languages => "Search languages",
                 Mode::Themes => "Search themes",
-                Mode::Line => "Type a line number, or line:column",
+                Mode::Line => "Enter a line number or line:column.",
                 Mode::Symbols => "Search symbols in this file",
                 Mode::WorkspaceSymbols => "Search symbols in the workspace",
-                Mode::Terminals => "Search terminals by name or what's running",
+                Mode::Terminals => "Search terminals by name or running program.",
             };
             let hint: String = hint
                 .chars()
@@ -905,7 +905,7 @@ impl Picker {
         } else if self.indexing && self.mode() == Mode::WorkspaceSymbols {
             " indexing…"
         } else if self.truncated && self.mode() == Mode::Files {
-            " (too many to list all)"
+            " (list truncated)"
         } else {
             ""
         };

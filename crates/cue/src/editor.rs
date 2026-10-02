@@ -1019,7 +1019,7 @@ impl Editor {
         match clipboard {
             Some(text) => self.edit(EditKind::Other, |eb| eb.insert_text(text)),
             None => self.show_message(
-                "Nothing copied yet. Use your terminal's paste for the system clipboard.",
+                "Nothing copied yet. Use your terminal's paste command to paste from the system clipboard.",
                 false,
             ),
         }

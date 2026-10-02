@@ -92,7 +92,7 @@ pub const MIN_TREE_WIDTH: u32 = 12;
 
 /// What Open Settings creates when there's no file yet: every setting, at
 /// its default, commented out.
-pub const TEMPLATE: &str = r#"# Uncomment to customize. Save in cue to apply, or run Reload Settings.
+pub const TEMPLATE: &str = r#"# Uncomment settings to customize. Save in cue or run Reload Settings to apply changes.
 
 [editor]
 # tab_width = 4
@@ -113,18 +113,18 @@ pub const TEMPLATE: &str = r#"# Uncomment to customize. Save in cue to apply, or
 [terminal]
 # Changes apply to new terminals.
 # shell = "/bin/zsh"         # Login shell; defaults to $SHELL.
-# scrollback = "10MB"        # Bytes, or a size like "512KB".
+# scrollback = "10MB"        # Size in bytes or with a unit, such as "512KB".
 
 [files]
 # Hide names from the tree, file picker, and search. Supports * wildcards.
 # exclude = ["node_modules", "*.pyc"]
 
 [keys]
-# Commands: cue --help. "none" unbinds a key. Ctrl and Cmd are separate.
+# Run cue --help to list commands. Use "none" to unbind a key. Ctrl and Cmd are separate.
 # "ctrl+shift+p" = "app:command-palette"
 # "cmd+shift+p" = "app:command-palette"
 # "ctrl+q" = "none"
-# "a" = "tree:new-file"      # Unmodified keys only bind in the file tree.
+# "a" = "tree:new-file"      # Keys without modifiers can only be bound to file tree commands.
 "#;
 
 #[cfg(not(test))]
@@ -203,7 +203,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
     };
     for (section, value) in &table {
         let Some(settings) = value.as_table() else {
-            warnings.push(format!("{section} should be a section, [{section}]"));
+            warnings.push(format!("Expected a [{section}] section."));
             continue;
         };
         if section == "keys" {
@@ -220,7 +220,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             if let Err(expected) = config.apply(&key, value) {
                 warnings.push(match expected {
                     Some(expected) => format!("{key} should be {expected}"),
-                    None => format!("There's no setting {key}"),
+                    None => format!("Unknown setting: {key}"),
                 });
             }
         }
@@ -258,7 +258,8 @@ impl Config {
                 self.scroll_margin = margin as f32;
             }
             "ui.theme" => {
-                const EXPECTED: &str = "a theme's name, as Select Theme lists them, or { dark = \"…\", light = \"…\" }";
+                const EXPECTED: &str =
+                    "a theme name from Select Theme, or { dark = \"…\", light = \"…\" }";
                 let named = |value: Option<&Value>| match value {
                     None => Some(ThemeId::TERMINAL),
                     Some(value) => ThemeId::named(value.as_str()?),
@@ -385,18 +386,17 @@ fn binding(key: &str, value: &Value) -> Result<(Key, Option<Command>), String> {
     let key: Key = key.parse()?;
     let id = value
         .as_str()
-        .ok_or("should be a command, such as \"app:quit\", or \"none\"")?;
+        .ok_or("expected a command ID, such as \"app:quit\", or \"none\"")?;
     if id == "none" {
         return Ok((key, None));
     }
-    let command = Command::from_id(id).ok_or_else(|| format!("there's no command \"{id}\""))?;
+    let command = Command::from_id(id).ok_or_else(|| format!("unknown command \"{id}\""))?;
     // Only the tree has no text to type into.
     let types =
         matches!(key.code, KeyCode::Char(_)) && !(key.mods.ctrl || key.mods.alt || key.mods.sup);
     if types && command.context() != Context::Tree {
         return Err(
-            "a key without Ctrl, Alt, or Cmd types text, so only tree: commands can have it"
-                .to_string(),
+            "Keys without Ctrl, Alt, or Cmd can only be bound to tree: commands.".to_string(),
         );
     }
     Ok((key, Some(command)))
@@ -573,11 +573,11 @@ mod tests {
         assert_eq!(
             warnings,
             [
-                r#"keys."hyper+k": there's no modifier "hyper""#,
-                r#"keys."ctrl+kk": there's no key "kk""#,
-                r#"keys."ctrl+j": there's no command "app:leave""#,
-                r#"keys."ctrl+l": should be a command, such as "app:quit", or "none""#,
-                r#"keys."shift+x": a key without Ctrl, Alt, or Cmd types text, so only tree: commands can have it"#,
+                r#"keys."hyper+k": unknown modifier "hyper""#,
+                r#"keys."ctrl+kk": unknown key "kk""#,
+                r#"keys."ctrl+j": unknown command "app:leave""#,
+                r#"keys."ctrl+l": expected a command ID, such as "app:quit", or "none""#,
+                r#"keys."shift+x": Keys without Ctrl, Alt, or Cmd can only be bound to tree: commands."#,
             ]
         );
         assert_eq!(config.keys.len(), 1);
@@ -650,13 +650,13 @@ mod tests {
         assert_eq!(
             warnings,
             [
-                "theme should be a section, [theme]",
+                "Expected a [theme] section.",
                 "editor.tab_width should be a number from 1 to 16",
                 "editor.wrap should be true or false",
-                "There's no setting editor.tabwidth",
+                "Unknown setting: editor.tabwidth",
                 "terminal.scrollback should be a size such as \"10MB\", or a number of bytes",
-                "There's no setting colors.red",
-                "ui.theme should be a theme's name, as Select Theme lists them, or { dark = \"…\", light = \"…\" }",
+                "Unknown setting: colors.red",
+                "ui.theme should be a theme name from Select Theme, or { dark = \"…\", light = \"…\" }",
             ]
         );
         assert_eq!(

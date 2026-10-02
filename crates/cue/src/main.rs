@@ -120,7 +120,7 @@ const USAGE: &str = "usage: cue [FOLDER]... [FILE[:LINE[:COLUMN]]]
 fn help() -> String {
     let keymap = Keymap::new(&config::load().0.keys);
     let mut help = format!(
-        "{USAGE}\n\nOpens each FOLDER, or the current folder, with FILE (or a new, unnamed buffer) open,\nat LINE and COLUMN if given, as compilers print them: src/main.rs:12:5.\nShift+movement or the mouse selects.\nSettings are in {}; Open Settings in the command palette makes it.\n\nSessions keep tabs, files, unsaved changes, and terminals to come back to (Keep Session, or\nquitting with unsaved changes or programs running). Quitting one leaves it running in the\nbackground while programs run in its terminals; End Session lets it go. Without FILE, cue goes\nback to the folder's session, if it has exactly one.\n  -r, --resume   choose among the folder's sessions\n      --fresh    start a new cue, though the folder has a session\n  -l, --list     list every session\n      --end      end SESSION, or the folder's session\n\n",
+        "{USAGE}\n\nOpens the specified folders, or the current folder if none are specified.\nOpens FILE, or a new unnamed buffer if no file is specified.\nAppend :LINE or :LINE:COLUMN to a file path, for example src/main.rs:12:5.\nHold Shift while moving the cursor, or drag with the mouse, to select text.\nSettings are stored in {}. Use Open Settings in the command palette to create the file.\n\nSessions preserve tabs, files, unsaved changes, and terminals.\nUse Keep Session to create a session. Quitting with unsaved changes or running\nprograms also creates one. When you quit, programs in session terminals continue\nrunning in the background. Use End Session to end the session.\nWithout FILE, cue resumes the folder's session if exactly one exists.\n\n  -r, --resume   choose a session for the folder\n      --fresh    start a new cue instance\n  -l, --list     list all sessions\n      --end      end SESSION, or the folder's session\n\n",
         config::path().map_or("~/.config/cue/config.toml".into(), |path| path.display().to_string())
     );
     let key = |command| {
@@ -207,7 +207,7 @@ fn parse_args() -> Result<Mode, ExitCode> {
             }
             Some("--") => options = false,
             Some(option) if option.starts_with('-') && option.len() > 1 => {
-                eprintln!("cue: there's no option {option}\n{USAGE}");
+                eprintln!("cue: unknown option {option}\n{USAGE}");
                 return Err(ExitCode::FAILURE);
             }
             _ => client.paths.push(PathBuf::from(arg)),
@@ -246,7 +246,7 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
         Start::Restore(dir) => resume(&dir, width, height, Vec::new())?,
         Start::Adopt(dir) => {
             let (ephemeral, adopted) =
-                attach::read_manifest(&dir).ok_or("there's nothing to take over")?;
+                attach::read_manifest(&dir).ok_or("No session state found to take over.")?;
             let mut app = resume(&dir, width, height, adopted)?;
             if ephemeral {
                 app.forget_session();
@@ -384,7 +384,7 @@ fn open(paths: Vec<PathBuf>, width: u32, height: u32) -> Result<App, Box<dyn std
         None => (None, None),
     };
     if let Some(extra) = files.next() {
-        return Err(format!("{}: only one file opens at a time", extra.display()).into());
+        return Err(format!("{}: only one file can be specified", extra.display()).into());
     }
     let workspace = match folders.is_empty() {
         true => Workspace::new([std::env::current_dir()?])?,
@@ -414,7 +414,7 @@ fn resume(
         .cloned()
         .collect();
     if roots.is_empty() {
-        return Err("the session's folders are gone".into());
+        return Err("The session's folders no longer exist.".into());
     }
     let mut app = App::new(Workspace::new(roots)?, None, width, height)?;
     app.restore_session(session, state, adopted)?;
@@ -441,11 +441,11 @@ fn background_sessions(app: &App) -> Option<String> {
     match running.len() {
         0 => None,
         1 => Some(format!(
-            "One session is running in the background: {}. See `cue --list`",
+            "One session is running in the background: {}. Run `cue --list` for details.",
             running[0]
         )),
         n => Some(format!(
-            "{n} sessions is running in the background: {}. See `cue --list`",
+            "{n} sessions are running in the background: {}. Run `cue --list` for details.",
             running.join(", ")
         )),
     }
@@ -461,11 +461,11 @@ fn detached(app: &App) -> String {
     let running = app.running_programs();
     let with = match running.as_slice() {
         [] => String::new(),
-        [program] => format!(", {program} running in it"),
-        programs => format!(", {} running in it", programs.join(", ")),
+        [program] => format!(". Running: {program}"),
+        programs => format!(". Running: {}", programs.join(", ")),
     };
     let id = app.session().map(Session::id).unwrap_or_default();
-    format!("detached session {id}{with}. `cue --resume`")
+    format!("Session {id} detached{with}. Run `cue --resume` to resume.")
 }
 
 /// A session's socket, listened on.
@@ -499,7 +499,7 @@ fn listening(app: &App, listener: &mut Option<Listener>) -> std::io::Result<()> 
     listen(app, listener)?;
     match listener {
         Some(_) => Ok(()),
-        None => Err(std::io::Error::other("this isn't a session")),
+        None => Err(std::io::Error::other("Not a session.")),
     }
 }
 
@@ -631,7 +631,7 @@ fn headless(app: &mut App, listener: Option<&std::os::unix::net::UnixListener>) 
 /// terminals, which would show it in itself: then it's told so.
 fn refuse(mut client: Control, request: &attach::Attach) -> Option<Control> {
     if request.is_inside(std::process::id()) {
-        client.send("error the session can't be shown in its own terminal");
+        client.send("error can't attach a session to its own terminal");
         return None;
     }
     Some(client)

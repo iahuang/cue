@@ -186,7 +186,7 @@ impl Session {
                 Err(err) => return Err(err),
             }
         }
-        Err(io::Error::other("no session id is free"))
+        Err(io::Error::other("No session IDs available."))
     }
 
     /// Takes the session in `dir`, as one that was dormant, or this
@@ -200,7 +200,9 @@ impl Session {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let err = io::Error::last_os_error();
             return Err(match err.raw_os_error() {
-                Some(libc::EWOULDBLOCK) => io::Error::other("another cue has the session"),
+                Some(libc::EWOULDBLOCK) => {
+                    io::Error::other("This session is in use by another cue process.")
+                }
                 _ => err,
             });
         }
