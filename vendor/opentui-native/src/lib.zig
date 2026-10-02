@@ -1426,6 +1426,11 @@ export fn setTerminalEnvVar(renderer_handle: NativeHandle, keyPtr: ?[*]const u8,
     return object_ptr.setTerminalEnvVar(key, value);
 }
 
+export fn setCompactOutput(renderer_handle: NativeHandle, compact: bool) void {
+    const object_ptr = acquireRenderer(renderer_handle) orelse return;
+    object_ptr.setCompactOutput(compact);
+}
+
 export fn setUseThread(renderer_handle: NativeHandle, useThread: bool) void {
     const object_ptr = acquireRenderer(renderer_handle) orelse return;
     object_ptr.setUseThread(useThread);

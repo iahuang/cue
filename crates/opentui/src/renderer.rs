@@ -229,6 +229,12 @@ impl Renderer {
         }
     }
 
+    /// Sends only the style and cursor changes the terminal doesn't
+    /// already have: fewer bytes per frame, for slow links.
+    pub fn set_compact_output(&mut self, compact: bool) {
+        unsafe { sys::setCompactOutput(self.handle, compact) }
+    }
+
     /// Renders on a native background thread instead of in `render`.
     pub fn set_use_thread(&mut self, use_thread: bool) {
         unsafe { sys::setUseThread(self.handle, use_thread) }

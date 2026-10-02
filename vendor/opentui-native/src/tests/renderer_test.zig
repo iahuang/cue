@@ -5048,3 +5048,56 @@ test "renderer clears an upper sixel hole when its lower image moves away" {
     try std.testing.expectEqual(renderer.RenderStatus.rendered, test_renderer.renderer.render(false));
     try std.testing.expect(std.mem.find(u8, test_renderer.memory.lastWrite(), "\x1b[1;1H") != null);
 }
+
+test "renderer - compact output sends only style and cursor changes (cue patch)" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+
+    var test_cli_renderer = try TestRenderer.create(std.testing.allocator, 8, 1, pool);
+    defer test_cli_renderer.deinit();
+    const cli_renderer = test_cli_renderer.renderer;
+    cli_renderer.terminal.caps.rgb = true;
+    cli_renderer.setCompactOutput(true);
+
+    const red = ansi.rgbColor(255, 0, 0, 255);
+    const green = ansi.rgbColor(0, 255, 0, 255);
+    const blue = ansi.rgbColor(0, 0, 255, 255);
+    const bg = ansi.defaultColor(0, 0, 0, 255);
+    const bold = ansi.TextAttributes.BOLD;
+    const cells = [_]struct { u32, RGBA, u32 }{
+        .{ 'a', red, bold },
+        .{ 'b', red, bold },
+        // Bold comes off: a reset, but no cursor move.
+        .{ 'c', red, 0 },
+        // Only the color changes.
+        .{ 'd', green, 0 },
+        // Not ASCII: its width is the terminal's to say, so the next run moves.
+        .{ 0x2192, green, 0 },
+        .{ 'e', blue, 0 },
+        .{ 'f', blue, 0 },
+        .{ 'g', blue, 0 },
+    };
+    const next_buffer = cli_renderer.getNextBuffer();
+    for (cells, 0..) |cell, x| {
+        next_buffer.set(@intCast(x), 0, .{ .char = cell[0], .fg = cell[1], .bg = bg, .attributes = cell[2] });
+    }
+    _ = cli_renderer.render(false);
+    try std.testing.expect(std.mem.find(
+        u8,
+        test_cli_renderer.lastOutput(),
+        "\x1b[1;1H\x1b[0;38;2;255;0;0;49;1mab\x1b[0;38;2;255;0;0;49mc\x1b[38;2;0;255;0md\u{2192}\x1b[1;6H\x1b[38;2;0;0;255mefg",
+    ) != null);
+
+    // An unchanged cell between two changed ones: no reset, and the style
+    // carries over to the next run.
+    const next = cli_renderer.getNextBuffer();
+    for (cells, 0..) |cell, x| {
+        next.set(@intCast(x), 0, .{ .char = cell[0], .fg = cell[1], .bg = bg, .attributes = cell[2] });
+    }
+    next.set(5, 0, .{ .char = 'E', .fg = blue, .bg = bg, .attributes = 0 });
+    next.set(7, 0, .{ .char = 'G', .fg = blue, .bg = bg, .attributes = 0 });
+    _ = cli_renderer.render(false);
+    const output = test_cli_renderer.lastOutput();
+    try std.testing.expect(std.mem.find(u8, output, "\x1b[1;6H\x1b[0;38;2;0;0;255;49mE\x1b[1;8HG") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "\x1b[0m"));
+}

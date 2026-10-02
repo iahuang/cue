@@ -62,6 +62,16 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 /// While output streams into a terminal, the screen is drawn at most this
 /// often, so drawing doesn't slow reading it.
 const FRAME: Duration = Duration::from_millis(8);
+/// Frames sent that the terminal hasn't been seen to get, at most. Over a
+/// slow link, ssh takes frames as fast as they're drawn and they queue in
+/// the network; holding off instead lets input pile up, so the next frame
+/// skips straight to where it leads.
+const FRAMES_IN_FLIGHT: usize = 2;
+/// How long to wait for a terminal that hasn't answered yet, which may be
+/// one that never does.
+const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long to wait for a terminal that answers, before drawing anyway.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
     // The renderer restores the terminal when dropped during unwinding; hold
@@ -180,6 +190,8 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     renderer.use_kitty_image_files();
     // Clicks, drags, and the wheel; plain motion isn't needed.
     renderer.enable_mouse(false);
+    // Experimental, for slow links such as ssh: fewer bytes per frame.
+    renderer.set_compact_output(env_flag("CUE_COMPACT_OUTPUT"));
     let mut parser = Parser::new();
     // What was typed while waiting for the terminal's colors.
     let mut typed = ask_colors_first(&mut renderer, &mut parser, &mut app)?;
@@ -197,18 +209,26 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     // When stdin last had input, to tell a lone ESC from the start of a
     // sequence split across reads.
     let mut last_input = Instant::now();
+    let mut pacing = Pacing::new(env_flag("CUE_PACING"));
+    // Whether something happened since the last frame.
+    let mut dirty = true;
+    let mut drawn = Instant::now();
     loop {
         app.update_theme();
         host_colors.apply(&mut renderer, &mut app);
-        {
-            let frame = renderer.next_buffer()?;
-            match app.draw(&frame) {
-                Some((x, y)) => renderer.set_cursor_position(x as i32 + 1, y as i32 + 1, true),
-                None => renderer.set_cursor_position(1, 1, false),
+        if dirty && pacing.ready() {
+            {
+                let frame = renderer.next_buffer()?;
+                match app.draw(&frame) {
+                    Some((x, y)) => renderer.set_cursor_position(x as i32 + 1, y as i32 + 1, true),
+                    None => renderer.set_cursor_position(1, 1, false),
+                }
             }
+            renderer.render(false);
+            pacing.sent();
+            dirty = false;
+            drawn = Instant::now();
         }
-        renderer.render(false);
-        let drawn = Instant::now();
 
         // Wait for input, or output in a terminal; after a partial
         // sequence, only briefly.
@@ -223,6 +243,9 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if changed {
                     timeout = timeout.min(FRAME.saturating_sub(drawn.elapsed()));
+                }
+                if dirty {
+                    timeout = timeout.min(pacing.time_left());
                 }
                 let bytes = tty::read_input(timeout, &app.watched())?;
                 // Dropping the app copies what's unsaved.
@@ -243,13 +266,22 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 changed |= renderer.poll_kitty_image_transport();
                 let resized = tty::size() != (width, height);
-                if !events.is_empty() || resized || (changed && drawn.elapsed() >= FRAME) {
+                if !events.is_empty()
+                    || resized
+                    || (changed && drawn.elapsed() >= FRAME)
+                    || (dirty && pacing.ready())
+                {
                     break events;
                 }
             }
         };
+        dirty |= changed;
 
         for event in events.drain(..) {
+            match &event {
+                Event::Reply(bytes) if is_device_attributes(bytes) => pacing.answered(),
+                _ => dirty = true,
+            }
             let action = match event {
                 Event::Key(key) => app.handle_key(key),
                 Event::Mouse(mouse) => app.handle_mouse(mouse, Instant::now()),
@@ -276,6 +308,7 @@ fn run(paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 
         let size = tty::size();
         if size != (width, height) {
+            dirty = true;
             (width, height) = size;
             renderer.resize(width, height);
             app.resize(width, height);
@@ -319,6 +352,73 @@ fn ask_colors_first(
 
 fn ask_colors() {
     write_to_terminal(&theme::color_queries());
+}
+
+/// Whether the environment variable `name` is set, to anything but 0.
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Keeps at most [`FRAMES_IN_FLIGHT`] frames between cue and the screen,
+/// when on (experimental: `CUE_PACING`).
+/// Each frame is followed by a request for the terminal's device
+/// attributes, which it answers once it has read everything before.
+struct Pacing {
+    /// When each frame not yet answered for was sent, oldest first.
+    sent: std::collections::VecDeque<Instant>,
+    /// Whether the terminal has answered at all.
+    answers: bool,
+    /// False once a terminal that never answered has been waited on.
+    on: bool,
+}
+
+impl Pacing {
+    fn new(on: bool) -> Self {
+        Pacing {
+            sent: std::collections::VecDeque::new(),
+            answers: false,
+            on,
+        }
+    }
+
+    fn sent(&mut self) {
+        if self.on {
+            write_to_terminal("\x1b[c");
+            self.sent.push_back(Instant::now());
+        }
+    }
+
+    fn answered(&mut self) {
+        self.answers = true;
+        self.sent.pop_front();
+    }
+
+    /// Whether another frame can be sent now.
+    fn ready(&mut self) -> bool {
+        if self.on && self.time_left().is_zero() {
+            // Not answering, or too slow to wait on.
+            self.on = self.answers;
+            self.sent.clear();
+        }
+        self.sent.len() < FRAMES_IN_FLIGHT
+    }
+
+    /// How long until waiting for an answer gives up.
+    fn time_left(&self) -> Duration {
+        let timeout = match self.answers {
+            true => ANSWER_TIMEOUT,
+            false => FIRST_ANSWER_TIMEOUT,
+        };
+        match self.sent.front() {
+            Some(oldest) => timeout.saturating_sub(oldest.elapsed()),
+            None => Duration::MAX,
+        }
+    }
+}
+
+/// Whether `reply` answers a request for device attributes (DA1).
+fn is_device_attributes(reply: &[u8]) -> bool {
+    reply.starts_with(b"\x1b[?") && reply.ends_with(b"c")
 }
 
 fn write_to_terminal(text: &str) {

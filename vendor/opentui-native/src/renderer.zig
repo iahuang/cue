@@ -337,6 +337,10 @@ pub const CliRenderer = struct {
     palette_epoch: u32,
     last_rendered_palette_epoch: ?u32 = null,
     force_full_repaint: bool = false,
+    /// Send only the style and cursor changes the terminal doesn't already
+    /// have, in one SGR per change, instead of a reset, a cursor move, and
+    /// each color and attribute separately at every run (cue patch).
+    compact_output: bool = false,
     palette_index_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     sixelCache: std.AutoHashMapUnmanaged(SixelCacheKey, SixelCacheEntry) = .empty,
     sixelCacheBytes: usize = 0,
@@ -705,6 +709,10 @@ pub const CliRenderer = struct {
         self.addStatSample(u32, &self.statSamples.cellsUpdated, self.renderStats.cellsUpdated);
     }
 
+    pub fn setCompactOutput(self: *CliRenderer, compact: bool) void {
+        self.compact_output = compact;
+    }
+
     pub fn setUseThread(self: *CliRenderer, useThread: bool) void {
         if (!self.backend.supportsThreading() and useThread) return;
         self.backend.setUseThread(useThread);
@@ -844,48 +852,81 @@ pub const CliRenderer = struct {
     }
 
     fn emitColor(self: *CliRenderer, writer: anytype, rgba: RGBA, is_background: bool) void {
+        writer.writeAll("\x1b[") catch {};
+        self.writeColorParams(writer, rgba, is_background);
+        writer.writeByte('m') catch {};
+    }
+
+    /// The SGR parameters that set `rgba`, without the CSI or final `m`.
+    fn writeColorParams(self: *CliRenderer, writer: anytype, rgba: RGBA, is_background: bool) void {
         const caps = self.terminal.getCapabilities();
 
-        if (ansi.intent(rgba) == .default) {
-            if (is_background) {
-                ansi.ANSI.bgDefaultOutput(writer) catch {};
-            } else {
-                ansi.ANSI.fgDefaultOutput(writer) catch {};
-            }
+        if (ansi.intent(rgba) == .default or (is_background and ansi.alpha(rgba) == 0)) {
+            writer.writeAll(if (is_background) "49" else "39") catch {};
             return;
         }
 
-        if (is_background and ansi.alpha(rgba) == 0) {
-            ansi.ANSI.bgDefaultOutput(writer) catch {};
-            return;
-        }
-
-        if (ansi.intent(rgba) == .indexed and caps.ansi256) {
-            const index = ansi.slot(rgba);
-            if (is_background) {
-                ansi.ANSI.bgIndexedColorOutput(writer, index) catch {};
-            } else {
-                ansi.ANSI.fgIndexedColorOutput(writer, index) catch {};
-            }
-            return;
-        }
-
-        if (!caps.rgb and caps.ansi256) {
-            const index: u8 = self.cachedNearestPaletteIndex(rgba);
-
-            if (is_background) {
-                ansi.ANSI.bgIndexedColorOutput(writer, index) catch {};
-            } else {
-                ansi.ANSI.fgIndexedColorOutput(writer, index) catch {};
-            }
-            return;
-        }
-
-        if (is_background) {
-            ansi.ANSI.bgColorOutput(writer, ansi.red(rgba), ansi.green(rgba), ansi.blue(rgba)) catch {};
+        const index: ?u8 = if (ansi.intent(rgba) == .indexed and caps.ansi256)
+            ansi.slot(rgba)
+        else if (!caps.rgb and caps.ansi256)
+            self.cachedNearestPaletteIndex(rgba)
+        else
+            null;
+        const kind: []const u8 = if (is_background) "48" else "38";
+        if (index) |i| {
+            writer.print("{s};5;{d}", .{ kind, i }) catch {};
         } else {
-            ansi.ANSI.fgColorOutput(writer, ansi.red(rgba), ansi.green(rgba), ansi.blue(rgba)) catch {};
+            writer.print("{s};2;{d};{d};{d}", .{ kind, ansi.red(rgba), ansi.green(rgba), ansi.blue(rgba) }) catch {};
         }
+    }
+
+    /// Changes the terminal's style to `cell`'s in one SGR (cue patch).
+    /// `fg`, `bg`, and `attributes` are what the terminal has, or null
+    /// when that isn't known.
+    fn emitStyleChange(self: *CliRenderer, writer: anytype, fg: ?RGBA, bg: ?RGBA, attributes: ?u32, cell: buf.Cell) void {
+        const new_attr = ansi.TextAttributes.getBaseAttributes(cell.attributes);
+        // Attributes only come off with a reset, which takes the colors too.
+        const reset = fg == null or bg == null or attributes == null or
+            ansi.TextAttributes.getBaseAttributes(attributes.?) & ~new_attr != 0;
+        const old_attr: u8 = if (reset) 0 else ansi.TextAttributes.getBaseAttributes(attributes.?);
+        const set_fg = reset or !buf.rgbaEqual(fg.?, cell.fg);
+        const set_bg = reset or !buf.rgbaEqual(bg.?, cell.bg);
+        const added = new_attr & ~old_attr;
+        if (!reset and !set_fg and !set_bg and added == 0) return;
+
+        writer.writeAll("\x1b[") catch {};
+        var first = true;
+        if (reset) {
+            writer.writeByte('0') catch {};
+            first = false;
+        }
+        if (set_fg) {
+            if (!first) writer.writeByte(';') catch {};
+            self.writeColorParams(writer, cell.fg, false);
+            first = false;
+        }
+        if (set_bg) {
+            if (!first) writer.writeByte(';') catch {};
+            self.writeColorParams(writer, cell.bg, true);
+            first = false;
+        }
+        const codes = [_]struct { u8, u8 }{
+            .{ ansi.TextAttributes.BOLD, '1' },
+            .{ ansi.TextAttributes.DIM, '2' },
+            .{ ansi.TextAttributes.ITALIC, '3' },
+            .{ ansi.TextAttributes.UNDERLINE, '4' },
+            .{ ansi.TextAttributes.BLINK, '5' },
+            .{ ansi.TextAttributes.INVERSE, '7' },
+            .{ ansi.TextAttributes.HIDDEN, '8' },
+            .{ ansi.TextAttributes.STRIKETHROUGH, '9' },
+        };
+        for (codes) |code| {
+            if (added & code[0] == 0) continue;
+            if (!first) writer.writeByte(';') catch {};
+            writer.writeByte(code[1]) catch {};
+            first = false;
+        }
+        writer.writeByte('m') catch {};
     }
 
     pub fn setRenderOffset(self: *CliRenderer, offset: u32) void {
@@ -2634,6 +2675,13 @@ pub const CliRenderer = struct {
         var currentBg: ?RGBA = null;
         var currentAttributes: ?u32 = null;
         var currentLinkId: u32 = 0;
+        // Where the terminal's cursor is, when known (compact output): only
+        // after a cursor move and printable ASCII since, the one text whose
+        // width the terminal can't see differently.
+        const compact = self.compact_output;
+        var writtenKnown = false;
+        var writtenX: u32 = 0;
+        var writtenY: u32 = 0;
         var utf8Buf: [4]u8 = undefined;
         var clearRunY: i64 = -1;
         var clearRunEnd: i64 = -1;
@@ -2684,7 +2732,7 @@ pub const CliRenderer = struct {
                     // placement's pixels are dirty (e.g. Sixel content change).
                     if (cellsEqual and !(clears_pending and cell_type == gp.CHAR_FLAG_IMAGE and dirtyImageChar(image_dirty_items, cell.char))) {
                         if (runLength > 0) {
-                            writer.writeAll(ansi.ANSI.reset) catch {};
+                            if (!compact) writer.writeAll(ansi.ANSI.reset) catch {};
                             runStart = -1;
                             runLength = 0;
                         }
@@ -2704,7 +2752,7 @@ pub const CliRenderer = struct {
                     if (state.protocol == .fallback) break :blk;
                     if (!should_force and !state.clear and gp.isImageChar(currentCell.?.char)) {
                         if (runLength > 0) {
-                            writer.writeAll(ansi.ANSI.reset) catch {};
+                            if (!compact) writer.writeAll(ansi.ANSI.reset) catch {};
                             runStart = -1;
                             runLength = 0;
                         }
@@ -2722,6 +2770,7 @@ pub const CliRenderer = struct {
                     writer.writeByte(' ') catch {};
                     clearRunY = y;
                     clearRunEnd = x + 1;
+                    writtenKnown = false;
                     currentFg = null;
                     currentBg = null;
                     currentAttributes = null;
@@ -2768,8 +2817,22 @@ pub const CliRenderer = struct {
                 }
 
                 if (!sameAttributes or runStart == -1) {
-                    if (runLength > 0) {
-                        writer.writeAll(ansi.ANSI.reset) catch {};
+                    if (compact) {
+                        if (!writtenKnown or writtenX != x or writtenY != y) {
+                            ansi.ANSI.moveToOutput(writer, x + 1, y + 1 + self.renderOffset) catch {};
+                            writtenKnown = true;
+                        }
+                        self.emitStyleChange(writer, currentFg, currentBg, currentAttributes, cell);
+                    } else {
+                        if (runLength > 0) {
+                            writer.writeAll(ansi.ANSI.reset) catch {};
+                        }
+                        ansi.ANSI.moveToOutput(writer, x + 1, y + 1 + self.renderOffset) catch {};
+
+                        self.emitColor(writer, cell.fg, false);
+                        self.emitColor(writer, cell.bg, true);
+
+                        ansi.TextAttributes.applyAttributesOutputWriter(writer, cell.attributes) catch {};
                     }
 
                     runStart = @intCast(x);
@@ -2778,13 +2841,6 @@ pub const CliRenderer = struct {
                     currentFg = cell.fg;
                     currentBg = cell.bg;
                     currentAttributes = cell.attributes;
-
-                    ansi.ANSI.moveToOutput(writer, x + 1, y + 1 + self.renderOffset) catch {};
-
-                    self.emitColor(writer, cell.fg, false);
-                    self.emitColor(writer, cell.bg, true);
-
-                    ansi.TextAttributes.applyAttributesOutputWriter(writer, cell.attributes) catch {};
                 }
 
                 // Handle grapheme characters
@@ -2827,6 +2883,12 @@ pub const CliRenderer = struct {
                     },
                 }
                 runLength += 1;
+                if (cell.char >= 32 and cell.char <= 126) {
+                    writtenX = x + 1;
+                    writtenY = y;
+                } else {
+                    writtenKnown = false;
+                }
 
                 // Sync this cell to the current buffer so the next frame's diff
                 // is correct. Use syncCell (set without span cleanup) because
