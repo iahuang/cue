@@ -3,6 +3,7 @@
 mod alert;
 mod app;
 mod attach;
+mod changes;
 mod client;
 mod config;
 mod context_menu;
@@ -11,6 +12,7 @@ mod editor;
 mod file_dialog;
 mod file_index;
 mod find;
+mod git;
 mod history;
 mod icons;
 mod image;

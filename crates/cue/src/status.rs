@@ -2,13 +2,18 @@
 //! where its cursor is and what its file is written in, a message after a
 //! key press, or a prompt, such as a terminal's new name. Shortcut hints
 //! fill the right, and in a session, a badge saying so: a click on it
-//! offers to detach or end the session.
+//! offers to detach or end the session. In a git repository, a badge at
+//! the left end names the branch (see [`GitBadge`]).
 
-use opentui::{Attributes, Buffer};
+use std::ops::Range;
 
+use opentui::{Attributes, Buffer, Rgba};
+
+use crate::icons;
 use crate::input::{Key, KeyCode};
 use crate::keymap::{Command, Keymap};
-use crate::theme;
+use crate::theme::{self, Hue};
+use crate::tree::truncate;
 
 /// What the status bar shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,10 +49,107 @@ impl Status {
 
 /// The badge at the right end of the status bar in a session.
 const SESSION_BADGE: &str = " session ";
+/// Branch names past this many characters are cut short in the git badge.
+const MAX_BRANCH: usize = 32;
+/// The git badge shows only if it leaves this many columns for the rest.
+const MIN_REST: u32 = 40;
+
+/// The badge at the left end of the status bar in a git repository. A
+/// click on it shows the changes in the sidebar, or goes back to the files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitBadge {
+    /// The branch, and if anything changed since the last commit, the lines
+    /// added and removed.
+    Branch {
+        name: String,
+        lines: Option<(usize, usize)>,
+    },
+    /// While the sidebar shows the changes: a button back to the files.
+    Files,
+}
+
+impl GitBadge {
+    /// What it says after the icon, in pieces, each with its color: its
+    /// label, then the lines added, in green, and removed, in red.
+    fn parts(&self) -> Vec<(String, Rgba)> {
+        let colors = theme::colors();
+        match self {
+            GitBadge::Branch { name, lines } => {
+                let mut parts = vec![(truncate(name, MAX_BRANCH), colors.text)];
+                if let Some((added, removed)) = lines {
+                    let (green, red) = (colors.hue(Hue::Green), colors.hue(Hue::Red));
+                    parts.push((format!(" +{}", short_count(*added)), green));
+                    parts.push((format!(" -{}", short_count(*removed)), red));
+                }
+                parts
+            }
+            GitBadge::Files => vec![("‹ Files".to_string(), colors.text)],
+        }
+    }
+
+    fn icon(&self) -> bool {
+        matches!(self, GitBadge::Branch { .. }) && icons::enabled()
+    }
+
+    fn width(&self) -> u32 {
+        let icon = if self.icon() { icons::WIDTH } else { 0 };
+        let text: usize = self
+            .parts()
+            .iter()
+            .map(|(part, _)| part.chars().count())
+            .sum();
+        2 + icon + text as u32
+    }
+
+    /// Draws it from the left end of row `y`.
+    fn draw(&self, frame: &Buffer, y: u32) {
+        let colors = theme::colors();
+        // A shade lighter than the status bar: toward the text on a dark
+        // theme, and back toward the background on a light one.
+        let lighter = match colors.light {
+            true => theme::mix(colors.surface, colors.bg, 0.5),
+            false => theme::mix(colors.surface, colors.text, 0.08),
+        };
+        frame.fill_rect(0, y, self.width(), 1, lighter);
+        let mut x = 1;
+        if self.icon() {
+            x = icons::branch().draw(frame, x, y, None);
+        }
+        for (part, fg) in self.parts() {
+            frame.draw_text(&part, x, y, fg, None, Attributes::NONE);
+            x += part.chars().count() as u32;
+        }
+    }
+}
+
+/// `n` in at most about five columns: `12345` is `12k`.
+fn short_count(n: usize) -> String {
+    match n {
+        0..10_000 => n.to_string(),
+        10_000..10_000_000 => format!("{}k", n / 1000),
+        _ => format!("{}M", n / 1_000_000),
+    }
+}
+
+/// The columns the git badge takes in a status bar `width` wide showing
+/// `status`, if it shows `badge`: not over a message or a prompt, nor
+/// where it would crowd out the rest. What the status bar says starts
+/// where it ends.
+pub fn git_badge(status: &Status, badge: Option<&GitBadge>, width: u32) -> Option<Range<u32>> {
+    let badge = badge?;
+    match status {
+        Status::Info(_) | Status::Terminal(_) | Status::EditorInfo { .. }
+            if width >= badge.width() + MIN_REST =>
+        {
+            Some(0..badge.width())
+        }
+        _ => None,
+    }
+}
 
 /// The columns the session badge takes in a status bar `width` wide
 /// showing `status`, if it shows one: not over a message or a prompt.
-pub fn session_badge(status: &Status, width: u32) -> Option<std::ops::Range<u32>> {
+pub fn session_badge(status: &Status, width: u32) -> Option<Range<u32>> {
     let len = SESSION_BADGE.len() as u32;
     match status {
         Status::Info(_) | Status::Terminal(_) | Status::EditorInfo { .. } if width >= len * 2 => {
@@ -112,8 +214,8 @@ impl Prompt {
 }
 
 /// Draws `status` across row `y` of `frame`, `width` wide, with the
-/// session badge if `session`. Returns where the terminal cursor goes
-/// while the prompt is open.
+/// session badge if `session`, and `git`'s badge if there's room. Returns
+/// where the terminal cursor goes while the prompt is open.
 pub fn draw(
     frame: &Buffer,
     status: &Status,
@@ -121,6 +223,7 @@ pub fn draw(
     width: u32,
     keymap: &Keymap,
     session: bool,
+    git: Option<&GitBadge>,
 ) -> Option<(u32, u32)> {
     let colors = theme::colors();
     match status {
@@ -171,13 +274,20 @@ pub fn draw(
             // The hints end in a space; another sets them off the badge.
             let right = badge.as_ref().map_or(width, |badge| badge.start - 1);
             let hints_x = right.saturating_sub(hints.len() as u32);
+            let x = match git.filter(|_| git_badge(status, git, width).is_some()) {
+                Some(git) => {
+                    git.draw(frame, y);
+                    git.width()
+                }
+                None => 0,
+            };
             let mut left = format!(" {info}");
             // The title a shell sets can run long; the hint is worth more.
             if let Status::Terminal(_) = status {
-                left = crate::tree::truncate(&left, (hints_x as usize).saturating_sub(1));
+                left = truncate(&left, hints_x.saturating_sub(x + 1) as usize);
             }
-            frame.draw_text(&left, 0, y, colors.text, None, Attributes::NONE);
-            if hints_x as usize > left.chars().count() {
+            frame.draw_text(&left, x, y, colors.text, None, Attributes::NONE);
+            if hints_x as usize > x as usize + left.chars().count() {
                 frame.draw_text(hints, hints_x, y, colors.muted, None, Attributes::NONE);
             }
             if let Some(badge) = badge {
@@ -186,5 +296,16 @@ pub fn draw(
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn big_counts_are_short() {
+        let counts = [0, 9_999, 10_000, 123_456, 12_345_678].map(short_count);
+        assert_eq!(counts, ["0", "9999", "10k", "123k", "12M"]);
     }
 }

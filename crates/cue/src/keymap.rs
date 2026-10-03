@@ -108,6 +108,7 @@ commands! {
     CursorPageDown => "cursor:page-down", "Page Down";
     ToggleTree => "tree:toggle", "Show or Hide File Tree";
     FocusTree => "tree:focus", "Focus File Tree";
+    ToggleChanges => "git:toggle-changes", "Show or Hide Changes";
     FocusEditor => "editor:focus", "Focus Editor";
     SplitRight => "panel:split-right", "Split Panel Right";
     SplitDown => "panel:split-down", "Split Panel Down";
@@ -233,13 +234,12 @@ impl Command {
             | ReloadSettings | SelectTheme | Save | SaveAs | NewFile | CreateFile | OpenFile
             | GoToFile | GoToLine | GoToSymbol | GoToWorkspaceSymbol | GoToTerminal
             | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext | FindPrevious
-            | ToggleTree | FocusTree | FocusEditor | SplitRight | SplitDown | ClosePanel | Pop
-            | GoBack | GoForward | FocusPanelLeft | FocusPanelRight | FocusPanelUp
-            | FocusPanelDown | NewTerminal | NewTab | CloseTab | NextTab | PreviousTab
-            | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3
-            | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder => {
-                Context::Global
-            }
+            | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight | SplitDown
+            | ClosePanel | Pop | GoBack | GoForward | FocusPanelLeft | FocusPanelRight
+            | FocusPanelUp | FocusPanelDown | NewTerminal | NewTab | CloseTab | NextTab
+            | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2
+            | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9
+            | AddFolder => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu
             | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate
@@ -894,6 +894,8 @@ mod tests {
             Command::KeepSession,
             Command::Detach,
             Command::EndSession,
+            // The branch badge gets there too.
+            Command::ToggleChanges,
         ];
         let keymap = Keymap::default();
         for &command in Command::ALL {

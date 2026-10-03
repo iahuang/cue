@@ -10,6 +10,9 @@
 //!
 //! Scrolled down, the folders the top rows are in stick to the top, one
 //! row each, outermost first, so it's clear where in the tree you are.
+//!
+//! Files git says changed are colored by how, with its letter at the right
+//! end, and a collapsed folder with changes in it is marked with a dot.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -19,6 +22,7 @@ use ignore::WalkBuilder;
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::file_index;
+use crate::git::{Kind, Repo};
 use crate::icons;
 use crate::keymap::Command;
 use crate::theme;
@@ -99,6 +103,10 @@ pub struct FileTree {
     active: Option<PathBuf>,
     /// The active file is a preview, shown in italics.
     active_preview: bool,
+    /// How each file git says changed did.
+    changes: HashMap<PathBuf, Kind>,
+    /// The folders with changes in them.
+    changed_folders: HashSet<PathBuf>,
 }
 
 impl FileTree {
@@ -115,6 +123,8 @@ impl FileTree {
             height: 1,
             active: None,
             active_preview: false,
+            changes: HashMap::new(),
+            changed_folders: HashSet::new(),
         };
         tree.set_roots(roots);
         tree
@@ -219,12 +229,20 @@ impl FileTree {
         self.active_preview = preview;
     }
 
-    /// The selected folder, or the folder of the selected file.
-    pub fn selected_folder(&self) -> Option<PathBuf> {
-        let row = self.rows.get(self.selected)?;
-        match row.is_dir {
-            true => Some(row.path.clone()),
-            false => row.path.parent().map(Path::to_path_buf),
+    /// Marks the files changed in `repos`, and the folders they're in.
+    pub fn set_changes(&mut self, repos: &[Repo]) {
+        self.changes.clear();
+        self.changed_folders.clear();
+        for repo in repos {
+            for change in &repo.changes {
+                self.changes.insert(change.path.clone(), change.kind);
+                let folders = change.path.ancestors().skip(1);
+                for folder in folders.take_while(|folder| folder.starts_with(&repo.root)) {
+                    if !self.changed_folders.insert(folder.to_path_buf()) {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -464,19 +482,40 @@ impl FileTree {
             let dim = row.ignored.then_some(colors.faint);
             name_x = icon.draw(frame, name_x, y, dim);
         }
+        let change = match row.is_dir {
+            true => None,
+            false => self.changes.get(&row.path).copied(),
+        };
         let (fg, attributes) = if row.depth == 0 {
             (colors.text, Attributes::BOLD)
         } else if self.active.as_ref() == Some(&row.path) && self.active_preview {
             (colors.accent, Attributes::BOLD | Attributes::ITALIC)
         } else if self.active.as_ref() == Some(&row.path) {
             (colors.accent, Attributes::BOLD)
+        } else if let Some(kind) = change {
+            (colors.hue(kind.hue()), Attributes::NONE)
         } else if row.ignored {
             (colors.faint, Attributes::NONE)
         } else {
             (colors.text, Attributes::NONE)
         };
-        let room = (x + width).saturating_sub(name_x + 1) as usize;
+        // At the right end: how the file changed, or that a collapsed
+        // folder has changes in it.
+        let mark = match change {
+            Some(kind) => Some((kind.letter(), colors.hue(kind.hue()))),
+            None if row.is_dir && !open && self.changed_folders.contains(&row.path) => {
+                Some(('•', colors.muted))
+            }
+            None => None,
+        };
+        let end = x + width;
+        let gap = if mark.is_some() { 3 } else { 1 };
+        let room = end.saturating_sub(name_x + gap) as usize;
         frame.draw_text(&truncate(&row.name, room), name_x, y, fg, None, attributes);
+        if let Some((mark, fg)) = mark.filter(|_| end >= name_x + 3) {
+            let mark = mark.encode_utf8(&mut [0; 4]).to_owned();
+            frame.draw_text(&mark, end - 2, y, fg, None, Attributes::NONE);
+        }
     }
 
     // --- navigation -----------------------------------------------------------

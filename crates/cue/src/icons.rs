@@ -94,6 +94,7 @@ const FILE: Icon = Icon::new('\u{e64e}', GRAY); // seti-default
 const FOLDER: Icon = Icon::new('\u{e5ff}', BLUE); // custom-folder
 const FOLDER_OPEN: Icon = Icon::new('\u{e5fe}', BLUE); // custom-folder_open
 const TERMINAL: Icon = Icon::new('\u{ea85}', GREEN); // cod-terminal
+const BRANCH: Icon = Icon::new('\u{e725}', PEACH); // dev-git_branch
 
 /// A folder's icon, open if its contents are showing.
 pub fn folder(open: bool) -> Icon {
@@ -106,6 +107,10 @@ pub fn folder(open: bool) -> Icon {
 
 pub fn terminal() -> Icon {
     TERMINAL
+}
+
+pub fn branch() -> Icon {
+    BRANCH
 }
 
 /// The icon for a file named `name`: by its whole name, else its extension.

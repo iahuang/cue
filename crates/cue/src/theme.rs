@@ -679,7 +679,7 @@ fn hex(rgb: u32) -> Rgba {
 }
 
 /// `a` with `share` of `b` mixed in, as RGB.
-fn mix(a: Rgba, b: Rgba, share: f32) -> Rgba {
+pub fn mix(a: Rgba, b: Rgba, share: f32) -> Rgba {
     let channel = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * share).round() as u8;
     Rgba::rgb(
         channel(a.r(), b.r()),

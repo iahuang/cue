@@ -33,6 +33,11 @@
 //! open, for the picker to bring back, and Ctrl+W in the picker closes it
 //! from there. Closing unsaved changes, or a running program, asks first.
 //!
+//! The sidebar can show the files git says changed instead of the tree
+//! (see [`crate::changes`]). At the left end of the status bar, a badge
+//! names the branch, with how many files changed; clicking it shows the
+//! changes, and while they show, it's a button back to the files.
+//!
 //! Right-clicking the file tree, or Shift+F10 there, opens a context menu
 //! of file commands: renaming, moving, duplicating, and trashing files and
 //! folders, and so on. They have keys and palette entries too, and act on
@@ -68,6 +73,7 @@ use std::time::{Duration, Instant};
 use opentui::{Attributes, Buffer};
 
 use crate::alert::{Alert, AlertAction, Button};
+use crate::changes::ChangesView;
 use crate::config::{self, Config, MIN_TREE_WIDTH};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
 use crate::document::{self, Disk, DiskChange, Document};
@@ -75,6 +81,7 @@ use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
 use crate::find;
+use crate::git::Git;
 use crate::image::{self, ImageView};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
@@ -87,7 +94,7 @@ use crate::recovery::{self, Orphan, Recovery};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::session::{self, Session, Shown};
-use crate::status::{self, Prompt, PromptKey};
+use crate::status::{self, GitBadge, Prompt, PromptKey};
 use crate::symbols::{self, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
@@ -193,6 +200,15 @@ enum Focus {
     Editor,
 }
 
+/// What the sidebar, left of the panels, shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sidebar {
+    /// The file tree.
+    Files,
+    /// The files git says changed.
+    Changes,
+}
+
 /// What a context menu's commands act on.
 enum MenuFor {
     /// A file or folder, from the tree.
@@ -208,6 +224,9 @@ enum MouseTarget {
     /// The status bar's session badge.
     Session,
     Tree,
+    /// The status bar's git badge: the branch, or the button back to the
+    /// files.
+    GitBadge,
     /// The tree's divider.
     Divider,
     /// The divider between panels side by side.
@@ -291,6 +310,12 @@ pub struct App {
     tree_visible: bool,
     /// The tree's width when there is room for it.
     tree_width: u32,
+    /// What the sidebar shows: the tree, or the changes. Which is shown,
+    /// and how wide, `tree_visible` and `tree_width` say.
+    sidebar: Sidebar,
+    changes: ChangesView,
+    /// What git says about the workspace's repositories.
+    git: Git,
     width: u32,
     height: u32,
     mouse_target: Option<MouseTarget>,
@@ -315,10 +340,11 @@ pub struct App {
     /// all listed: index them once they are.
     index_symbols_after_listing: bool,
     /// Hears of files other programs change, in the tree's open folders
-    /// and those of open files.
+    /// and those of open files, and of commits and the like in the `.git`
+    /// folders of the workspace's repositories.
     watcher: Watcher,
-    /// The tree's listing and open files' folders the watcher last took,
-    /// to tell when to update it.
+    /// The tree's listing, and open files' folders and `.git` folders, the
+    /// watcher last took, to tell when to update it.
     watching: Option<(u64, BTreeSet<PathBuf>)>,
     /// Files and terminals shown in the active panel, most recent first.
     recent: Vec<Recent>,
@@ -503,6 +529,9 @@ impl App {
         let mut app = App {
             files: FileIndex::new(&workspace),
             symbols: SymbolIndex::new(&workspace),
+            git: Git::new(workspace.roots()),
+            changes: ChangesView::new(),
+            sidebar: Sidebar::Files,
             index_symbols_after_listing: false,
             watcher: Watcher::new(),
             watching: None,
@@ -843,6 +872,7 @@ impl App {
                     self.focus = Focus::Tree;
                 }
             }
+            Command::ToggleChanges => self.toggle_changes(),
             Command::FocusEditor => self.focus = Focus::Editor,
             Command::GoToFile => self.show_picker(Mode::Files),
             Command::GoToLine => self.show_picker(Mode::Line),
@@ -1026,10 +1056,17 @@ impl App {
                 let target = self.file_target();
                 return self.file_command(command, target, false);
             }
-            command if command.context() == Context::Tree => {
-                let action = self.tree.run(command);
-                self.tree_action(action);
-            }
+            Command::TreeRefresh if self.sidebar == Sidebar::Changes => self.git.refresh(),
+            command if command.context() == Context::Tree => match self.sidebar {
+                Sidebar::Files => {
+                    let action = self.tree.run(command);
+                    self.tree_action(action);
+                }
+                Sidebar::Changes => {
+                    let action = self.changes.run(command);
+                    self.changes_action(action);
+                }
+            },
             command => {
                 let Some(editor) = self.tabs[self.tab].active_panel_mut().editor_mut() else {
                     return AppAction::Continue;
@@ -1135,9 +1172,15 @@ impl App {
                 {
                     self.focus = Focus::Tree;
                     // Below the entries, it's for the workspace's folder.
-                    let target = match self.tree.select_at(mouse.y) {
-                        true => self.tree.selected(),
-                        false => self.tree.root(),
+                    let target = match self.sidebar {
+                        Sidebar::Files => match self.tree.select_at(mouse.y) {
+                            true => self.tree.selected(),
+                            false => self.tree.root(),
+                        },
+                        Sidebar::Changes => match self.changes.select_at(mouse.y) {
+                            true => self.changes.selected(),
+                            false => None,
+                        },
                     };
                     if let Some(target) = target {
                         self.open_menu(target, Some((mouse.x, mouse.y)));
@@ -1150,13 +1193,35 @@ impl App {
                     });
                     // A third click starts over rather than counting as another double.
                     self.last_tree_click = (!double).then_some((mouse.y, now));
-                    let action = self.tree.click(mouse.y, double);
-                    self.tree_action(action);
+                    match self.sidebar {
+                        Sidebar::Files => {
+                            let action = self.tree.click(mouse.y, double);
+                            self.tree_action(action);
+                        }
+                        Sidebar::Changes => {
+                            let action = self.changes.click(mouse.y, double);
+                            self.changes_action(action);
+                        }
+                    }
                 }
-                MouseKind::ScrollUp => self.tree.scroll(-1),
-                MouseKind::ScrollDown => self.tree.scroll(1),
+                MouseKind::ScrollUp | MouseKind::ScrollDown => {
+                    let rows = match mouse.kind {
+                        MouseKind::ScrollUp => -1,
+                        _ => 1,
+                    };
+                    match self.sidebar {
+                        Sidebar::Files => self.tree.scroll(rows),
+                        Sidebar::Changes => self.changes.scroll(rows),
+                    }
+                }
                 _ => {}
             },
+            MouseTarget::GitBadge => {
+                if let MouseKind::Press(MouseButton::Left) = mouse.kind {
+                    self.focus = Focus::Tree;
+                    self.toggle_changes();
+                }
+            }
             MouseTarget::Divider => {
                 if let MouseKind::Drag(MouseButton::Left) = mouse.kind {
                     let max = self.width.saturating_sub(MIN_EDITOR_WIDTH + 1);
@@ -1240,6 +1305,12 @@ impl App {
                         return Some(MouseTarget::Session);
                     }
                 }
+                let git = status::git_badge(&status, self.git_badge().as_ref(), self.width);
+                if git.as_ref().is_some_and(|git| git.contains(&x)) {
+                    return Some(MouseTarget::GitBadge);
+                }
+                // What the status bar says starts after the git badge.
+                let x = x.wrapping_sub(git.map_or(0, |git| git.end));
                 if let crate::status::Status::EditorInfo { language, .. } = status {
                     if language.contains(&x) {
                         return Some(MouseTarget::Language);
@@ -1471,8 +1542,11 @@ impl App {
         let tree_width = self.visible_tree_width();
         let main = self.main_area();
         if tree_width > 0 {
-            self.tree
-                .draw(frame, 0, tree_width, self.focus == Focus::Tree);
+            let focused = self.focus == Focus::Tree;
+            match self.sidebar {
+                Sidebar::Files => self.tree.draw(frame, 0, tree_width, focused),
+                Sidebar::Changes => self.changes.draw(frame, 0, tree_width, focused),
+            }
             for y in 0..self.height.saturating_sub(1) {
                 frame.draw_text("│", tree_width, y, colors.divider, None, Attributes::NONE);
             }
@@ -1497,8 +1571,17 @@ impl App {
             };
             let y = self.height - 1;
             let session = self.session.is_some();
-            if let Some(prompt) = status::draw(frame, &status, y, self.width, &self.keymap, session)
-            {
+            let git = self.git_badge();
+            let width = self.width;
+            if let Some(prompt) = status::draw(
+                frame,
+                &status,
+                y,
+                width,
+                &self.keymap,
+                session,
+                git.as_ref(),
+            ) {
                 cursor = Some(prompt);
             }
         }
@@ -1592,6 +1675,7 @@ impl App {
             self.save_session(screens);
         }
         if let Some(changes) = self.watcher.poll() {
+            self.git.refresh();
             changed |= self.disk_changed(changes);
             // Folders may have come back for open files, and the tree may
             // list others.
@@ -1599,7 +1683,20 @@ impl App {
             self.watch_folders();
             changed |= self.follow_settings();
         }
+        if self.git.poll() {
+            self.git_changed();
+            changed = true;
+        }
         changed
+    }
+
+    /// Catches up with what git says now: the changes view and the tree
+    /// show it, and the watcher hears of the repositories' `.git` folders.
+    fn git_changed(&mut self) {
+        let repos = self.git.repos();
+        self.changes.set_repos(repos);
+        self.tree.set_changes(repos);
+        self.watch_folders();
     }
 
     /// Text a terminal's program copied since the last call, for the
@@ -1608,14 +1705,15 @@ impl App {
         self.copied.take()
     }
 
-    /// Watches the folders open in the tree, and those of open files, if
-    /// they changed since last time.
+    /// Watches the folders open in the tree, those of open files, and the
+    /// repositories' `.git` folders, if they changed since last time.
     fn watch_folders(&mut self) {
-        let files: BTreeSet<PathBuf> = self
+        let mut files: BTreeSet<PathBuf> = self
             .documents
             .iter()
             .filter_map(|doc| doc.path()?.parent().map(Path::to_path_buf))
             .collect();
+        files.extend(self.git.repos().iter().map(|repo| repo.git_dir.clone()));
         let watching = (self.tree.listing(), files);
         if self.watching.as_ref() == Some(&watching) {
             return;
@@ -2453,6 +2551,7 @@ impl App {
         let doc = self.active_panel().document();
         let preview = doc.is_some_and(|doc| self.is_preview(doc));
         self.tree.set_active(path.as_deref(), preview);
+        self.changes.set_active(path.as_deref(), preview);
         self.note_recent();
     }
 
@@ -3225,7 +3324,7 @@ impl App {
     /// one with what's on screen, or the first.
     fn current_root(&self) -> PathBuf {
         let selected = match self.focus {
-            Focus::Tree => self.tree.selected().map(|entry| entry.path),
+            Focus::Tree => self.sidebar_selected().map(|entry| entry.path),
             _ => None,
         };
         let path = selected
@@ -3495,6 +3594,7 @@ impl App {
             tree_visible: self.tree_visible,
             tree_width: self.tree_width,
             tree_focused: self.focus == Focus::Tree,
+            changes_shown: self.sidebar == Sidebar::Changes,
             tab: self.tab,
             tabs,
             documents,
@@ -3516,6 +3616,10 @@ impl App {
     ) -> Result<(), String> {
         self.close_popups();
         self.tree_visible = state.tree_visible;
+        self.sidebar = match state.changes_shown {
+            true => Sidebar::Changes,
+            false => Sidebar::Files,
+        };
         if state.tree_width > 0 {
             self.tree_width = state.tree_width.max(MIN_TREE_WIDTH);
         }
@@ -3841,7 +3945,14 @@ impl App {
     /// workspace's.
     fn dialog_folder(&self) -> PathBuf {
         if self.focus == Focus::Tree {
-            if let Some(folder) = self.tree.selected_folder() {
+            let folder = self
+                .sidebar_selected()
+                .and_then(|entry| match entry.is_dir {
+                    true => Some(entry.path),
+                    false => entry.path.parent().map(Path::to_path_buf),
+                });
+            // A folder in the changes may be gone.
+            if let Some(folder) = folder.filter(|folder| folder.is_dir()) {
                 return folder;
             }
         }
@@ -3982,6 +4093,18 @@ impl App {
         }
     }
 
+    /// What the changes view asked for: as the tree's, but a file that's
+    /// gone isn't opened, as a new one.
+    fn changes_action(&mut self, action: TreeAction) {
+        if let TreeAction::Open { path, .. } = &action {
+            if !path.exists() {
+                self.show_message(format!("{} was deleted.", file_name(path)), false);
+                return;
+            }
+        }
+        self.tree_action(action);
+    }
+
     fn editor_action(&mut self, action: Action) -> AppAction {
         match action {
             Action::Continue => AppAction::Continue,
@@ -4022,7 +4145,7 @@ impl App {
     /// folder.
     fn file_target(&self) -> Entry {
         if self.focus == Focus::Tree {
-            if let Some(entry) = self.tree.selected() {
+            if let Some(entry) = self.sidebar_selected() {
                 return entry;
             }
         }
@@ -4046,6 +4169,7 @@ impl App {
     fn show_tree_menu(&mut self) {
         if self.focus != Focus::Tree {
             let file = self.active_panel().path();
+            self.sidebar = Sidebar::Files;
             self.run(Command::FocusTree, false);
             if let Some(file) = file {
                 self.tree.reveal(&file);
@@ -4054,7 +4178,7 @@ impl App {
         if self.focus != Focus::Tree {
             return;
         }
-        if let Some(target) = self.tree.selected() {
+        if let Some(target) = self.sidebar_selected() {
             self.open_menu(target, None);
         }
     }
@@ -4106,7 +4230,10 @@ impl App {
             item(TreeReveal, reveal),
         ]);
         let (x, y) = at
-            .or_else(|| self.tree.selected_position())
+            .or_else(|| match self.sidebar {
+                Sidebar::Files => self.tree.selected_position(),
+                Sidebar::Changes => self.changes.selected_position(),
+            })
             .unwrap_or((0, 0));
         let menu = ContextMenu::new(
             items,
@@ -4172,6 +4299,10 @@ impl App {
             false => parent.clone(),
         };
         let name = file_name(&target.path);
+        if matches!(command, Command::TreeOpen | Command::TreeOpenToSide) && !target.path.exists() {
+            self.show_message(format!("{name} was deleted."), false);
+            return AppAction::Continue;
+        }
         match command {
             Command::TreeOpen if !target.is_dir => {
                 if self.open(&target.path, false) {
@@ -4273,6 +4404,7 @@ impl App {
     /// Shows the workspace's folders, after one came or went.
     fn roots_changed(&mut self) {
         self.tree.set_roots(self.workspace.roots());
+        self.git.set_roots(self.workspace.roots());
         self.files = FileIndex::new(&self.workspace);
         self.symbols = SymbolIndex::new(&self.workspace);
         self.watching = None;
@@ -4722,6 +4854,50 @@ impl App {
     // --- layout and helpers ----------------------------------------------------
 
     /// The tree's width on screen, 0 when hidden or when there's no room.
+    /// Shows the changes in the sidebar, with the keyboard, or if they're
+    /// showing, goes back to the files.
+    fn toggle_changes(&mut self) {
+        if self.tree_visible && self.sidebar == Sidebar::Changes {
+            self.sidebar = Sidebar::Files;
+            // Pick up files created since it was last read.
+            self.tree.refresh();
+        } else {
+            self.sidebar = Sidebar::Changes;
+            self.tree_visible = true;
+            self.git.refresh();
+            self.focus = Focus::Tree;
+        }
+        self.layout();
+    }
+
+    /// The entry selected in the sidebar, in the tree or the changes,
+    /// whichever it shows.
+    fn sidebar_selected(&self) -> Option<Entry> {
+        match self.sidebar {
+            Sidebar::Files => self.tree.selected(),
+            Sidebar::Changes => self.changes.selected(),
+        }
+    }
+
+    /// The status bar's git badge, if any: while the sidebar shows the
+    /// changes, a button back to the files, and otherwise in a repository,
+    /// its branch. The repository is the one with the file on screen, or
+    /// else the first.
+    fn git_badge(&self) -> Option<GitBadge> {
+        if self.sidebar == Sidebar::Changes && self.visible_tree_width() > 0 {
+            return Some(GitBadge::Files);
+        }
+        let path = self.active_panel().path();
+        let repo = path
+            .and_then(|path| self.git.repo_of(&path))
+            .or_else(|| self.git.repos().first())?;
+        let lines = (!repo.changes.is_empty()).then_some((repo.added, repo.removed));
+        Some(GitBadge::Branch {
+            name: repo.head.name().to_string(),
+            lines,
+        })
+    }
+
     fn visible_tree_width(&self) -> u32 {
         if !self.tree_visible {
             return 0;
@@ -4775,8 +4951,9 @@ impl App {
         if self.visible_tree_width() == 0 && self.focus == Focus::Tree {
             self.focus = Focus::Editor;
         }
-        // The tree is as tall as the tab bar and panels together.
+        // The sidebar is as tall as the tab bar and panels together.
         self.tree.set_height(self.height.saturating_sub(1));
+        self.changes.set_height(self.height.saturating_sub(1));
         if let Some(picker) = &mut self.picker {
             picker.set_size(self.width, self.height);
         }
@@ -5922,6 +6099,108 @@ mod tests {
         let line = screen(&app).lines().nth(1).unwrap().to_string();
         assert_eq!(line.chars().nth(20), Some('│'));
         assert!(line.contains("inside"), "{line}");
+    }
+
+    /// Takes what git says about `app`'s workspace, once it's said it.
+    fn wait_for_git(app: &mut App) {
+        app.git.wait();
+        app.git_changed();
+    }
+
+    #[test]
+    fn the_branch_badge_shows_the_changes_and_goes_back_to_the_files() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-badge");
+        fs::write(root.join("a.txt"), "changed\n").unwrap();
+        fs::remove_file(root.join("b.txt")).unwrap();
+        let mut app = app(&root, None);
+        wait_for_git(&mut app);
+        let lines = |app: &App| -> Vec<String> {
+            let tree = app.visible_tree_width() as usize;
+            screen(app)
+                .lines()
+                .map(|line| {
+                    line.chars()
+                        .take(tree)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        };
+        let status = |app: &App| screen(app).lines().nth(9).unwrap_or("").to_string();
+        assert!(
+            status(&app).starts_with(" main +1 -2  Ln 1, Col 1"),
+            "{}",
+            status(&app)
+        );
+        let files = lines(&app);
+        assert!(
+            files[1].starts_with("     a.txt") && files[1].ends_with('M'),
+            "{files:?}"
+        );
+
+        left_click(&mut app, 3, 9);
+        assert_eq!(app.sidebar, Sidebar::Changes);
+        assert_eq!(app.focus, Focus::Tree);
+        let changes = lines(&app);
+        assert!(changes[0].starts_with(" ▾ app-badge") && changes[0].ends_with("main"));
+        assert!(changes[1].starts_with("     a.txt") && changes[1].ends_with('M'));
+        assert!(changes[2].starts_with("     b.txt") && changes[2].ends_with('D'));
+        assert!(
+            status(&app).starts_with(" ‹ Files  Ln 1"),
+            "{}",
+            status(&app)
+        );
+
+        // A file that's gone isn't opened as a new one.
+        left_click(&mut app, 6, 2);
+        assert!(app.active_panel().path().is_none());
+        assert!(status(&app).contains("b.txt was deleted."));
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_panel().path(), Some(root.join("a.txt")));
+        assert_eq!(app.focus, Focus::Editor);
+
+        // The language, after the badge, is still where it's clicked.
+        let language = match app.ed().status() {
+            crate::status::Status::EditorInfo { language, .. } => language.start,
+            other => panic!("{other:?}"),
+        };
+        let status_now = app.active_panel().status();
+        let badge = status::git_badge(&status_now, app.git_badge().as_ref(), 80).unwrap();
+        left_click(&mut app, badge.end + language - 1, 9);
+        assert!(app.picker.is_none(), "just before the language");
+        left_click(&mut app, badge.end + language, 9);
+        assert_eq!(app.picker.as_ref().map(Picker::mode), Some(Mode::Languages));
+        key(&mut app, KeyCode::Esc);
+
+        left_click(&mut app, 3, 9);
+        assert_eq!(app.sidebar, Sidebar::Files);
+        assert!(
+            status(&app).starts_with(" main +1 -2  Ln 1"),
+            "{}",
+            status(&app)
+        );
+    }
+
+    #[test]
+    fn the_changes_command_shows_and_hides_the_changes() {
+        let _serial = crate::test_serial();
+        let root = fixture("not-a-repo", &[("a.txt", "")]);
+        let mut app = app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+        assert_eq!(app.git_badge(), None, "no badge outside a repository");
+        app.run(Command::ToggleTree, false);
+        app.run(Command::ToggleChanges, false);
+        assert!(app.tree_visible, "showing the changes shows the sidebar");
+        assert_eq!(app.focus, Focus::Tree);
+        let shown = screen(&app);
+        assert!(shown.contains("Not in a git repository."), "{shown}");
+        assert!(shown.contains("‹ Files"));
+        app.run(Command::ToggleChanges, false);
+        assert_eq!(app.sidebar, Sidebar::Files);
+        assert!(!screen(&app).contains("‹ Files"));
     }
 
     #[test]

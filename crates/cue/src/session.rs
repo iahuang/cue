@@ -117,6 +117,8 @@ pub struct State {
     pub tree_visible: bool,
     pub tree_width: u32,
     pub tree_focused: bool,
+    /// The sidebar shows the changes rather than the tree.
+    pub changes_shown: bool,
     /// The tab on screen.
     pub tab: usize,
     pub tabs: Vec<TabState>,
@@ -612,6 +614,7 @@ pub fn encode(state: &State) -> String {
     tree.insert("visible".into(), Value::Boolean(state.tree_visible));
     tree.insert("width".into(), int(state.tree_width as u64));
     tree.insert("focused".into(), Value::Boolean(state.tree_focused));
+    tree.insert("changes".into(), Value::Boolean(state.changes_shown));
     root.insert("tree".into(), Value::Table(tree));
     root.insert("tab".into(), int(state.tab as u64));
     root.insert("recent".into(), shown_list(&state.recent));
@@ -780,6 +783,7 @@ pub fn decode(text: &str) -> Option<State> {
         tree_visible: tree_flag("visible").unwrap_or(true),
         tree_width: tree.and_then(|tree| get_u32(tree, "width")).unwrap_or(0),
         tree_focused: tree_flag("focused").unwrap_or(false),
+        changes_shown: tree_flag("changes").unwrap_or(false),
         tab: get_u32(&root, "tab").unwrap_or(0) as usize,
         recent: shown_list(&root, "recent"),
         ..State::default()
@@ -897,6 +901,7 @@ mod tests {
             tree_visible: false,
             tree_width: 32,
             tree_focused: true,
+            changes_shown: true,
             tab: 1,
             tabs: vec![
                 TabState {
