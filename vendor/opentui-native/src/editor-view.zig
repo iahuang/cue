@@ -46,6 +46,9 @@ pub const EditorView = struct {
     cursor_visual_affinity: ?CursorVisualAffinity,
     selection_updates_cursor: bool,
     selection_follow_cursor: bool, // Keep viewport synced during selection
+    // Scrolled away from the cursor, which stays put (cue patch): rendering
+    // leaves the viewport be until the cursor moves.
+    cursor_left_behind: bool,
     cursor_changed_listener: event_emitter.EventEmitter(eb.EditBufferEvent).Listener,
 
     placeholder_buffer: ?*UnifiedTextBuffer,
@@ -59,6 +62,7 @@ pub const EditorView = struct {
         const self: *EditorView = @ptrCast(@alignCast(ctx));
         self.updatePlaceholderVisibility();
         if (!self.followsCursor()) return;
+        self.cursor_left_behind = false;
         self.desired_visual_col = null;
 
         const cursor = self.edit_buffer.getPrimaryCursor();
@@ -89,6 +93,7 @@ pub const EditorView = struct {
             .cursor_visual_affinity = null,
             .selection_updates_cursor = false,
             .selection_follow_cursor = false,
+            .cursor_left_behind = false,
             .cursor_changed_listener = .{
                 .ctx = undefined, // Will be set below
                 .handle = onCursorChanged,
@@ -140,6 +145,7 @@ pub const EditorView = struct {
     pub fn setViewport(self: *EditorView, vp: ?tbv.Viewport, moveCursor: bool) void {
         const old_viewport = self.text_buffer_view.getViewport();
         self.text_buffer_view.setViewport(vp);
+        self.cursor_left_behind = false;
         if (old_viewport == null or vp == null or old_viewport.?.width != vp.?.width) {
             self.cursor_visual_affinity = null;
         }
@@ -147,6 +153,19 @@ pub const EditorView = struct {
         if (moveCursor) {
             self.makeCursorVisible();
         }
+    }
+
+    /// Scrolls to `x`, `y`, leaving the cursor where it is, out of sight if
+    /// need be, until it moves (cue patch).
+    pub fn scrollAwayFromCursor(self: *EditorView, x: u32, y: u32) void {
+        const vp = self.text_buffer_view.getViewport() orelse return;
+        self.text_buffer_view.setViewport(.{ .x = x, .y = y, .width = vp.width, .height = vp.height });
+        self.cursor_left_behind = true;
+    }
+
+    /// Whether it scrolled away from the cursor, which hasn't moved since.
+    pub fn isCursorLeftBehind(self: *const EditorView) bool {
+        return self.cursor_left_behind;
     }
 
     /// Makes this the view that keeps the buffer's cursor in sight; the
@@ -327,7 +346,7 @@ pub const EditorView = struct {
     pub fn updateBeforeRender(self: *EditorView) void {
         self.updatePlaceholderVisibility();
 
-        if (!self.followsCursor()) return;
+        if (!self.followsCursor() or self.cursor_left_behind) return;
         const has_selection = self.text_buffer_view.selection != null;
 
         if (!has_selection or self.selection_follow_cursor) {
@@ -556,7 +575,7 @@ pub const EditorView = struct {
             });
         }
 
-        if (!self.followsCursor()) return;
+        if (!self.followsCursor() or self.cursor_left_behind) return;
         const vcursor = self.getPrimaryVisualCursorAbsolute();
         self.ensureCursorVisible(vcursor.visual_row);
     }
@@ -797,6 +816,7 @@ pub const EditorView = struct {
     }
 
     pub fn moveUpVisual(self: *EditorView) void {
+        self.cursor_left_behind = false;
         const vcursor = self.getPrimaryVisualCursorAbsolute();
 
         if (vcursor.visual_row == 0) {
@@ -838,6 +858,7 @@ pub const EditorView = struct {
     }
 
     pub fn moveDownVisual(self: *EditorView) void {
+        self.cursor_left_behind = false;
         const vcursor = self.getPrimaryVisualCursorAbsolute();
 
         const vlines = self.text_buffer_view.virtual_lines.items;

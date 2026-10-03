@@ -3265,6 +3265,18 @@ export fn editorViewSetViewportSize(view_handle: NativeHandle, width: u32, heigh
     object_ptr.setViewportSize(width, height);
 }
 
+/// cue patch: see `EditorView.scrollAwayFromCursor`.
+export fn editorViewScrollAwayFromCursor(view_handle: NativeHandle, x: u32, y: u32) void {
+    const object_ptr = acquireEditorView(view_handle) orelse return;
+    object_ptr.scrollAwayFromCursor(x, y);
+}
+
+/// cue patch: see `EditorView.isCursorLeftBehind`.
+export fn editorViewIsCursorLeftBehind(view_handle: NativeHandle) bool {
+    const object_ptr = acquireEditorView(view_handle) orelse return false;
+    return object_ptr.isCursorLeftBehind();
+}
+
 /// cue patch: see `EditorView.takeCursor`.
 export fn editorViewTakeCursor(view_handle: NativeHandle) void {
     const object_ptr = acquireEditorView(view_handle) orelse return;

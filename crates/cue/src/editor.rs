@@ -202,6 +202,9 @@ impl Editor {
         self.view.take_cursor();
         // Typing in one editor and then another makes two undo steps.
         doc.history.borrow_mut().break_group();
+        // Scrolled away from its cursor, the view stays put as the cursor
+        // comes back.
+        let away = self.view.cursor_left_behind().then(|| self.view.viewport());
         if let Some(parked) = doc.unpark(self.id) {
             if parked.epoch != self.buffer.content_epoch() {
                 // Edited elsewhere: the selection may cover other text now.
@@ -209,6 +212,9 @@ impl Editor {
                 self.view.clear_selection();
             }
             self.buffer.set_cursor(parked.row, parked.col);
+        }
+        if let Some(vp) = away {
+            self.view.scroll_away_from_cursor(vp.x, vp.y);
         }
         // The document's find highlights are this editor's matches.
         match &mut self.find {
@@ -710,12 +716,12 @@ impl Editor {
     }
 
     /// Draws the editor in its area and returns the terminal cursor
-    /// position (0-based column, row). The keymap labels the find bar's
-    /// buttons.
-    pub fn draw(&self, frame: &Buffer, keymap: &Keymap) -> (u32, u32) {
+    /// position (0-based column, row), if it's in view. The keymap labels
+    /// the find bar's buttons.
+    pub fn draw(&self, frame: &Buffer, keymap: &Keymap) -> Option<(u32, u32)> {
         if let Some(reader) = self.reader() {
             reader.draw(frame, self.x, self.y);
-            return (self.x, self.y);
+            return None;
         }
         self.sync_view_size();
         self.sync_syntax();
@@ -731,10 +737,25 @@ impl Editor {
                 let (x, width, _) = area;
                 bar.draw(frame, (x, self.y, width), self.current_match(), keymap)
             });
-        find_cursor.unwrap_or_else(|| {
-            let cursor = self.view.visual_cursor();
-            (text_x + cursor.col, self.y + cursor.row)
+        find_cursor.or_else(|| {
+            let (col, row) = self.cursor_in_view()?;
+            Some((text_x + col, self.y + row))
         })
+    }
+
+    /// The cursor's column and row in the viewport, unless the view
+    /// scrolled away from it.
+    fn cursor_in_view(&self) -> Option<(u32, u32)> {
+        // Laying out scrolls the cursor into view, unless it was left behind.
+        self.view.visual_cursor();
+        let vp = self.view.viewport();
+        let at = self.view.visual_cursor_absolute();
+        let col = match self.wrap {
+            WrapMode::None => at.col.checked_sub(vp.x).filter(|&col| col < vp.width)?,
+            _ => at.col,
+        };
+        let row = at.row.checked_sub(vp.y).filter(|&row| row < vp.height)?;
+        Some((col, row))
     }
 
     /// Highlights the lines about to be drawn.
@@ -1250,9 +1271,9 @@ impl Editor {
         count
     }
 
-    /// Scrolls the viewport, dragging the cursor along so it stays visible.
-    /// It scrolls past the end of the text, until the last line is near the
-    /// top.
+    /// Scrolls the viewport, leaving the cursor where it is, out of view if
+    /// need be, until it moves. It scrolls past the end of the text, until
+    /// the last line is near the top.
     fn scroll(&mut self, dx: i64, dy: i64) {
         if dx != 0 && self.wrap != WrapMode::None {
             return;
@@ -1262,13 +1283,12 @@ impl Editor {
         let x = (vp.x as i64 + dx).max(0) as u32;
         if (x, y) != (vp.x, vp.y) {
             self.history().break_group();
-            self.view.scroll_to(x, y, true);
+            self.view.scroll_away_from_cursor(x, y);
         }
     }
 
-    /// How far down the view can scroll, dragging the cursor along: the
-    /// cursor, dragged to the last line, stays the scroll margin from the
-    /// top, or the view would scroll back to it.
+    /// How far down the view can scroll: the last line stays the scroll
+    /// margin from the top, as the cursor on it would keep it.
     fn max_scroll(&self) -> u32 {
         let vp = self.view.viewport();
         let margin = ((vp.height as f32 * config::get().scroll_margin) as u32).max(1);
@@ -1520,13 +1540,14 @@ impl Editor {
         let (gutter, _, _) = self.text_area();
         // The bar's first column, in the viewport.
         let left = x - (self.x + gutter);
-        // Laying out scrolls the cursor into view first.
-        let cursor = self.view.visual_cursor();
-        if cursor.row >= rows || cursor.col <= left {
+        let Some((col, row)) = self.cursor_in_view() else {
+            return;
+        };
+        if row >= rows || col <= left {
             return;
         }
         let vp = self.view.viewport();
-        let y = vp.y.saturating_sub(rows - cursor.row);
+        let y = vp.y.saturating_sub(rows - row);
         if y != vp.y {
             self.view.scroll_to(vp.x, y, false);
         }
@@ -1862,8 +1883,8 @@ impl Editor {
 
     /// Scrolls along with another view of the file (see
     /// [`Editor::scroll_anchor`]): file line `line` goes `row` rows down,
-    /// as near as the text allows. Editing, the cursor is dragged along
-    /// into view, as the wheel drags it.
+    /// as near as the text allows. Editing, the cursor stays where it is,
+    /// as it does for the wheel.
     pub fn follow(&mut self, (line, row): (u32, u32)) {
         if let Some(reader) = self.reader_mut() {
             reader.scroll_line_to(line, row);
@@ -1873,7 +1894,7 @@ impl Editor {
         let vp = self.view.viewport();
         let top = self.top_for(line, row).min(self.max_scroll());
         if top != vp.y {
-            self.view.scroll_to(vp.x, top, true);
+            self.view.scroll_away_from_cursor(vp.x, top);
         }
     }
 
@@ -1989,7 +2010,7 @@ mod tests {
     }
 
     /// Draws `editor` on a cleared `screen`, as the app does.
-    fn draw(editor: &Editor, screen: &OwnedBuffer) -> (u32, u32) {
+    fn draw(editor: &Editor, screen: &OwnedBuffer) -> Option<(u32, u32)> {
         screen.clear(Rgba::terminal_default([0, 0, 0]));
         editor.draw(screen, &Keymap::default())
     }
@@ -2725,7 +2746,7 @@ mod tests {
     }
 
     #[test]
-    fn wheel_scrolls_and_keeps_cursor_in_view() {
+    fn wheel_scrolls_and_leaves_the_cursor_put() {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
         let text: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
@@ -2736,25 +2757,62 @@ mod tests {
         for _ in 0..4 {
             mouse(&mut editor, MouseKind::ScrollDown, 0, 0, now);
         }
-        let screen = OwnedBuffer::new(60, 6, false, WidthMethod::Unicode, "test").unwrap();
-        let (_, cursor_row) = draw(&editor, &screen);
-        let first = screen
-            .to_text(true)
-            .lines()
-            .next()
-            .unwrap()
-            .trim_end()
-            .to_string();
-        assert_eq!(first, " 13  line 12");
-        assert!(cursor_row < 5);
+        let (lines, cursor) = screen_lines(&editor, 60, 6);
+        assert_eq!(lines[0], " 13  line 12");
+        assert_eq!(cursor, None, "the cursor is out of view");
+        assert_eq!((eb.cursor().row, eb.cursor().col), (0, 0));
+        // Resizing leaves the view where it is too.
+        editor.set_area(0, 0, 60, 8);
+        let (lines, _) = screen_lines(&editor, 60, 8);
+        assert_eq!(lines[0], " 13  line 12");
+
         for _ in 0..10 {
             mouse(&mut editor, MouseKind::ScrollUp, 0, 0, now);
         }
-        draw(&editor, &screen);
-        assert_eq!(
-            screen.to_text(true).lines().next().unwrap().trim_end(),
-            "  1  line 0"
-        );
+        let (lines, cursor) = screen_lines(&editor, 60, 8);
+        assert_eq!(lines[0], "  1  line 0");
+        // Right of two digits of line numbers.
+        assert_eq!(cursor, Some((5, 0)));
+
+        // Moving the cursor brings the view back to it.
+        for _ in 0..4 {
+            mouse(&mut editor, MouseKind::ScrollDown, 0, 0, now);
+        }
+        key(&mut editor, KeyCode::Down);
+        let (lines, cursor) = screen_lines(&editor, 60, 8);
+        assert_eq!(lines[0], "  1  line 0");
+        assert_eq!(cursor, Some((5, 1)));
+        // And so does typing.
+        for _ in 0..4 {
+            mouse(&mut editor, MouseKind::ScrollDown, 0, 0, now);
+        }
+        editor.paste("x");
+        let (lines, cursor) = screen_lines(&editor, 60, 8);
+        assert_eq!(lines[0], "  1  line 0");
+        assert_eq!(cursor, Some((6, 1)));
+    }
+
+    #[test]
+    fn taking_the_cursor_back_keeps_the_view_scrolled_away_from_it() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let text: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        eb.set_text(&text.join("\n"));
+        eb.set_cursor(0, 0);
+        let mut first = Editor::new(eb.clone(), unnamed(), theme(), 60, 6).unwrap();
+        let now = Instant::now();
+        for _ in 0..4 {
+            mouse(&mut first, MouseKind::ScrollDown, 0, 0, now);
+        }
+        let mut second = Editor::show(first.document().clone(), 60, 6).unwrap();
+        key(&mut second, KeyCode::Down);
+        // The wheel takes the cursor back without the view jumping to it.
+        first.attach();
+        mouse(&mut first, MouseKind::ScrollDown, 0, 0, now);
+        let (lines, cursor) = screen_lines(&first, 60, 6);
+        assert_eq!(lines[0], " 16  line 15");
+        assert_eq!(cursor, None);
+        assert_eq!(eb.cursor().row, 0);
     }
 
     #[test]
@@ -2804,7 +2862,7 @@ mod tests {
         assert_eq!(eb.text(), "0123456789".repeat(20));
     }
 
-    fn screen_lines(editor: &Editor, width: u32, height: u32) -> (Vec<String>, (u32, u32)) {
+    fn screen_lines(editor: &Editor, width: u32, height: u32) -> (Vec<String>, Option<(u32, u32)>) {
         let screen = OwnedBuffer::new(width, height, false, WidthMethod::Unicode, "test").unwrap();
         let cursor = draw(editor, &screen);
         let lines = screen
@@ -2824,6 +2882,7 @@ mod tests {
         let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 30, 6).unwrap();
         editor.set_wrap(WrapMode::None);
         let (lines, cursor) = screen_lines(&editor, 30, 6);
+        let cursor = cursor.expect("the cursor is in view");
         assert_eq!(
             lines[..3],
             [" 1  one", " 2  two two two two two two tw", " 3  three"]
@@ -2857,6 +2916,7 @@ mod tests {
         editor.set_area(0, 0, 20, 6);
         editor.handle_key(Key::new(KeyCode::Home, Mods::CTRL));
         let (lines, cursor) = screen_lines(&editor, 20, 6);
+        let cursor = cursor.expect("the cursor is in view");
         assert_eq!(lines[0], "one", "{lines:?}");
         assert_eq!(cursor, (0, 0));
     }
@@ -2875,6 +2935,7 @@ mod tests {
         assert_eq!(editor.selected_text().as_deref(), Some("needle"));
         assert_eq!(eb.cursor().row, 30);
         let (_, cursor) = screen_lines(&editor, 40, 10);
+        let cursor = cursor.expect("the cursor is in view");
         let top = editor.view.viewport().y;
         assert_eq!(top, 30 - 9 / 3, "a third of the way down");
         assert_eq!(cursor.1, 30 - top);
@@ -2901,6 +2962,7 @@ mod tests {
         editor.select_in_line(30, 0..2);
         assert_eq!(editor.selected_text().as_deref(), Some("30"));
         let (lines, cursor) = screen_lines(&editor, 40, 10);
+        let cursor = cursor.expect("the cursor is in view");
         assert_eq!(cursor.1, 9 / 3, "a third of the way down: {lines:?}");
         assert!(
             lines[cursor.1 as usize].contains("31  30 word"),
@@ -2917,6 +2979,7 @@ mod tests {
         // from following the cursor there.
         editor.select_in_line(5, 0..1);
         let (lines, cursor) = screen_lines(&editor, 40, 10);
+        let cursor = cursor.expect("the cursor is in view");
         assert_eq!(cursor.1, 9 / 3, "a third of the way down: {lines:?}");
         assert!(lines[cursor.1 as usize].contains("6  5 word"), "{lines:?}");
     }
@@ -2949,6 +3012,7 @@ mod tests {
 
         editor.toggle_wrap();
         let (lines, cursor) = screen_lines(&editor, 40, 16);
+        let cursor = cursor.expect("the cursor is in view");
         assert_eq!(editor.view.viewport().x, 0);
         assert_eq!(lines[0], " 27  line 26", "{lines:?}");
         assert!(lines[cursor.1 as usize].contains("abcdefghij"), "{lines:?}");
@@ -2970,8 +3034,8 @@ mod tests {
         let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 10).unwrap();
         editor.set_wrap(WrapMode::Word);
         let _ = screen_lines(&editor, 40, 10);
-        // Past the end, until the last line is a row from the top, where
-        // the cursor dragged along stays clear of the scroll margin.
+        // Past the end, until the last line is a row from the top, the
+        // scroll margin.
         let max_y = editor.view.total_virtual_line_count() - 2;
         let mut y = 0;
         while y < max_y {
@@ -2984,7 +3048,8 @@ mod tests {
         let (lines, cursor) = screen_lines(&editor, 40, 10);
         assert_eq!(lines[1], " 40  line 39", "{lines:?}");
         assert_eq!(lines[2], "", "{lines:?}");
-        assert_eq!(cursor.1, 1, "the cursor came along to the last line");
+        assert_eq!(cursor, None, "the cursor stayed at the top");
+        assert_eq!(eb.cursor().row, 0);
         // Unwrapped, and resized, it stays there.
         editor.toggle_wrap();
         editor.set_area(0, 0, 40, 12);
@@ -3454,6 +3519,7 @@ mod tests {
         assert_eq!(editor.view.viewport().y, 20);
         find_query(&mut editor, "needle");
         let (_, cursor) = screen_lines(&editor, 100, 10);
+        let cursor = cursor.expect("the cursor is in view");
         assert_eq!(editor.view.viewport().y, 19, "one row down, below the bar");
         assert_eq!(cursor.1, 0, "the cursor is in the query");
     }

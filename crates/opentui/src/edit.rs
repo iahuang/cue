@@ -737,6 +737,18 @@ impl EditorView<'_> {
         unsafe { sys::editorViewSetViewport(self.handle, x, y, vp.width, vp.height, move_cursor) }
     }
 
+    /// Scrolls to `x`, `y`, leaving the cursor where it is, out of view if
+    /// need be. The view stays put until the cursor moves.
+    pub fn scroll_away_from_cursor(&self, x: u32, y: u32) {
+        unsafe { sys::editorViewScrollAwayFromCursor(self.handle, x, y) }
+    }
+
+    /// Whether it scrolled away from the cursor (see
+    /// [`EditorView::scroll_away_from_cursor`]), which hasn't moved since.
+    pub fn cursor_left_behind(&self) -> bool {
+        unsafe { sys::editorViewIsCursorLeftBehind(self.handle) }
+    }
+
     /// The rows in the viewport, top to bottom, after scrolling the cursor
     /// into view.
     pub fn visible_lines(&self) -> Vec<VisibleLine> {

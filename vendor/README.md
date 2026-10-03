@@ -65,6 +65,11 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   `src/lib.zig` too) gives the cursor's row in the whole document without
   scrolling to it: with a selection the viewport doesn't follow the cursor,
   and `getVisualCursor` clamps a row above the viewport to its top.
+  `scrollAwayFromCursor` (`editorViewScrollAwayFromCursor`) scrolls without
+  moving the cursor, for the wheel: until the cursor moves (a cursor change,
+  visual up/down, or setting the viewport), rendering and resizing leave the
+  viewport be instead of scrolling back to it. `isCursorLeftBehind`
+  (`editorViewIsCursorLeftBehind`) says whether it's in that state.
 - `src/embedded-terminal/`, `src/lib.zig`: for cue's terminals.
   `setHostPalette` (`embeddedTerminalSetHostPalette`) composes default and
   palette colors as the host terminal's own (SGR 39/49 and indexed colors)
