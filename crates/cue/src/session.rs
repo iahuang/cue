@@ -370,9 +370,9 @@ impl Listing {
         self.state.roots.iter().any(|root| folder.starts_with(root))
     }
 
-    /// A line about it, as `~/cue + ~/notes · 3 tabs · nvim · 2h ago · live`:
-    /// its folders, shortest first, with `~` for the home folder.
-    pub fn describe(&self, now: SystemTime) -> String {
+    /// Its folders, shortest first, with `~` for the home folder, as
+    /// `~/cue + ~/notes`.
+    pub fn folders(&self) -> String {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut roots: Vec<String> = self
             .state
@@ -390,7 +390,37 @@ impl Listing {
             })
             .collect();
         roots.sort_by_key(|root| (root.chars().count(), root.clone()));
-        let mut parts = vec![roots.join(" + ")];
+        roots.join(" + ")
+    }
+
+    /// How many of its files have unsaved changes.
+    pub fn unsaved(&self) -> usize {
+        self.state
+            .documents
+            .iter()
+            .filter(|doc| doc.unsaved.is_some())
+            .count()
+    }
+
+    /// How long ago it was saved, as `2h ago`.
+    pub fn age(&self, now: SystemTime) -> String {
+        let saved = UNIX_EPOCH + Duration::from_secs(self.state.saved);
+        ago(now.duration_since(saved).unwrap_or_default())
+    }
+
+    /// Whether a terminal shows it (`attached`), it's in the background
+    /// (`running`), or it waits on disk (`saved`).
+    pub fn status(&self) -> &'static str {
+        match (self.live, self.state.attached) {
+            (true, true) => "attached",
+            (true, false) => "running",
+            (false, _) => "saved",
+        }
+    }
+
+    /// A line about it, as `~/cue + ~/notes · 3 tabs · nvim · 2h ago · running`.
+    pub fn describe(&self, now: SystemTime) -> String {
+        let mut parts = vec![self.folders()];
         match self.state.tabs.len() {
             0 | 1 => {}
             tabs => parts.push(format!("{tabs} tabs")),
@@ -399,24 +429,13 @@ impl Listing {
         if !programs.is_empty() {
             parts.push(programs.join(", "));
         }
-        let unsaved = self
-            .state
-            .documents
-            .iter()
-            .filter(|doc| doc.unsaved.is_some())
-            .count();
-        match unsaved {
+        match self.unsaved() {
             0 => {}
             1 => parts.push("1 unsaved file".to_string()),
             n => parts.push(format!("{n} unsaved files")),
         }
-        let saved = UNIX_EPOCH + Duration::from_secs(self.state.saved);
-        parts.push(ago(now.duration_since(saved).unwrap_or_default()));
-        parts.push(match (self.live, self.state.attached) {
-            (true, true) => "attached".to_string(),
-            (true, false) => "running".to_string(),
-            (false, _) => "saved".to_string(),
-        });
+        parts.push(self.age(now));
+        parts.push(self.status().to_string());
         parts.join(" · ")
     }
 }

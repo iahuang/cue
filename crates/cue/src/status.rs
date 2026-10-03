@@ -1,7 +1,8 @@
 //! The status bar along the bottom of the screen. It's the active panel's:
 //! where its cursor is and what its file is written in, a message after a
 //! key press, or a prompt, such as a terminal's new name. Shortcut hints
-//! fill the right.
+//! fill the right, and in a session, a badge saying so: a click on it
+//! offers to detach or end the session.
 
 use opentui::{Attributes, Buffer};
 
@@ -38,6 +39,21 @@ impl Status {
             Status::Message { text, .. } => format!(" {text}"),
             Status::Prompt { label, input } => format!(" {label}: {input}"),
         }
+    }
+}
+
+/// The badge at the right end of the status bar in a session.
+const SESSION_BADGE: &str = " session ";
+
+/// The columns the session badge takes in a status bar `width` wide
+/// showing `status`, if it shows one: not over a message or a prompt.
+pub fn session_badge(status: &Status, width: u32) -> Option<std::ops::Range<u32>> {
+    let len = SESSION_BADGE.len() as u32;
+    match status {
+        Status::Info(_) | Status::Terminal(_) | Status::EditorInfo { .. } if width >= len * 2 => {
+            Some(width - len..width)
+        }
+        _ => None,
     }
 }
 
@@ -95,14 +111,16 @@ impl Prompt {
     }
 }
 
-/// Draws `status` across row `y` of `frame`, `width` wide. Returns where the
-/// terminal cursor goes while the prompt is open.
+/// Draws `status` across row `y` of `frame`, `width` wide, with the
+/// session badge if `session`. Returns where the terminal cursor goes
+/// while the prompt is open.
 pub fn draw(
     frame: &Buffer,
     status: &Status,
     y: u32,
     width: u32,
     keymap: &Keymap,
+    session: bool,
 ) -> Option<(u32, u32)> {
     let colors = theme::colors();
     match status {
@@ -154,7 +172,10 @@ pub fn draw(
                 })
                 .collect();
             let hints = hints.strip_suffix(' ').unwrap_or(&hints);
-            let hints_x = width.saturating_sub(hints.len() as u32);
+            let badge = session_badge(status, width).filter(|_| session);
+            // The hints end in a space; another sets them off the badge.
+            let right = badge.as_ref().map_or(width, |badge| badge.start - 1);
+            let hints_x = right.saturating_sub(hints.len() as u32);
             let mut left = format!(" {info}");
             // The title a shell sets can run long; the hint is worth more.
             if let Status::Terminal(_) = status {
@@ -163,6 +184,10 @@ pub fn draw(
             frame.draw_text(&left, 0, y, colors.text, None, Attributes::NONE);
             if hints_x as usize > left.chars().count() {
                 frame.draw_text(hints, hints_x, y, colors.muted, None, Attributes::NONE);
+            }
+            if let Some(badge) = badge {
+                let (fg, bg) = (colors.on_accent, Some(colors.accent));
+                frame.draw_text(SESSION_BADGE, badge.start, y, fg, bg, Attributes::BOLD);
             }
             None
         }

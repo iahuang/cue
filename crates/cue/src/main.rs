@@ -25,6 +25,7 @@ mod panel;
 mod picker;
 mod pty;
 mod recovery;
+mod resume;
 mod search;
 mod search_modal;
 mod session;
@@ -113,14 +114,14 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "usage: cue [FOLDER]... [FILE[:LINE[:COLUMN]]]
-       cue --resume | --fresh [FOLDER]...
+       cue --resume [--all] | --fresh [FOLDER]...
        cue --list | --end [SESSION]";
 
 /// Usage and every command with its shortcut.
 fn help() -> String {
     let keymap = Keymap::new(&config::load().0.keys);
     let mut help = format!(
-        "{USAGE}\n\nOpens the specified folders, or the current folder if none are specified.\nOpens FILE, or a new unnamed buffer if no file is specified.\nAppend :LINE or :LINE:COLUMN to a file path, for example src/main.rs:12:5.\nHold Shift while moving the cursor, or drag with the mouse, to select text.\nSettings are stored in {}. Use Open Settings in the command palette to create the file.\n\nSessions preserve tabs, files, unsaved changes, and terminals.\nUse Keep Session to create a session. Quitting with unsaved changes or running\nprograms also creates one. When you quit, programs in session terminals continue\nrunning in the background. Use End Session to end the session.\nWithout FILE, cue resumes the folder's session if exactly one exists.\n\n  -r, --resume   choose a session for the folder\n      --fresh    start a new cue instance\n  -l, --list     list all sessions\n      --end      end SESSION, or the folder's session\n\n",
+        "{USAGE}\n\nOpens the specified folders, or the current folder if none are specified.\nOpens FILE, or a new unnamed buffer if no file is specified.\nAppend :LINE or :LINE:COLUMN to a file path, for example src/main.rs:12:5.\nHold Shift while moving the cursor, or drag with the mouse, to select text.\nSettings are stored in {}. Use Open Settings in the command palette to create the file.\n\nSessions preserve tabs, files, unsaved changes, and terminals.\nUse Keep Session to create a session. Quitting with unsaved changes or running\nprograms also creates one. When you quit, programs in session terminals continue\nrunning in the background. Use End Session to end the session.\nWithout FILE, cue resumes the folder's session if exactly one exists.\n\n  -r, --resume   choose a session for the folder\n  -a, --all      choose from every session (implies --resume)\n      --fresh    start a new cue instance\n  -l, --list     list all sessions\n      --end      end SESSION, or the folder's session\n\n",
         config::path().map_or("~/.config/cue/config.toml".into(), |path| path.display().to_string())
     );
     let key = |command| {
@@ -199,6 +200,11 @@ fn parse_args() -> Result<Mode, ExitCode> {
                 return Err(ExitCode::SUCCESS);
             }
             Some("-r" | "--resume") => client.resume = true,
+            // Implies --resume.
+            Some("-a" | "--all") => {
+                client.resume = true;
+                client.all = true;
+            }
             Some("--fresh") => client.fresh = true,
             Some("-l" | "--list") => return Ok(Mode::List),
             Some("--end") => {

@@ -5,11 +5,12 @@
 //! `cue` in a folder of exactly one session's workspace goes back to it,
 //! unless a file is named, or it runs in a cue terminal; `--fresh` starts
 //! a new cue regardless. `--resume` lists the folder's sessions to choose
-//! from, `--list` lists every session, and `--end` ends one.
+//! from, or with `--all` every one (see [`crate::resume`]), `--list`
+//! prints every session, and `--end` ends one.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,8 @@ pub struct Args {
     pub paths: Vec<PathBuf>,
     /// Choose among the folder's sessions.
     pub resume: bool,
+    /// Choose among every session.
+    pub all: bool,
     /// Start a new cue even if the folder has a session.
     pub fresh: bool,
 }
@@ -46,12 +49,16 @@ pub fn run(args: Args) -> ExitCode {
         _ => Vec::new(),
     };
     let target = if args.resume {
-        if found.is_empty() {
-            return fail(&format!("there are no sessions in {}", tilde(&folder)));
+        let all = sessions.as_deref().map(session::list).unwrap_or_default();
+        if all.is_empty() {
+            return fail("there are no sessions");
         }
-        match pick(found, &folder) {
-            Some(listing) => Some(listing),
-            None => return ExitCode::SUCCESS,
+        // With none here, the rest are worth seeing.
+        let everywhere = args.all || !all.iter().any(|listing| listing.has(&folder));
+        match pick(all, &folder, everywhere) {
+            Ok(Some(listing)) => Some(listing),
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(err) => return fail(&format!("can't list sessions: {err}")),
         }
     } else if found.len() == 1 && !nested {
         found.into_iter().next()
@@ -272,138 +279,21 @@ pub fn tilde(path: &Path) -> String {
 
 // --- choosing a session ---------------------------------------------------------
 
-/// Asks which of `listings`, the sessions in `folder`, to open, with the
-/// arrow keys, or a number, and Enter. `None` if none was chosen.
-fn pick(listings: Vec<Listing>, folder: &Path) -> Option<Listing> {
+/// Asks which of `listings` to open, those in `folder` unless `all`, full
+/// screen (see [`crate::resume`]); without a terminal, prints them.
+/// `None` if none was chosen.
+fn pick(listings: Vec<Listing>, folder: &Path, all: bool) -> io::Result<Option<Listing>> {
+    let interactive = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
+    if interactive {
+        return crate::resume::choose(listings, folder, all);
+    }
     let now = SystemTime::now();
-    let lines: Vec<String> = listings.iter().map(|l| l.describe(now)).collect();
-    let interactive = unsafe { libc::isatty(0) == 1 && libc::isatty(2) == 1 };
-    if !interactive {
-        eprintln!("Sessions in {}:", tilde(folder));
-        for (listing, line) in listings.iter().zip(&lines) {
-            eprintln!("  {}  {line}", listing.id);
-        }
-        return None;
+    match all {
+        true => eprintln!("Sessions:"),
+        false => eprintln!("Sessions in {}:", tilde(folder)),
     }
-    let raw = Raw::enable(0)?;
-    let width = terminal_width();
-    let mut out = io::stderr();
-    let room = width.saturating_sub(1);
-    let mut title = clip(&format!("Sessions in {}", tilde(folder)), room);
-    let hint = "  ↑↓ to choose, Enter to open, Esc to cancel";
-    if title.chars().count() + hint.chars().count() <= room {
-        title += &format!("\x1b[2m{hint}\x1b[0m");
+    for listing in listings.iter().filter(|listing| all || listing.has(folder)) {
+        eprintln!("  {}  {}", listing.id, listing.describe(now));
     }
-    let mut selected = 0;
-    let mut drawn = 0;
-    let chosen = loop {
-        // Back to the top of what was drawn, and draw it again.
-        let mut frame = String::new();
-        if drawn > 0 {
-            frame += &format!("\x1b[{drawn}A");
-        }
-        frame += &format!("\r\x1b[J{title}\r\n");
-        for (i, line) in lines.iter().enumerate() {
-            // Short of the edge, so that no line wraps.
-            let line = clip(&format!("{} {line}", i + 1), width.saturating_sub(5));
-            frame += &match i == selected {
-                true => format!("\x1b[1m›\x1b[0m \x1b[7m {line} \x1b[0m\r\n"),
-                false => format!("   {line}\r\n"),
-            };
-        }
-        drawn = lines.len() + 1;
-        let _ = out.write_all(frame.as_bytes());
-        let _ = out.flush();
-        match read_key() {
-            Some(Key::Up) => selected = (selected + lines.len() - 1) % lines.len(),
-            Some(Key::Down) => selected = (selected + 1) % lines.len(),
-            Some(Key::Digit(n)) if n >= 1 && n <= lines.len() => break Some(n - 1),
-            Some(Key::Enter) => break Some(selected),
-            Some(Key::Cancel) | None => break None,
-            Some(Key::Digit(_)) => {}
-        }
-    };
-    let _ = write!(out, "\x1b[{drawn}A\r\x1b[J");
-    let _ = out.flush();
-    drop(raw);
-    chosen.map(|index| listings.into_iter().nth(index).expect("chosen from them"))
-}
-
-enum Key {
-    Up,
-    Down,
-    Enter,
-    Cancel,
-    Digit(usize),
-}
-
-/// The next key, as a terminal without the kitty keyboard protocol sends
-/// it; `None` if stdin closed.
-fn read_key() -> Option<Key> {
-    loop {
-        let mut buf = [0u8; 16];
-        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return None;
-        }
-        let key = match &buf[..n as usize] {
-            b"\x1b[A" | b"\x1bOA" | b"k" => Key::Up,
-            b"\x1b[B" | b"\x1bOB" | b"j" => Key::Down,
-            b"\r" | b"\n" => Key::Enter,
-            b"\x1b" | b"\x03" | b"q" => Key::Cancel,
-            [digit @ b'1'..=b'9'] => Key::Digit((digit - b'0') as usize),
-            _ => continue,
-        };
-        return Some(key);
-    }
-}
-
-/// The terminal's width, or 80.
-fn terminal_width() -> usize {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::ioctl(2, libc::TIOCGWINSZ, &mut ws) } == 0;
-    match ok && ws.ws_col > 0 {
-        true => ws.ws_col as usize,
-        false => 80,
-    }
-}
-
-/// The first `max` characters of `s`.
-fn clip(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
-}
-
-/// Raw input on a terminal, until dropped: keys come one at a time,
-/// without echo.
-struct Raw {
-    fd: RawFd,
-    saved: libc::termios,
-}
-
-impl Raw {
-    fn enable(fd: RawFd) -> Option<Raw> {
-        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
-            return None;
-        }
-        let mut raw = saved;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-            return None;
-        }
-        let _ = io::stderr().write_all(b"\x1b[?25l");
-        Some(Raw { fd, saved })
-    }
-}
-
-impl Drop for Raw {
-    fn drop(&mut self) {
-        let _ = io::stderr().write_all(b"\x1b[?25h");
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
-    }
+    Ok(None)
 }

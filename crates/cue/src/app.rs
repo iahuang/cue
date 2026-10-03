@@ -193,10 +193,20 @@ enum Focus {
     Editor,
 }
 
+/// What a context menu's commands act on.
+enum MenuFor {
+    /// A file or folder, from the tree.
+    File(Entry),
+    /// The session, from the status bar's badge.
+    Session,
+}
+
 /// Where a mouse press landed; drags and the release go there too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MouseTarget {
     Language,
+    /// The status bar's session badge.
+    Session,
     Tree,
     /// The tree's divider.
     Divider,
@@ -315,7 +325,7 @@ pub struct App {
     dialog: Option<FileDialog>,
     /// A context menu, while open, and what its commands act on. Never
     /// open with another popup.
-    menu: Option<(ContextMenu, Entry)>,
+    menu: Option<(ContextMenu, MenuFor)>,
     /// What the last search left behind, for the next one.
     search_memory: Memory,
     /// The last find bar's query and replacement.
@@ -1001,6 +1011,11 @@ impl App {
                     self.show_picker(Mode::Languages);
                 }
             }
+            MouseTarget::Session => {
+                if let MouseKind::Press(_) = mouse.kind {
+                    self.show_session_menu();
+                }
+            }
             MouseTarget::Tree => match mouse.kind {
                 // Ctrl+click, as on macOS.
                 MouseKind::Press(button)
@@ -1103,9 +1118,13 @@ impl App {
                 && x < self.width
                 && self.tab_prompt.is_none()
             {
-                if let crate::status::Status::EditorInfo { language, .. } =
-                    self.active_panel().status()
-                {
+                let status = self.active_panel().status();
+                if let Some(badge) = status::session_badge(&status, self.width) {
+                    if self.session.is_some() && badge.contains(&x) {
+                        return Some(MouseTarget::Session);
+                    }
+                }
+                if let crate::status::Status::EditorInfo { language, .. } = status {
                     if language.contains(&x) {
                         return Some(MouseTarget::Language);
                     }
@@ -1357,7 +1376,9 @@ impl App {
                 None => self.active_panel().status(),
             };
             let y = self.height - 1;
-            if let Some(prompt) = status::draw(frame, &status, y, self.width, &self.keymap) {
+            let session = self.session.is_some();
+            if let Some(prompt) = status::draw(frame, &status, y, self.width, &self.keymap, session)
+            {
                 cursor = Some(prompt);
             }
         }
@@ -3896,7 +3917,31 @@ impl App {
             self.height,
         );
         self.close_popups();
-        self.menu = Some((menu, target));
+        self.menu = Some((menu, MenuFor::File(target)));
+    }
+
+    /// The session badge's menu, above it: to detach or end the session.
+    fn show_session_menu(&mut self) {
+        let status = self.active_panel().status();
+        let Some(badge) = status::session_badge(&status, self.width) else {
+            return;
+        };
+        let items = vec![
+            MenuItem::Command(Command::Detach, "Detach Session".into()),
+            MenuItem::Command(Command::EndSession, "End Session".into()),
+        ];
+        let y = self.height.saturating_sub(1);
+        let menu = ContextMenu::new(
+            items,
+            &self.keymap,
+            badge.start,
+            y,
+            true,
+            self.width,
+            self.height,
+        );
+        self.close_popups();
+        self.menu = Some((menu, MenuFor::Session));
     }
 
     fn menu_action(&mut self, action: MenuAction) -> AppAction {
@@ -3907,7 +3952,8 @@ impl App {
                 AppAction::Continue
             }
             MenuAction::Accept(command) => match self.menu.take() {
-                Some((_, target)) => self.file_command(command, target, true),
+                Some((_, MenuFor::File(target))) => self.file_command(command, target, true),
+                Some((_, MenuFor::Session)) => self.run(command, false),
                 None => AppAction::Continue,
             },
         }
@@ -8004,6 +8050,67 @@ mod tests {
         );
         drop(app);
         assert!(!session::is_live(&dir));
+    }
+
+    #[test]
+    fn the_status_bar_shows_a_session_and_its_badge_detaches_or_ends_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("session-badge", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.sessions = Some(sessions_dir("badge"));
+        let status_line = |app: &App| screen(app).lines().last().unwrap().trim_end().to_string();
+        assert!(
+            !status_line(&app).ends_with(" session"),
+            "{}",
+            status_line(&app)
+        );
+        left_click(&mut app, 78, 9);
+        assert!(app.menu.is_none());
+
+        app.run(Command::KeepSession, false);
+        key(&mut app, KeyCode::Right);
+        let line = status_line(&app);
+        assert!(line.ends_with(" session"), "{line}");
+        // Where a menu item is on screen, by its label.
+        let find = |app: &App, label: &str| {
+            screen(app).lines().enumerate().find_map(|(y, line)| {
+                let x = line.find(label)?;
+                Some((line[..x].chars().count() as u32, y as u32))
+            })
+        };
+        let click = |app: &mut App, (x, y): (u32, u32)| {
+            let mut action = AppAction::Continue;
+            for kind in [
+                MouseKind::Press(MouseButton::Left),
+                MouseKind::Release(MouseButton::Left),
+            ] {
+                let mouse = Mouse {
+                    kind,
+                    x,
+                    y,
+                    mods: Mods::NONE,
+                };
+                // The press picks; the release does nothing more.
+                match app.handle_mouse(mouse, Instant::now()) {
+                    AppAction::Continue => {}
+                    picked => action = picked,
+                }
+            }
+            action
+        };
+        click(&mut app, (78, 9));
+        assert!(app.menu.is_some());
+        let detach = find(&app, "Detach Session").expect("the menu");
+        assert!(find(&app, "End Session").is_some(), "{}", screen(&app));
+        assert!(matches!(click(&mut app, detach), AppAction::Detach));
+        assert!(app.menu.is_none());
+
+        click(&mut app, (78, 9));
+        let end = find(&app, "End Session").expect("the menu");
+        let dir = app.session().unwrap().dir().to_path_buf();
+        assert!(matches!(click(&mut app, end), AppAction::Quit));
+        assert!(app.session().is_none());
+        assert!(!dir.exists());
     }
 
     #[test]
