@@ -127,3 +127,12 @@ these, and update the commit above.
 `queries/highlights.scm` as upstream has them. MIT licensed; see its
 `LICENSE`. Its Rust bindings depend on an older `tree-sitter` than cue's, so
 the `Cargo.toml`, `build.rs`, and `lib.rs` are our own.
+
+## `katex-fonts/`
+
+[KaTeX](https://github.com/KaTeX/KaTeX)'s TrueType fonts, as the
+[`ratex-katex-fonts`](https://crates.io/crates/ratex-katex-fonts) 0.1.14 crate
+packages them, for drawing math in reader mode: one per RaTeX `FontId`
+(`KaTeX_Caligraphic-Bold.ttf` has none, so it's left out). SIL Open Font
+License 1.1; see `OFL.txt`. Embedded with `include_bytes!` rather than through
+that crate, which pulls in `rust-embed`.

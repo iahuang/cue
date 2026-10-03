@@ -68,6 +68,14 @@ notify = "8.2.0"
 toml = { version = "1.1.6", features = ["preserve_order"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 unicode-width = "0.2"
+# Math in reader mode: KaTeX's parser and layout, ported to Rust, and a
+# rasterizer for what it lays out.
+ratex-parser = "0.1.14"
+ratex-layout = "0.1.14"
+ratex-types = "0.1.14"
+ratex-font = "0.1.14"
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ttf-parser = "0.25"
 
 
 # musl's allocator is slow under contention (parallel search, file indexing).

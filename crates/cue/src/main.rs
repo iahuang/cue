@@ -21,6 +21,7 @@ mod language;
 mod layout;
 mod line_edit;
 mod location;
+mod math;
 mod panel;
 mod picker;
 mod pty;
@@ -661,6 +662,8 @@ fn attached(
     // Zooming into a large image sends it whole: tens of megabytes as
     // base64 through the terminal otherwise.
     renderer.use_kitty_image_files();
+    // Until the terminal answers, unless OPENTUI_IMAGE_PROTOCOL says.
+    math::set_images(renderer.draws_images());
     // Clicks, drags, and the wheel; plain motion isn't needed.
     renderer.enable_mouse(false);
     // Experimental, for slow links such as ssh: fewer bytes per frame.
@@ -977,6 +980,7 @@ fn take_reply(renderer: &mut Renderer, app: &mut App, bytes: &[u8]) {
     }
     if !renderer.process_kitty_image_reply(bytes) {
         renderer.process_capability_response(bytes);
+        math::set_images(renderer.draws_images());
     }
 }
 

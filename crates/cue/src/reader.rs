@@ -2,7 +2,8 @@
 //! written. Markup is hidden, headings are bold and ruled, tables are drawn
 //! with box characters, code blocks sit on a band of background with their
 //! syntax colored, and prose wraps to the panel, at most [`MEASURE`]
-//! columns wide.
+//! columns wide. Math is drawn as images where the terminal shows them
+//! (see [`math`]).
 //!
 //! The text is laid out into rows whenever it or the panel's width
 //! changes, so edits made elsewhere (in another panel, or on disk by an
@@ -29,6 +30,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::input::{Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::language;
+use crate::math::{self, Formula, Typesetter};
 use crate::status::Status;
 use crate::syntax::ExcerptHighlighter;
 use crate::theme::{self, Colors, Hue, SyntaxColor};
@@ -115,12 +117,27 @@ impl Style {
     }
 }
 
-/// A run of text in one style, maybe a link.
+/// A run of text in one style, maybe a link, or a formula's place.
 #[derive(Debug, Clone, PartialEq)]
 struct Span {
+    /// For a formula, spaces as wide as it.
     text: String,
     style: Style,
     link: Option<Rc<str>>,
+    math: Option<Mark>,
+}
+
+/// A row of a formula's image, drawn over its span.
+#[derive(Debug, Clone)]
+struct Mark {
+    formula: Rc<Formula>,
+    row: u32,
+}
+
+impl PartialEq for Mark {
+    fn eq(&self, other: &Mark) -> bool {
+        Rc::ptr_eq(&self.formula, &other.formula) && self.row == other.row
+    }
 }
 
 /// A row of the laid out text.
@@ -132,8 +149,32 @@ struct Line {
 }
 
 impl Line {
+    #[cfg(test)]
     fn text(&self) -> String {
         self.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    /// The text in screen columns `range`, as copied: formulas as the
+    /// LaTeX they're from, display math's on its first row.
+    fn copy(&self, range: Range<usize>) -> String {
+        let mut out = String::new();
+        let mut col = 0;
+        for span in &self.spans {
+            let width = span.text.width();
+            let (from, to) = (range.start.max(col), range.end.min(col + width));
+            if from < to {
+                match &span.math {
+                    Some(mark) if mark.row > 0 => {}
+                    Some(mark) if mark.formula.display => {
+                        out.push_str(&format!("$${}$$", mark.formula.tex.trim()))
+                    }
+                    Some(mark) => out.push_str(&format!("${}$", mark.formula.tex)),
+                    None => out.push_str(columns(&span.text, from - col..to - col)),
+                }
+            }
+            col += width;
+        }
+        out
     }
 }
 
@@ -164,10 +205,12 @@ impl Layout {
 #[derive(Debug, Clone)]
 enum Piece {
     Word {
+        /// For a formula, spaces as wide as it.
         text: String,
         style: Style,
         link: Option<Rc<str>>,
         source: u32,
+        math: Option<Rc<Formula>>,
     },
     Space,
     Break,
@@ -192,9 +235,27 @@ impl Inline {
                     style,
                     link: link.cloned(),
                     source,
+                    math: None,
                 });
             }
         }
+    }
+
+    /// Adds a formula, as a word.
+    fn push_math(
+        &mut self,
+        formula: Rc<Formula>,
+        style: Style,
+        link: Option<&Rc<str>>,
+        source: u32,
+    ) {
+        self.pieces.push(Piece::Word {
+            text: " ".repeat(formula.cols as usize),
+            style,
+            link: link.cloned(),
+            source,
+            math: Some(formula),
+        });
     }
 
     fn space(&mut self) {
@@ -208,6 +269,10 @@ impl Inline {
         let mut out = String::new();
         for piece in &self.pieces {
             match piece {
+                Piece::Word {
+                    math: Some(formula),
+                    ..
+                } => out.push_str(&formula.tex),
                 Piece::Word { text, .. } => out.push_str(text),
                 Piece::Space | Piece::Break => out.push(' '),
             }
@@ -244,7 +309,10 @@ fn push_span(spans: &mut Vec<Span>, text: &str, style: Style, link: Option<&Rc<s
         return;
     }
     if let Some(last) = spans.last_mut() {
-        if last.style == style && last.link.as_deref() == link.map(|link| &**link) {
+        if last.math.is_none()
+            && last.style == style
+            && last.link.as_deref() == link.map(|link| &**link)
+        {
             last.text.push_str(text);
             return;
         }
@@ -253,7 +321,17 @@ fn push_span(spans: &mut Vec<Span>, text: &str, style: Style, link: Option<&Rc<s
         text: text.to_string(),
         style,
         link: link.cloned(),
+        math: None,
     });
+}
+
+/// Adds `span` to `spans`, joined to the last if it's text styled the
+/// same.
+fn append(spans: &mut Vec<Span>, span: Span) {
+    match span.math {
+        Some(_) => spans.push(span),
+        None => push_span(spans, &span.text, span.style, span.link.as_ref()),
+    }
 }
 
 /// The longest start of `text` at most `width` columns wide, and the rest.
@@ -297,6 +375,36 @@ fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
                 space = false;
                 i += 1;
             }
+            // Display math: rows of its own, centered.
+            Piece::Word {
+                text,
+                style,
+                link,
+                source: from,
+                math: Some(formula),
+            } if formula.display => {
+                if col > 0 {
+                    out.push((std::mem::take(&mut line), source.take()));
+                }
+                let pad = width.saturating_sub(text.width()) / 2;
+                for row in 0..formula.rows {
+                    let mut spans = Vec::new();
+                    push_span(&mut spans, &" ".repeat(pad), Style::TEXT, None);
+                    spans.push(Span {
+                        text: text.clone(),
+                        style: *style,
+                        link: link.clone(),
+                        math: Some(Mark {
+                            formula: formula.clone(),
+                            row,
+                        }),
+                    });
+                    out.push((spans, Some(*from)));
+                }
+                col = 0;
+                space = false;
+                i += 1;
+            }
             Piece::Word { .. } => {
                 let end = pieces[i..]
                     .iter()
@@ -333,10 +441,32 @@ fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
                         style,
                         link,
                         source: from,
+                        math,
                     } = piece
                     else {
                         continue;
                     };
+                    // A formula isn't broken, even if it's wider than a
+                    // line.
+                    if let Some(formula) = math {
+                        if col > 0 && col + text.width() > width {
+                            out.push((std::mem::take(&mut line), source.take()));
+                            col = 0;
+                        }
+                        line.push(Span {
+                            text: text.clone(),
+                            style: *style,
+                            link: link.clone(),
+                            math: Some(Mark {
+                                formula: formula.clone(),
+                                row: 0,
+                            }),
+                        });
+                        source.get_or_insert(*from);
+                        col += text.width();
+                        last = Some((*style, link.clone()));
+                        continue;
+                    }
                     let mut rest = text.as_str();
                     while !rest.is_empty() {
                         if col >= width {
@@ -514,11 +644,20 @@ struct Builder<'a> {
     /// Names the text, for the highlighter's cache.
     name: &'a str,
     code_blocks: usize,
+    /// Lays out math, if it's drawn as images.
+    typesetter: Option<&'a mut Typesetter>,
 }
 
 /// Lays out `text` for a panel `width` columns wide. `name` names it in
-/// the highlighter's cache.
-fn lay_out(text: &str, width: usize, highlighter: &mut ExcerptHighlighter, name: &str) -> Layout {
+/// the highlighter's cache. Math is drawn as images if there's a
+/// `typesetter`, and is text otherwise.
+fn lay_out(
+    text: &str,
+    width: usize,
+    highlighter: &mut ExcerptHighlighter,
+    name: &str,
+    typesetter: Option<&mut Typesetter>,
+) -> Layout {
     let line_starts = std::iter::once(0)
         .chain(text.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
@@ -541,6 +680,7 @@ fn lay_out(text: &str, width: usize, highlighter: &mut ExcerptHighlighter, name:
         highlighter,
         name,
         code_blocks: 0,
+        typesetter,
     };
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
@@ -554,6 +694,9 @@ fn lay_out(text: &str, width: usize, highlighter: &mut ExcerptHighlighter, name:
         builder.event(event, range);
     }
     builder.flush_tight();
+    if let Some(typesetter) = builder.typesetter {
+        typesetter.finish();
+    }
     builder.layout
 }
 
@@ -617,7 +760,7 @@ impl Builder<'_> {
     fn emit(&mut self, spans: Vec<Span>, source: u32) {
         let mut line = self.prefix(true);
         for span in spans {
-            push_span(&mut line, &span.text, span.style, span.link.as_ref());
+            append(&mut line, span);
         }
         self.layout.lines.push(Line {
             spans: line,
@@ -713,6 +856,20 @@ impl Builder<'_> {
         style
     }
 
+    /// `tex` laid out to draw, if math is drawn and it parses.
+    fn formula(&mut self, tex: &str, display: bool, room: usize) -> Option<Rc<Formula>> {
+        self.typesetter.as_mut()?.formula(tex, display, room)
+    }
+
+    /// How math that's text looks: as LaTeX, or as an error where it's
+    /// drawn but this doesn't parse.
+    fn math_style(&self) -> Style {
+        match self.typesetter {
+            Some(_) => Style::ink(Ink::Hue(Hue::Red)),
+            None => Style::capture("text.literal"),
+        }
+    }
+
     fn push_text(&mut self, text: &str, style: Style, source: u32) {
         let link = self.links.last().cloned();
         self.inline().push(text, style, link.as_ref(), source);
@@ -789,11 +946,27 @@ impl Builder<'_> {
                 self.push_text(&text, style, source);
             }
             Event::InlineMath(text) => {
-                let style = merge(self.inline_style(), Style::capture("text.literal"));
+                let room = self.avail();
+                if let Some(formula) = self.formula(&text, false, room) {
+                    let style = self.inline_style();
+                    let link = self.links.last().cloned();
+                    self.inline()
+                        .push_math(formula, style, link.as_ref(), source);
+                    return;
+                }
+                let style = merge(self.inline_style(), self.math_style());
                 self.push_text(&text, style, source);
             }
             Event::DisplayMath(text) => {
-                let style = Style::capture("text.literal");
+                let room = self.avail_wide();
+                if let Some(formula) = self.formula(&text, true, room) {
+                    let inline = self.inline();
+                    inline.pieces.push(Piece::Break);
+                    inline.push_math(formula, Style::TEXT, None, source);
+                    inline.pieces.push(Piece::Break);
+                    return;
+                }
+                let style = self.math_style();
                 self.inline().pieces.push(Piece::Break);
                 for (i, line) in text.trim_matches('\n').split('\n').enumerate() {
                     self.inline().pieces.push(Piece::Break);
@@ -825,6 +998,7 @@ impl Builder<'_> {
                     text: rule,
                     style: Style::ink(Ink::Border),
                     link: None,
+                    math: None,
                 }];
                 self.emit(spans, source);
                 self.gap = true;
@@ -839,6 +1013,7 @@ impl Builder<'_> {
                         text: mark.to_string(),
                         style,
                         link: None,
+                        math: None,
                     }];
                     *width = mark.width();
                 }
@@ -883,6 +1058,7 @@ impl Builder<'_> {
                         text: label.to_string(),
                         style,
                         link: None,
+                        math: None,
                     }];
                     self.emit(spans, source);
                 }
@@ -924,6 +1100,7 @@ impl Builder<'_> {
                         text,
                         style: Style::capture("text.list"),
                         link: None,
+                        math: None,
                     }],
                     width,
                     pending: true,
@@ -938,6 +1115,7 @@ impl Builder<'_> {
                         text,
                         style: Style::capture("text.reference"),
                         link: None,
+                        math: None,
                     }],
                     width,
                     pending: true,
@@ -1031,6 +1209,7 @@ impl Builder<'_> {
                         text: rule.repeat(self.avail()),
                         style: Style::ink(Ink::Border),
                         link: None,
+                        math: None,
                     }];
                     self.emit(spans, source);
                 }
@@ -1142,6 +1321,7 @@ impl Builder<'_> {
                 text: line.to_string(),
                 style,
                 link: None,
+                math: None,
             }];
             for spans in hard_wrap(spans, width) {
                 self.emit(spans, source + i as u32);
@@ -1155,6 +1335,17 @@ impl Builder<'_> {
         let mut text = code.text;
         if text.ends_with('\n') {
             text.pop();
+        }
+        if code.math {
+            let room = self.avail_wide();
+            if let Some(formula) = self.formula(&text, true, room) {
+                let mut inline = Inline::default();
+                inline.push_math(formula, Style::TEXT, None, code.source);
+                for (spans, _) in wrap(&inline.pieces, self.avail()) {
+                    self.emit(spans, code.source);
+                }
+                return;
+            }
         }
         let lines: Vec<&str> = text.split('\n').collect();
         let longest = lines
@@ -1224,6 +1415,7 @@ impl Builder<'_> {
                         text: " ".to_string(),
                         style: plain,
                         link: None,
+                        math: None,
                     },
                 );
                 pad(&mut row, band, plain);
@@ -1309,6 +1501,7 @@ impl Builder<'_> {
                 text,
                 style: border,
                 link: None,
+                math: None,
             }]
         };
         // Rules are from the line before the row after them, so that a
@@ -1345,7 +1538,7 @@ impl Builder<'_> {
                     };
                     push_span(&mut spans, &" ".repeat(1 + before), Style::TEXT, None);
                     for span in content {
-                        push_span(&mut spans, &span.text, span.style, span.link.as_ref());
+                        append(&mut spans, span);
                     }
                     push_span(
                         &mut spans,
@@ -1413,6 +1606,8 @@ struct Laid {
     layout: Layout,
     epoch: u64,
     width: u32,
+    /// The cell size math was laid out for, if it's drawn.
+    cell: Option<(u32, u32)>,
 }
 
 struct Click {
@@ -1426,6 +1621,7 @@ pub struct Reader {
     /// Names the file, for the highlighter's cache.
     name: String,
     highlighter: RefCell<ExcerptHighlighter>,
+    typesetter: RefCell<Option<Typesetter>>,
     laid: RefCell<Option<Laid>>,
     /// The row at the top of the view.
     top: Cell<usize>,
@@ -1450,6 +1646,7 @@ impl Reader {
             buffer,
             name,
             highlighter: RefCell::new(ExcerptHighlighter::new()),
+            typesetter: RefCell::new(None),
             laid: RefCell::new(None),
             top: Cell::new(0),
             pending: Cell::new(Some((top, 0))),
@@ -1484,7 +1681,8 @@ impl Reader {
     fn sync(&self) {
         let epoch = self.buffer.content_epoch();
         let width = self.text_width();
-        let current = matches!(&*self.laid.borrow(), Some(laid) if laid.epoch == epoch && laid.width == width);
+        let cell = math::cell();
+        let current = matches!(&*self.laid.borrow(), Some(laid) if laid.epoch == epoch && laid.width == width && laid.cell == cell);
         if !current {
             let old = self.laid.borrow_mut().take();
             let keep = old.as_ref().map(|old| {
@@ -1492,11 +1690,16 @@ impl Reader {
                 let source = old.layout.source_of(top);
                 (source, top.saturating_sub(old.layout.row_of(source)))
             });
+            let mut typesetter = self.typesetter.borrow_mut();
+            if typesetter.as_ref().map(Typesetter::cell) != cell {
+                *typesetter = cell.map(Typesetter::new);
+            }
             let layout = lay_out(
                 &self.buffer.text(),
                 width as usize,
                 &mut self.highlighter.borrow_mut(),
                 &self.name,
+                typesetter.as_mut(),
             );
             if let Some((source, within)) = keep {
                 let row = layout.row_of(source);
@@ -1510,6 +1713,7 @@ impl Reader {
                 layout,
                 epoch,
                 width,
+                cell,
             });
         }
         if let Some((source, down)) = self.pending.take() {
@@ -1604,10 +1808,18 @@ impl Reader {
         let text = self.with_layout(|layout| {
             let mut out = Vec::new();
             for row in start.0..=end.0.min(layout.lines.len().saturating_sub(1)) {
-                let text = layout.lines[row].text();
+                let line = &layout.lines[row];
+                // Display math's rows after its first copy as nothing.
+                if line
+                    .spans
+                    .iter()
+                    .any(|span| span.math.as_ref().is_some_and(|mark| mark.row > 0))
+                {
+                    continue;
+                }
                 let from = if row == start.0 { start.1 } else { 0 };
                 let to = if row == end.0 { end.1 } else { usize::MAX };
-                out.push(columns(&text, from..to).trim_end().to_string());
+                out.push(line.copy(from..to).trim_end().to_string());
             }
             out.join("\n")
         });
@@ -1743,6 +1955,7 @@ impl Reader {
             return;
         }
         let top = self.top.get();
+        let mut formulas = Vec::new();
         for (i, line) in lines
             .iter()
             .skip(top)
@@ -1786,9 +1999,37 @@ impl Reader {
                     let screen_x = x + margin + from as u32;
                     frame.draw_text(text, screen_x, screen_y, fg, bg, attributes);
                 }
+                // A formula, from its first row, or from the top of the
+                // view if that's above it.
+                if let Some(mark) = span.math.as_ref().filter(|mark| mark.row == 0 || i == 0) {
+                    let at = (
+                        (x + margin) as i32 + col as i32,
+                        screen_y as i32 - mark.row as i32,
+                    );
+                    formulas.push((mark.formula.clone(), at, [fg.r(), fg.g(), fg.b()]));
+                }
                 col += width;
             }
         }
+        // After the text, which would replace the cells of a formula's
+        // rows after its first.
+        frame.with_clip(x, y, self.width, self.height, || {
+            for (formula, (image_x, image_y), fg) in formulas {
+                if let Some(image) = formula.image(fg) {
+                    let (cols, rows) = (formula.cols, formula.rows);
+                    let (cell_w, cell_h) = formula.cell;
+                    frame.draw_image(
+                        &image,
+                        image_x,
+                        image_y,
+                        cols,
+                        rows,
+                        cols * cell_w,
+                        rows * cell_h,
+                    );
+                }
+            }
+        });
     }
 
     pub fn status(&self) -> Status {
@@ -1833,7 +2074,7 @@ mod tests {
 
     fn render(text: &str, width: usize) -> Vec<String> {
         let mut highlighter = ExcerptHighlighter::new();
-        lay_out(text, width, &mut highlighter, "test.md")
+        lay_out(text, width, &mut highlighter, "test.md", None)
             .lines
             .iter()
             .map(|line| line.text().trim_end().to_string())
@@ -1842,7 +2083,7 @@ mod tests {
 
     fn layout(text: &str, width: usize) -> Layout {
         let mut highlighter = ExcerptHighlighter::new();
-        lay_out(text, width, &mut highlighter, "test.md")
+        lay_out(text, width, &mut highlighter, "test.md", None)
     }
 
     #[test]
@@ -2012,6 +2253,117 @@ mod tests {
         assert_eq!(lines, ["costs $5 and x^2 here"]);
         let lines = render("$$\n\\int f\n$$\n", 40);
         assert_eq!(lines, ["\\int f"]);
+    }
+
+    /// Laid out with math drawn, for cells 10 x 20 pixels in size.
+    fn layout_math(text: &str, width: usize) -> Layout {
+        let mut highlighter = ExcerptHighlighter::new();
+        let mut typesetter = Typesetter::new((10, 20));
+        lay_out(
+            text,
+            width,
+            &mut highlighter,
+            "test.md",
+            Some(&mut typesetter),
+        )
+    }
+
+    fn marks(line: &Line) -> Vec<(String, u32)> {
+        line.spans
+            .iter()
+            .filter_map(|span| span.math.as_ref())
+            .map(|mark| (mark.formula.tex.clone(), mark.row))
+            .collect()
+    }
+
+    #[test]
+    fn inline_math_is_a_word_of_its_own_width() {
+        let laid = layout_math("so $x_i^2$, and $y$ too\n", 40);
+        assert_eq!(laid.lines.len(), 1);
+        let line = &laid.lines[0];
+        assert_eq!(
+            marks(line),
+            [("x_i^2".to_string(), 0), ("y".to_string(), 0)]
+        );
+        let span = line.spans.iter().find(|span| span.math.is_some()).unwrap();
+        let formula = &span.math.as_ref().unwrap().formula;
+        assert_eq!(span.text, " ".repeat(formula.cols as usize));
+        // The comma stays with it.
+        assert!(line.text().starts_with(&format!("so {},", span.text)));
+        assert_eq!(line.copy(0..usize::MAX), "so $x_i^2$, and $y$ too");
+    }
+
+    #[test]
+    fn inline_math_wraps_whole() {
+        let laid = layout_math("aaaa bbbb $x + y + z$\n", 12);
+        let rows: Vec<Vec<(String, u32)>> = laid.lines.iter().map(marks).collect();
+        assert_eq!(rows.last().unwrap(), &[("x + y + z".to_string(), 0)]);
+        assert!(rows[..rows.len() - 1].iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn display_math_takes_rows_of_its_own() {
+        let laid = layout_math("Before\n$$\n\\frac{a}{b}\n$$\nafter\n", 40);
+        let lines: Vec<String> = laid
+            .lines
+            .iter()
+            .map(|line| line.text().trim().to_string())
+            .collect();
+        assert_eq!(lines.first().unwrap(), "Before");
+        assert_eq!(lines.last().unwrap(), "after");
+        let rows: Vec<u32> = laid
+            .lines
+            .iter()
+            .flat_map(marks)
+            .map(|(_, row)| row)
+            .collect();
+        assert!(rows.len() >= 2, "{rows:?}");
+        assert_eq!(rows, (0..rows.len() as u32).collect::<Vec<_>>());
+        // Centered.
+        let first = &laid.lines[1];
+        let pad = first.spans[0].text.width();
+        let cols = first.spans[1].text.width();
+        assert!(
+            pad > 0 && pad.abs_diff(40 - pad - cols) <= 1,
+            "{pad} {cols}"
+        );
+        assert_eq!(first.copy(0..usize::MAX).trim(), "$$\\frac{a}{b}$$");
+    }
+
+    #[test]
+    fn math_code_blocks_are_display_math() {
+        let laid = layout_math("```math\nx^2\n```\n", 40);
+        assert!(
+            laid.lines.iter().all(|line| marks(line).len() == 1),
+            "{:?}",
+            laid.lines
+        );
+    }
+
+    #[test]
+    fn math_in_tables_and_quotes() {
+        let laid = layout_math("| a | b |\n|---|---|\n| $x$ | 1 |\n", 40);
+        assert!(laid.lines.iter().any(|line| !marks(line).is_empty()));
+        let laid = layout_math("> $$\n> x\n> $$\n", 40);
+        let row = laid
+            .lines
+            .iter()
+            .find(|line| !marks(line).is_empty())
+            .unwrap();
+        assert!(row.text().starts_with(QUOTE_BAR));
+    }
+
+    #[test]
+    fn math_that_does_not_parse_is_text() {
+        let laid = layout_math("see $\\left( x$ here\n", 40);
+        assert_eq!(laid.lines[0].text(), "see \\left( x here");
+        assert!(laid.lines[0].spans.iter().all(|span| span.math.is_none()));
+        let error = laid.lines[0]
+            .spans
+            .iter()
+            .find(|span| span.text.contains("left"))
+            .unwrap();
+        assert_eq!(error.style.fg, Ink::Hue(Hue::Red));
     }
 
     #[test]

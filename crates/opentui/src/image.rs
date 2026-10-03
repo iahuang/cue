@@ -44,6 +44,38 @@ impl Image {
         })
     }
 
+    /// An image of `width` x `height` pixels, given as rows of RGBA bytes
+    /// (straight alpha), top first.
+    pub fn from_rgba(width: u32, height: u32, pixels: &[u8]) -> Result<Image> {
+        let claim = Claim::acquire()?;
+        let mut handle = sys::INVALID_HANDLE;
+        let status = unsafe {
+            sys::imageCreateFromRgba(
+                pixels.as_ptr(),
+                pixels.len() as u64,
+                width,
+                height,
+                width * 4,
+                &mut handle,
+            )
+        };
+        if status != 0 || handle == sys::INVALID_HANDLE {
+            return Err(Error::Image(status_reason(status)));
+        }
+        let mut info = std::mem::MaybeUninit::<sys::ImageInfo>::zeroed();
+        let status = unsafe { sys::imageGetInfo(handle, info.as_mut_ptr()) };
+        if status != 0 {
+            unsafe { sys::imageDestroy(handle) };
+            return Err(Error::Image(status_reason(status)));
+        }
+        Ok(Image {
+            handle,
+            info: unsafe { info.assume_init() },
+            _claim: claim,
+            _not_send: PhantomData,
+        })
+    }
+
     /// Width in pixels, after orientation.
     pub fn width(&self) -> u32 {
         self.info.width

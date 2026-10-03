@@ -206,6 +206,22 @@ impl Renderer {
         unsafe { sys::resizeRenderer(self.handle, width, height) }
     }
 
+    /// Whether images are drawn as images (Kitty graphics or Sixel) rather
+    /// than as half-block characters, as far as the terminal has answered
+    /// the renderer's queries. Decided as the renderer decides it.
+    pub fn draws_images(&self) -> bool {
+        let mut caps = std::mem::MaybeUninit::<sys::ExternalCapabilities>::zeroed();
+        unsafe { sys::getTerminalCapabilities(self.handle, caps.as_mut_ptr()) };
+        let caps = unsafe { caps.assume_init() };
+        // `Terminal.ImageProtocol`, as OPENTUI_IMAGE_PROTOCOL may set it.
+        match caps.image_protocol {
+            1 | 2 => true,
+            3 => false,
+            // Auto: not in tmux (`Terminal.Multiplexer.tmux`).
+            _ => caps.multiplexer != 1 && (caps.kitty_graphics || caps.sixel),
+        }
+    }
+
     pub fn set_background_color(&mut self, color: Rgba) {
         unsafe { sys::setBackgroundColor(self.handle, color.as_ptr()) }
     }
