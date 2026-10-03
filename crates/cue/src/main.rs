@@ -24,6 +24,7 @@ mod location;
 mod panel;
 mod picker;
 mod pty;
+mod reader;
 mod recovery;
 mod resume;
 mod search;

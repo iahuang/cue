@@ -1,6 +1,6 @@
 a post-agentic terminal code editor
 
-```
+```bash
 curl -fsSL https://s3.ianhuang.dev/cue/install.sh | bash
 ```
 
@@ -16,6 +16,7 @@ curl -fsSL https://s3.ianhuang.dev/cue/install.sh | bash
 - multi panel editing
 - on-keystroke `ripgrep` search
 - terminal buffers
+- markdown reader mode, and a live preview beside the editor
 - resumable sessions including persistent terminals
 - themes
 - customizable keybinds

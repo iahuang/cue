@@ -45,10 +45,11 @@ const BUTTONS: [(HeaderButton, &str); 3] = [
     (HeaderButton::Forward, " > "),
     (HeaderButton::Close, " × "),
 ];
-/// Each header button takes this many columns.
-const BUTTON_WIDTH: u32 = 3;
 /// Headers narrower than this leave the buttons out, for the name.
 const MIN_BUTTONS_WIDTH: u32 = 24;
+/// Headers narrower than this leave out the button that goes to and from
+/// reader mode.
+const MIN_READER_BUTTON_WIDTH: u32 = 32;
 
 /// A button at the right end of a panel's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,8 @@ pub enum HeaderButton {
     Back,
     Forward,
     Close,
+    /// Goes to reader mode, or back to editing, on a Markdown file.
+    Reader,
 }
 
 /// Something a panel showed, to go back or forward to.
@@ -159,6 +162,29 @@ impl Panel {
         let editor = self.editors.get_mut(self.current?)?;
         editor.attach();
         Some(editor)
+    }
+
+    /// Scrolls the editor on screen along with a view of `doc` in the
+    /// other mode (see [`Editor::follow`]), if it shows `doc` in reader
+    /// mode and `reading` is false, or the other way around.
+    pub fn follow(&mut self, doc: &Rc<Document>, reading: bool, anchor: (u32, u32)) {
+        if !self.shows(doc) {
+            return;
+        }
+        let Some(editor) = self.current.and_then(|i| self.editors.get_mut(i)) else {
+            return;
+        };
+        if editor.reading() != reading {
+            editor.follow(anchor);
+            // Moved along, it didn't move of its own accord.
+            editor.moved();
+        }
+    }
+
+    /// A link clicked in the editor on screen, in reader mode, to follow.
+    pub fn take_link(&mut self) -> Option<String> {
+        let editor = self.editors.get_mut(self.current?)?;
+        editor.take_link()
     }
 
     /// The terminal on screen, if any.
@@ -423,11 +449,12 @@ impl Panel {
     }
 
     /// Every editor's document and place in it (see [`Editor::place`]),
-    /// most recently opened last.
-    pub fn places(&self) -> impl Iterator<Item = (&Rc<Document>, (u32, u32, u32))> {
+    /// and in reader mode, the file line at the top (see
+    /// [`Editor::reading_line`]), most recently opened last.
+    pub fn places(&self) -> impl Iterator<Item = (&Rc<Document>, (u32, u32, u32), Option<u32>)> {
         self.editors
             .iter()
-            .map(|editor| (editor.document(), editor.place()))
+            .map(|editor| (editor.document(), editor.place(), editor.reading_line()))
     }
 
     /// What it showed before, most recent last, and went back from.
@@ -547,6 +574,11 @@ impl Panel {
                 return None;
             }
             match self.editor() {
+                // Reader mode has no cursor.
+                Some(editor) if editor.reading() => {
+                    editor.draw(frame, keymap);
+                    None
+                }
                 Some(editor) => Some(editor.draw(frame, keymap)),
                 None => {
                     self.draw_empty(frame, keymap);
@@ -557,28 +589,48 @@ impl Panel {
     }
 
     /// The header's buttons, with the screen column each starts at, if the
-    /// header is wide enough for them.
-    fn buttons(&self) -> impl Iterator<Item = (HeaderButton, &'static str, u32)> {
+    /// header is wide enough for them. A Markdown file's has one to go to
+    /// reader mode, or back to editing, first.
+    fn buttons(&self) -> Vec<(HeaderButton, &'static str, u32)> {
         let area = self.area;
-        let shown = area.width >= MIN_BUTTONS_WIDTH;
-        let start = (area.x + area.width).saturating_sub(BUTTON_WIDTH * BUTTONS.len() as u32);
-        BUTTONS
+        if area.width < MIN_BUTTONS_WIDTH {
+            return Vec::new();
+        }
+        let mut buttons = Vec::new();
+        if let Some(editor) = self.editor().filter(|editor| editor.is_markdown()) {
+            if area.width >= MIN_READER_BUTTON_WIDTH {
+                let label = if editor.reading() { " Edit " } else { " Read " };
+                buttons.push((HeaderButton::Reader, label));
+            }
+        }
+        buttons.extend(BUTTONS);
+        let width: u32 = buttons.iter().map(|(_, label)| label_width(label)).sum();
+        let mut x = (area.x + area.width).saturating_sub(width);
+        buttons
             .into_iter()
-            .filter(move |_| shown)
-            .zip(0..)
-            .map(move |((button, label), i)| (button, label, start + BUTTON_WIDTH * i))
+            .map(|(button, label)| {
+                let start = x;
+                x += label_width(label);
+                (button, label, start)
+            })
+            .collect()
     }
 
     /// The header's columns left of its buttons.
     fn title_width(&self) -> u32 {
-        let buttons = self.buttons().count() as u32 * BUTTON_WIDTH;
+        let buttons: u32 = self
+            .buttons()
+            .iter()
+            .map(|(_, label, _)| label_width(label))
+            .sum();
         self.area.width.saturating_sub(buttons)
     }
 
     /// The header button at screen column `x`, if any.
     pub fn header_button(&self, x: u32) -> Option<HeaderButton> {
         self.buttons()
-            .find(|&(_, _, start)| (start..start + BUTTON_WIDTH).contains(&x))
+            .into_iter()
+            .find(|&(_, label, start)| (start..start + label_width(label)).contains(&x))
             .map(|(button, ..)| button)
     }
 
@@ -742,6 +794,10 @@ fn header_icon(frame: &Buffer, icon: Icon, area: Rect, active: bool) -> u32 {
     let dim = (!active).then(|| theme::colors().muted);
     icon.draw(frame, area.x + 1, area.y, dim);
     icons::WIDTH
+}
+
+fn label_width(label: &str) -> u32 {
+    label.chars().count() as u32
 }
 
 fn truncate_left(s: &str, max: usize) -> String {

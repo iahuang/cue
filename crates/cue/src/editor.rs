@@ -8,8 +8,11 @@
 //!
 //! Over the top right of the text, the find bar (Ctrl+F) finds and replaces
 //! in the file: it highlights every match and selects the current one.
+//!
+//! A Markdown file can be read rather than edited: in reader mode, the
+//! editor shows a [`Reader`] of its text instead.
 
-use std::cell::RefMut;
+use std::cell::{Cell, RefMut};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -32,6 +35,7 @@ use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::Edit;
 use crate::location::Position;
+use crate::reader::{Reader, ReaderEvent};
 use crate::search::Toggle;
 use crate::status::Status;
 use crate::theme;
@@ -74,6 +78,8 @@ pub enum Action {
     /// The file changed on disk while this had unsaved changes: the app
     /// asks whether to overwrite it or take the file's text.
     Conflict,
+    /// A key that edits, pressed in reader mode: the app says how to edit.
+    ReadOnly,
 }
 
 struct Message {
@@ -120,6 +126,13 @@ pub struct Editor {
     height: u32,
     message: Option<Message>,
     find: Option<FindBar>,
+    /// In reader mode, what shows instead of the text.
+    reader: Option<Reader>,
+    /// A link clicked in reader mode, for the app to follow.
+    link: Option<String>,
+    /// The mode, the row at the top, and the text's epoch, when last
+    /// asked whether it moved (see [`Editor::moved`]).
+    seen: Cell<Option<(bool, u32, u64)>>,
 }
 
 impl Editor {
@@ -161,6 +174,9 @@ impl Editor {
             height,
             message: None,
             find: None,
+            reader: None,
+            link: None,
+            seen: Cell::new(None),
         };
         editor.attach();
         Ok(editor)
@@ -229,6 +245,9 @@ impl Editor {
         self.width = width;
         self.height = height;
         self.sync_view_size();
+        if let Some(reader) = &mut self.reader {
+            reader.set_size(width, height);
+        }
     }
 
     /// Fits the view to the text area, which narrows or widens as the line
@@ -280,6 +299,9 @@ impl Editor {
 
     /// The selected text, if anything is selected.
     pub fn selected_text(&self) -> Option<String> {
+        if let Some(reader) = self.reader() {
+            return reader.selected_text();
+        }
         self.view
             .selection()
             .filter(|(s, e)| s != e)
@@ -305,6 +327,9 @@ impl Editor {
             self.view.set_selection(start, end, selection_colors());
         }
         self.reveal(vp);
+        if let Some(reader) = &mut self.reader {
+            reader.scroll_line_to(row, 0);
+        }
     }
 
     /// Puts the cursor at `position`, as a compiler printed it: the line's
@@ -373,8 +398,19 @@ impl Editor {
     }
 
     /// Types a key bound to no command. Keys with Ctrl/Alt/Cmd held never
-    /// type.
-    pub fn type_key(&mut self, key: Key) {
+    /// type. In reader mode, Space pages down, and Shift+Space up.
+    pub fn type_key(&mut self, key: Key) -> Action {
+        if let Some(reader) = self.reader_mut() {
+            return match key.code {
+                KeyCode::Char(' ') if key.mods.is_plain() => {
+                    let page = reader.page();
+                    reader.scroll(if key.mods.shift { -page } else { page });
+                    Action::Continue
+                }
+                KeyCode::Char(_) if key.mods.is_plain() => Action::ReadOnly,
+                _ => Action::Continue,
+            };
+        }
         if let KeyCode::Char(c) = key.code {
             if key.mods.is_plain() {
                 let mut utf8 = [0u8; 4];
@@ -383,6 +419,7 @@ impl Editor {
                 self.sync_find();
             }
         }
+        Action::Continue
     }
 
     /// Runs an editing or find bar command; others are ignored. With
@@ -394,9 +431,54 @@ impl Editor {
         select: bool,
         clipboard: &mut Option<String>,
     ) -> Action {
+        if self.reading() {
+            return self.run_reading(command, clipboard);
+        }
         let action = self.run_command(command, select, clipboard);
         self.sync_find();
         action
+    }
+
+    /// Runs a command in reader mode: keys that move the cursor scroll,
+    /// and those that edit don't.
+    fn run_reading(&mut self, command: Command, clipboard: &mut Option<String>) -> Action {
+        let Some(reader) = self.reader.as_mut() else {
+            return Action::Continue;
+        };
+        match command {
+            Command::ToggleReader => self.set_reading(false),
+            Command::Save => return self.save(),
+            Command::Copy => match reader.selected_text() {
+                Some(text) => return self.copy_text(text, clipboard),
+                None => self.show_message("Nothing selected.", false),
+            },
+            Command::SelectAll => reader.select_all(),
+            Command::ClearSelection => reader.clear_selection(),
+            Command::CursorUp => reader.scroll(-1),
+            Command::CursorDown => reader.scroll(1),
+            Command::CursorPageUp => reader.scroll(-reader.page()),
+            Command::CursorPageDown => reader.scroll(reader.page()),
+            Command::DocumentStart => reader.scroll_to_end(false),
+            Command::DocumentEnd => reader.scroll_to_end(true),
+            Command::Undo
+            | Command::Redo
+            | Command::Cut
+            | Command::Paste
+            | Command::NewLine
+            | Command::InsertTab
+            | Command::Indent
+            | Command::Outdent
+            | Command::DeleteBackward
+            | Command::DeleteForward
+            | Command::DeleteWordBackward
+            | Command::DeleteWordForward
+            | Command::MoveLinesUp
+            | Command::MoveLinesDown
+            | Command::Replace
+            | Command::ReplaceAll => return Action::ReadOnly,
+            _ => {}
+        }
+        Action::Continue
     }
 
     fn run_command(
@@ -432,6 +514,7 @@ impl Editor {
                 }
             }
             Command::ToggleWrap => self.toggle_wrap(),
+            Command::ToggleReader => self.set_reading(true),
             Command::NewLine => self.edit(EditKind::Other, EditBuffer::new_line),
             // With lines selected, Tab indents them, as in most editors.
             Command::InsertTab if self.selection_spans_lines() => self.indent_lines(Forward),
@@ -485,6 +568,17 @@ impl Editor {
     }
 
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) {
+        if let Some(reader) = self.reader_mut() {
+            match reader.handle_mouse(mouse, now) {
+                Some(ReaderEvent::Edit { line, row }) => {
+                    self.reader = None;
+                    self.scroll_line_to(line, row, Some(line));
+                }
+                Some(ReaderEvent::Link(url)) => self.link = Some(url),
+                None => {}
+            }
+            return;
+        }
         let (text_x, text_w, text_h) = self.text_area();
         // A drag that started in the text stays with it.
         let pressed = matches!(mouse.kind, MouseKind::Press(_));
@@ -604,17 +698,25 @@ impl Editor {
         true
     }
 
-    pub fn paste(&mut self, text: &str) {
+    pub fn paste(&mut self, text: &str) -> Action {
+        if self.reading() {
+            return Action::ReadOnly;
+        }
         // Terminals send newlines in pastes as CR.
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         self.edit(EditKind::Other, |eb| eb.insert_text(&text));
         self.sync_find();
+        Action::Continue
     }
 
     /// Draws the editor in its area and returns the terminal cursor
     /// position (0-based column, row). The keymap labels the find bar's
     /// buttons.
     pub fn draw(&self, frame: &Buffer, keymap: &Keymap) -> (u32, u32) {
+        if let Some(reader) = self.reader() {
+            reader.draw(frame, self.x, self.y);
+            return (self.x, self.y);
+        }
         self.sync_view_size();
         self.sync_syntax();
         let (gutter, _, _) = self.text_area();
@@ -997,6 +1099,10 @@ impl Editor {
             self.show_message("Nothing selected.", false);
             return Action::Continue;
         }
+        self.copy_text(text, clipboard)
+    }
+
+    fn copy_text(&mut self, text: String, clipboard: &mut Option<String>) -> Action {
         self.show_message(
             format!("Copied {} characters.", text.chars().count()),
             false,
@@ -1152,19 +1258,23 @@ impl Editor {
             return;
         }
         let vp = self.view.viewport();
-        // The cursor, dragged to the last line, stays the scroll margin
-        // from the top, or the view would scroll back to it.
-        let margin = ((vp.height as f32 * config::get().scroll_margin) as u32).max(1);
-        let max_y = self
-            .view
-            .total_virtual_line_count()
-            .saturating_sub(1 + margin);
-        let y = (vp.y as i64 + dy).clamp(0, max_y as i64) as u32;
+        let y = (vp.y as i64 + dy).clamp(0, self.max_scroll() as i64) as u32;
         let x = (vp.x as i64 + dx).max(0) as u32;
         if (x, y) != (vp.x, vp.y) {
             self.history().break_group();
             self.view.scroll_to(x, y, true);
         }
+    }
+
+    /// How far down the view can scroll, dragging the cursor along: the
+    /// cursor, dragged to the last line, stays the scroll margin from the
+    /// top, or the view would scroll back to it.
+    fn max_scroll(&self) -> u32 {
+        let vp = self.view.viewport();
+        let margin = ((vp.height as f32 * config::get().scroll_margin) as u32).max(1);
+        self.view
+            .total_virtual_line_count()
+            .saturating_sub(1 + margin)
     }
 
     fn has_selection(&self) -> bool {
@@ -1179,6 +1289,8 @@ impl Editor {
     /// focuses it if there's a query; with the replacement focused already,
     /// it hides it.
     pub fn show_find(&mut self, memory: &find::Memory, replacing: bool) {
+        // Find works on the text as written.
+        self.set_reading(false);
         let focus = self.find.as_ref().and_then(|bar| bar.focus);
         match focus {
             Some(Field::Find) if !replacing => return self.close_find(),
@@ -1222,6 +1334,8 @@ impl Editor {
     /// opens with `memory`'s query, keeping focus in the text, or if there's
     /// no query, to type one.
     pub fn find_step(&mut self, memory: &find::Memory, forward: bool) {
+        // Matches are in the text as written.
+        self.set_reading(false);
         if self.find.is_none() {
             if memory.query.text.is_empty() {
                 return self.show_find(memory, false);
@@ -1500,6 +1614,9 @@ impl Editor {
                 error: message.error,
             };
         }
+        if let Some(reader) = self.reader() {
+            return reader.status();
+        }
         // While typing a query that isn't a valid regex, why.
         if let Some(error) = self
             .find
@@ -1577,6 +1694,9 @@ impl Editor {
     /// Toggle Word Wrap may have set it here.
     /// Recolors the selection, in the theme in use.
     pub fn restyle(&mut self) {
+        if let Some(reader) = &mut self.reader {
+            reader.invalidate();
+        }
         let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) else {
             return;
         };
@@ -1608,6 +1728,163 @@ impl Editor {
 
     fn page(&self) -> u32 {
         self.text_area().2.saturating_sub(1).max(1)
+    }
+
+    // --- reader mode -------------------------------------------------------
+
+    /// Whether the file is Markdown, which reader mode is for.
+    pub fn is_markdown(&self) -> bool {
+        self.doc
+            .language
+            .get()
+            .is_some_and(|language| language.name == "Markdown")
+    }
+
+    /// The reader, in reader mode. A file that's no longer Markdown is
+    /// edited.
+    fn reader(&self) -> Option<&Reader> {
+        self.reader.as_ref().filter(|_| self.is_markdown())
+    }
+
+    fn reader_mut(&mut self) -> Option<&mut Reader> {
+        let markdown = self.is_markdown();
+        self.reader.as_mut().filter(|_| markdown)
+    }
+
+    pub fn reading(&self) -> bool {
+        self.reader().is_some()
+    }
+
+    /// Goes to reader mode, or back to editing, keeping the line at the top
+    /// of the view at the top.
+    pub fn set_reading(&mut self, on: bool) {
+        if on == self.reading() {
+            return;
+        }
+        if !on {
+            let top = self.reader.take().map_or(0, |reader| reader.top_line());
+            self.scroll_line_to(top, 0, None);
+            return;
+        }
+        if !self.is_markdown() {
+            self.show_message("Reader mode is for Markdown files.", false);
+            return;
+        }
+        if self.find.is_some() {
+            self.close_find();
+        }
+        self.drag = None;
+        let top = self.view.visible_lines().first().map_or(0, |row| row.line);
+        self.read_from(top);
+    }
+
+    /// Goes to reader mode with file line `top` at the top.
+    pub fn read_from(&mut self, top: u32) {
+        if !self.is_markdown() {
+            return;
+        }
+        let name = self
+            .doc
+            .path()
+            .map_or_else(|| "untitled".to_string(), |path| path.display().to_string());
+        let mut reader = Reader::new(self.buffer.clone(), name, top);
+        reader.set_size(self.width, self.height);
+        self.reader = Some(reader);
+    }
+
+    /// In reader mode, the file line at the top of the view.
+    pub fn reading_line(&self) -> Option<u32> {
+        self.reader().map(Reader::top_line)
+    }
+
+    /// In reader mode, scrolls to the heading with `anchor`.
+    pub fn go_to_anchor(&mut self, anchor: &str) {
+        if let Some(reader) = self.reader_mut() {
+            reader.go_to_anchor(anchor);
+        }
+    }
+
+    /// A link clicked in reader mode, to follow.
+    pub fn take_link(&mut self) -> Option<String> {
+        self.link.take()
+    }
+
+    /// Scrolls the view so that file line `line` is `row` rows down, and
+    /// puts the cursor at the start of line `cursor`, or if that's `None`,
+    /// leaves it where it is if it's in view, or else puts it on `line`.
+    fn scroll_line_to(&mut self, line: u32, row: u32, cursor: Option<u32>) {
+        self.attach();
+        self.anchor = None;
+        self.view.clear_selection();
+        let last = self.buffer.line_count().saturating_sub(1);
+        let line = line.min(last);
+        let top = self.top_for(line, row);
+        let (_, _, height) = self.text_area();
+        let cursor = cursor.or_else(|| {
+            let at = self.view.first_row_of_line(self.cursor().0);
+            (!(top..top + height).contains(&at)).then_some(line)
+        });
+        if let Some(cursor) = cursor {
+            self.buffer.set_cursor(cursor.min(last), 0);
+        }
+        self.view.scroll_to(0, top, false);
+    }
+
+    /// Where it is in its file, for views of it in the other mode to
+    /// scroll along with (see [`Editor::follow`]): a file line, and how
+    /// many rows down the view it is. Editing, that's the cursor's line
+    /// while it's in view; otherwise, the line at the top.
+    pub fn scroll_anchor(&self) -> (u32, u32) {
+        if let Some(reader) = self.reader() {
+            return (reader.top_line(), 0);
+        }
+        let vp = self.view.viewport();
+        if self.doc.cursor_owner.get() == Some(self.id) {
+            let at = self.view.visual_cursor_absolute().row;
+            if (vp.y..vp.y + vp.height).contains(&at) {
+                return (self.buffer.cursor().row, at - vp.y);
+            }
+        }
+        let top = self.view.visible_lines().first().map_or(0, |row| row.line);
+        (top, 0)
+    }
+
+    /// Whether it scrolled, its text changed, or it changed mode, since it
+    /// was last asked.
+    pub fn moved(&self) -> bool {
+        let top = match self.reader() {
+            Some(reader) => reader.top_row(),
+            None => self.view.viewport().y,
+        };
+        let now = (self.reading(), top, self.buffer.content_epoch());
+        self.seen.replace(Some(now)) != Some(now)
+    }
+
+    /// Scrolls along with another view of the file (see
+    /// [`Editor::scroll_anchor`]): file line `line` goes `row` rows down,
+    /// as near as the text allows. Editing, the cursor is dragged along
+    /// into view, as the wheel drags it.
+    pub fn follow(&mut self, (line, row): (u32, u32)) {
+        if let Some(reader) = self.reader_mut() {
+            reader.scroll_line_to(line, row);
+            return;
+        }
+        self.attach();
+        let vp = self.view.viewport();
+        let top = self.top_for(line, row).min(self.max_scroll());
+        if top != vp.y {
+            self.view.scroll_to(vp.x, top, true);
+        }
+    }
+
+    /// The row at the top of the view that puts file line `line` `row`
+    /// rows down.
+    fn top_for(&self, line: u32, row: u32) -> u32 {
+        let max_top = self.view.total_virtual_line_count().saturating_sub(1);
+        self.view
+            .first_row_of_line(line)
+            .saturating_sub(row)
+            .min(max_top)
     }
 }
 

@@ -70,6 +70,8 @@ pub struct Place {
     pub row: u32,
     pub col: u32,
     pub top: u32,
+    /// In reader mode, the file line at the top of the view.
+    pub reading: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -666,6 +668,9 @@ pub fn encode(state: &State) -> String {
                 table.insert("row".into(), int(place.row as u64));
                 table.insert("col".into(), int(place.col as u64));
                 table.insert("top".into(), int(place.top as u64));
+                if let Some(line) = place.reading {
+                    table.insert("reading".into(), int(line as u64));
+                }
                 Value::Table(table)
             });
             table.insert("places".into(), Value::Array(places.collect()));
@@ -828,6 +833,7 @@ pub fn decode(text: &str) -> Option<State> {
                                 row: get_u32(place, "row").unwrap_or(0),
                                 col: get_u32(place, "col").unwrap_or(0),
                                 top: get_u32(place, "top").unwrap_or(0),
+                                reading: get_u32(place, "reading"),
                             })
                         })
                         .collect();
@@ -905,6 +911,7 @@ mod tests {
                             row: 12,
                             col: 4,
                             top: 3,
+                            reading: Some(7),
                         }],
                         back: vec![Shown::Terminal(2), Shown::Image("/w/i.png".into())],
                         forward: vec![Shown::Untitled(1)],

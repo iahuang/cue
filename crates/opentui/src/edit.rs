@@ -771,6 +771,30 @@ impl EditorView<'_> {
             .collect()
     }
 
+    /// The first wrapped row, counting from the top of the document, of
+    /// logical line `line`; past the end, the row count.
+    pub fn first_row_of_line(&self, line: u32) -> u32 {
+        let mut info = sys::ExternalLineInfo {
+            start_cols_ptr: std::ptr::null(),
+            start_cols_len: 0,
+            width_cols_ptr: std::ptr::null(),
+            width_cols_len: 0,
+            sources_ptr: std::ptr::null(),
+            sources_len: 0,
+            wraps_ptr: std::ptr::null(),
+            wraps_len: 0,
+            width_cols_max: 0,
+        };
+        unsafe { sys::editorViewGetLogicalLineInfoDirect(self.handle, &mut info) };
+        let len = info.sources_len as usize;
+        if len == 0 {
+            return 0;
+        }
+        // Each row's logical line, in order, for the whole document.
+        let sources = unsafe { std::slice::from_raw_parts(info.sources_ptr, len) };
+        sources.partition_point(|&source| source < line) as u32
+    }
+
     /// Wrapped lines in the whole document.
     pub fn total_virtual_line_count(&self) -> u32 {
         unsafe { sys::editorViewGetTotalVirtualLineCount(self.handle) }

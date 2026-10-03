@@ -231,7 +231,7 @@ pub fn find_file(path: &str, folders: &[PathBuf]) -> Option<PathBuf> {
 
 /// `%XX` escapes decoded, as in a `file://` URL's path. Invalid ones, and
 /// escapes that don't make UTF-8, are kept as they are.
-fn percent_decode(text: &str) -> String {
+pub fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

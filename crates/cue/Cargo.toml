@@ -66,6 +66,8 @@ tree-sitter-mermaid = { package = "tree-sitter-mermaid-vendored", path = "../../
 trash = "5"
 notify = "8.2.0"
 toml = { version = "1.1.6", features = ["preserve_order"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
 
 
 # musl's allocator is slow under contention (parallel search, file indexing).

@@ -82,6 +82,8 @@ commands! {
     SelectAll => "editor:select-all", "Select All";
     ClearSelection => "editor:clear-selection", "Clear Selection";
     ToggleWrap => "editor:toggle-wrap", "Toggle Word Wrap";
+    ToggleReader => "markdown:toggle-reader", "Toggle Reader Mode";
+    PreviewToSide => "markdown:preview-to-side", "Open Preview to the Side";
     NewLine => "editor:newline", "Insert Line Break";
     InsertTab => "editor:insert-tab", "Insert Tab";
     Indent => "editor:indent", "Indent Lines";
@@ -363,6 +365,8 @@ impl Default for Keymap {
             ('w', ClosePanel),
             // As in browsers.
             ('t', NewTab),
+            // Legacy terminals send it as itself, unlike most Ctrl+Shift keys.
+            ('u', ToggleReader),
         ] {
             bindings.push((key(Char(c), Mods::CTRL), command));
             bindings.push((key(Char(c), SUPER), command));
@@ -871,6 +875,7 @@ mod tests {
             Command::ReloadSettings,
             Command::SelectTheme,
             Command::ToggleWrap,
+            Command::PreviewToSide,
             Command::CloseFile,
             Command::ClearTerminal,
             Command::RenameTerminal,

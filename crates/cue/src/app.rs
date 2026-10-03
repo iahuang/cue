@@ -80,7 +80,7 @@ use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLIC
 use crate::keymap::{Command, Context, Keymap};
 use crate::layout::{self, Axis, Direction, Layout, PanelId, Rect};
 use crate::line_edit::Edit;
-use crate::location::{Position, Target};
+use crate::location::{self, Position, Target};
 use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::recovery::{self, Orphan, Recovery};
@@ -268,6 +268,9 @@ pub struct App {
     /// The terminal prefix (Ctrl+`) was pressed: the next key is a cue
     /// shortcut.
     terminal_prefix: bool,
+    /// The panel the last input went to, if it may not be the active one:
+    /// the wheel scrolls panels without making them active.
+    input_panel: Option<PanelId>,
     /// The terminal last told it has the keyboard.
     focused_terminal: Option<Rc<RefCell<Terminal>>>,
     /// The tabs, in the order the bar lists them. Never empty.
@@ -440,6 +443,7 @@ impl App {
             terminals: Vec::new(),
             next_terminal: 1,
             terminal_prefix: false,
+            input_panel: None,
             focused_terminal: None,
             tabs: vec![Tab::new(0, 0)],
             tab: 0,
@@ -624,7 +628,8 @@ impl App {
             None => {
                 if self.focus == Focus::Editor {
                     if let Some(editor) = self.editor_mut() {
-                        editor.type_key(key);
+                        let action = editor.type_key(key);
+                        return self.editor_action(action);
                     }
                 }
                 AppAction::Continue
@@ -747,6 +752,7 @@ impl App {
             Command::AddFolder => self.show_dialog(Purpose::AddFolder),
             Command::SaveAs => self.show_dialog(Purpose::SaveAs),
             Command::SplitRight => self.split(Axis::Horizontal),
+            Command::PreviewToSide => self.preview_to_side(),
             Command::SplitDown => self.split(Axis::Vertical),
             Command::ClosePanel => self.close_panel(),
             Command::Pop => self.pop(),
@@ -1062,6 +1068,7 @@ impl App {
             }
             MouseTarget::Header(id) => self.drag_header(id, mouse, now),
             MouseTarget::Panel(id) => {
+                self.input_panel = Some(id);
                 if let MouseKind::Press(MouseButton::Left) = mouse.kind {
                     self.activate(id);
                     // As Cmd+click in terminals on macOS, which terminals
@@ -1072,8 +1079,12 @@ impl App {
                     }
                 }
                 // The wheel scrolls any panel; the rest goes to the active one.
-                if let Some(panel) = self.tab_mut().panel_mut(id) {
+                let link = self.tab_mut().panel_mut(id).and_then(|panel| {
                     panel.handle_mouse(mouse, now);
+                    panel.take_link()
+                });
+                if let Some(link) = link {
+                    self.follow_link(&link);
                 }
                 self.note_find_memory();
             }
@@ -1185,6 +1196,9 @@ impl App {
                         HeaderButton::Back => self.go_history(true),
                         HeaderButton::Forward => self.go_history(false),
                         HeaderButton::Close => self.close_panel(),
+                        HeaderButton::Reader => {
+                            self.run(Command::ToggleReader, false);
+                        }
                     }
                     return;
                 }
@@ -1318,8 +1332,8 @@ impl App {
             input.edit(Edit::Insert(line));
             self.note_find_memory();
         } else if self.focus == Focus::Editor {
-            if let Some(editor) = self.editor_mut() {
-                editor.paste(text);
+            if let Some(action) = self.editor_mut().map(|editor| editor.paste(text)) {
+                self.editor_action(action);
             }
             self.keep_if_edited();
         }
@@ -1336,6 +1350,7 @@ impl App {
         for doc in &self.documents {
             doc.follow_edits();
         }
+        self.sync_scroll();
         self.editor_mut();
         self.note_terminal_focus();
         self.watch_folders();
@@ -1587,6 +1602,80 @@ impl App {
         tab.panels.push(Panel::new(id));
         self.layout();
         self.activate(id);
+    }
+
+    /// Shows the Markdown file on screen in reader mode in a new panel to
+    /// the right, which scrolls along with it, and keeps the keyboard here,
+    /// editing. A panel on screen reading it already will do instead.
+    fn preview_to_side(&mut self) {
+        let Some(editor) = self.editor() else {
+            self.show_message("Open a Markdown file to preview it.", false);
+            return;
+        };
+        if !editor.is_markdown() {
+            self.show_message("Previews are for Markdown files.", false);
+            return;
+        }
+        let doc = editor.document().clone();
+        let here = self.tab().active;
+        let Some(anchor) = self.editor_mut().map(|editor| {
+            editor.set_reading(false);
+            editor.scroll_anchor()
+        }) else {
+            return;
+        };
+        let shown = self.tab().panels.iter().any(|panel| {
+            panel.id != here && panel.shows(&doc) && panel.editor().is_some_and(Editor::reading)
+        });
+        if !shown {
+            self.split(Axis::Horizontal);
+            if self.tab().active == here {
+                // There wasn't room.
+                return;
+            }
+            if let Err(err) = self.active_panel_mut().show(&doc) {
+                self.show_message(format!("Can't show a preview: {err}"), true);
+                self.activate(here);
+                return;
+            }
+            if let Some(editor) = self.editor_mut() {
+                editor.read_from(0);
+                editor.follow(anchor);
+            }
+            self.activate(here);
+            return;
+        }
+        for panel in &mut self.tab_mut().panels {
+            if panel.id != here {
+                panel.follow(&doc, false, anchor);
+            }
+        }
+    }
+
+    /// Scrolls views of a Markdown file in one mode along with the view of
+    /// it in the other mode that the last input went to, so that an editor
+    /// and a reader of it side by side keep to the same place. Views in
+    /// the same mode are left alone, to show different places.
+    fn sync_scroll(&mut self) {
+        let leader = self.input_panel.take().unwrap_or(self.tab().active);
+        let tab = &mut self.tabs[self.tab];
+        // Moving the cursor around doesn't move the others; scrolling,
+        // editing, and switching modes do.
+        let Some(editor) = tab
+            .panels
+            .iter()
+            .find(|panel| panel.id == leader)
+            .and_then(Panel::editor)
+            .filter(|editor| editor.is_markdown() && editor.moved())
+        else {
+            return;
+        };
+        let doc = editor.document().clone();
+        let reading = editor.reading();
+        let anchor = editor.scroll_anchor();
+        for panel in tab.panels.iter_mut().filter(|panel| panel.id != leader) {
+            panel.follow(&doc, reading, anchor);
+        }
     }
 
     /// Closes the active panel and what it shows (see
@@ -3269,12 +3358,13 @@ impl App {
                             shows: panel.visit().as_ref().and_then(visit_shown),
                             places: panel
                                 .places()
-                                .filter_map(|(doc, (row, col, top))| {
+                                .filter_map(|(doc, (row, col, top), reading)| {
                                     Some(session::Place {
                                         doc: doc_shown(doc)?,
                                         row,
                                         col,
                                         top,
+                                        reading,
                                     })
                                 })
                                 .collect(),
@@ -3493,6 +3583,9 @@ impl App {
                     if panel.show(&doc).is_ok() {
                         if let Some(editor) = panel.editor_mut() {
                             editor.set_place(place.row, place.col, place.top);
+                            if let Some(line) = place.reading {
+                                editor.read_from(line);
+                            }
                         }
                     }
                 }
@@ -3804,6 +3897,14 @@ impl App {
                 if let Some(doc) = self.active_panel().document().cloned() {
                     self.ask_overwrite(doc, None);
                 }
+                AppAction::Continue
+            }
+            Action::ReadOnly => {
+                let how = match self.keymap.shortcut(Command::ToggleReader) {
+                    Some(key) => format!("double-click or press {key}"),
+                    None => "double-click, or click Edit above,".to_string(),
+                };
+                self.show_message(format!("This is reader mode: {how} to edit."), false);
                 AppAction::Continue
             }
         }
@@ -4226,6 +4327,58 @@ impl App {
             // Waited for, so it doesn't linger as a zombie.
             Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
             Err(err) => self.show_message(format!("Can't show {}: {err}", file_name(path)), true),
+        }
+    }
+
+    /// Follows a link clicked in reader mode: a web page opens in the
+    /// browser, and a file in the panel, a Markdown one in reader mode at
+    /// the heading the link names, if any.
+    fn follow_link(&mut self, link: &str) {
+        let scheme = link
+            .split_once(':')
+            .is_some_and(|(scheme, _)| scheme.len() > 1 && !scheme.contains('/'));
+        if scheme && !link.starts_with("file:") {
+            self.open_url(link);
+            return;
+        }
+        let link = link.strip_prefix("file://").unwrap_or(link);
+        let (path, anchor) = match link.split_once('#') {
+            Some((path, anchor)) => (path, Some(anchor)),
+            None => (link, None),
+        };
+        let path = location::percent_decode(path);
+        let base = match self.active_panel().path() {
+            Some(file) => file.parent().map(Path::to_path_buf),
+            None => None,
+        }
+        .unwrap_or_else(|| self.current_root());
+        // A path from `/` is from the workspace's folder, as on GitHub,
+        // unless it's a file there.
+        let target = match path.strip_prefix('/') {
+            Some(rest) if !Path::new(&path).exists() => self.current_root().join(rest),
+            _ => base.join(&path),
+        };
+        if !target.exists() {
+            self.show_message(format!("Can't find {path}."), true);
+            return;
+        }
+        if target.is_dir() {
+            self.tree_visible = true;
+            self.layout();
+            self.tree.reveal(&target);
+            return;
+        }
+        if !self.open(&target, false) {
+            return;
+        }
+        self.focus = Focus::Editor;
+        if let Some(editor) = self.editor_mut().filter(|editor| editor.is_markdown()) {
+            if !editor.reading() {
+                editor.read_from(0);
+            }
+            if let Some(anchor) = anchor {
+                editor.go_to_anchor(anchor);
+            }
         }
     }
 
@@ -8319,5 +8472,308 @@ mod tests {
             fs::read_to_string(dir.join("docs/backup.txt")).unwrap(),
             "xalpha"
         );
+    }
+
+    /// Where `text` is on screen, as (column, row), if it's there.
+    fn find_on_screen(app: &App, text: &str) -> Option<(u32, u32)> {
+        screen(app).lines().enumerate().find_map(|(y, line)| {
+            let byte = line.find(text)?;
+            Some((line[..byte].chars().count() as u32, y as u32))
+        })
+    }
+
+    fn status_message(app: &App) -> Option<String> {
+        match app.active_panel().status() {
+            status::Status::Message { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn reader_mode_shows_markdown_as_it_reads_and_cant_be_typed_in() {
+        let _serial = crate::test_serial();
+        let text = "# Title\n\nSome **bold** text.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let root = fixture("reader-mode", &[("doc.md", text), ("a.txt", "a")]);
+        let mut app = app(&root, Some("doc.md"));
+        assert!(screen(&app).contains(" Read "), "{}", screen(&app));
+        app.run(Command::ToggleReader, false);
+        assert!(app.ed().reading());
+        let shown = screen(&app);
+        assert!(shown.contains("Some bold text."), "{shown}");
+        assert!(shown.contains("┌───┬───┐"), "{shown}");
+        assert!(
+            !shown.contains("**") && !shown.contains("# Title"),
+            "{shown}"
+        );
+        assert!(shown.contains(" Edit "), "{shown}");
+
+        // Typing, pasting, and deleting say how to edit, and don't.
+        key(&mut app, KeyCode::Char('x'));
+        let message = status_message(&app).unwrap_or_default();
+        assert!(
+            message.contains("reader mode") && message.contains("Ctrl+U"),
+            "{message:?}"
+        );
+        app.paste("pasted");
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.ed().document().text(), text);
+
+        // Back to editing, the markup shows.
+        ctrl(&mut app, 'u');
+        assert!(!app.ed().reading());
+        assert!(screen(&app).contains("# Title"));
+        // Find and Find Next work on the text as written.
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, 'f');
+        assert!(!app.ed().reading());
+        type_text(&mut app, "bold");
+        key(&mut app, KeyCode::Esc);
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, 'g');
+        assert!(!app.ed().reading());
+        assert_eq!(app.ed().selected_text().as_deref(), Some("bold"));
+        // Other files have no reader mode.
+        app.open(&root.join("a.txt"), false);
+        assert!(!screen(&app).contains(" Read "));
+        app.run(Command::ToggleReader, false);
+        assert!(!app.ed().reading());
+    }
+
+    #[test]
+    fn reader_mode_keeps_the_line_at_the_top_both_ways() {
+        let _serial = crate::test_serial();
+        let text: String = (0..60).map(|i| format!("para {i}\n\n")).collect();
+        let root = fixture("reader-top", &[("doc.md", &text)]);
+        let mut app = app(&root, Some("doc.md"));
+        // Paragraph 10 is on line 20, and the cursor clear of the edges.
+        app.ed_mut().set_place(23, 0, 20);
+        app.run(Command::ToggleReader, false);
+        assert_eq!(app.ed().reading_line(), Some(20));
+        let body = app.active_panel().body();
+        assert_eq!(
+            find_on_screen(&app, "para 10").map(|(_, y)| y),
+            Some(body.y)
+        );
+        // Two rows down is the next paragraph.
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.ed().reading_line(), Some(22));
+        app.run(Command::ToggleReader, false);
+        let (row, _, top) = app.ed().place();
+        assert_eq!(top, 22, "the line at the top");
+        // The cursor, still in view, stays put.
+        assert_eq!(row, 23, "the cursor's row");
+        assert_eq!(
+            find_on_screen(&app, "para 11").map(|(_, y)| y),
+            Some(body.y)
+        );
+    }
+
+    #[test]
+    fn double_clicking_in_reader_mode_edits_the_line_there() {
+        let _serial = crate::test_serial();
+        let text: String = (0..30).map(|i| format!("para {i}\n\n")).collect();
+        let root = fixture("reader-edit", &[("doc.md", &text)]);
+        let mut app = app(&root, Some("doc.md"));
+        app.run(Command::ToggleReader, false);
+        app.run(Command::CursorPageDown, false);
+        app.run(Command::CursorPageDown, false);
+        let (x, y) = find_on_screen(&app, "para 8").unwrap();
+        left_click(&mut app, x, y);
+        left_click(&mut app, x, y);
+        assert!(!app.ed().reading());
+        assert_eq!(app.ed().place().0, 16, "the cursor's row");
+        // The line stays where it was on screen.
+        assert_eq!(find_on_screen(&app, "para 8").map(|(_, row)| row), Some(y));
+    }
+
+    #[test]
+    fn links_in_reader_mode_open_files_at_their_headings() {
+        let _serial = crate::test_serial();
+        let other: String = std::iter::once("# One\n\n".to_string())
+            .chain((0..20).map(|i| format!("filler {i}\n\n")))
+            .chain(std::iter::once("## Part Two\n\n".to_string()))
+            .chain((0..20).map(|i| format!("more {i}\n\n")))
+            .collect();
+        let root = fixture(
+            "reader-links",
+            &[
+                (
+                    "doc.md",
+                    "see [the other](sub/other%20file.md#part-two) one\n",
+                ),
+                ("sub/other file.md", &other),
+            ],
+        );
+        let mut app = app(&root, Some("doc.md"));
+        app.run(Command::ToggleReader, false);
+        let (x, y) = find_on_screen(&app, "the other").unwrap();
+        // Clicking elsewhere doesn't.
+        left_click(&mut app, x - 2, y);
+        assert_eq!(shown_name(&app).as_deref(), Some("doc.md"));
+        left_click(&mut app, x + 1, y);
+        assert_eq!(shown_name(&app).as_deref(), Some("other file.md"));
+        assert!(app.ed().reading());
+        let body = app.active_panel().body();
+        assert_eq!(
+            find_on_screen(&app, "Part Two").map(|(_, y)| y),
+            Some(body.y)
+        );
+        // Back goes to the file with the link, still in reader mode.
+        app.run(Command::GoBack, false);
+        assert_eq!(shown_name(&app).as_deref(), Some("doc.md"));
+        assert!(app.ed().reading());
+        // A link to nowhere says so.
+        fs::write(root.join("doc.md"), "[gone](missing.md)\n").unwrap();
+        app.ed().document().revert().unwrap();
+        let (x, y) = find_on_screen(&app, "gone").unwrap();
+        left_click(&mut app, x, y);
+        assert_eq!(shown_name(&app).as_deref(), Some("doc.md"));
+        let message = status_message(&app).unwrap_or_default();
+        assert!(message.contains("Can't find missing.md"), "{message:?}");
+    }
+
+    #[test]
+    fn reader_mode_follows_edits_from_other_panels() {
+        let _serial = crate::test_serial();
+        let root = fixture("reader-live", &[("doc.md", "# Title\n\nbody\n")]);
+        let mut app = app(&root, Some("doc.md"));
+        app.run(Command::SplitRight, false);
+        app.open(&root.join("doc.md"), false);
+        app.run(Command::ToggleReader, false);
+        app.run(Command::FocusPanelLeft, false);
+        assert!(!app.ed().reading(), "each panel has its own mode");
+        app.run(Command::DocumentEnd, false);
+        type_text(&mut app, "- new item");
+        assert!(screen(&app).contains("• new item"), "{}", screen(&app));
+    }
+
+    #[test]
+    fn header_button_switches_reader_mode() {
+        let _serial = crate::test_serial();
+        let root = fixture("reader-button", &[("doc.md", "# Title\n")]);
+        let mut app = app(&root, Some("doc.md"));
+        let (x, y) = find_on_screen(&app, " Read ").unwrap();
+        left_click(&mut app, x + 1, y);
+        assert!(app.ed().reading());
+        let (x, y) = find_on_screen(&app, " Edit ").unwrap();
+        left_click(&mut app, x + 1, y);
+        assert!(!app.ed().reading());
+    }
+
+    fn screen_of(app: &App, width: u32, height: u32) -> String {
+        let frame = OwnedBuffer::new(width, height, false, WidthMethod::Unicode, "test").unwrap();
+        app.draw(&frame);
+        frame.to_text(true)
+    }
+
+    /// The rows `text` is on in the active panel and the other one, of two
+    /// side by side, 120 x 20.
+    fn level(app: &App, text: &str) -> (Option<u32>, Option<u32>) {
+        let split = other_panel(app).area().x as usize;
+        let screen = screen_of(app, 120, 20);
+        let find = |right: bool| {
+            screen.lines().enumerate().find_map(|(y, line)| {
+                let cut: String = match right {
+                    false => line.chars().take(split).collect(),
+                    true => line.chars().skip(split).collect(),
+                };
+                cut.contains(text).then_some(y as u32)
+            })
+        };
+        (find(false), find(true))
+    }
+
+    /// The panel other than the active one, of two.
+    fn other_panel(app: &App) -> &Panel {
+        let tab = app.tab();
+        tab.panels
+            .iter()
+            .find(|panel| panel.id != tab.active)
+            .unwrap()
+    }
+
+    #[test]
+    fn preview_to_the_side_reads_beside_the_editor_and_scrolls_with_it() {
+        let _serial = crate::test_serial();
+        let text: String = (0..80).map(|i| format!("para {i}\n\n")).collect();
+        let root = fixture("preview-side", &[("doc.md", &text), ("a.txt", "a")]);
+        let mut app = app(&root, Some("doc.md"));
+        app.resize(120, 20);
+        app.ed_mut().set_place(23, 0, 20);
+        app.run(Command::PreviewToSide, false);
+        assert_eq!(app.tab().panels.len(), 2);
+        // The keyboard stays with the editor, on the left.
+        assert!(!app.ed().reading());
+        let preview = other_panel(&app).editor().unwrap();
+        assert!(preview.reading());
+        assert!(other_panel(&app).area().x > app.active_panel().area().x);
+        // The cursor's line is level in both.
+        let (left, right) = level(&app, "para 11 ");
+        assert!(
+            left.is_some() && left == right,
+            "{}",
+            screen_of(&app, 120, 20)
+        );
+
+        // Paging the editor down pages the preview.
+        key(&mut app, KeyCode::PageDown);
+        let line = app.ed().place().0;
+        let shown = format!("para {} ", line / 2);
+        let (left, right) = level(&app, &shown);
+        assert!(
+            left.is_some() && left == right,
+            "{shown:?} {}",
+            screen_of(&app, 120, 20)
+        );
+
+        // Moving the cursor without scrolling leaves the preview be.
+        let before = other_panel(&app).editor().unwrap().reading_line();
+        key(&mut app, KeyCode::Up);
+        assert_eq!(other_panel(&app).editor().unwrap().reading_line(), before);
+
+        // The wheel over the preview scrolls the editor along.
+        let area = other_panel(&app).body();
+        for _ in 0..4 {
+            app.handle_mouse(
+                Mouse {
+                    kind: MouseKind::ScrollDown,
+                    x: area.x + 5,
+                    y: area.y + 2,
+                    mods: Mods::NONE,
+                },
+                Instant::now(),
+            );
+        }
+        let top = other_panel(&app).editor().unwrap().reading_line().unwrap();
+        assert!(top > before.unwrap());
+        let editor_top = app.ed().scroll_anchor();
+        assert!(
+            app.ed().place().2 >= top.saturating_sub(1),
+            "{editor_top:?} {top}"
+        );
+
+        // Asked again, the preview on screen will do.
+        app.run(Command::PreviewToSide, false);
+        assert_eq!(app.tab().panels.len(), 2);
+        // Other files have no preview.
+        app.open(&root.join("a.txt"), false);
+        app.run(Command::PreviewToSide, false);
+        assert_eq!(app.tab().panels.len(), 2);
+    }
+
+    #[test]
+    fn two_editors_of_a_file_scroll_apart() {
+        let _serial = crate::test_serial();
+        let text: String = (0..80).map(|i| format!("para {i}\n\n")).collect();
+        let root = fixture("preview-apart", &[("doc.md", &text)]);
+        let mut app = app(&root, Some("doc.md"));
+        app.resize(120, 20);
+        app.run(Command::SplitRight, false);
+        app.open(&root.join("doc.md"), false);
+        let before = other_panel(&app).editor().unwrap().place().2;
+        key(&mut app, KeyCode::PageDown);
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(other_panel(&app).editor().unwrap().place().2, before);
     }
 }
