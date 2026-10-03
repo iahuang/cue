@@ -3073,11 +3073,6 @@ impl App {
         }
     }
 
-    /// The workspace's folders.
-    pub fn roots(&self) -> &[PathBuf] {
-        self.workspace.roots()
-    }
-
     /// The programs running in terminals, by name.
     pub fn running_programs(&self) -> Vec<String> {
         running_programs(&self.terminals)

@@ -158,12 +158,7 @@ pub fn draw(
             // In a terminal, those keys are the shell's.
             let hints: &[(Command, &str)] = match status {
                 Status::Terminal(_) => &[(Command::TerminalPrefix, "cue keys")],
-                _ => &[
-                    (Command::Save, "save"),
-                    (Command::FocusTree, "files"),
-                    (Command::Palette, "commands"),
-                    (Command::Quit, "quit"),
-                ],
+                _ => &[(Command::Palette, "commands"), (Command::Quit, "quit")],
             };
             let hints: String = hints
                 .iter()

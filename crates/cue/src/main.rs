@@ -459,11 +459,6 @@ fn background_sessions(app: &App) -> Option<String> {
 
 /// What the client that detached says about how to come back.
 fn detached(app: &App) -> String {
-    let folder = app
-        .roots()
-        .first()
-        .map(|root| client::tilde(root))
-        .unwrap_or_default();
     let running = app.running_programs();
     let with = match running.as_slice() {
         [] => String::new(),
