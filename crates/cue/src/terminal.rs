@@ -753,8 +753,8 @@ impl Terminal {
             bar.origin = bottom;
         }
         bar.focus = Some(Field::Find);
-        // Typing replaces the query, as if it were selected.
-        bar.replace_query = !bar.memory.query.text.is_empty();
+        // Typing replaces the query.
+        bar.select_query();
         self.sync_find();
     }
 
@@ -822,6 +822,25 @@ impl Terminal {
             find.bar.edit(edit);
         }
         self.sync_find();
+    }
+
+    /// Edits the query with Shift held: moving the cursor selects.
+    pub fn find_edit_selecting(&mut self, edit: Edit) {
+        if let Some(find) = &mut self.find {
+            find.bar.edit_selecting(edit);
+        }
+    }
+
+    /// Selects all of the query.
+    pub fn find_select_all(&mut self) {
+        if let Some(find) = &mut self.find {
+            find.bar.select_all();
+        }
+    }
+
+    /// The part of the query selected.
+    pub fn find_selected_text(&self) -> Option<&str> {
+        self.find.as_ref()?.bar.selected_text()
     }
 
     pub fn find_toggle(&mut self, toggle: Toggle) {
@@ -928,7 +947,8 @@ impl Terminal {
     }
 
     /// A mouse event on the find bar, which it handles; returns false if
-    /// it's elsewhere. A press elsewhere gives the program the keyboard.
+    /// it's elsewhere. A press elsewhere gives the program the keyboard. A
+    /// drag from the query selects in it, wherever it goes.
     fn handle_find_mouse(&mut self, mouse: Mouse) -> bool {
         let (x, width) = self.find_area();
         let area = self.area;
@@ -936,6 +956,19 @@ impl Terminal {
         let Some(find) = &mut self.find else {
             return false;
         };
+        if find.bar.pressed() {
+            match mouse.kind {
+                MouseKind::Drag(_) => {
+                    find.bar.drag(mouse.x);
+                    return true;
+                }
+                MouseKind::Release(_) => {
+                    find.bar.release();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         let inside = (x..x + width).contains(&mouse.x)
             && (area.y..area.y + find.bar.rows()).contains(&mouse.y);
         let press = matches!(mouse.kind, MouseKind::Press(_));
@@ -955,7 +988,7 @@ impl Terminal {
             _ => return true,
         }
         match find.bar.target(mouse.x, mouse.y - area.y) {
-            find::Target::Field(_) => find.bar.focus = Some(Field::Find),
+            find::Target::Field(_) => find.bar.press(Field::Find, mouse.x, Instant::now()),
             find::Target::Toggle(toggle) => self.find_toggle(toggle),
             find::Target::Close => self.close_find(),
             find::Target::Expander | find::Target::Replace | find::Target::ReplaceAll => {}

@@ -35,7 +35,7 @@ use crate::file_index::FileIndex;
 use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Context, Keymap};
-use crate::line_edit::{Caret, Edit};
+use crate::line_edit::{self, Caret, Edit};
 use crate::location::{self, Position};
 use crate::symbols::{self, Symbol};
 use crate::theme::{self, SyntaxColor, ThemeId};
@@ -866,7 +866,7 @@ impl Picker {
         let room = width.saturating_sub(4) as usize;
         let (shown, column) = self.caret.view(&self.query, room);
         let shown_width = shown.chars().count();
-        draw_selection(frame, &self.caret, &self.query, text_x, y + 1, room);
+        line_edit::draw_selection(frame, &self.caret, &self.query, text_x, y + 1, room);
         frame.draw_text(&shown, text_x, y + 1, colors.text, None, Attributes::NONE);
         let cursor = (text_x + column as u32, y + 1);
         if self.needle().is_empty() {
@@ -1135,19 +1135,6 @@ pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
 }
 
 /// Draws `status` into the right of a popup's bottom border.
-/// Shades the part of a field's `text` selected, under where it's drawn
-/// from `x`, in `room` columns.
-pub fn draw_selection(frame: &Buffer, caret: &Caret, text: &str, x: u32, y: u32, room: usize) {
-    if let Some(columns) = caret.selected_columns(text) {
-        let end = columns.end.min(room);
-        if columns.start < end {
-            let width = (end - columns.start) as u32;
-            let x = x + columns.start as u32;
-            frame.fill_rect(x, y, width, 1, theme::colors().selection);
-        }
-    }
-}
-
 pub fn draw_status(frame: &Buffer, area: Area, status: &str) {
     let colors = theme::colors();
     let x = (area.x + area.width).saturating_sub(status.chars().count() as u32 + 2);

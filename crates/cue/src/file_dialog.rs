@@ -38,7 +38,7 @@ use crate::document;
 use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
-use crate::line_edit::{Caret, Edit};
+use crate::line_edit::{self, Caret, Edit};
 use crate::picker::{self, Area};
 use crate::theme;
 use crate::tree;
@@ -756,7 +756,7 @@ impl FileDialog {
             Attributes::NONE,
         );
         let name_x = text_x + dir_part.chars().count() as u32;
-        picker::draw_selection(frame, &self.caret, &self.text, text_x, y + 1, room);
+        line_edit::draw_selection(frame, &self.caret, &self.text, text_x, y + 1, room);
         let name_bg = self.name_selected.then_some(colors.selected);
         frame.draw_text(
             &name_part,

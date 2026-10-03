@@ -356,21 +356,17 @@ pub struct App {
     attached: bool,
 }
 
-/// A popup's query line, which typing, pasting, and the editor's cursor
-/// keys edit.
+/// A popup's query line, or a find bar's focused field, which typing,
+/// pasting, and the editor's cursor and selection keys edit.
 trait QueryInput {
     fn edit(&mut self, edit: Edit);
 
-    /// An edit with Shift held, which selects where the field can.
-    fn edit_selecting(&mut self, edit: Edit) {
-        self.edit(edit);
-    }
+    /// An edit with Shift held: moving the cursor selects.
+    fn edit_selecting(&mut self, edit: Edit);
 
-    fn select_all(&mut self) {}
+    fn select_all(&mut self);
 
-    fn selected_text(&self) -> Option<&str> {
-        None
-    }
+    fn selected_text(&self) -> Option<&str>;
 }
 
 impl QueryInput for Picker {
@@ -396,11 +392,54 @@ impl QueryInput for Editor {
     fn edit(&mut self, edit: Edit) {
         self.find_edit(edit);
     }
+
+    fn edit_selecting(&mut self, edit: Edit) {
+        self.find_edit_selecting(edit);
+    }
+
+    fn select_all(&mut self) {
+        self.find_select_all();
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        self.find_selected_text()
+    }
+}
+
+/// The find bar's query.
+impl QueryInput for Terminal {
+    fn edit(&mut self, edit: Edit) {
+        self.find_edit(edit);
+    }
+
+    fn edit_selecting(&mut self, edit: Edit) {
+        self.find_edit_selecting(edit);
+    }
+
+    fn select_all(&mut self) {
+        self.find_select_all();
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        self.find_selected_text()
+    }
 }
 
 impl QueryInput for SearchModal {
     fn edit(&mut self, edit: Edit) {
         SearchModal::edit(self, edit);
+    }
+
+    fn edit_selecting(&mut self, edit: Edit) {
+        SearchModal::edit_selecting(self, edit);
+    }
+
+    fn select_all(&mut self) {
+        SearchModal::select_all(self);
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        SearchModal::selected_text(self)
     }
 }
 
@@ -698,31 +737,41 @@ impl App {
             .map(|editor| editor as &mut dyn QueryInput)
     }
 
+    /// Runs `f` on the query with the keyboard: a terminal's find bar, or
+    /// [`App::query_input`]'s.
+    fn with_query_input<R>(&mut self, f: impl FnOnce(&mut dyn QueryInput) -> R) -> Option<R> {
+        if let Some(terminal) = self.finding_terminal() {
+            let mut terminal = terminal.borrow_mut();
+            return Some(f(&mut *terminal));
+        }
+        self.query_input().map(f)
+    }
+
     /// A key for a popup's query: typing, or the editor's keys for moving
     /// the cursor, selecting, deleting, and the clipboard.
     fn edit_query(&mut self, key: Key) -> AppAction {
         let binding = self.keymap.lookup(key, Context::Editor);
         let (command, select) = binding.unzip();
-        if self.finding_terminal().is_none() {
-            if let Some(input) = self.query_input() {
-                match command {
-                    Some(Command::SelectAll) => {
-                        input.select_all();
-                        return AppAction::Continue;
-                    }
-                    Some(command @ (Command::Copy | Command::Cut)) => {
-                        let Some(text) = input.selected_text().map(str::to_string) else {
-                            return AppAction::Continue;
-                        };
-                        if command == Command::Cut {
-                            input.edit(Edit::DeleteBackward);
-                        }
-                        self.clipboard = Some(text.clone());
-                        return AppAction::Copy(text);
-                    }
-                    _ => {}
-                }
+        match command {
+            Some(Command::SelectAll) => {
+                self.with_query_input(|input| input.select_all());
+                return AppAction::Continue;
             }
+            Some(command @ (Command::Copy | Command::Cut)) => {
+                let text = self.with_query_input(|input| {
+                    let text = input.selected_text()?.to_string();
+                    if command == Command::Cut {
+                        input.edit(Edit::DeleteBackward);
+                    }
+                    Some(text)
+                });
+                let Some(text) = text.flatten() else {
+                    return AppAction::Continue;
+                };
+                self.clipboard = Some(text.clone());
+                return AppAction::Copy(text);
+            }
+            _ => {}
         }
         let clipboard = self.clipboard.clone();
         let mut buf = [0; 4];
@@ -747,14 +796,10 @@ impl App {
                 _ => return AppAction::Continue,
             },
         };
-        if let Some(terminal) = self.finding_terminal() {
-            terminal.borrow_mut().find_edit(edit);
-        } else if let Some(input) = self.query_input() {
-            match select {
-                Some(true) => input.edit_selecting(edit),
-                _ => input.edit(edit),
-            }
-        }
+        self.with_query_input(|input| match select {
+            Some(true) => input.edit_selecting(edit),
+            _ => input.edit(edit),
+        });
         AppAction::Continue
     }
 
@@ -1028,7 +1073,7 @@ impl App {
             self.menu = None;
         }
         if let Some(search) = &mut self.search {
-            let action = search.handle_mouse(mouse);
+            let action = search.handle_mouse(mouse, now);
             let action = self.search_action(action);
             self.keep_if_edited();
             return action;
@@ -5224,6 +5269,46 @@ mod tests {
         assert!(!path.ends_with('/'), "{path}");
         key(&mut app, KeyCode::Backspace);
         assert!(app.dialog.as_ref().unwrap().selected_text().is_none());
+        key(&mut app, KeyCode::Esc);
+
+        // Workspace search: the query it opens with is selected.
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        type_text(&mut app, "abc");
+        app.handle_key(shift_left);
+        assert_eq!(copied(ctrl(&mut app, 'x')).as_deref(), Some("c"));
+        key(&mut app, KeyCode::Esc);
+        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        assert_eq!(copied(ctrl(&mut app, 'c')).as_deref(), Some("ab"));
+        key(&mut app, KeyCode::Esc);
+    }
+
+    #[test]
+    fn find_bar_fields_select_copy_and_cut() {
+        let _serial = crate::test_serial();
+        let root = fixture("find-select", &[("a.txt", "hello world")]);
+        let mut app = app(&root, Some("a.txt"));
+        let copied = |action| match action {
+            AppAction::Copy(text) => Some(text),
+            _ => None,
+        };
+        ctrl(&mut app, 'f');
+        type_text(&mut app, "world");
+        app.handle_key(Key::new(KeyCode::Left, Mods::SHIFT));
+        assert_eq!(copied(ctrl(&mut app, 'c')).as_deref(), Some("d"));
+        ctrl(&mut app, 'a');
+        assert_eq!(copied(ctrl(&mut app, 'x')).as_deref(), Some("world"));
+        assert_eq!(app.find_memory.query.text, "");
+        type_text(&mut app, "hello");
+        // Reopened, it selects the query, so typing replaces it.
+        key(&mut app, KeyCode::Esc);
+        ctrl(&mut app, 'f');
+        type_text(&mut app, "wor");
+        assert_eq!(app.find_memory.query.text, "wor");
+        assert_eq!(app.clipboard.as_deref(), Some("world"));
     }
 
     #[test]

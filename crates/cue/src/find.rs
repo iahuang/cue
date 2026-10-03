@@ -9,15 +9,16 @@
 //! match, and the editor does the replacing; this module finds the matches
 //! and draws the bar.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
+use std::time::Instant;
 
 use grep_matcher::{Captures, Matcher};
 use grep_regex::RegexMatcher;
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::keymap::{Command, Context, Keymap};
-use crate::line_edit::{Caret, Edit};
+use crate::line_edit::{self, Caret, Edit};
 use crate::search::{Query, Toggle};
 use crate::theme;
 
@@ -102,10 +103,7 @@ pub struct FindBar {
     pub replacing: bool,
     /// The field with the keyboard, or `None` while the text has it.
     pub focus: Option<Field>,
-    /// Typing replaces the query instead of adding to it: it came from the
-    /// selection or the last find.
-    pub replace_query: bool,
-    /// The cursor in the query, and in the replacement.
+    /// The cursor and selection in the query, and in the replacement.
     pub carets: [Caret; 2],
     /// In order. Never empty ranges.
     pub matches: Vec<Match>,
@@ -122,12 +120,14 @@ pub struct FindBar {
     /// The buttons as last drawn, as (row, screen columns, target), for
     /// clicks.
     drawn: RefCell<Vec<(u32, Range<u32>, Target)>>,
+    /// The screen column the fields' text starts at, as last drawn.
+    text_x: Cell<u32>,
 }
 
 impl FindBar {
+    /// A bar with `memory`'s query selected, so typing replaces it.
     pub fn new(memory: Memory, origin: u32) -> FindBar {
-        FindBar {
-            replace_query: !memory.query.text.is_empty(),
+        let mut bar = FindBar {
             memory,
             replaceable: true,
             replacing: false,
@@ -139,7 +139,10 @@ impl FindBar {
             epoch: None,
             origin,
             drawn: RefCell::default(),
-        }
+            text_x: Cell::new(0),
+        };
+        bar.select_query();
+        bar
     }
 
     /// Rows the bar takes.
@@ -156,31 +159,97 @@ impl FindBar {
     /// Edits the focused field: typing, pasting, deleting, or moving the
     /// cursor. Changing the query marks the matches for finding again.
     pub fn edit(&mut self, edit: Edit) {
+        self.edit_field(edit, false);
+    }
+
+    /// Edits the focused field with Shift held: moving the cursor selects.
+    pub fn edit_selecting(&mut self, edit: Edit) {
+        self.edit_field(edit, true);
+    }
+
+    fn edit_field(&mut self, edit: Edit, select: bool) {
         let Some(field) = self.focus else {
             return;
         };
+        let (caret, text) = self.field_mut(field);
+        let changed = match select {
+            true => caret.select(text, edit),
+            false => caret.edit(text, edit),
+        };
+        if changed && field == Field::Find {
+            self.epoch = None;
+        }
+    }
+
+    fn field_mut(&mut self, field: Field) -> (&mut Caret, &mut String) {
         let caret = &mut self.carets[field as usize];
         match field {
-            Field::Find => {
-                let text = &mut self.memory.query.text;
-                let changed = if std::mem::take(&mut self.replace_query) {
-                    caret.edit_selected(text, edit)
-                } else {
-                    caret.edit(text, edit)
-                };
-                if changed {
-                    self.epoch = None;
-                }
-            }
-            Field::Replace => {
-                caret.edit(&mut self.memory.replacement, edit);
-            }
+            Field::Find => (caret, &mut self.memory.query.text),
+            Field::Replace => (caret, &mut self.memory.replacement),
         }
+    }
+
+    fn text(&self, field: Field) -> &str {
+        match field {
+            Field::Find => &self.memory.query.text,
+            Field::Replace => &self.memory.replacement,
+        }
+    }
+
+    /// Selects all of the query, so typing replaces it.
+    pub fn select_query(&mut self) {
+        let (caret, text) = self.field_mut(Field::Find);
+        caret.select_all(text);
+    }
+
+    /// Selects all of the focused field.
+    pub fn select_all(&mut self) {
+        if let Some(field) = self.focus {
+            let (caret, text) = self.field_mut(field);
+            caret.select_all(text);
+        }
+    }
+
+    /// The part of the focused field selected.
+    pub fn selected_text(&self) -> Option<&str> {
+        let field = self.focus?;
+        self.carets[field as usize].selected_text(self.text(field))
+    }
+
+    /// A press of the mouse on `field` at screen column `x`: focuses it and
+    /// puts the cursor there, or selects (see [`Caret::press`]).
+    pub fn press(&mut self, field: Field, x: u32, now: Instant) {
+        self.focus = Some(field);
+        let column = x.saturating_sub(self.text_x.get()) as usize;
+        let (caret, text) = self.field_mut(field);
+        caret.press(text, column, now);
+    }
+
+    /// The mouse dragged to screen column `x`, selecting in the field
+    /// pressed, if any.
+    pub fn drag(&mut self, x: u32) {
+        let column = x.saturating_sub(self.text_x.get()) as usize;
+        for field in [Field::Find, Field::Replace] {
+            let (caret, text) = self.field_mut(field);
+            caret.drag(text, column);
+        }
+    }
+
+    /// The mouse was released.
+    pub fn release(&mut self) {
+        for field in [Field::Find, Field::Replace] {
+            let (caret, text) = self.field_mut(field);
+            caret.release(text);
+        }
+    }
+
+    /// Whether a press in a field is held, so drags select there.
+    pub fn pressed(&self) -> bool {
+        self.carets.iter().any(Caret::pressed)
     }
 
     pub fn toggle(&mut self, toggle: Toggle) {
         toggle.flip(&mut self.memory.query);
-        self.replace_query = false;
         self.epoch = None;
     }
 
@@ -270,6 +339,7 @@ impl FindBar {
             Field::Replace => (&self.memory.replacement, "Replace"),
         };
         let text_x = columns.start + 1;
+        self.text_x.set(text_x);
         if text.is_empty() {
             let placeholder: String = placeholder.chars().take(room).collect();
             frame.draw_text(
@@ -281,10 +351,14 @@ impl FindBar {
                 Attributes::NONE,
             );
         }
-        let (shown, column) = self.carets[field as usize].view(text, room);
-        let bg = (field == Field::Find && self.replace_query).then_some(colors.selected);
-        frame.draw_text(&shown, text_x, y, colors.text, bg, Attributes::NONE);
-        (self.focus == Some(field)).then_some((text_x + column as u32, y))
+        let caret = &self.carets[field as usize];
+        let (shown, column) = caret.view(text, room);
+        let focused = self.focus == Some(field);
+        if focused {
+            line_edit::draw_selection(frame, caret, text, text_x, y, room);
+        }
+        frame.draw_text(&shown, text_x, y, colors.text, None, Attributes::NONE);
+        focused.then_some((text_x + column as u32, y))
     }
 
     /// Lays out a bar at column `x`, `width` wide: on the first row, the
@@ -582,5 +656,51 @@ mod tests {
         bar.matches.clear();
         assert_eq!(bar.next_from(0), None);
         assert_eq!(bar.previous_from(0), None);
+    }
+
+    #[test]
+    fn fields_select_with_the_keyboard_and_the_mouse() {
+        let _serial = crate::test_serial();
+        let memory = Memory {
+            query: query("needle"),
+            replacement: "pin".to_string(),
+        };
+        let mut bar = FindBar::new(memory, 0);
+        assert_eq!(bar.selected_text(), Some("needle"), "typing replaces it");
+        bar.edit(Edit::Insert("hay"));
+        assert_eq!(bar.memory.query.text, "hay");
+        bar.edit_selecting(Edit::WordLeft);
+        assert_eq!(bar.selected_text(), Some("hay"));
+        bar.edit(Edit::Right);
+        assert_eq!(bar.selected_text(), None);
+
+        // Drawn from column 10, the fields' text starts at a column after.
+        bar.replacing = true;
+        let keymap = Keymap::default();
+        let screen =
+            opentui::OwnedBuffer::new(80, 4, false, opentui::WidthMethod::Unicode, "test").unwrap();
+        bar.draw(&screen, (10, 0, 60), None, &keymap);
+        let text_x = 10 + EXPANDER_WIDTH + 1;
+        let now = Instant::now();
+        bar.press(Field::Replace, text_x + 1, now);
+        assert_eq!(bar.focus, Some(Field::Replace));
+        assert!(bar.pressed());
+        bar.drag(text_x + 3);
+        bar.release();
+        assert!(!bar.pressed());
+        assert_eq!(bar.selected_text(), Some("in"));
+        bar.drag(text_x);
+        assert_eq!(bar.selected_text(), Some("in"), "not after the release");
+        bar.draw(&screen, (10, 0, 60), None, &keymap);
+        let selection = theme::colors().selection;
+        let shaded: Vec<bool> = (text_x..text_x + 4)
+            .map(|x| screen.bg_at(x, 1) == Some(selection))
+            .collect();
+        assert_eq!(shaded, [false, true, true, false]);
+        // Only the focused field shows its selection.
+        bar.press(Field::Find, text_x, now);
+        bar.release();
+        bar.draw(&screen, (10, 0, 60), None, &keymap);
+        assert_ne!(screen.bg_at(text_x + 1, 1), Some(selection));
     }
 }

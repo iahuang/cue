@@ -12,7 +12,10 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::time::Instant;
 
+use opentui::Buffer;
+
 use crate::input::MULTI_CLICK;
+use crate::theme;
 
 /// An edit to a field, from a key or a paste.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,29 +173,6 @@ impl Caret {
         replaced || text.len() != len
     }
 
-    /// Applies `edit` to `text`, all of it selected: typing replaces it,
-    /// deleting clears it, and moving goes to its start or end. Returns
-    /// whether the text changed.
-    pub fn edit_selected(&mut self, text: &mut String, edit: Edit) -> bool {
-        self.anchor = None;
-        let len = text.len();
-        match edit {
-            Edit::Left | Edit::WordLeft | Edit::Start => {
-                self.edit(text, Edit::Start);
-            }
-            Edit::Right | Edit::WordRight | Edit::End => self.move_to_end(),
-            _ => {
-                text.clear();
-                self.move_to_end();
-                if let Edit::Insert(_) = edit {
-                    self.edit(text, edit);
-                }
-            }
-        }
-        // Replaced with itself, it changed too: the selection went.
-        text.len() != len || matches!(edit, Edit::Insert(inserted) if !inserted.is_empty())
-    }
-
     /// The part of `text` shown in `room` columns, and the cursor's column
     /// in it. The view scrolls only as far as it takes to keep the cursor in
     /// view, with a column after the text for it at the end.
@@ -271,6 +251,11 @@ impl Caret {
         self.anchor = (anchor != at).then_some(anchor);
     }
 
+    /// Whether a press in the field is held, so dragging selects.
+    pub fn pressed(&self) -> bool {
+        self.pressed
+    }
+
     /// The mouse was released. Returns whether a press in the field was a
     /// plain click: once, without dragging a selection.
     pub fn release(&mut self, text: &str) -> bool {
@@ -286,6 +271,19 @@ impl Edit<'_> {
             self,
             Edit::Left | Edit::Right | Edit::WordLeft | Edit::WordRight | Edit::Start | Edit::End
         )
+    }
+}
+
+/// Shades the part of a field's `text` that `caret` has selected, under
+/// where the text is drawn from `x`, in `room` columns.
+pub fn draw_selection(frame: &Buffer, caret: &Caret, text: &str, x: u32, y: u32, room: usize) {
+    if let Some(columns) = caret.selected_columns(text) {
+        let end = columns.end.min(room);
+        if columns.start < end {
+            let width = (end - columns.start) as u32;
+            let x = x + columns.start as u32;
+            frame.fill_rect(x, y, width, 1, theme::colors().selection);
+        }
     }
 }
 
@@ -505,22 +503,6 @@ mod tests {
             "src/main.[rs]",
             "past the end, the last word"
         );
-    }
-
-    #[test]
-    fn edits_a_selected_text_as_a_whole() {
-        let edited = |edit| {
-            let mut text = "abc".to_string();
-            let mut caret = Caret::default();
-            let changed = caret.edit_selected(&mut text, edit);
-            let at = caret.at(&text);
-            (format!("{}|{}", &text[..at], &text[at..]), changed)
-        };
-        assert_eq!(edited(Edit::Insert("x")), ("x|".to_string(), true));
-        assert_eq!(edited(Edit::Insert("abc")), ("abc|".to_string(), true));
-        assert_eq!(edited(Edit::DeleteForward), ("|".to_string(), true));
-        assert_eq!(edited(Edit::Left), ("|abc".to_string(), false));
-        assert_eq!(edited(Edit::WordRight), ("abc|".to_string(), false));
     }
 
     #[test]

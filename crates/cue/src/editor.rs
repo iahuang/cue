@@ -588,7 +588,7 @@ impl Editor {
         let (text_x, text_w, text_h) = self.text_area();
         // A drag that started in the text stays with it.
         let pressed = matches!(mouse.kind, MouseKind::Press(_));
-        if (self.drag.is_none() || pressed) && self.handle_find_mouse(mouse) {
+        if (self.drag.is_none() || pressed) && self.handle_find_mouse(mouse, now) {
             self.drag = None;
             return;
         }
@@ -654,8 +654,9 @@ impl Editor {
     }
 
     /// A mouse event on the find bar, which it handles; returns false if
-    /// it's elsewhere. A press elsewhere gives the text the keyboard.
-    fn handle_find_mouse(&mut self, mouse: Mouse) -> bool {
+    /// it's elsewhere. A press elsewhere gives the text the keyboard. A
+    /// drag from a field selects in it, wherever it goes.
+    fn handle_find_mouse(&mut self, mouse: Mouse, now: Instant) -> bool {
         let Some((x, width, rows)) = self.find_area() else {
             return false;
         };
@@ -665,6 +666,19 @@ impl Editor {
         let Some(bar) = &mut self.find else {
             return false;
         };
+        if bar.pressed() {
+            match mouse.kind {
+                MouseKind::Drag(_) => {
+                    bar.drag(screen_x);
+                    return true;
+                }
+                MouseKind::Release(_) => {
+                    bar.release();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if !inside {
             if let MouseKind::Press(_) = mouse.kind {
                 bar.focus = None;
@@ -685,7 +699,7 @@ impl Editor {
             return true;
         }
         match bar.target(screen_x, mouse.y) {
-            Target::Field(field) => bar.focus = Some(field),
+            Target::Field(field) => bar.press(field, screen_x, now),
             Target::Toggle(toggle) => bar.toggle(toggle),
             Target::Expander => {
                 bar.replacing = !bar.replacing;
@@ -1343,8 +1357,10 @@ impl Editor {
         } else {
             Field::Find
         });
-        // Typing replaces the query, as if it were selected.
-        bar.replace_query = has_query && bar.focus == Some(Field::Find);
+        // Typing replaces the query.
+        if has_query && bar.focus == Some(Field::Find) {
+            bar.select_query();
+        }
         self.sync_find();
         self.keep_clear_of_find();
     }
@@ -1411,6 +1427,26 @@ impl Editor {
         self.sync_find();
     }
 
+    /// Edits the focused find bar field with Shift held: moving the cursor
+    /// selects.
+    pub fn find_edit_selecting(&mut self, edit: Edit) {
+        if let Some(bar) = &mut self.find {
+            bar.edit_selecting(edit);
+        }
+    }
+
+    /// Selects all of the focused find bar field.
+    pub fn find_select_all(&mut self) {
+        if let Some(bar) = &mut self.find {
+            bar.select_all();
+        }
+    }
+
+    /// The part of the focused find bar field selected.
+    pub fn find_selected_text(&self) -> Option<&str> {
+        self.find.as_ref()?.selected_text()
+    }
+
     /// Closes the find bar, leaving the current match selected.
     fn close_find(&mut self) {
         if self.find.take().is_none() {
@@ -1430,7 +1466,6 @@ impl Editor {
             Some(Field::Find) => Some(Field::Replace),
             _ => Some(Field::Find),
         };
-        bar.replace_query = false;
     }
 
     /// Finds the matches again if the text or the query changed. After the

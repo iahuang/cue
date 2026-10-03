@@ -10,13 +10,14 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
-use crate::line_edit::{Caret, Edit};
+use crate::line_edit::{self, Caret, Edit};
 use crate::picker::{self, Area};
 use crate::search::{FileMatches, Found, Line, Query, Search, Toggle, CONTEXT_LINES};
 use crate::theme;
@@ -80,9 +81,9 @@ pub struct SearchModal {
     /// Unsaved text of open files, searched instead of what's on disk.
     unsaved: HashMap<PathBuf, String>,
     query: Query,
+    /// The cursor and selection in the query. The query filled in on
+    /// opening is selected, so typing replaces it.
     caret: Caret,
-    /// The query was filled in on opening: typing replaces it.
-    replace_query: bool,
     /// The search in progress, if any.
     search: Option<Search>,
     /// The results are from the previous query, shown until the new search
@@ -143,7 +144,6 @@ impl SearchModal {
         let mut modal = SearchModal {
             workspace: workspace.clone(),
             unsaved,
-            replace_query: !query.text.is_empty(),
             query,
             caret: Caret::default(),
             search: None,
@@ -161,6 +161,7 @@ impl SearchModal {
             screen_width: width,
             screen_height: height,
         };
+        modal.caret.select_all(&modal.query.text);
         modal.start();
         modal.restore = restore;
         modal
@@ -205,30 +206,55 @@ impl SearchModal {
 
     /// Edits the query: typing, pasting, deleting, or moving the cursor.
     pub fn edit(&mut self, edit: Edit) {
-        let changed = if std::mem::take(&mut self.replace_query) {
-            self.caret.edit_selected(&mut self.query.text, edit)
-        } else {
-            self.caret.edit(&mut self.query.text, edit)
-        };
-        if changed {
+        if self.caret.edit(&mut self.query.text, edit) {
             self.query_changed();
         }
     }
 
+    /// Edits the query with Shift held: moving the cursor selects.
+    pub fn edit_selecting(&mut self, edit: Edit) {
+        if self.caret.select(&mut self.query.text, edit) {
+            self.query_changed();
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        self.caret.select_all(&self.query.text);
+    }
+
+    /// The part of the query selected.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.caret.selected_text(&self.query.text)
+    }
+
     /// A click on a line opens the file there, on a toggle flips it; one
-    /// outside the popup closes it. The wheel scrolls.
-    pub fn handle_mouse(&mut self, mouse: Mouse) -> SearchAction {
+    /// outside the popup closes it. In the query, a click puts the cursor,
+    /// and a drag or a double or triple click selects. The wheel scrolls.
+    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> SearchAction {
         let area = self.area();
         let inside = area.contains(mouse.x, mouse.y);
+        let column = mouse.x.saturating_sub(area.x + 2) as usize;
         match mouse.kind {
             MouseKind::Press(_) if !inside => SearchAction::Close,
+            MouseKind::Drag(MouseButton::Left) => {
+                self.caret.drag(&self.query.text, column);
+                SearchAction::Continue
+            }
+            MouseKind::Release(_) => {
+                self.caret.release(&self.query.text);
+                SearchAction::Continue
+            }
             MouseKind::Press(MouseButton::Left) if mouse.y == area.y + 1 => {
-                let toggle = self
-                    .toggles(area)
-                    .into_iter()
+                let toggles = self.toggles(area);
+                let toggle = toggles
+                    .iter()
                     .find(|(_, columns)| columns.contains(&mouse.x));
-                if let Some((toggle, _)) = toggle {
-                    self.toggle(toggle);
+                match toggle {
+                    Some(&(toggle, _)) => self.toggle(toggle),
+                    None if mouse.x < toggles[0].1.start => {
+                        self.caret.press(&self.query.text, column, now);
+                    }
+                    None => {}
                 }
                 SearchAction::Continue
             }
@@ -319,7 +345,6 @@ impl SearchModal {
 
     fn toggle(&mut self, toggle: Toggle) {
         toggle.flip(&mut self.query);
-        self.replace_query = false;
         self.query_changed();
     }
 
@@ -598,15 +623,8 @@ impl SearchModal {
         let text_x = x + 2;
         let room = toggles[0].1.start.saturating_sub(text_x + 1) as usize;
         let (shown, column) = self.caret.view(&self.query.text, room);
-        let query_bg = self.replace_query.then_some(colors.selected);
-        frame.draw_text(
-            &shown,
-            text_x,
-            y + 1,
-            colors.text,
-            query_bg,
-            Attributes::NONE,
-        );
+        line_edit::draw_selection(frame, &self.caret, &self.query.text, text_x, y + 1, room);
+        frame.draw_text(&shown, text_x, y + 1, colors.text, None, Attributes::NONE);
         let cursor = (text_x + column as u32, y + 1);
         if self.query.text.is_empty() {
             let hint: String = "Search in files"
@@ -1004,12 +1022,15 @@ mod tests {
         // Clicking a toggle flips it.
         let area = modal.area();
         let (_, columns) = modal.toggles(area)[2].clone();
-        modal.handle_mouse(Mouse {
-            kind: MouseKind::Press(MouseButton::Left),
-            x: columns.start + 1,
-            y: area.y + 1,
-            mods: Mods::NONE,
-        });
+        modal.handle_mouse(
+            Mouse {
+                kind: MouseKind::Press(MouseButton::Left),
+                x: columns.start + 1,
+                y: area.y + 1,
+                mods: Mods::NONE,
+            },
+            Instant::now(),
+        );
         assert!(modal.query.regex);
         modal.edit(Edit::Insert("("));
         let text = screen(&modal).join("\n");
@@ -1028,7 +1049,7 @@ mod tests {
         fs::write(root.join("a.txt"), "x\ny\nx\nx\n").unwrap();
 
         let mut second = modal(&root, first.memory(), None, 20);
-        assert!(second.replace_query);
+        assert_eq!(second.selected_text(), Some("x"));
         wait(&mut second);
         assert_eq!(
             opened(second.run(Command::PickerAccept)),
@@ -1076,12 +1097,15 @@ mod tests {
 
         let area = modal.area();
         let click = |modal: &mut SearchModal, y| {
-            modal.handle_mouse(Mouse {
-                kind: MouseKind::Press(MouseButton::Left),
-                x: area.x + 10,
-                y,
-                mods: Mods::NONE,
-            })
+            modal.handle_mouse(
+                Mouse {
+                    kind: MouseKind::Press(MouseButton::Left),
+                    x: area.x + 10,
+                    y,
+                    mods: Mods::NONE,
+                },
+                Instant::now(),
+            )
         };
         let first_line = modal.scroll - 1;
         let (_, line, _) = opened(click(&mut modal, area.y + 3));
