@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Instant;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -518,10 +519,36 @@ impl Picker {
         }
     }
 
-    /// A click on a result picks it; one outside the popup closes it.
-    pub fn handle_mouse(&mut self, mouse: Mouse) -> PickerAction {
+    /// Edits the query with Shift held: moving the cursor selects.
+    pub fn edit_selecting(&mut self, edit: Edit) {
+        if self.caret.select(&mut self.query, edit) {
+            self.query_changed();
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        self.caret.select_all(&self.query);
+    }
+
+    /// The part of the query selected.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.caret.selected_text(&self.query)
+    }
+
+    /// A click on a result picks it; one outside the popup closes it. In
+    /// the query, a click puts the cursor, and a drag or a double or triple
+    /// click selects.
+    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> PickerAction {
         let area = self.area();
         let inside = area.contains(mouse.x, mouse.y);
+        let column = mouse.x.saturating_sub(area.x + 2) as usize;
+        match mouse.kind {
+            MouseKind::Drag(MouseButton::Left) => self.caret.drag(&self.query, column),
+            MouseKind::Release(_) => {
+                self.caret.release(&self.query);
+            }
+            _ => {}
+        }
         if self
             .preview_area()
             .is_some_and(|area| area.contains(mouse.x, mouse.y))
@@ -530,6 +557,10 @@ impl Picker {
         }
         match mouse.kind {
             MouseKind::Press(_) if !inside => PickerAction::Close,
+            MouseKind::Press(MouseButton::Left) if mouse.y == area.y + 1 => {
+                self.caret.press(&self.query, column, now);
+                PickerAction::Continue
+            }
             MouseKind::Press(MouseButton::Left) => {
                 let list = area.y + 3;
                 if mouse.y < list || mouse.y + 1 >= area.y + area.height {
@@ -835,6 +866,7 @@ impl Picker {
         let room = width.saturating_sub(4) as usize;
         let (shown, column) = self.caret.view(&self.query, room);
         let shown_width = shown.chars().count();
+        draw_selection(frame, &self.caret, &self.query, text_x, y + 1, room);
         frame.draw_text(&shown, text_x, y + 1, colors.text, None, Attributes::NONE);
         let cursor = (text_x + column as u32, y + 1);
         if self.needle().is_empty() {
@@ -1103,6 +1135,19 @@ pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
 }
 
 /// Draws `status` into the right of a popup's bottom border.
+/// Shades the part of a field's `text` selected, under where it's drawn
+/// from `x`, in `room` columns.
+pub fn draw_selection(frame: &Buffer, caret: &Caret, text: &str, x: u32, y: u32, room: usize) {
+    if let Some(columns) = caret.selected_columns(text) {
+        let end = columns.end.min(room);
+        if columns.start < end {
+            let width = (end - columns.start) as u32;
+            let x = x + columns.start as u32;
+            frame.fill_rect(x, y, width, 1, theme::colors().selection);
+        }
+    }
+}
+
 pub fn draw_status(frame: &Buffer, area: Area, status: &str) {
     let colors = theme::colors();
     let x = (area.x + area.width).saturating_sub(status.chars().count() as u32 + 2);
@@ -1268,12 +1313,15 @@ mod tests {
             assert!(!list.contains(preview.x, preview.y));
             let choice = picker.selected_choice().cloned();
             assert_eq!(
-                picker.handle_mouse(Mouse {
-                    kind: MouseKind::Press(MouseButton::Left),
-                    x: preview.x + 2,
-                    y: preview.y + 3,
-                    mods: crate::input::Mods::NONE,
-                }),
+                picker.handle_mouse(
+                    Mouse {
+                        kind: MouseKind::Press(MouseButton::Left),
+                        x: preview.x + 2,
+                        y: preview.y + 3,
+                        mods: crate::input::Mods::NONE,
+                    },
+                    Instant::now()
+                ),
                 PickerAction::Continue
             );
             assert_eq!(picker.selected_choice(), choice.as_ref());
@@ -1371,19 +1419,25 @@ mod tests {
             mods: Mods::NONE,
         };
         let area = picker.area();
-        picker.handle_mouse(at(MouseKind::ScrollDown, 40, area.y + 5));
+        picker.handle_mouse(at(MouseKind::ScrollDown, 40, area.y + 5), Instant::now());
         assert_eq!(picker.scroll, WHEEL_ROWS);
         // The first result row is below the top border, query, and rule.
         assert_eq!(
-            picker.handle_mouse(at(MouseKind::Press(MouseButton::Left), 40, area.y + 4)),
+            picker.handle_mouse(
+                at(MouseKind::Press(MouseButton::Left), 40, area.y + 4),
+                Instant::now()
+            ),
             PickerAction::Accept(Choice::File(root.join("f04.rs")))
         );
         assert_eq!(
-            picker.handle_mouse(at(
-                MouseKind::Press(MouseButton::Left),
-                40,
-                area.y + area.height
-            )),
+            picker.handle_mouse(
+                at(
+                    MouseKind::Press(MouseButton::Left),
+                    40,
+                    area.y + area.height
+                ),
+                Instant::now()
+            ),
             PickerAction::Close
         );
     }
@@ -1417,6 +1471,17 @@ mod tests {
         assert!(lines[4].trim_end().ends_with("name.rs │"), "{text}");
         assert!(lines[5].contains("1 of 2"), "{text}");
         assert_eq!(cursor, (picker.area().x + 6, 2));
+
+        // The query's selection is shaded.
+        picker.edit(Edit::Left);
+        picker.edit_selecting(Edit::Left);
+        picker.draw(&screen);
+        let x = picker.area().x + 2;
+        let selection = theme::colors().selection;
+        let shaded: Vec<bool> = (x..x + 5)
+            .map(|x| screen.bg_at(x, 2) == Some(selection))
+            .collect();
+        assert_eq!(shaded, [false, false, true, false, false]);
     }
 
     #[test]

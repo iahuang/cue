@@ -360,11 +360,34 @@ pub struct App {
 /// keys edit.
 trait QueryInput {
     fn edit(&mut self, edit: Edit);
+
+    /// An edit with Shift held, which selects where the field can.
+    fn edit_selecting(&mut self, edit: Edit) {
+        self.edit(edit);
+    }
+
+    fn select_all(&mut self) {}
+
+    fn selected_text(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl QueryInput for Picker {
     fn edit(&mut self, edit: Edit) {
         Picker::edit(self, edit);
+    }
+
+    fn edit_selecting(&mut self, edit: Edit) {
+        Picker::edit_selecting(self, edit);
+    }
+
+    fn select_all(&mut self) {
+        Picker::select_all(self);
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        Picker::selected_text(self)
     }
 }
 
@@ -384,6 +407,18 @@ impl QueryInput for SearchModal {
 impl QueryInput for FileDialog {
     fn edit(&mut self, edit: Edit) {
         FileDialog::edit(self, edit);
+    }
+
+    fn edit_selecting(&mut self, edit: Edit) {
+        FileDialog::edit_selecting(self, edit);
+    }
+
+    fn select_all(&mut self) {
+        FileDialog::select_all(self);
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        FileDialog::selected_text(self)
     }
 }
 
@@ -622,8 +657,7 @@ impl App {
             }
             None if self.menu.is_some() => AppAction::Continue,
             None if self.query_input().is_some() || self.finding_terminal().is_some() => {
-                self.edit_query(key);
-                AppAction::Continue
+                self.edit_query(key)
             }
             None => {
                 if self.focus == Focus::Editor {
@@ -665,12 +699,34 @@ impl App {
     }
 
     /// A key for a popup's query: typing, or the editor's keys for moving
-    /// the cursor, deleting, and pasting.
-    fn edit_query(&mut self, key: Key) {
+    /// the cursor, selecting, deleting, and the clipboard.
+    fn edit_query(&mut self, key: Key) -> AppAction {
         let binding = self.keymap.lookup(key, Context::Editor);
+        let (command, select) = binding.unzip();
+        if self.finding_terminal().is_none() {
+            if let Some(input) = self.query_input() {
+                match command {
+                    Some(Command::SelectAll) => {
+                        input.select_all();
+                        return AppAction::Continue;
+                    }
+                    Some(command @ (Command::Copy | Command::Cut)) => {
+                        let Some(text) = input.selected_text().map(str::to_string) else {
+                            return AppAction::Continue;
+                        };
+                        if command == Command::Cut {
+                            input.edit(Edit::DeleteBackward);
+                        }
+                        self.clipboard = Some(text.clone());
+                        return AppAction::Copy(text);
+                    }
+                    _ => {}
+                }
+            }
+        }
         let clipboard = self.clipboard.clone();
         let mut buf = [0; 4];
-        let edit = match binding.map(|(command, _)| command) {
+        let edit = match command {
             Some(Command::DeleteBackward) => Edit::DeleteBackward,
             Some(Command::DeleteForward) => Edit::DeleteForward,
             Some(Command::DeleteWordBackward) => Edit::DeleteWordBackward,
@@ -683,19 +739,23 @@ impl App {
             Some(Command::LineEnd | Command::DocumentEnd) => Edit::End,
             Some(Command::Paste) => match &clipboard {
                 Some(text) => Edit::Insert(text.lines().next().unwrap_or("")),
-                None => return,
+                None => return AppAction::Continue,
             },
-            Some(_) => return,
+            Some(_) => return AppAction::Continue,
             None => match key.code {
                 KeyCode::Char(c) if key.mods.is_plain() => Edit::Insert(c.encode_utf8(&mut buf)),
-                _ => return,
+                _ => return AppAction::Continue,
             },
         };
         if let Some(terminal) = self.finding_terminal() {
             terminal.borrow_mut().find_edit(edit);
         } else if let Some(input) = self.query_input() {
-            input.edit(edit);
+            match select {
+                Some(true) => input.edit_selecting(edit),
+                _ => input.edit(edit),
+            }
         }
+        AppAction::Continue
     }
 
     /// Runs `command`. With `select`, a cursor movement extends the selection.
@@ -974,13 +1034,13 @@ impl App {
             return action;
         }
         if let Some(picker) = &mut self.picker {
-            let action = picker.handle_mouse(mouse);
+            let action = picker.handle_mouse(mouse, now);
             let action = self.picker_action(action);
             self.keep_if_edited();
             return action;
         }
         if let Some(dialog) = &mut self.dialog {
-            let action = dialog.handle_mouse(mouse);
+            let action = dialog.handle_mouse(mouse, now);
             return self.dialog_action(action);
         }
         let target = match mouse.kind {
@@ -5128,6 +5188,42 @@ mod tests {
         ctrl(&mut app, 'v');
         assert!(screen(&app).contains("copy me"));
         assert!(app.ed().is_modified());
+    }
+
+    #[test]
+    fn popup_queries_select_copy_and_cut() {
+        let _serial = crate::test_serial();
+        let root = fixture("popup-select", &[("main.rs", "")]);
+        let mut app = app(&root, None);
+        let copied = |action| match action {
+            AppAction::Copy(text) => Some(text),
+            _ => None,
+        };
+        let shift_left = Key::new(KeyCode::Left, Mods::SHIFT);
+
+        ctrl(&mut app, 'p');
+        type_text(&mut app, "main");
+        app.handle_key(shift_left);
+        app.handle_key(shift_left);
+        assert_eq!(copied(ctrl(&mut app, 'c')).as_deref(), Some("in"));
+        assert_eq!(copied(ctrl(&mut app, 'x')).as_deref(), Some("in"));
+        assert_eq!(app.clipboard.as_deref(), Some("in"));
+        assert_eq!(copied(ctrl(&mut app, 'c')), None, "nothing selected");
+        ctrl(&mut app, 'a');
+        assert_eq!(copied(ctrl(&mut app, 'c')).as_deref(), Some("ma"));
+        type_text(&mut app, "x");
+        ctrl(&mut app, 'a');
+        assert_eq!(copied(ctrl(&mut app, 'c')).as_deref(), Some("x"));
+        key(&mut app, KeyCode::Esc);
+
+        // Backspace deletes the path's `/` like any other character.
+        ctrl(&mut app, 'o');
+        key(&mut app, KeyCode::Backspace);
+        ctrl(&mut app, 'a');
+        let path = copied(ctrl(&mut app, 'c')).unwrap();
+        assert!(!path.ends_with('/'), "{path}");
+        key(&mut app, KeyCode::Backspace);
+        assert!(app.dialog.as_ref().unwrap().selected_text().is_none());
     }
 
     #[test]

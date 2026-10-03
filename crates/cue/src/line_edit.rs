@@ -1,12 +1,18 @@
 //! Editing a one-line text field, as in the picker, workspace search, and
 //! the find bar: a cursor that typing goes in at, the keys that move it and
-//! delete around it, and the part of the text shown when it doesn't fit.
+//! delete around it, the part of the text selected, and the part shown when
+//! it doesn't fit.
 //!
 //! The text lives with its owner (a query is searched for, a replacement
-//! remembered), so a [`Caret`] only knows where in it the cursor is. Positions
-//! are bytes, always on a character boundary; widths are characters.
+//! remembered), so a [`Caret`] only knows where in it the cursor and the
+//! selection are. Positions are bytes, always on a character boundary;
+//! widths and columns are characters.
 
 use std::cell::Cell;
+use std::ops::Range;
+use std::time::Instant;
+
+use crate::input::MULTI_CLICK;
 
 /// An edit to a field, from a key or a paste.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,8 +36,14 @@ pub struct Caret {
     /// The cursor's byte offset, or `None` at the end, where it stays as the
     /// text is replaced.
     at: Option<usize>,
+    /// Where the selection started, the cursor being where it ends.
+    anchor: Option<usize>,
     /// The first character shown, when the text doesn't fit.
     scroll: Cell<usize>,
+    /// The last press of the mouse: where, when, and how many in a row.
+    last_click: Option<(usize, Instant, u32)>,
+    /// A press in the field is held, so dragging selects.
+    pressed: bool,
 }
 
 impl Caret {
@@ -46,14 +58,81 @@ impl Caret {
     /// Puts the cursor at the end, where it stays as the text is replaced.
     pub fn move_to_end(&mut self) {
         self.at = None;
+        self.anchor = None;
     }
 
     fn set(&mut self, text: &str, at: usize) {
         self.at = (at < text.len()).then_some(at);
     }
 
+    /// The part of `text` selected, if any.
+    pub fn selection(&self, text: &str) -> Option<Range<usize>> {
+        let anchor = floor_boundary(text, self.anchor?);
+        let at = self.at(text);
+        (anchor != at).then(|| anchor.min(at)..anchor.max(at))
+    }
+
+    /// The text selected, if any.
+    pub fn selected_text<'a>(&self, text: &'a str) -> Option<&'a str> {
+        self.selection(text).map(|range| &text[range])
+    }
+
+    /// Selects all of `text`, the cursor at its end.
+    pub fn select_all(&mut self, text: &str) {
+        self.at = None;
+        self.anchor = (!text.is_empty()).then_some(0);
+    }
+
+    /// Applies `edit` to `text` with Shift held: a movement extends the
+    /// selection; anything else is as [`Caret::edit`]. Returns whether the
+    /// text changed.
+    pub fn select(&mut self, text: &mut String, edit: Edit) -> bool {
+        if !edit.moves() {
+            return self.edit(text, edit);
+        }
+        let anchor = match self.anchor {
+            Some(anchor) => floor_boundary(text, anchor),
+            None => self.at(text),
+        };
+        self.anchor = None;
+        self.edit(text, edit);
+        self.anchor = (anchor != self.at(text)).then_some(anchor);
+        false
+    }
+
     /// Applies `edit` to `text`, and returns whether the text changed.
+    /// With text selected, typing replaces it, deleting deletes it, and
+    /// Left and Right go to its start and end.
     pub fn edit(&mut self, text: &mut String, edit: Edit) -> bool {
+        let mut replaced = false;
+        if let Some(selection) = self.selection(text) {
+            self.anchor = None;
+            match edit {
+                Edit::Insert(_) => {
+                    text.replace_range(selection.clone(), "");
+                    self.set(text, selection.start);
+                    replaced = true;
+                }
+                Edit::DeleteBackward
+                | Edit::DeleteForward
+                | Edit::DeleteWordBackward
+                | Edit::DeleteWordForward => {
+                    text.replace_range(selection.clone(), "");
+                    self.set(text, selection.start);
+                    return true;
+                }
+                Edit::Left => {
+                    self.set(text, selection.start);
+                    return false;
+                }
+                Edit::Right => {
+                    self.set(text, selection.end);
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        self.anchor = None;
         // Every change adds or removes something.
         let len = text.len();
         let at = self.at(text);
@@ -88,13 +167,14 @@ impl Caret {
             Edit::End => text.len(),
         };
         self.set(text, at);
-        text.len() != len
+        replaced || text.len() != len
     }
 
     /// Applies `edit` to `text`, all of it selected: typing replaces it,
     /// deleting clears it, and moving goes to its start or end. Returns
     /// whether the text changed.
     pub fn edit_selected(&mut self, text: &mut String, edit: Edit) -> bool {
+        self.anchor = None;
         let len = text.len();
         match edit {
             Edit::Left | Edit::WordLeft | Edit::Start => {
@@ -129,6 +209,84 @@ impl Caret {
         let shown = text.chars().skip(scroll).take(room).collect();
         (shown, cursor - scroll)
     }
+
+    /// The columns of the view last drawn that are selected, which may run
+    /// past its right edge.
+    pub fn selected_columns(&self, text: &str) -> Option<Range<usize>> {
+        let selection = self.selection(text)?;
+        let scroll = self.scroll.get();
+        let start = text[..selection.start].chars().count();
+        let end = start + text[selection].chars().count();
+        (end > scroll).then(|| start.saturating_sub(scroll)..end - scroll)
+    }
+
+    /// Where in `text` column `column` of the view last drawn is: before
+    /// the character there, or at the end past the text.
+    fn offset_at(&self, text: &str, column: usize) -> usize {
+        let index = self.scroll.get() + column;
+        text.char_indices()
+            .nth(index)
+            .map_or(text.len(), |(i, _)| i)
+    }
+
+    /// A press of the mouse at `column` of the view last drawn: puts the
+    /// cursor there, ready to drag a selection. A second press in a row
+    /// there selects the word, and a third, all of the text.
+    pub fn press(&mut self, text: &str, column: usize, now: Instant) {
+        let at = self.offset_at(text, column);
+        let count = match self.last_click {
+            Some((last, time, count)) if last == at && now.duration_since(time) < MULTI_CLICK => {
+                count % 3 + 1
+            }
+            _ => 1,
+        };
+        self.last_click = Some((at, now, count));
+        self.pressed = count == 1;
+        match count {
+            1 => {
+                self.anchor = None;
+                self.set(text, at);
+            }
+            2 => {
+                let word = word_around(text, at);
+                self.anchor = Some(word.start);
+                self.set(text, word.end);
+            }
+            _ => self.select_all(text),
+        }
+    }
+
+    /// The mouse dragged, after a press in the field, to `column` of the
+    /// view last drawn: selects from the press to there.
+    pub fn drag(&mut self, text: &str, column: usize) {
+        if !self.pressed {
+            return;
+        }
+        let anchor = match self.anchor {
+            Some(anchor) => floor_boundary(text, anchor),
+            None => self.at(text),
+        };
+        let at = self.offset_at(text, column);
+        self.set(text, at);
+        self.anchor = (anchor != at).then_some(anchor);
+    }
+
+    /// The mouse was released. Returns whether a press in the field was a
+    /// plain click: once, without dragging a selection.
+    pub fn release(&mut self, text: &str) -> bool {
+        let clicked = std::mem::take(&mut self.pressed) && self.selection(text).is_none();
+        clicked && matches!(self.last_click, Some((_, _, 1)))
+    }
+}
+
+impl Edit<'_> {
+    /// Whether this only moves the cursor.
+    fn moves(self) -> bool {
+        matches!(
+            self,
+            Edit::Left | Edit::Right | Edit::WordLeft | Edit::WordRight | Edit::Start | Edit::End
+        )
+    }
 }
 
 fn floor_boundary(text: &str, at: usize) -> usize {
@@ -160,6 +318,24 @@ fn word_start(text: &str, at: usize) -> usize {
         Some(c) => trimmed.len() - c.len_utf8(),
         None => 0,
     }
+}
+
+/// The word at `at`, as a double click selects it: the run of word
+/// characters there, or the one other character. At the end, the word
+/// before.
+fn word_around(text: &str, at: usize) -> Range<usize> {
+    let at = match text[at..].chars().next() {
+        Some(c) if !is_word(c) => return at..at + c.len_utf8(),
+        Some(_) => at,
+        None => match text[..at].chars().next_back() {
+            Some(c) if is_word(c) => at,
+            Some(c) => return at - c.len_utf8()..at,
+            None => return at..at,
+        },
+    };
+    let start = text[..at].trim_end_matches(is_word).len();
+    let end = text.len() - text[at..].trim_start_matches(is_word).len();
+    start..end
 }
 
 /// [`word_start`] mirrored.
@@ -216,6 +392,119 @@ mod tests {
         assert_eq!(edited("foo bar", &[WordLeft, DeleteWordBackward]), "|bar");
         assert_eq!(edited("foo bar", &[Start, DeleteWordForward]), "| bar");
         assert_eq!(edited("src/", &[DeleteWordBackward]), "src|");
+    }
+
+    /// `text` after `edits` from its end, Shift held for those marked, with
+    /// `[` and `]` around the selection or `|` at the cursor.
+    fn selected(text: &str, edits: &[(Edit, bool)]) -> String {
+        let mut text = text.to_string();
+        let mut caret = Caret::default();
+        for &(edit, select) in edits {
+            match select {
+                true => caret.select(&mut text, edit),
+                false => caret.edit(&mut text, edit),
+            };
+        }
+        shown(&text, &caret)
+    }
+
+    fn shown(text: &str, caret: &Caret) -> String {
+        match caret.selection(text) {
+            Some(range) => format!(
+                "{}[{}]{}",
+                &text[..range.start],
+                &text[range.clone()],
+                &text[range.end..]
+            ),
+            None => {
+                let at = caret.at(text);
+                format!("{}|{}", &text[..at], &text[at..])
+            }
+        }
+    }
+
+    #[test]
+    fn shift_selects_and_edits_replace_the_selection() {
+        use Edit::*;
+        let shift = |edit| (edit, true);
+        let plain = |edit| (edit, false);
+        assert_eq!(selected("abc", &[shift(Left), shift(Left)]), "a[bc]");
+        assert_eq!(selected("abc", &[shift(Left), shift(Right)]), "abc|");
+        assert_eq!(selected("src/main.rs", &[shift(WordLeft)]), "src/main.[rs]");
+        assert_eq!(
+            selected("abc", &[plain(Start), shift(Right), shift(End)]),
+            "[abc]"
+        );
+        assert_eq!(
+            selected("abc", &[shift(Left), shift(Left), plain(Insert("x"))]),
+            "ax|"
+        );
+        assert_eq!(
+            selected("abc", &[shift(Left), shift(Left), plain(DeleteBackward)]),
+            "a|"
+        );
+        assert_eq!(
+            selected("abc", &[shift(Left), shift(Left), plain(Left)]),
+            "a|bc"
+        );
+        assert_eq!(
+            selected("abc", &[plain(Start), shift(Right), plain(Right)]),
+            "a|bc"
+        );
+        assert_eq!(
+            selected("abc", &[shift(Start), shift(DeleteWordBackward)]),
+            "|"
+        );
+
+        let mut caret = Caret::default();
+        caret.select_all("abc");
+        assert_eq!(shown("abc", &caret), "[abc]");
+        assert_eq!(caret.selected_text("abc"), Some("abc"));
+        caret.move_to_end();
+        assert_eq!(caret.selected_text("abc"), None);
+    }
+
+    #[test]
+    fn the_mouse_places_the_cursor_and_selects() {
+        let text = "src/main.rs";
+        let mut caret = Caret::default();
+        caret.view(text, 20);
+        let now = Instant::now();
+        caret.press(text, 5, now);
+        assert_eq!(shown(text, &caret), "src/m|ain.rs");
+        caret.drag(text, 8);
+        assert_eq!(shown(text, &caret), "src/m[ain].rs");
+        caret.drag(text, 2);
+        assert_eq!(shown(text, &caret), "sr[c/m]ain.rs");
+        caret.drag(text, 40);
+        assert_eq!(shown(text, &caret), "src/m[ain.rs]");
+        assert!(!caret.release(text), "a drag isn't a click");
+        caret.drag(text, 0);
+        assert_eq!(
+            shown(text, &caret),
+            "src/m[ain.rs]",
+            "not after the release"
+        );
+        assert_eq!(caret.selected_columns(text), Some(5..11));
+
+        // Two clicks in a row select a word, three all of it.
+        caret.press(text, 6, now);
+        assert!(caret.release(text));
+        caret.press(text, 6, now);
+        assert_eq!(shown(text, &caret), "src/[main].rs");
+        caret.press(text, 6, now);
+        assert_eq!(shown(text, &caret), "[src/main.rs]");
+        caret.press(text, 3, now);
+        assert_eq!(shown(text, &caret), "src|/main.rs");
+        caret.press(text, 3, now);
+        assert_eq!(shown(text, &caret), "src[/]main.rs");
+        caret.press(text, 30, now - MULTI_CLICK / 2);
+        caret.press(text, 30, now);
+        assert_eq!(
+            shown(text, &caret),
+            "src/main.[rs]",
+            "past the end, the last word"
+        );
     }
 
     #[test]

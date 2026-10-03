@@ -8,10 +8,10 @@
 //! listed, and whose name, after the last `/`, narrows the list as you type
 //! it, fuzzily, as the file picker does.
 //!
-//! Typing `/` after a folder's name goes into it, and Backspace right after
-//! a `/`, or Alt+Up, goes back up. Tab completes the selected name. A click
-//! goes into a folder or picks a file, and a click on a folder in the path
-//! goes back to it.
+//! Typing `/` after a folder's name goes into it, and Alt+Up goes back up.
+//! Tab completes the selected name. A click goes into a folder or picks a
+//! file, and a click on a folder in the path goes back to it; a drag there
+//! selects.
 //!
 //! Saving and creating take a path that doesn't exist yet, folders
 //! included, which the app creates. Saving over another file asks first.
@@ -28,6 +28,7 @@ use std::cmp::Reverse;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -242,6 +243,25 @@ impl FileDialog {
 
     /// Edits the path: typing, pasting, deleting, or moving the cursor.
     pub fn edit(&mut self, edit: Edit) {
+        self.edit_path(edit, false);
+    }
+
+    /// Edits the path with Shift held: moving the cursor selects.
+    pub fn edit_selecting(&mut self, edit: Edit) {
+        self.edit_path(edit, true);
+    }
+
+    pub fn select_all(&mut self) {
+        self.leave_name();
+        self.caret.select_all(&self.text);
+    }
+
+    /// The part of the path selected.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.caret.selected_text(&self.text)
+    }
+
+    fn edit_path(&mut self, edit: Edit, select: bool) {
         self.message = None;
         // A whole path pasted replaces the one there.
         if let Edit::Insert(text) = edit {
@@ -273,27 +293,46 @@ impl FileDialog {
             // Moving the cursor leaves the name to edit, narrowing the list.
             self.refilter();
         }
-        let at_end = self.caret.at(&self.text) == self.text.len();
-        if edit == Edit::DeleteBackward && at_end && self.text.ends_with('/') {
-            self.go_up(false);
-            return;
-        }
-        if self.caret.edit(&mut self.text, edit) {
+        let changed = match select {
+            true => self.caret.select(&mut self.text, edit),
+            false => self.caret.edit(&mut self.text, edit),
+        };
+        if changed {
             self.text_changed();
         }
     }
 
+    /// Leaves the suggested name to edit, narrowing the list.
+    fn leave_name(&mut self) {
+        if std::mem::take(&mut self.name_selected) {
+            self.refilter();
+        }
+    }
+
     /// A click on an entry goes into a folder or picks a file, and one on a
-    /// folder in the path goes back to it. One outside the popup closes it.
-    pub fn handle_mouse(&mut self, mouse: Mouse) -> DialogAction {
+    /// folder in the path goes back to it. In the path, a drag or a double
+    /// or triple click selects. A click outside the popup closes it.
+    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> DialogAction {
         let area = self.area();
         let inside = area.contains(mouse.x, mouse.y);
+        let column = mouse.x.saturating_sub(area.x + 2) as usize;
         match mouse.kind {
             MouseKind::Press(_) if !inside => DialogAction::Close,
+            MouseKind::Drag(MouseButton::Left) => {
+                self.caret.drag(&self.text, column);
+                DialogAction::Continue
+            }
+            MouseKind::Release(_) => {
+                if self.caret.release(&self.text) && mouse.y == area.y + 1 {
+                    self.click_path(column);
+                }
+                DialogAction::Continue
+            }
             MouseKind::Press(MouseButton::Left) => {
                 self.message = None;
                 if mouse.y == area.y + 1 {
-                    self.click_path(mouse.x.saturating_sub(area.x + 2) as usize);
+                    self.leave_name();
+                    self.caret.press(&self.text, column, now);
                     return DialogAction::Continue;
                 }
                 let list = area.y + 3;
@@ -717,6 +756,7 @@ impl FileDialog {
             Attributes::NONE,
         );
         let name_x = text_x + dir_part.chars().count() as u32;
+        picker::draw_selection(frame, &self.caret, &self.text, text_x, y + 1, room);
         let name_bg = self.name_selected.then_some(colors.selected);
         frame.draw_text(
             &name_part,
@@ -1051,13 +1091,24 @@ mod tests {
     }
 
     #[test]
-    fn slashes_go_into_folders_and_backspace_goes_back_up() {
+    fn slashes_go_into_folders_and_backspace_deletes_them() {
         let root = fixture("folders", &["src/main.rs", "src/lib.rs", "top.rs"]);
         let mut dialog = dialog(Purpose::Open, &root, "");
         type_text(&mut dialog, "src/");
         assert_eq!(listed(&dialog), ["../", "lib.rs", "main.rs"]);
+        // Backspace deletes the `/`, as any other character, leaving the
+        // folder's name narrowing the one above.
         dialog.edit(Edit::DeleteBackward);
-        assert_eq!(dialog.text, display_dir(&root), "the whole folder goes");
+        assert_eq!(dialog.text, format!("{}src", display_dir(&root)));
+        assert_eq!(dialog.listing.dir, root);
+        assert_eq!(listed(&dialog), ["src/"]);
+        for _ in 0..3 {
+            dialog.edit(Edit::DeleteBackward);
+        }
+        assert_eq!(dialog.text, display_dir(&root));
+        dialog.edit(Edit::DeleteBackward);
+        assert_eq!(dialog.listing.dir, root.parent().unwrap());
+        dialog.edit(Edit::Insert("/"));
         assert_eq!(dialog.listing.dir, root);
 
         // Enter or Tab on a folder goes into it; `..` goes up.
@@ -1167,11 +1218,21 @@ mod tests {
             y,
             mods: Mods::NONE,
         };
+        let click = |dialog: &mut FileDialog, x, y| {
+            let now = Instant::now();
+            let action = dialog.handle_mouse(at(x, y), now);
+            let release = Mouse {
+                kind: MouseKind::Release(MouseButton::Left),
+                ..at(x, y)
+            };
+            dialog.handle_mouse(release, now);
+            action
+        };
         let mut dialog = dialog(Purpose::Create, &root, "new.txt");
         let area = dialog.area();
         let list = area.y + 3;
         // Rows: `..`, dir/, file.txt.
-        dialog.handle_mouse(at(area.x + 4, list + 1));
+        click(&mut dialog, area.x + 4, list + 1);
         assert_eq!(dialog.listing.dir, root.join("dir"));
         assert_eq!(dialog.name(), "new.txt", "the name is kept");
 
@@ -1181,25 +1242,29 @@ mod tests {
         let (_, column) = dialog.caret.view(&dialog.text, room);
         let scroll = dialog.text.chars().count() - column;
         let root_end = dialog.text.len() - "dir/new.txt".len() - 1;
-        dialog.handle_mouse(at(area.x + 2 + (root_end - scroll) as u32, area.y + 1));
+        click(
+            &mut dialog,
+            area.x + 2 + (root_end - scroll) as u32,
+            area.y + 1,
+        );
         assert_eq!(dialog.listing.dir, root);
 
         // Creating, a click on a file names it, and another takes it.
         let mut dialog = self::dialog(Purpose::SaveAs, &root, "");
-        dialog.handle_mouse(at(area.x + 4, list + 2));
+        click(&mut dialog, area.x + 4, list + 2);
         assert_eq!(dialog.name(), "file.txt");
         assert_eq!(selected(&dialog).as_deref(), Some("file.txt"));
         assert_eq!(
-            dialog.handle_mouse(at(area.x + 4, list + 2)),
+            click(&mut dialog, area.x + 4, list + 2),
             DialogAction::Continue
         );
         assert_eq!(
-            dialog.handle_mouse(at(area.x + 4, list + 2)),
+            click(&mut dialog, area.x + 4, list + 2),
             DialogAction::Accept(root.join("file.txt")),
             "after asking to replace it"
         );
         assert_eq!(
-            dialog.handle_mouse(at(0, area.y + area.height)),
+            click(&mut dialog, 0, area.y + area.height),
             DialogAction::Close
         );
     }
