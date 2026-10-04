@@ -23,6 +23,7 @@ use std::time::SystemTime;
 use opentui::{EditBuffer, WidthMethod};
 
 use crate::config;
+use crate::git::Tracked;
 use crate::history::{EditKind, History};
 use crate::indent::Indent;
 use crate::language::{self, Language};
@@ -142,6 +143,9 @@ pub struct Document {
     /// The text the parked cursors point into, and its content epoch.
     parked_text: RefCell<(u64, String)>,
     on_disk: RefCell<OnDisk>,
+    /// What git says of the file, if it's in a repository, as the app last
+    /// heard (see [`Document::set_tracked`]).
+    tracked: RefCell<Option<Rc<Tracked>>>,
 }
 
 /// An editor's cursor while another editor of the same document has the
@@ -230,6 +234,22 @@ impl Document {
             parked: RefCell::default(),
             parked_text: RefCell::default(),
             on_disk: RefCell::default(),
+            tracked: RefCell::default(),
+        }
+    }
+
+    /// What git says of the file, if it's in a repository.
+    pub fn tracked(&self) -> Option<Rc<Tracked>> {
+        self.tracked.borrow().clone()
+    }
+
+    /// Takes what git says of the file now. What it was in the last commit
+    /// is kept, unless that's another commit or file now.
+    pub fn set_tracked(&self, tracked: Option<Tracked>) {
+        let mut current = self.tracked.borrow_mut();
+        match (&*current, tracked) {
+            (Some(old), Some(new)) if old.same_base(&new) => old.kind.set(new.kind.get()),
+            (_, new) => *current = new.map(Rc::new),
         }
     }
 

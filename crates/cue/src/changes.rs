@@ -446,11 +446,13 @@ mod tests {
         Repo {
             git_dir: root.join(".git"),
             head: Head::Branch("main".into()),
+            commit: None,
             changes: changes
                 .iter()
                 .map(|&(path, kind)| Change {
                     path: root.join(path),
                     kind,
+                    from: None,
                 })
                 .collect(),
             added: 0,

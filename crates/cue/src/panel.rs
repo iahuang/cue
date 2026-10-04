@@ -47,9 +47,12 @@ const BUTTONS: [(HeaderButton, &str); 3] = [
 ];
 /// Headers narrower than this leave the buttons out, for the name.
 const MIN_BUTTONS_WIDTH: u32 = 24;
-/// Headers narrower than this leave out the button that goes to and from
-/// reader mode.
-const MIN_READER_BUTTON_WIDTH: u32 = 32;
+/// Headers narrower than this leave out the buttons that go to and from
+/// reader and diff mode.
+const MIN_MODE_BUTTON_WIDTH: u32 = 32;
+/// Headers narrower than this have room for one of them only: the one to
+/// leave the mode the editor's in, or otherwise the diff's.
+const MIN_MODE_BUTTONS_WIDTH: u32 = 40;
 
 /// A button at the right end of a panel's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +62,8 @@ pub enum HeaderButton {
     Close,
     /// Goes to reader mode, or back to editing, on a Markdown file.
     Reader,
+    /// Goes to diff mode, or back to editing, on a file with changes.
+    Diff,
 }
 
 /// Something a panel showed, to go back or forward to.
@@ -174,7 +179,7 @@ impl Panel {
         let Some(editor) = self.current.and_then(|i| self.editors.get_mut(i)) else {
             return;
         };
-        if editor.reading() != reading {
+        if editor.reading() != reading && !editor.diffing() {
             editor.follow(anchor);
             // Moved along, it didn't move of its own accord.
             editor.moved();
@@ -586,17 +591,34 @@ impl Panel {
 
     /// The header's buttons, with the screen column each starts at, if the
     /// header is wide enough for them. A Markdown file's has one to go to
-    /// reader mode, or back to editing, first.
+    /// reader mode, or back to editing, first, and a changed file's one to
+    /// go to diff mode, or back.
     fn buttons(&self) -> Vec<(HeaderButton, &'static str, u32)> {
         let area = self.area;
         if area.width < MIN_BUTTONS_WIDTH {
             return Vec::new();
         }
         let mut buttons = Vec::new();
-        if let Some(editor) = self.editor().filter(|editor| editor.is_markdown()) {
-            if area.width >= MIN_READER_BUTTON_WIDTH {
-                let label = if editor.reading() { " Edit " } else { " Read " };
-                buttons.push((HeaderButton::Reader, label));
+        if let Some(editor) = self
+            .editor()
+            .filter(|_| area.width >= MIN_MODE_BUTTON_WIDTH)
+        {
+            let reader = editor.is_markdown().then(|| match editor.reading() {
+                true => (HeaderButton::Reader, " Edit "),
+                false => (HeaderButton::Reader, " Read "),
+            });
+            let diff = editor.has_diff().then(|| match editor.diffing() {
+                true => (HeaderButton::Diff, " Edit "),
+                false => (HeaderButton::Diff, " Diff "),
+            });
+            match (reader, diff) {
+                (Some(reader), Some(_))
+                    if area.width < MIN_MODE_BUTTONS_WIDTH && editor.reading() =>
+                {
+                    buttons.push(reader)
+                }
+                (Some(_), Some(diff)) if area.width < MIN_MODE_BUTTONS_WIDTH => buttons.push(diff),
+                (reader, diff) => buttons.extend(reader.into_iter().chain(diff)),
             }
         }
         buttons.extend(BUTTONS);

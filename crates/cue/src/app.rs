@@ -1375,6 +1375,9 @@ impl App {
                         HeaderButton::Reader => {
                             self.run(Command::ToggleReader, false);
                         }
+                        HeaderButton::Diff => {
+                            self.run(Command::ToggleDiff, false);
+                        }
                     }
                     return;
                 }
@@ -1696,7 +1699,15 @@ impl App {
         let repos = self.git.repos();
         self.changes.set_repos(repos);
         self.tree.set_changes(repos);
+        self.track_documents();
         self.watch_folders();
+    }
+
+    /// Tells the open files what git says of them now, for their diffs.
+    fn track_documents(&self) {
+        for doc in &self.documents {
+            doc.set_tracked(doc.path().and_then(|path| self.git.tracked(&path)));
+        }
     }
 
     /// Text a terminal's program copied since the last call, for the
@@ -1869,7 +1880,7 @@ impl App {
             .iter()
             .find(|panel| panel.id == leader)
             .and_then(Panel::editor)
-            .filter(|editor| editor.is_markdown() && editor.moved())
+            .filter(|editor| editor.is_markdown() && !editor.diffing() && editor.moved())
         else {
             return;
         };
@@ -2392,6 +2403,13 @@ impl App {
     /// without `preview` keeps it. Returns false, with a message, if the
     /// file can't be opened.
     fn open(&mut self, path: &Path, preview: bool) -> bool {
+        self.open_as(path, preview, false)
+    }
+
+    /// Opens `path` as [`App::open`] does, and with `diff`, shows how it
+    /// changed since the last commit rather than its text, unless it shows
+    /// that already. Without, it shows the text.
+    fn open_as(&mut self, path: &Path, preview: bool, diff: bool) -> bool {
         let path = document::resolve(path);
         self.active_panel_mut().clear_message();
         // Coming back to a file, the keyboard is for its text.
@@ -2445,8 +2463,16 @@ impl App {
             if let Some(notice) = notice {
                 self.show_message(notice, false);
             }
+            self.track_documents();
         } else if !preview && self.preview.as_ref().is_some_and(|p| Rc::ptr_eq(p, &doc)) {
             self.preview = None;
+        }
+        if let Some(editor) = self.editor_mut() {
+            match diff {
+                true if !editor.diffing() => editor.diff_from(0),
+                true => {}
+                false => editor.set_diffing(false),
+            }
         }
         self.prune_documents();
         if had_terminal {
@@ -4093,16 +4119,25 @@ impl App {
         }
     }
 
-    /// What the changes view asked for: as the tree's, but a file that's
-    /// gone isn't opened, as a new one.
+    /// What the changes view asked for: as the tree's, but a file opens
+    /// to how it changed, and a file that's gone isn't opened, as a new
+    /// one.
     fn changes_action(&mut self, action: TreeAction) {
-        if let TreeAction::Open { path, .. } = &action {
-            if !path.exists() {
-                self.show_message(format!("{} was deleted.", file_name(path)), false);
-                return;
-            }
+        let TreeAction::Open {
+            path,
+            focus,
+            preview,
+        } = action
+        else {
+            return;
+        };
+        if !path.exists() {
+            self.show_message(format!("{} was deleted.", file_name(&path)), false);
+            return;
         }
-        self.tree_action(action);
+        if self.open_as(&path, preview, true) && focus {
+            self.focus = Focus::Editor;
+        }
     }
 
     fn editor_action(&mut self, action: Action) -> AppAction {
@@ -4111,6 +4146,7 @@ impl App {
             Action::Copy(text) => AppAction::Copy(text),
             Action::Saved => {
                 // The file may be new, or saved under a new name.
+                self.track_documents();
                 self.tree.refresh();
                 self.files.refresh();
                 self.show_active_in_tree();
@@ -4128,11 +4164,15 @@ impl App {
                 AppAction::Continue
             }
             Action::ReadOnly => {
-                let how = match self.keymap.shortcut(Command::ToggleReader) {
+                let (mode, command) = match self.editor().is_some_and(Editor::diffing) {
+                    true => ("the diff", Command::ToggleDiff),
+                    false => ("reader mode", Command::ToggleReader),
+                };
+                let how = match self.keymap.shortcut(command) {
                     Some(key) => format!("double-click or press {key}"),
                     None => "double-click, or click Edit above,".to_string(),
                 };
-                self.show_message(format!("This is reader mode: {how} to edit."), false);
+                self.show_message(format!("This is {mode}: {how} to edit."), false);
                 AppAction::Continue
             }
         }
@@ -6161,6 +6201,8 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.active_panel().path(), Some(root.join("a.txt")));
         assert_eq!(app.focus, Focus::Editor);
+        assert!(app.ed().diffing(), "the changes open files to their diffs");
+        app.run(Command::ToggleDiff, false);
 
         // The language, after the badge, is still where it's clicked.
         let language = match app.ed().status() {
@@ -6182,6 +6224,114 @@ mod tests {
             "{}",
             status(&app)
         );
+    }
+
+    #[test]
+    fn changed_files_open_to_their_diffs_and_headers_toggle_them() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-diff");
+        fs::write(root.join("a.txt"), "a\nnew\n").unwrap();
+        let mut app = app(&root, Some("b.txt"));
+        wait_for_git(&mut app);
+        let header = |app: &App| screen(app).lines().next().unwrap_or("").to_string();
+        let click_header = |app: &mut App, label: &str| {
+            let header = header(app);
+            let at = header.find(label).expect(label);
+            let x = header[..at].chars().count() as u32 + 1;
+            left_click(app, x, 0);
+        };
+        assert!(!header(&app).contains(" Diff "), "b.txt didn't change");
+
+        app.run(Command::ToggleChanges, false);
+        left_click(&mut app, 6, 1);
+        assert_eq!(app.active_panel().path(), Some(root.join("a.txt")));
+        assert!(app.ed().diffing());
+        assert_eq!(app.focus, Focus::Tree, "a click previews");
+        let shown = screen(&app);
+        assert!(shown.contains("+ new"), "{shown}");
+        assert!(shown.contains("Diff  +1 −0"), "{shown}");
+        assert!(header(&app).contains(" Edit "));
+
+        click_header(&mut app, " Edit ");
+        assert!(!app.ed().diffing());
+        click_header(&mut app, " Diff ");
+        assert!(app.ed().diffing());
+        assert!(matches!(
+            app.ed_mut()
+                .type_key(Key::new(KeyCode::Char('x'), Mods::NONE)),
+            Action::ReadOnly
+        ));
+
+        // Opened any other way, a file shows its text.
+        app.open(&root.join("a.txt"), false);
+        assert!(!app.ed().diffing());
+
+        // Unsaved changes to a file count too.
+        app.open(&root.join("b.txt"), false);
+        app.focus = Focus::Editor;
+        key(&mut app, KeyCode::Char('x'));
+        assert!(header(&app).contains(" Diff "));
+        app.run(Command::ToggleDiff, false);
+        let shown = screen(&app);
+        assert!(shown.contains("- b") && shown.contains("+ xb"), "{shown}");
+    }
+
+    #[test]
+    fn text_in_a_diff_is_selected_and_copied_as_written() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-diff-copy");
+        fs::write(root.join("a.txt"), "a\n\tb c\n").unwrap();
+        let mut app = app(&root, None);
+        wait_for_git(&mut app);
+        assert!(app.open_as(&root.join("a.txt"), false, true));
+        app.focus = Focus::Editor;
+        let body = app.active_panel().body();
+        let mouse = |app: &mut App, kind, x, y| {
+            let mods = Mods::NONE;
+            app.handle_mouse(Mouse { kind, x, y, mods }, Instant::now());
+        };
+        assert!(matches!(ctrl(&mut app, 'c'), AppAction::Continue));
+        assert!(screen(&app).contains("Nothing selected."));
+
+        // From the line numbers, which count as the start, to past the end.
+        mouse(
+            &mut app,
+            MouseKind::Press(MouseButton::Left),
+            body.x,
+            body.y,
+        );
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 79, body.y + 1);
+        mouse(
+            &mut app,
+            MouseKind::Release(MouseButton::Left),
+            79,
+            body.y + 1,
+        );
+        assert!(app.ed().diffing(), "dragging doesn't go to editing");
+        let frame = OwnedBuffer::new(80, 10, false, WidthMethod::Unicode, "t").unwrap();
+        app.draw(&frame);
+        let text_x = (body.x..80)
+            .find(|&x| {
+                frame
+                    .to_text(true)
+                    .lines()
+                    .nth(body.y as usize)
+                    .unwrap()
+                    .chars()
+                    .nth(x as usize)
+                    == Some('a')
+            })
+            .unwrap();
+        assert_eq!(frame.bg_at(text_x, body.y), Some(theme::colors().selection));
+        assert!(
+            matches!(ctrl(&mut app, 'c'), AppAction::Copy(text) if text == "a\n\tb c"),
+            "without line numbers, signs, or the tab's spaces"
+        );
+
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.ed().selected_text(), None);
+        app.run(Command::SelectAll, false);
+        assert_eq!(app.ed().selected_text().as_deref(), Some("a\n\tb c"));
     }
 
     #[test]

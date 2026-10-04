@@ -109,6 +109,7 @@ commands! {
     ToggleTree => "tree:toggle", "Show or Hide File Tree";
     FocusTree => "tree:focus", "Focus File Tree";
     ToggleChanges => "git:toggle-changes", "Show or Hide Changes";
+    ToggleDiff => "git:toggle-diff", "Toggle Diff View";
     FocusEditor => "editor:focus", "Focus Editor";
     SplitRight => "panel:split-right", "Split Panel Right";
     SplitDown => "panel:split-down", "Split Panel Down";
@@ -896,6 +897,8 @@ mod tests {
             Command::EndSession,
             // The branch badge gets there too.
             Command::ToggleChanges,
+            // So does the button in a changed file's header.
+            Command::ToggleDiff,
         ];
         let keymap = Keymap::default();
         for &command in Command::ALL {

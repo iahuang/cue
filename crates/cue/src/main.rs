@@ -6,6 +6,7 @@ mod attach;
 mod changes;
 mod client;
 mod config;
+mod diff;
 mod context_menu;
 mod document;
 mod editor;

@@ -76,6 +76,8 @@ ratex-types = "0.1.14"
 ratex-font = "0.1.14"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 ttf-parser = "0.25"
+# Diff mode: line diffs, and which words in a changed line changed.
+similar = { version = "3", features = ["inline"] }
 
 
 # musl's allocator is slow under contention (parallel search, file indexing).

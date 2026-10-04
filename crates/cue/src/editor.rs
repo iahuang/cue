@@ -10,7 +10,9 @@
 //! in the file: it highlights every match and selects the current one.
 //!
 //! A Markdown file can be read rather than edited: in reader mode, the
-//! editor shows a [`Reader`] of its text instead.
+//! editor shows a [`Reader`] of its text instead. A file in a git
+//! repository can be shown as it changed since the last commit: in diff
+//! mode, the editor shows a [`DiffView`] of it instead.
 
 use std::cell::{Cell, RefMut};
 use std::ops::Range;
@@ -25,6 +27,7 @@ use opentui::{
 };
 
 use crate::config::{self, Config};
+use crate::diff::{DiffEvent, DiffView};
 #[cfg(test)]
 use crate::document::File;
 use crate::document::{Disk, Document};
@@ -78,7 +81,8 @@ pub enum Action {
     /// The file changed on disk while this had unsaved changes: the app
     /// asks whether to overwrite it or take the file's text.
     Conflict,
-    /// A key that edits, pressed in reader mode: the app says how to edit.
+    /// A key that edits, pressed in reader or diff mode: the app says how
+    /// to edit.
     ReadOnly,
 }
 
@@ -128,6 +132,8 @@ pub struct Editor {
     find: Option<FindBar>,
     /// In reader mode, what shows instead of the text.
     reader: Option<Reader>,
+    /// In diff mode, what shows instead of the text.
+    diff: Option<DiffView>,
     /// A link clicked in reader mode, for the app to follow.
     link: Option<String>,
     /// The mode, the row at the top, and the text's epoch, when last
@@ -175,6 +181,7 @@ impl Editor {
             message: None,
             find: None,
             reader: None,
+            diff: None,
             link: None,
             seen: Cell::new(None),
         };
@@ -254,6 +261,9 @@ impl Editor {
         if let Some(reader) = &mut self.reader {
             reader.set_size(width, height);
         }
+        if let Some(diff) = &mut self.diff {
+            diff.set_size(width, height);
+        }
     }
 
     /// Fits the view to the text area, which narrows or widens as the line
@@ -308,6 +318,9 @@ impl Editor {
         if let Some(reader) = self.reader() {
             return reader.selected_text();
         }
+        if let Some(diff) = &self.diff {
+            return diff.selected_text();
+        }
         self.view
             .selection()
             .filter(|(s, e)| s != e)
@@ -318,6 +331,8 @@ impl Editor {
     /// cursor at its start if it's empty. A line off screen is scrolled to
     /// a third of the way down.
     pub fn select_in_line(&mut self, row: u32, range: Range<usize>) {
+        // Going somewhere in the text is going to edit it.
+        self.diff = None;
         self.history().break_group();
         self.anchor = None;
         self.view.clear_selection();
@@ -404,8 +419,19 @@ impl Editor {
     }
 
     /// Types a key bound to no command. Keys with Ctrl/Alt/Cmd held never
-    /// type. In reader mode, Space pages down, and Shift+Space up.
+    /// type. In reader and diff mode, Space pages down, and Shift+Space up.
     pub fn type_key(&mut self, key: Key) -> Action {
+        if let Some(diff) = &mut self.diff {
+            return match key.code {
+                KeyCode::Char(' ') if key.mods.is_plain() => {
+                    let page = diff.page();
+                    diff.scroll(if key.mods.shift { -page } else { page });
+                    Action::Continue
+                }
+                KeyCode::Char(_) if key.mods.is_plain() => Action::ReadOnly,
+                _ => Action::Continue,
+            };
+        }
         if let Some(reader) = self.reader_mut() {
             return match key.code {
                 KeyCode::Char(' ') if key.mods.is_plain() => {
@@ -437,6 +463,9 @@ impl Editor {
         select: bool,
         clipboard: &mut Option<String>,
     ) -> Action {
+        if self.diffing() {
+            return self.run_diffing(command, clipboard);
+        }
         if self.reading() {
             return self.run_reading(command, clipboard);
         }
@@ -453,6 +482,7 @@ impl Editor {
         };
         match command {
             Command::ToggleReader => self.set_reading(false),
+            Command::ToggleDiff => self.set_diffing(true),
             Command::Save => return self.save(),
             Command::Copy => match reader.selected_text() {
                 Some(text) => return self.copy_text(text, clipboard),
@@ -466,6 +496,49 @@ impl Editor {
             Command::CursorPageDown => reader.scroll(reader.page()),
             Command::DocumentStart => reader.scroll_to_end(false),
             Command::DocumentEnd => reader.scroll_to_end(true),
+            Command::Undo
+            | Command::Redo
+            | Command::Cut
+            | Command::Paste
+            | Command::NewLine
+            | Command::InsertTab
+            | Command::Indent
+            | Command::Outdent
+            | Command::DeleteBackward
+            | Command::DeleteForward
+            | Command::DeleteWordBackward
+            | Command::DeleteWordForward
+            | Command::MoveLinesUp
+            | Command::MoveLinesDown
+            | Command::Replace
+            | Command::ReplaceAll => return Action::ReadOnly,
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    /// Runs a command in diff mode: keys that move the cursor scroll, and
+    /// those that edit don't.
+    fn run_diffing(&mut self, command: Command, clipboard: &mut Option<String>) -> Action {
+        let Some(diff) = self.diff.as_mut() else {
+            return Action::Continue;
+        };
+        match command {
+            Command::ToggleDiff => self.set_diffing(false),
+            Command::ToggleReader => self.set_reading(true),
+            Command::Save => return self.save(),
+            Command::Copy => match diff.selected_text() {
+                Some(text) => return self.copy_text(text, clipboard),
+                None => self.show_message("Nothing selected.", false),
+            },
+            Command::SelectAll => diff.select_all(),
+            Command::ClearSelection => diff.clear_selection(),
+            Command::CursorUp => diff.scroll(-1),
+            Command::CursorDown => diff.scroll(1),
+            Command::CursorPageUp => diff.scroll(-diff.page()),
+            Command::CursorPageDown => diff.scroll(diff.page()),
+            Command::DocumentStart => diff.scroll_to_end(false),
+            Command::DocumentEnd => diff.scroll_to_end(true),
             Command::Undo
             | Command::Redo
             | Command::Cut
@@ -521,6 +594,7 @@ impl Editor {
             }
             Command::ToggleWrap => self.toggle_wrap(),
             Command::ToggleReader => self.set_reading(true),
+            Command::ToggleDiff => self.set_diffing(true),
             Command::NewLine => self.edit(EditKind::Other, EditBuffer::new_line),
             // With lines selected, Tab indents them, as in most editors.
             Command::InsertTab if self.selection_spans_lines() => self.indent_lines(Forward),
@@ -574,6 +648,13 @@ impl Editor {
     }
 
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) {
+        if let Some(diff) = &mut self.diff {
+            if let Some(DiffEvent::Edit { line, row }) = diff.handle_mouse(mouse, now) {
+                self.diff = None;
+                self.scroll_line_to(line, row, Some(line));
+            }
+            return;
+        }
         if let Some(reader) = self.reader_mut() {
             match reader.handle_mouse(mouse, now) {
                 Some(ReaderEvent::Edit { line, row }) => {
@@ -719,7 +800,7 @@ impl Editor {
     }
 
     pub fn paste(&mut self, text: &str) -> Action {
-        if self.reading() {
+        if self.reading() || self.diffing() {
             return Action::ReadOnly;
         }
         // Terminals send newlines in pastes as CR.
@@ -733,6 +814,10 @@ impl Editor {
     /// position (0-based column, row), if it's in view. The keymap labels
     /// the find bar's buttons.
     pub fn draw(&self, frame: &Buffer, keymap: &Keymap) -> Option<(u32, u32)> {
+        if let Some(diff) = &self.diff {
+            diff.draw(frame, self.x, self.y);
+            return None;
+        }
         if let Some(reader) = self.reader() {
             reader.draw(frame, self.x, self.y);
             return None;
@@ -1325,6 +1410,7 @@ impl Editor {
     pub fn show_find(&mut self, memory: &find::Memory, replacing: bool) {
         // Find works on the text as written.
         self.set_reading(false);
+        self.set_diffing(false);
         let focus = self.find.as_ref().and_then(|bar| bar.focus);
         match focus {
             Some(Field::Find) if !replacing => return self.close_find(),
@@ -1372,6 +1458,7 @@ impl Editor {
     pub fn find_step(&mut self, memory: &find::Memory, forward: bool) {
         // Matches are in the text as written.
         self.set_reading(false);
+        self.set_diffing(false);
         if self.find.is_none() {
             if memory.query.text.is_empty() {
                 return self.show_find(memory, false);
@@ -1670,6 +1757,9 @@ impl Editor {
                 error: message.error,
             };
         }
+        if let Some(diff) = &self.diff {
+            return diff.status();
+        }
         if let Some(reader) = self.reader() {
             return reader.status();
         }
@@ -1753,6 +1843,9 @@ impl Editor {
         if let Some(reader) = &mut self.reader {
             reader.invalidate();
         }
+        if let Some(diff) = &mut self.diff {
+            diff.invalidate();
+        }
         let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) else {
             return;
         };
@@ -1826,12 +1919,20 @@ impl Editor {
             self.show_message("Reader mode is for Markdown files.", false);
             return;
         }
+        let top = match self.diff.take() {
+            Some(diff) => diff.top_line(),
+            None => self.top_line(),
+        };
         if self.find.is_some() {
             self.close_find();
         }
         self.drag = None;
-        let top = self.view.visible_lines().first().map_or(0, |row| row.line);
         self.read_from(top);
+    }
+
+    /// The file line at the top of the view, editing.
+    fn top_line(&self) -> u32 {
+        self.view.visible_lines().first().map_or(0, |row| row.line)
     }
 
     /// Goes to reader mode with file line `top` at the top.
@@ -1839,6 +1940,7 @@ impl Editor {
         if !self.is_markdown() {
             return;
         }
+        self.diff = None;
         let name = self
             .doc
             .path()
@@ -1863,6 +1965,58 @@ impl Editor {
     /// A link clicked in reader mode, to follow.
     pub fn take_link(&mut self) -> Option<String> {
         self.link.take()
+    }
+
+    // --- diff mode ---------------------------------------------------------
+
+    pub fn diffing(&self) -> bool {
+        self.diff.is_some()
+    }
+
+    /// Whether there's a diff worth showing: the file changed since the
+    /// last commit, as git says, or it has unsaved changes, in a
+    /// repository. In diff mode, there's always one, if only to leave.
+    pub fn has_diff(&self) -> bool {
+        self.diffing()
+            || self
+                .doc
+                .tracked()
+                .is_some_and(|tracked| tracked.kind.get().is_some() || self.doc.is_modified())
+    }
+
+    /// Goes to diff mode, or back to editing, keeping the line at the top
+    /// of the view at the top.
+    pub fn set_diffing(&mut self, on: bool) {
+        if on == self.diffing() {
+            return;
+        }
+        if !on {
+            let top = self.diff.take().map_or(0, |diff| diff.top_line());
+            self.scroll_line_to(top, 0, None);
+            return;
+        }
+        if self.doc.tracked().is_none() {
+            self.show_message("Not in a git repository.", false);
+            return;
+        }
+        let top = match self.reader.take() {
+            Some(reader) => reader.top_line(),
+            None => self.top_line(),
+        };
+        self.diff_from(top);
+    }
+
+    /// Goes to diff mode with file line `top`, or the first row after it,
+    /// at the top.
+    pub fn diff_from(&mut self, top: u32) {
+        if self.find.is_some() {
+            self.close_find();
+        }
+        self.drag = None;
+        self.reader = None;
+        let mut diff = DiffView::new(self.doc.clone(), top);
+        diff.set_size(self.width, self.height);
+        self.diff = Some(diff);
     }
 
     /// Scrolls the view so that file line `line` is `row` rows down, and

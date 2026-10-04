@@ -16,6 +16,7 @@
 //! otherwise each run would change the `.git` folder that's watched, and
 //! run it again.
 
+use std::cell::{Cell, OnceCell};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -87,6 +88,8 @@ pub struct Change {
     /// Where it is, or was, if it's gone.
     pub path: PathBuf,
     pub kind: Kind,
+    /// Where it was, if it was renamed.
+    pub from: Option<PathBuf>,
 }
 
 /// What a repository has checked out.
@@ -115,12 +118,80 @@ pub struct Repo {
     /// Its `.git` folder, which may be elsewhere, as a worktree's is.
     pub git_dir: PathBuf,
     pub head: Head,
+    /// The commit checked out, by its hash; `None` before the first.
+    pub commit: Option<String>,
     /// Sorted by path; past [`MAX_CHANGES`], the rest aren't listed.
     pub changes: Vec<Change>,
     /// Lines added since the last commit, staged or not, and in new files.
     pub added: usize,
     /// Lines removed since the last commit, staged or not.
     pub removed: usize,
+}
+
+/// What git says of a file: the repository it's in, how it changed since
+/// the last commit, if it did, and what it was in that commit, read the
+/// first time it's asked for.
+#[derive(Debug)]
+pub struct Tracked {
+    pub root: PathBuf,
+    /// The commit checked out; `None` before the first.
+    commit: Option<String>,
+    /// Where it was in that commit, from the root: where it is now, or
+    /// where it was renamed from.
+    old_path: PathBuf,
+    /// How it changed, if git says it did.
+    pub kind: Cell<Option<Kind>>,
+    base: OnceCell<Base>,
+}
+
+/// What a file was in the last commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Base {
+    /// Its text, with `\n` line breaks.
+    Text(String),
+    /// It wasn't in it, or there's no commit yet.
+    Missing,
+    Binary,
+}
+
+impl Tracked {
+    /// Whether `other` is of the same file in the same commit, so what it
+    /// was then is the same.
+    pub fn same_base(&self, other: &Tracked) -> bool {
+        (&self.root, &self.commit, &self.old_path) == (&other.root, &other.commit, &other.old_path)
+    }
+
+    /// What the file was in the last commit, asking git the first time.
+    pub fn base(&self) -> &Base {
+        self.base.get_or_init(|| {
+            let Some(commit) = &self.commit else {
+                return Base::Missing;
+            };
+            let spec = format!("{commit}:{}", self.old_path.to_string_lossy());
+            let output = git(&self.root).args(["cat-file", "blob", &spec]).output();
+            match output {
+                Ok(output) if output.status.success() => base_text(output.stdout),
+                _ => Base::Missing,
+            }
+        })
+    }
+}
+
+/// A file's bytes as [`Base`] has them: binary if there's a NUL early on,
+/// as git tells, and otherwise its text, with `\r\n` as `\n`, as editors
+/// have it.
+fn base_text(bytes: Vec<u8>) -> Base {
+    if bytes[..bytes.len().min(8000)].contains(&0) {
+        return Base::Binary;
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    };
+    match text.contains('\r') {
+        true => Base::Text(text.replace("\r\n", "\n")),
+        false => Base::Text(text),
+    }
 }
 
 pub struct Git {
@@ -169,6 +240,26 @@ impl Git {
             .iter()
             .filter(|repo| path.starts_with(&repo.root))
             .max_by_key(|repo| repo.root.components().count())
+    }
+
+    /// What git says of the file at `path`, if it's in a repository.
+    pub fn tracked(&self, path: &Path) -> Option<Tracked> {
+        let repo = self.repo_of(path)?;
+        let change = repo
+            .changes
+            .binary_search_by(|change| change.path.as_path().cmp(path))
+            .ok()
+            .map(|index| &repo.changes[index]);
+        let old = change
+            .and_then(|change| change.from.as_deref())
+            .unwrap_or(path);
+        Some(Tracked {
+            root: repo.root.clone(),
+            commit: repo.commit.clone(),
+            old_path: old.strip_prefix(&repo.root).ok()?.to_path_buf(),
+            kind: Cell::new(change.map(|change| change.kind)),
+            base: OnceCell::new(),
+        })
     }
 
     /// Asks git again: now, unless a run is in progress or one started
@@ -301,19 +392,20 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
     if !output.status.success() {
         return None;
     }
-    let (head, initial, changes) = parse_status(&output.stdout);
-    let (mut added, removed) = diff_lines(top, initial);
+    let (head, commit, changes) = parse_status(&output.stdout);
+    let (mut added, removed) = diff_lines(top, commit.is_none());
     let untracked = changes
         .iter()
-        .filter(|(_, kind)| *kind == Kind::Untracked)
-        .map(|(path, _)| top.join(path));
+        .filter(|(_, kind, _)| *kind == Kind::Untracked)
+        .map(|(path, ..)| top.join(path));
     added += count_lines(untracked);
     let mut changes: Vec<Change> = changes
         .into_iter()
         .take(MAX_CHANGES)
-        .map(|(path, kind)| Change {
+        .map(|(path, kind, from)| Change {
             path: top.join(path),
             kind,
+            from: from.map(|from| top.join(from)),
         })
         .collect();
     changes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -321,6 +413,7 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
         root: top.to_path_buf(),
         git_dir,
         head,
+        commit,
         changes,
         added,
         removed,
@@ -388,10 +481,13 @@ fn count_lines(paths: impl Iterator<Item = PathBuf>) -> usize {
     lines
 }
 
-/// What `git status --porcelain=v2 --branch -z` says: the head, whether
-/// it has no commits yet, and each changed file's path in the working tree
-/// with how it changed.
-fn parse_status(output: &[u8]) -> (Head, bool, Vec<(PathBuf, Kind)>) {
+/// A changed file's path in the working tree, how it changed, and if it
+/// was renamed, its path before.
+type Entry = (PathBuf, Kind, Option<PathBuf>);
+
+/// What `git status --porcelain=v2 --branch -z` says: the head, the commit
+/// checked out, unless there's none yet, and the files changed.
+fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>) {
     let mut oid = None;
     let mut branch = None;
     let mut changes = Vec::new();
@@ -412,37 +508,37 @@ fn parse_status(output: &[u8]) -> (Head, bool, Vec<(PathBuf, Kind)>) {
             continue;
         };
         let change = match kind {
-            "?" => Some((rest.to_string(), Kind::Untracked)),
+            "?" => Some((rest.to_string(), Kind::Untracked, None)),
             // XY sub mH mI mW hH hI path
             "1" => rest
                 .splitn(8, ' ')
                 .nth(7)
-                .map(|path| (path.to_string(), ordinary(rest))),
+                .map(|path| (path.to_string(), ordinary(rest), None)),
             // XY sub mH mI mW hH hI Xscore path, then the old path.
             "2" => {
                 let mut parts = rest.splitn(9, ' ').skip(7);
                 let score = parts.next().unwrap_or("");
                 let path = parts.next().map(str::to_string);
+                let from = fields.next();
                 // A copy is new, as far as what changed goes.
-                let kind = match score.starts_with('C') {
-                    true => Kind::Added,
-                    false => Kind::Renamed,
+                let (kind, from) = match score.starts_with('C') {
+                    true => (Kind::Added, None),
+                    false => (Kind::Renamed, from),
                 };
-                fields.next();
-                path.map(|path| (path, kind))
+                path.map(|path| (path, kind, from))
             }
             // XY sub m1 m2 m3 mW h1 h2 h3 path
             "u" => rest
                 .splitn(10, ' ')
                 .nth(9)
-                .map(|path| (path.to_string(), Kind::Conflicted)),
+                .map(|path| (path.to_string(), Kind::Conflicted, None)),
             _ => None,
         };
-        if let Some((path, kind)) = change {
-            changes.push((PathBuf::from(path), kind));
+        if let Some((path, kind, from)) = change {
+            changes.push((PathBuf::from(path), kind, from.map(PathBuf::from)));
         }
     }
-    let initial = oid.as_deref() == Some("(initial)");
+    let commit = oid.clone().filter(|oid| oid != "(initial)");
     let head = match branch {
         Some(branch) if branch != "(detached)" => Head::Branch(branch),
         _ => {
@@ -450,7 +546,7 @@ fn parse_status(output: &[u8]) -> (Head, bool, Vec<(PathBuf, Kind)>) {
             Head::Detached(oid.chars().take(7).collect())
         }
     };
-    (head, initial, changes)
+    (head, commit, changes)
 }
 
 /// How an ordinary changed entry changed, from the `XY` its line starts
@@ -521,21 +617,21 @@ pub(crate) mod tests {
             2 C. N... 100644 100644 100644 aaa aaa C75 copy.rs\0orig.rs\0\
             u UU N... 100644 100644 100644 100644 a b c both.rs\0\
             ? notes.txt\0";
-        let (head, initial, changes) = parse_status(output);
+        let (head, commit, changes) = parse_status(output);
         assert_eq!(head, Head::Branch("main".into()));
-        assert!(!initial);
+        assert_eq!(commit.as_deref(), Some("0123456789abcdef"));
         let expected = [
-            ("src/a b.rs", Kind::Modified),
-            ("new.rs", Kind::Added),
-            ("gone.rs", Kind::Deleted),
-            ("to.rs", Kind::Renamed),
-            ("copy.rs", Kind::Added),
-            ("both.rs", Kind::Conflicted),
-            ("notes.txt", Kind::Untracked),
+            ("src/a b.rs", Kind::Modified, None),
+            ("new.rs", Kind::Added, None),
+            ("gone.rs", Kind::Deleted, None),
+            ("to.rs", Kind::Renamed, Some("from.rs")),
+            ("copy.rs", Kind::Added, None),
+            ("both.rs", Kind::Conflicted, None),
+            ("notes.txt", Kind::Untracked, None),
         ];
-        let expected: Vec<(PathBuf, Kind)> = expected
+        let expected: Vec<Entry> = expected
             .into_iter()
-            .map(|(path, kind)| (PathBuf::from(path), kind))
+            .map(|(path, kind, from)| (PathBuf::from(path), kind, from.map(PathBuf::from)))
             .collect();
         assert_eq!(changes, expected);
     }
@@ -599,6 +695,23 @@ pub(crate) mod tests {
             Some(&dir)
         );
         assert_eq!((repo.added, repo.removed), (2, 2));
+    }
+
+    #[test]
+    fn reads_what_a_file_was_in_the_last_commit() {
+        let dir = repo("base");
+        fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        run(&dir, &["mv", "b.txt", "c.txt"]);
+        fs::write(dir.join("new.txt"), "new\n").unwrap();
+        let mut git = Git::new(std::slice::from_ref(&dir));
+        git.wait();
+        let base = |name: &str| git.tracked(&dir.join(name)).map(|t| t.base().clone());
+        assert_eq!(base("a.txt"), Some(Base::Text("a\n".into())));
+        assert_eq!(base("c.txt"), Some(Base::Text("b\n".into())), "renamed");
+        assert_eq!(base("new.txt"), Some(Base::Missing));
+        let tracked = git.tracked(&dir.join("a.txt")).unwrap();
+        assert_eq!(tracked.kind.get(), Some(Kind::Modified));
+        assert!(git.tracked(Path::new("/elsewhere/a.txt")).is_none());
     }
 
     #[test]

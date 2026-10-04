@@ -2048,7 +2048,7 @@ impl Reader {
 }
 
 /// The part of `text` in screen columns `range`.
-fn columns(text: &str, range: Range<usize>) -> &str {
+pub fn columns(text: &str, range: Range<usize>) -> &str {
     let mut col = 0;
     let mut start = text.len();
     let mut end = text.len();
