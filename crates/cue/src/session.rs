@@ -81,8 +81,16 @@ pub struct PanelState {
     /// Where it was in each file it showed, most recently opened last.
     pub places: Vec<Place>,
     /// What it showed before, most recent last, and went back from.
-    pub back: Vec<Shown>,
-    pub forward: Vec<Shown>,
+    pub back: Vec<Visited>,
+    pub forward: Vec<Visited>,
+}
+
+/// Something a panel showed, in its history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Visited {
+    pub shown: Shown,
+    /// The cursor's row and column, in a file.
+    pub at: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -599,6 +607,20 @@ fn shown_list(list: &[Shown]) -> Value {
     Value::Array(list.iter().map(shown_value).collect())
 }
 
+fn visited_list(list: &[Visited]) -> Value {
+    let visited = list.iter().map(|visited| {
+        let Value::Table(mut table) = shown_value(&visited.shown) else {
+            unreachable!()
+        };
+        if let Some((row, col)) = visited.at {
+            table.insert("row".into(), Value::Integer(row as i64));
+            table.insert("col".into(), Value::Integer(col as i64));
+        }
+        Value::Table(table)
+    });
+    Value::Array(visited.collect())
+}
+
 /// `state` as `session.toml` has it.
 pub fn encode(state: &State) -> String {
     let int = |n: u64| Value::Integer(n.min(i64::MAX as u64) as i64);
@@ -677,8 +699,8 @@ pub fn encode(state: &State) -> String {
                 Value::Table(table)
             });
             table.insert("places".into(), Value::Array(places.collect()));
-            table.insert("back".into(), shown_list(&panel.back));
-            table.insert("forward".into(), shown_list(&panel.forward));
+            table.insert("back".into(), visited_list(&panel.back));
+            table.insert("forward".into(), visited_list(&panel.forward));
             Value::Table(table)
         });
         table.insert("panels".into(), Value::Array(panels.collect()));
@@ -760,6 +782,16 @@ pub fn decode(text: &str) -> Option<State> {
     }
     let shown_list = |table: &Table, key: &str| -> Vec<Shown> {
         get_array(table, key).filter_map(shown_from).collect()
+    };
+    let visited_list = |table: &Table, key: &str| -> Vec<Visited> {
+        get_array(table, key)
+            .filter_map(|visited| {
+                Some(Visited {
+                    shown: shown_from(visited)?,
+                    at: get_u32(visited, "row").zip(get_u32(visited, "col")),
+                })
+            })
+            .collect()
     };
     let tree = root.get("tree").and_then(Value::as_table);
     let tree_flag = |key: &str| tree.and_then(|tree| tree.get(key)).and_then(Value::as_bool);
@@ -848,8 +880,8 @@ pub fn decode(text: &str) -> Option<State> {
                             .and_then(Value::as_table)
                             .and_then(shown_from),
                         places,
-                        back: shown_list(panel, "back"),
-                        forward: shown_list(panel, "forward"),
+                        back: visited_list(panel, "back"),
+                        forward: visited_list(panel, "forward"),
                     })
                 })
                 .filter(|panel| ids.contains(&panel.id))
@@ -918,8 +950,20 @@ mod tests {
                             top: 3,
                             reading: Some(7),
                         }],
-                        back: vec![Shown::Terminal(2), Shown::Image("/w/i.png".into())],
-                        forward: vec![Shown::Untitled(1)],
+                        back: vec![
+                            Visited {
+                                shown: Shown::Terminal(2),
+                                at: None,
+                            },
+                            Visited {
+                                shown: Shown::File("/w/cue/b.rs".into()),
+                                at: Some((40, 2)),
+                            },
+                        ],
+                        forward: vec![Visited {
+                            shown: Shown::Untitled(1),
+                            at: Some((0, 5)),
+                        }],
                     }],
                 },
                 TabState {

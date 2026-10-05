@@ -17,10 +17,11 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use opentui::{EditBuffer, WidthMethod};
+use opentui::{EditBuffer, LogicalCursor, WidthMethod};
 
 use crate::config;
 use crate::git::Tracked;
@@ -148,6 +149,70 @@ pub struct Document {
     tracked: RefCell<Option<Rc<Tracked>>>,
 }
 
+/// A new id, for an editor or a [`Spot`]: none is used twice.
+pub fn next_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A place in a document's text to go back to, which moves along with
+/// edits as parked cursors do. Once the document is closed, it stays where
+/// it was last seen.
+#[derive(Debug)]
+pub struct Spot {
+    doc: Weak<Document>,
+    id: u64,
+    seen: Cell<(u32, u32)>,
+}
+
+impl Spot {
+    /// The place at `row` and `col` in `doc`, or as near as the text has.
+    pub fn new(doc: &Rc<Document>, row: u32, col: u32) -> Spot {
+        let id = next_id();
+        let buffer = &doc.buffer;
+        let row = row.min(buffer.line_count().saturating_sub(1));
+        // Past the end of the line, its start.
+        let offset = match buffer.position_to_offset(row, col) {
+            0 => buffer.position_to_offset(row, 0),
+            offset => offset,
+        };
+        if let Some(cursor) = buffer.offset_to_position(offset) {
+            doc.keep(id, cursor);
+        }
+        let seen = doc.parked(id).map_or((row, col), |p| (p.row, p.col));
+        Spot {
+            doc: Rc::downgrade(doc),
+            id,
+            seen: Cell::new(seen),
+        }
+    }
+
+    /// The place at `row` and `col` in a file that isn't open.
+    pub fn closed(row: u32, col: u32) -> Spot {
+        Spot {
+            doc: Weak::new(),
+            id: next_id(),
+            seen: Cell::new((row, col)),
+        }
+    }
+
+    /// Its row and column.
+    pub fn at(&self) -> (u32, u32) {
+        if let Some(parked) = self.doc.upgrade().and_then(|doc| doc.parked(self.id)) {
+            self.seen.set((parked.row, parked.col));
+        }
+        self.seen.get()
+    }
+}
+
+impl Drop for Spot {
+    fn drop(&mut self) {
+        if let Some(doc) = self.doc.upgrade() {
+            doc.forget(self.id);
+        }
+    }
+}
+
 /// An editor's cursor while another editor of the same document has the
 /// buffer's. It moves along with edits made meanwhile (see
 /// [`Document::follow_edits`]).
@@ -255,8 +320,13 @@ impl Document {
 
     /// Parks the buffer's cursor for editor `id`, which is giving it up.
     pub fn park(&self, id: u64) {
+        self.keep(id, self.buffer.cursor());
+    }
+
+    /// Keeps the place `cursor` is at for `id`, moving it along with edits
+    /// as a parked cursor (see [`Document::follow_edits`]).
+    fn keep(&self, id: u64, cursor: LogicalCursor) {
         self.follow_edits();
-        let cursor = self.buffer.cursor();
         let epoch = self.buffer.content_epoch();
         let mut snapshot = self.parked_text.borrow_mut();
         if snapshot.0 != epoch || self.parked.borrow().is_empty() {

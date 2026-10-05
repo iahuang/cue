@@ -14,7 +14,10 @@
 //!
 //! Like a browser tab, a panel keeps a history of what it showed, to go
 //! back and forward through (Ctrl+- and Ctrl+=). Popping (Ctrl+0) closes
-//! what it shows and goes back, as from the top of a stack.
+//! what it shows and goes back, as from the top of a stack. The history
+//! keeps where in a file the cursor was, and jumps within a file count
+//! too, as in Vim's jump list: going to a line, symbol, or search result,
+//! to the start or end, a click, or the find bar, when they go far.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -24,7 +27,7 @@ use std::time::Instant;
 use opentui::{Attributes, Buffer};
 
 use crate::commit_diff::CommitDiff;
-use crate::document::{Disk, Document};
+use crate::document::{Disk, Document, Spot};
 use crate::editor::Editor;
 use crate::git::{Change, Commit};
 use crate::icons::{self, Icon};
@@ -41,6 +44,9 @@ use crate::workspace::Workspace;
 const SUGGESTIONS: &[Command] = &[Command::GoToFile, Command::NewFile, Command::NewTerminal];
 /// How far back a panel's history goes.
 const HISTORY: usize = 50;
+/// Places in a file at most this many lines apart are one place to the
+/// history: a jump goes nowhere new unless it goes further.
+const NEAR_LINES: u32 = 10;
 /// The header's buttons, left to right, and their labels.
 const BUTTONS: [(HeaderButton, &str); 3] = [
     (HeaderButton::Back, " < "),
@@ -72,8 +78,8 @@ pub enum HeaderButton {
 #[derive(Debug, Clone)]
 pub enum Visit {
     /// A file: its document while it's open, and its path, to open it
-    /// again once it's closed.
-    File(Weak<Document>, Option<PathBuf>),
+    /// again once it's closed, and where the cursor was in it, if known.
+    File(Weak<Document>, Option<PathBuf>, Option<Rc<Spot>>),
     /// A terminal, by id.
     Terminal(u32),
     /// An image file.
@@ -86,10 +92,39 @@ pub enum Visit {
     },
 }
 
+/// A visit to `doc` at `row` and `col`, unless it's an unnamed document
+/// that was never typed in, which isn't worth going back to.
+fn visit_file(doc: &Rc<Document>, row: u32, col: u32) -> Option<Visit> {
+    if doc.is_blank() {
+        return None;
+    }
+    let spot = Spot::new(doc, row, col);
+    Some(Visit::File(
+        Rc::downgrade(doc),
+        doc.path(),
+        Some(Rc::new(spot)),
+    ))
+}
+
 impl Visit {
+    /// Whether it's the same place as `other`: the same file, and near the
+    /// same line in it.
     fn is(&self, other: &Visit) -> bool {
+        if !self.shows_same(other) {
+            return false;
+        }
         match (self, other) {
-            (Visit::File(a, a_path), Visit::File(b, b_path)) => {
+            (Visit::File(_, _, Some(a)), Visit::File(_, _, Some(b))) => {
+                a.at().0.abs_diff(b.at().0) <= NEAR_LINES
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether it shows what `other` does, wherever in a file.
+    fn shows_same(&self, other: &Visit) -> bool {
+        match (self, other) {
+            (Visit::File(a, a_path, _), Visit::File(b, b_path, _)) => {
                 a.ptr_eq(b) || (a_path.is_some() && a_path == b_path)
             }
             (Visit::Terminal(a), Visit::Terminal(b)) => a == b,
@@ -473,16 +508,41 @@ impl Panel {
                 change: commit.change().clone(),
             });
         }
-        let doc = self.document().filter(|doc| !doc.is_blank())?;
-        Some(Visit::File(Rc::downgrade(doc), doc.path()))
+        let editor = self.editor()?;
+        let (row, col, _) = editor.place();
+        visit_file(editor.document(), row, col)
     }
 
     /// Notes what's on screen, which is about to go, as the place to go
-    /// back to. Going somewhere new, there's no going forward.
+    /// back to.
     fn leave(&mut self) {
-        let Some(visit) = self.visit() else {
+        if let Some(visit) = self.visit() {
+            self.note(visit);
+        }
+    }
+
+    /// Notes where the editor on screen jumped from in its file, if it did
+    /// (see [`Editor::take_jump`]), as the place to go back to, unless
+    /// it's near where it is now.
+    pub fn note_jump(&mut self) {
+        let jumps: Vec<_> = self.editors.iter_mut().map(Editor::take_jump).collect();
+        let Some(current) = self.current else {
             return;
         };
+        let Some((row, col)) = jumps[current] else {
+            return;
+        };
+        let Some(from) = visit_file(self.editors[current].document(), row, col) else {
+            return;
+        };
+        if !self.visit().is_some_and(|here| here.is(&from)) {
+            self.note(from);
+        }
+    }
+
+    /// Notes `visit` as the place to go back to. Going somewhere new,
+    /// there's no going forward.
+    fn note(&mut self, visit: Visit) {
         let History { back, forward } = &mut self.history;
         forward.clear();
         back.retain(|old| !old.is(&visit));
@@ -522,7 +582,7 @@ impl Panel {
     /// Drops `visit` from the places to go back to, as when it was closed
     /// for good.
     pub fn drop_visit(&mut self, visit: &Visit) {
-        self.history.back.retain(|old| !old.is(visit));
+        self.history.back.retain(|old| !old.shows_same(visit));
     }
 
     /// Whether there's a place to go back to (or forward to, if not

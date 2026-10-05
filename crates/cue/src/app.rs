@@ -77,7 +77,7 @@ use crate::changes::ChangesView;
 use crate::commit_diff::{CommitDiff, Outcome};
 use crate::config::{self, Config, MIN_TREE_WIDTH};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
-use crate::document::{self, Disk, DiskChange, Document};
+use crate::document::{self, Disk, DiskChange, Document, Spot};
 use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
@@ -1568,6 +1568,9 @@ impl App {
         for doc in &self.documents {
             doc.follow_edits();
         }
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            panel.note_jump();
+        }
         self.sync_scroll();
         self.editor_mut();
         self.note_terminal_focus();
@@ -2027,7 +2030,7 @@ impl App {
             .collect();
         let (documents, terminals) = (&self.documents, &self.terminals);
         let usable = |visit: &Visit| match visit {
-            Visit::File(doc, path) => {
+            Visit::File(doc, path, _) => {
                 let open = doc
                     .upgrade()
                     .is_some_and(|doc| documents.iter().any(|d| Rc::ptr_eq(d, &doc)));
@@ -2047,18 +2050,28 @@ impl App {
         };
         let history = self.active_panel_mut().take_history();
         match visit {
-            Visit::File(doc, path) => {
+            Visit::File(doc, path, spot) => {
                 let doc = doc
                     .upgrade()
                     .filter(|doc| self.documents.iter().any(|d| Rc::ptr_eq(d, doc)));
-                match (doc, path) {
-                    (Some(doc), _) => self.show_document(&doc),
+                let shown = match (doc, path) {
+                    (Some(doc), _) => {
+                        self.show_document(&doc);
+                        self.active_panel().shows(&doc)
+                    }
                     (None, Some(path)) => {
-                        if self.open(&path, false) {
+                        let opened = self.open(&path, false);
+                        if opened {
                             self.focus = Focus::Editor;
                         }
+                        opened
                     }
-                    (None, None) => {}
+                    (None, None) => false,
+                };
+                if let Some(editor) = self.editor_mut().filter(|_| shown) {
+                    if let Some(spot) = spot {
+                        editor.return_to(spot.at());
+                    }
                 }
             }
             Visit::Terminal(id) => {
@@ -2284,9 +2297,8 @@ impl App {
                         }
                     }
                     Choice::FileAt(path, position) => {
-                        if self.open(&path, false) {
+                        if self.open_and(&path, |editor| editor.go_to(position)) {
                             self.focus = Focus::Editor;
-                            self.go_to(position);
                         }
                     }
                     Choice::Line(position) => {
@@ -2294,12 +2306,12 @@ impl App {
                         self.go_to(position);
                     }
                     Choice::Symbol(path, line, bytes) => {
+                        let go = |editor: &mut Editor| editor.select_in_line(line, bytes);
                         let shown = match &path {
-                            Some(path) => self.open(path, false),
-                            None => self.editor().is_some(),
+                            Some(path) => self.open_and(path, go),
+                            None => self.editor_mut().map(go).is_some(),
                         };
-                        if let Some(editor) = self.editor_mut().filter(|_| shown) {
-                            editor.select_in_line(line, bytes);
+                        if shown {
                             self.focus = Focus::Editor;
                         }
                     }
@@ -2444,10 +2456,7 @@ impl App {
             SearchAction::Close => self.close_search(),
             SearchAction::Open { path, line, range } => {
                 self.close_search();
-                if self.open(&path, false) {
-                    if let Some(editor) = self.editor_mut() {
-                        editor.select_in_line(line, range);
-                    }
+                if self.open_and(&path, |editor| editor.select_in_line(line, range)) {
                     self.focus = Focus::Editor;
                 }
             }
@@ -2465,6 +2474,24 @@ impl App {
     /// file can't be opened.
     fn open(&mut self, path: &Path, preview: bool) -> bool {
         self.open_as(path, preview, false)
+    }
+
+    /// Opens `path` as [`App::open`] does, and moves in it with `go`. In a
+    /// file it went to, moving is part of going there, which the panel's
+    /// history notes already, rather than a jump within it.
+    fn open_and(&mut self, path: &Path, go: impl FnOnce(&mut Editor)) -> bool {
+        let before = self.active_panel().document().cloned();
+        if !self.open(path, false) {
+            return false;
+        }
+        let arrived = !before.is_some_and(|doc| self.active_panel().shows(&doc));
+        if let Some(editor) = self.editor_mut() {
+            go(editor);
+            if arrived {
+                editor.take_jump();
+            }
+        }
+        true
     }
 
     /// Opens `path` as [`App::open`] does, and with `diff`, shows how it
@@ -3678,8 +3705,8 @@ impl App {
                                     })
                                 })
                                 .collect(),
-                            back: back.iter().filter_map(visit_shown).collect(),
-                            forward: forward.iter().filter_map(visit_shown).collect(),
+                            back: back.iter().filter_map(visited).collect(),
+                            forward: forward.iter().filter_map(visited).collect(),
                         }
                     })
                     .collect(),
@@ -3878,14 +3905,25 @@ impl App {
         for tab in &mut self.tabs {
             tab.set_area(area);
         }
-        let visit = |shown: &Shown| match shown {
-            Shown::File(path) => Some(Visit::File(
-                find_doc(shown).map_or_else(Weak::new, |doc| Rc::downgrade(&doc)),
-                Some(path.clone()),
-            )),
-            Shown::Untitled(_) => Some(Visit::File(Rc::downgrade(&find_doc(shown)?), None)),
-            Shown::Terminal(id) => Some(Visit::Terminal(*id)),
-            Shown::Image(path) => Some(Visit::Image(path.clone())),
+        let visit = |visited: &session::Visited| {
+            let shown = &visited.shown;
+            let doc = find_doc(shown);
+            let spot = visited.at.map(|(row, col)| {
+                Rc::new(match &doc {
+                    Some(doc) => Spot::new(doc, row, col),
+                    None => Spot::closed(row, col),
+                })
+            });
+            match shown {
+                Shown::File(path) => Some(Visit::File(
+                    doc.as_ref().map_or_else(Weak::new, Rc::downgrade),
+                    Some(path.clone()),
+                    spot,
+                )),
+                Shown::Untitled(_) => Some(Visit::File(Rc::downgrade(&doc?), None, spot)),
+                Shown::Terminal(id) => Some(Visit::Terminal(*id)),
+                Shown::Image(path) => Some(Visit::Image(path.clone())),
+            }
         };
         for (tab, saved) in self.tabs.iter_mut().zip(&state.tabs) {
             for saved in &saved.panels {
@@ -4880,11 +4918,13 @@ impl App {
             // the terminal keeps running.
             None => self.split(Axis::Horizontal),
         }
-        if self.open(path, false) {
-            self.focus = Focus::Editor;
+        let go = |editor: &mut Editor| {
             if let Some(position) = position {
-                self.go_to(position);
+                editor.go_to(position);
             }
+        };
+        if self.open_and(path, go) {
+            self.focus = Focus::Editor;
         }
     }
 
@@ -5238,12 +5278,25 @@ fn running_programs(terminals: &[Rc<RefCell<Terminal>>]) -> Vec<String> {
 /// What a session calls `visit`, if it's still about.
 fn visit_shown(visit: &Visit) -> Option<Shown> {
     Some(match visit {
-        Visit::File(_, Some(path)) => Shown::File(path.clone()),
-        Visit::File(doc, None) => Shown::Untitled(doc.upgrade()?.untitled.get()),
+        Visit::File(_, Some(path), _) => Shown::File(path.clone()),
+        Visit::File(doc, None, _) => Shown::Untitled(doc.upgrade()?.untitled.get()),
         Visit::Terminal(id) => Shown::Terminal(*id),
         Visit::Image(path) => Shown::Image(path.clone()),
         // Read from git again easily enough, but not worth keeping.
         Visit::Commit { .. } => return None,
+    })
+}
+
+/// What a session keeps of `visit` in a panel's history, if it's still
+/// about: what it showed, and where the cursor was in a file.
+fn visited(visit: &Visit) -> Option<session::Visited> {
+    let at = match visit {
+        Visit::File(_, _, Some(spot)) => Some(spot.at()),
+        _ => None,
+    };
+    Some(session::Visited {
+        shown: visit_shown(visit)?,
+        at,
     })
 }
 
@@ -5966,6 +6019,85 @@ mod tests {
             "the terminal is the other panel's"
         );
         assert!(screen(&app).contains("Nothing to go forward to."));
+    }
+
+    #[test]
+    fn going_back_returns_to_where_the_cursor_jumped_from() {
+        let _serial = crate::test_serial();
+        let text: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let root = fixture("jumps", &[("a.txt", &text), ("b.txt", "b")]);
+        let mut app = app(&root, Some("a.txt"));
+        let row = |app: &App| app.ed().place().0;
+        let back = |app: &mut App| ctrl(app, '-');
+        let forward = |app: &mut App| ctrl(app, '=');
+        let go_to_line = |app: &mut App, line| {
+            app.picker_action(PickerAction::Accept(Choice::Line(Position::printed(
+                line, None,
+            ))));
+            app.after_input();
+        };
+
+        // Ctrl+End and back, and forward again.
+        app.handle_key(Key::new(KeyCode::End, Mods::CTRL));
+        assert_eq!(row(&app), 200);
+        back(&mut app);
+        assert_eq!((shown_name(&app).as_deref(), row(&app)), (Some("a.txt"), 0));
+        forward(&mut app);
+        assert_eq!(row(&app), 200);
+
+        // Going to a line is a jump; going a few lines further isn't.
+        go_to_line(&mut app, 100);
+        go_to_line(&mut app, 105);
+        assert_eq!(row(&app), 104);
+        back(&mut app);
+        assert_eq!(row(&app), 200);
+
+        // Places follow edits made since.
+        go_to_line(&mut app, 50);
+        app.handle_key(Key::new(KeyCode::Home, Mods::CTRL));
+        type_text(&mut app, "x");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        back(&mut app);
+        assert_eq!(row(&app), 51);
+
+        // Going to a line in another file goes back to that file, not to
+        // where the cursor was in the file before going there.
+        app.open(&root.join("b.txt"), false);
+        app.after_input();
+        app.picker_action(PickerAction::Accept(Choice::FileAt(
+            root.join("a.txt"),
+            Position::printed(150, None),
+        )));
+        app.after_input();
+        assert_eq!(row(&app), 149);
+        back(&mut app);
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        back(&mut app);
+        assert_eq!(
+            (shown_name(&app).as_deref(), row(&app)),
+            (Some("a.txt"), 51)
+        );
+
+        // Finding goes back to before finding, however many matches on.
+        ctrl(&mut app, 'f');
+        type_text(&mut app, "line 1");
+        assert_eq!(row(&app), 101);
+        type_text(&mut app, "80");
+        assert_eq!(row(&app), 181);
+        key(&mut app, KeyCode::Esc);
+        back(&mut app);
+        assert_eq!(row(&app), 51);
+
+        // A click far off is a jump.
+        let body = app.active_panel().body();
+        for _ in 0..20 {
+            mouse_at(&mut app, MouseKind::ScrollDown, body.x + 10, body.y + 2);
+        }
+        left_click(&mut app, body.x + 10, body.y + 2);
+        assert!(row(&app) > 100, "{}", row(&app));
+        back(&mut app);
+        assert_eq!(row(&app), 51);
     }
 
     #[test]

@@ -18,7 +18,6 @@ use std::cell::{Cell, RefMut};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use opentui::{
@@ -30,7 +29,7 @@ use crate::config::{self, Config};
 use crate::diff::{self, DiffEvent, DiffView, Hunks, LineMark};
 #[cfg(test)]
 use crate::document::File;
-use crate::document::{Disk, Document};
+use crate::document::{self, Disk, Document};
 use crate::find::{self, Field, FindBar, Match, Target};
 use crate::history::{EditKind, History};
 use crate::indent::Indent;
@@ -141,6 +140,11 @@ pub struct Editor {
     /// The mode, the row at the top, and the text's epoch, when last
     /// asked whether it moved (see [`Editor::moved`]).
     seen: Cell<Option<(bool, u32, u64)>>,
+    /// Where the cursor was before it jumped, until the panel takes it for
+    /// its history (see [`Editor::take_jump`]).
+    jumped: Option<(u32, u32)>,
+    /// Where the cursor was when the find bar opened, while it's open.
+    find_start: Option<(u32, u32)>,
 }
 
 impl Editor {
@@ -159,7 +163,6 @@ impl Editor {
     /// An editor `width` x `height` of `doc`, with line numbers down the
     /// left. It starts with the buffer's cursor.
     pub fn show(doc: Rc<Document>, width: u32, height: u32) -> opentui::Result<Editor> {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let buffer = doc.buffer.clone();
         let (_, view_w, view_h) = text_area(width, height, buffer.line_count());
         let view = buffer.shared_view(view_w, view_h)?;
@@ -168,7 +171,7 @@ impl Editor {
         view.set_wrap_mode(wrap);
         view.set_scroll_margin(config.scroll_margin);
         let mut editor = Editor {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id: document::next_id(),
             doc,
             buffer,
             view,
@@ -187,6 +190,8 @@ impl Editor {
             hunks: Hunks::default(),
             link: None,
             seen: Cell::new(None),
+            jumped: None,
+            find_start: None,
         };
         editor.attach();
         Ok(editor)
@@ -334,6 +339,7 @@ impl Editor {
     /// cursor at its start if it's empty. A line off screen is scrolled to
     /// a third of the way down.
     pub fn select_in_line(&mut self, row: u32, range: Range<usize>) {
+        self.jump_from(self.cursor());
         // Going somewhere in the text is going to edit it.
         self.diff = None;
         self.history().break_group();
@@ -389,6 +395,49 @@ impl Editor {
         self.buffer.set_cursor(row, col);
         let max_top = self.view.total_virtual_line_count().saturating_sub(1);
         self.view.scroll_to(0, top.min(max_top), false);
+    }
+
+    /// Puts the cursor back at `row` and `col`, as going back through a
+    /// panel's history does, scrolling it into view. Already there, the
+    /// editor stays as it is.
+    pub fn return_to(&mut self, (row, col): (u32, u32)) {
+        if self.cursor() == (row, col) {
+            return;
+        }
+        self.attach();
+        self.diff = None;
+        self.history().break_group();
+        self.anchor = None;
+        self.view.clear_selection();
+        let vp = self.view.viewport();
+        let row = row.min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(row, col);
+        self.reveal(vp);
+        if let Some(reader) = &mut self.reader {
+            reader.scroll_line_to(row, 0);
+        }
+    }
+
+    /// Notes that the cursor jumped from `from`, for the panel's history.
+    /// Several jumps before it's taken go back to the first.
+    fn jump_from(&mut self, from: (u32, u32)) {
+        self.jumped.get_or_insert(from);
+    }
+
+    /// Notes a jump from the cursor, unless the move is `select`ing:
+    /// selecting to somewhere isn't going there.
+    fn jump_unless_selecting(&mut self, select: bool) {
+        if !select {
+            self.jump_from(self.cursor());
+        }
+    }
+
+    /// Where the cursor was before it jumped somewhere else in the text, if
+    /// it did since last asked: with Go to Line, a symbol or search result,
+    /// Ctrl+Home or Ctrl+End, a click, or the find bar. The panel decides
+    /// whether it went far enough to go back to.
+    pub fn take_jump(&mut self) -> Option<(u32, u32)> {
+        self.jumped.take()
     }
 
     /// Scrolls the cursor's row a third of the way down if it was off screen
@@ -636,9 +685,13 @@ impl Editor {
                 self.move_cursor(select, Forward, |ed| ed.view.move_to_visual_line_end())
             }
             Command::DocumentStart => {
+                self.jump_unless_selecting(select);
                 self.move_cursor(select, Backward, Self::move_to_document_start)
             }
-            Command::DocumentEnd => self.move_cursor(select, Forward, Self::move_to_document_end),
+            Command::DocumentEnd => {
+                self.jump_unless_selecting(select);
+                self.move_cursor(select, Forward, Self::move_to_document_end)
+            }
             Command::CursorPageUp => self.move_cursor(select, Backward, |ed| {
                 (0..ed.page()).for_each(|_| ed.view.move_up_visual())
             }),
@@ -695,6 +748,7 @@ impl Editor {
                     3 => SelectionBehavior::Line,
                     _ => SelectionBehavior::Cell,
                 };
+                self.jump_from(self.cursor());
                 self.anchor = None;
                 self.view.clear_selection();
                 self.view.set_local_selection(
@@ -1452,6 +1506,9 @@ impl Editor {
         }
         let selected = self.selected_text().filter(|text| !text.contains('\n'));
         let origin = self.selection_start();
+        if self.find.is_none() {
+            self.find_start = Some(self.cursor());
+        }
         let bar = self
             .find
             .get_or_insert_with(|| FindBar::new(memory.clone(), origin));
@@ -1493,6 +1550,7 @@ impl Editor {
             let mut bar = FindBar::new(memory.clone(), self.selection_start());
             bar.focus = None;
             self.find = Some(bar);
+            self.find_start = Some(self.cursor());
         }
         self.sync_find();
         let Some(bar) = &self.find else {
@@ -1566,6 +1624,7 @@ impl Editor {
         if self.find.take().is_none() {
             return;
         }
+        self.find_start = None;
         self.buffer.remove_highlights(FIND_HIGHLIGHTS);
         if let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) {
             self.view.set_selection(start, end, selection_colors());
@@ -1669,6 +1728,10 @@ impl Editor {
             return;
         };
         bar.origin = m.offsets.start;
+        // However far it goes, going back is to before finding.
+        if let Some(start) = self.find_start {
+            self.jump_from(start);
+        }
         self.history().break_group();
         let vp = self.view.viewport();
         self.view.set_cursor_by_offset(m.offsets.end);
