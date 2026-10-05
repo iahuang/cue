@@ -15,7 +15,7 @@
 //! When the shell exits, the terminal keeps its last screen until Enter
 //! starts a new shell.
 //!
-//! The find bar (Cmd+F or Ctrl+Shift+F) finds in the output and the
+//! The find bar (Ctrl+F or Cmd+F) finds in the output and the
 //! history above it, as the editor's does in a file, without replacing.
 //! As in other terminals, the next match is the one above: finding starts
 //! from the bottom of the view and goes back through the history. Matches

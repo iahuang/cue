@@ -142,7 +142,7 @@ commands! {
     NewTerminal => "terminal:new", "New Terminal";
     ClearTerminal => "terminal:clear", "Clear Terminal";
     RenameTerminal => "terminal:rename", "Rename Terminal";
-    TerminalPrefix => "terminal:prefix", "Terminal: Send Next Shortcut to cue";
+    ToggleTerminalKeys => "terminal:toggle-keys", "Terminal: Toggle Sending Shortcuts to the Shell";
     TreeUp => "tree:up", "File Tree: Select Previous";
     TreeDown => "tree:down", "File Tree: Select Next";
     TreeExpand => "tree:expand", "File Tree: Expand";
@@ -253,7 +253,7 @@ impl Command {
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
             DialogParent | DialogComplete => Context::Dialog,
             FindSwitchField | FindClose => Context::Find,
-            ClearTerminal | RenameTerminal | TerminalPrefix => Context::Terminal,
+            ClearTerminal | RenameTerminal | ToggleTerminalKeys => Context::Terminal,
             Replace | ReplaceAll => Context::Replace,
             _ => Context::Editor,
         }
@@ -406,7 +406,7 @@ impl Default for Keymap {
         // palette has it.
         bindings.push((key(Char('n'), CTRL_SHIFT), NewTerminal));
         bindings.push((key(Char('n'), SUPER_SHIFT), NewTerminal));
-        // As in VS Code; Ctrl+` alone is the terminal's prefix. Some
+        // As in VS Code; Ctrl+` alone toggles the terminal's keys. Some
         // terminals report the shifted key, `~`.
         bindings.push((key(Char('`'), CTRL_SHIFT), NewTerminal));
         bindings.push((key(Char('~'), CTRL_SHIFT), NewTerminal));
@@ -572,17 +572,16 @@ impl Default for Keymap {
             });
         }
         // In a terminal, Ctrl+C and Ctrl+V are the shell's; as in Linux
-        // terminals, Ctrl+Shift copies and pastes. Ctrl+` makes the next
-        // shortcut cue's, as in tmux (VS Code's terminal toggle; shells
-        // don't use it). Terminals without the kitty keyboard protocol send
-        // it as Ctrl+Space. Ctrl+1 to 9 go to tabs, and Ctrl+0 pops, from
-        // terminals too: shells don't use them either.
+        // terminals, Ctrl+Shift copies and pastes. Ctrl+` toggles whether
+        // cue's shortcuts or the shell gets Ctrl keys (VS Code's terminal
+        // toggle; shells don't use it). Ctrl+1 to 9 go to tabs, and Ctrl+0
+        // pops, from terminals too: shells don't use them either.
         let go_to_tab = ('1'..='9')
             .zip(Command::GO_TO_TAB)
             .map(|(n, command)| (key(Char(n), Mods::CTRL), command));
         for (key, command) in go_to_tab.chain([
             (key(Char('0'), Mods::CTRL), Pop),
-            (key(Char('`'), Mods::CTRL), TerminalPrefix),
+            (key(Char('`'), Mods::CTRL), ToggleTerminalKeys),
             (key(Char('c'), CTRL_SHIFT), Copy),
             (key(Char('c'), SUPER), Copy),
             (key(Char('v'), CTRL_SHIFT), Paste),
@@ -651,56 +650,29 @@ impl Keymap {
     }
 
     /// The command bound to `key` in a terminal, which gets the key when
-    /// there is none. The shell has the keys a terminal would send it:
-    /// cue keeps only its terminal bindings, and global shortcuts with
-    /// Cmd (Super), Ctrl+Alt, or Ctrl+Shift, which shells don't use.
-    /// Ctrl+Shift+key runs cue's Ctrl+key command, taking precedence over
-    /// its usual shifted binding. The prefix, Ctrl+`, reaches the rest.
-    pub fn lookup_terminal(&self, key: Key) -> Option<Command> {
+    /// there is none. With `cue_keys` (Ctrl+` toggles it), cue keeps its
+    /// terminal bindings and its global shortcuts with Ctrl or Cmd (Super);
+    /// unbinding one gives it back to the shell. Without, the shell gets
+    /// every key but Ctrl+` and Cmd's, which shells don't use.
+    pub fn lookup_terminal(&self, key: Key, cue_keys: bool) -> Option<Command> {
         let key = normalize(key);
-        let bound = |key, context| {
+        let bound = |context| {
             self.bindings
                 .iter()
                 .find(|b| b.key == key && b.context == context)
                 .map(|b| b.command)
         };
-        if key.mods.ctrl && key.mods.shift {
-            // Terminals may report the shifted character instead of the
-            // base key (for example, `|` instead of `\\`).
-            let code = match key.code {
-                KeyCode::Char(c) => {
-                    let base = "~!@#$%^&*()_+{}|:\"<>?"
-                        .chars()
-                        .zip("`1234567890-=[]\\;',./".chars())
-                        .find_map(|(shifted, base)| (c == shifted).then_some(base))
-                        .unwrap_or(c);
-                    KeyCode::Char(base)
-                }
-                code => code,
-            };
-            let unshifted = Key::new(
-                code,
-                Mods {
-                    shift: false,
-                    ..key.mods
-                },
-            );
-            return bound(unshifted, Context::Terminal)
-                .or_else(|| self.find(unshifted, Context::Editor));
+        let terminal = bound(Context::Terminal);
+        if !cue_keys && !key.mods.sup {
+            return terminal.filter(|&command| command == Command::ToggleTerminalKeys);
         }
-        if let Some(command) = bound(key, Context::Terminal) {
-            return Some(command);
+        if terminal.is_some() {
+            return terminal;
         }
-        let Mods {
-            shift,
-            alt,
-            ctrl,
-            sup,
-        } = key.mods;
-        if !(sup || (ctrl && (alt || shift))) {
+        if !(key.mods.ctrl || key.mods.sup) {
             return None;
         }
-        bound(key, Context::Global)
+        bound(Context::Global)
     }
 
     /// The key shown for `command`, if it has one.
@@ -1085,64 +1057,62 @@ mod tests {
     }
 
     #[test]
-    fn terminals_get_keys_but_cues_chords() {
+    fn terminals_get_keys_but_cues_shortcuts() {
         let keymap = Keymap::default();
         let key =
             |c, shift, alt, ctrl, sup| Key::new(KeyCode::Char(c), mods(shift, alt, ctrl, sup));
-        let lookup = |key| keymap.lookup_terminal(key);
-        // The shell's: Ctrl+key, Alt+key, Esc, arrows.
+        let lookup = |key| keymap.lookup_terminal(key, true);
+        // The shell's: keys cue doesn't bind there, Alt+key, Esc, arrows.
         for key in [
-            key('p', false, false, true, false),
-            key('w', false, false, true, false),
             key('c', false, false, true, false),
-            key('q', false, false, true, false),
-            key('\\', false, false, true, false),
+            key('z', false, false, true, false),
+            key('a', false, false, true, false),
+            key('d', false, false, true, false),
+            key('p', true, false, true, false),
+            key('z', true, false, true, false),
             key('b', false, true, false, false),
             Key::new(KeyCode::Esc, Mods::NONE),
             Key::new(KeyCode::Left, Mods::CTRL),
-            Key::new(KeyCode::PageDown, Mods::CTRL),
-            key('t', false, false, true, false),
         ] {
             assert_eq!(lookup(key), None, "{key}");
         }
-        // cue's: Ctrl+Shift aliases Ctrl; Cmd and Ctrl+Alt keep their bindings.
+        // cue's: its Ctrl, Cmd, and Ctrl+Alt shortcuts, and Ctrl+Shift's
+        // own, not their Ctrl ones.
         for (key, command) in [
-            (key('p', true, false, true, false), Command::GoToFile),
-            (key('P', false, false, true, false), Command::GoToFile),
-            (key('w', true, false, true, false), Command::ClosePanel),
-            (key('k', true, false, true, false), Command::Palette),
-            (key('z', true, false, true, false), Command::Undo),
-            (key('|', true, false, true, false), Command::SplitRight),
-            (key('!', true, false, true, false), Command::GoToTab1),
-            (key('_', true, false, true, false), Command::GoBack),
-            (key('f', true, false, true, false), Command::Find),
-            (key('\\', true, false, true, false), Command::SplitRight),
+            (key('p', false, false, true, false), Command::GoToFile),
+            (key('w', false, false, true, false), Command::ClosePanel),
+            (key('q', false, false, true, false), Command::Quit),
+            (key('\\', false, false, true, false), Command::SplitRight),
+            (key('t', false, false, true, false), Command::NewTab),
             (key('p', false, false, false, true), Command::GoToFile),
-            (key('n', true, false, true, false), Command::NewFile),
-            (key('N', false, false, true, false), Command::NewFile),
-            (key('`', true, false, true, false), Command::TerminalPrefix),
-            (key('~', true, false, true, false), Command::TerminalPrefix),
+            (key('f', false, false, true, false), Command::Find),
+            (key('f', true, false, true, false), Command::SearchWorkspace),
+            (key('n', true, false, true, false), Command::NewTerminal),
+            (key('N', false, false, true, false), Command::NewTerminal),
+            (key('|', true, false, true, false), Command::SplitDown),
+            (key('`', true, false, true, false), Command::NewTerminal),
+            (key('~', true, false, true, false), Command::NewTerminal),
             (key('n', false, true, true, false), Command::CreateFile),
-            (key('s', true, false, true, false), Command::Save),
             (
                 Key::new(KeyCode::Left, mods(false, true, true, false)),
                 Command::FocusPanelLeft,
             ),
             (key('t', false, false, false, true), Command::NewTab),
             (key('1', false, false, true, false), Command::GoToTab1),
-            (key('9', false, false, true, false), Command::GoToTab9),
             (key('9', false, false, false, true), Command::GoToTab9),
             (key('w', false, true, true, false), Command::CloseTab),
-            (key(']', false, true, true, false), Command::NextTab),
-            (key('[', false, true, true, false), Command::PreviousTab),
+            (Key::new(KeyCode::PageDown, Mods::CTRL), Command::NextTab),
             (
                 Key::new(KeyCode::PageDown, mods(true, false, true, false)),
-                Command::NextTab,
+                Command::MoveTabRight,
             ),
             (key('c', true, false, true, false), Command::Copy),
             (key('c', false, false, false, true), Command::Copy),
             (key('v', true, false, true, false), Command::Paste),
-            (key('`', false, false, true, false), Command::TerminalPrefix),
+            (
+                key('`', false, false, true, false),
+                Command::ToggleTerminalKeys,
+            ),
         ] {
             assert_eq!(lookup(key), Some(command), "{key}");
         }
@@ -1151,6 +1121,29 @@ mod tests {
             lookup(Key::new(KeyCode::Left, mods(false, false, false, true))),
             None
         );
+
+        // Toggled, the shell gets all but Ctrl+` and Cmd's.
+        let lookup = |key| keymap.lookup_terminal(key, false);
+        for key in [
+            key('p', false, false, true, false),
+            key('w', false, false, true, false),
+            key('1', false, false, true, false),
+            key('n', true, false, true, false),
+            key('c', true, false, true, false),
+            key('n', false, true, true, false),
+        ] {
+            assert_eq!(lookup(key), None, "{key}");
+        }
+        for (key, command) in [
+            (
+                key('`', false, false, true, false),
+                Command::ToggleTerminalKeys,
+            ),
+            (key('p', false, false, false, true), Command::GoToFile),
+            (key('c', false, false, false, true), Command::Copy),
+        ] {
+            assert_eq!(lookup(key), Some(command), "{key}");
+        }
     }
 
     #[test]
@@ -1214,7 +1207,7 @@ mod tests {
         assert_eq!(lookup("a", Context::Editor), None);
         assert_eq!(lookup("ctrl+p", Context::Tree), Some(Command::TreeUp));
         assert_eq!(lookup("ctrl+p", Context::Editor), Some(Command::GoToFile));
-        assert_eq!(keymap.lookup_terminal(key("ctrl+q")), None);
+        assert_eq!(keymap.lookup_terminal(key("ctrl+q"), true), None);
 
         // A later binding of a key wins.
         let keymap = Keymap::new(&[
@@ -1222,7 +1215,7 @@ mod tests {
             (key("Ctrl+Alt+T"), Some(Command::NewTab)),
         ]);
         assert_eq!(
-            keymap.lookup_terminal(key("ctrl+alt+t")),
+            keymap.lookup_terminal(key("ctrl+alt+t"), true),
             Some(Command::NewTab)
         );
     }

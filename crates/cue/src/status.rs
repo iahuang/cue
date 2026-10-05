@@ -214,8 +214,11 @@ impl Prompt {
 }
 
 /// Draws `status` across row `y` of `frame`, `width` wide, with the
-/// session badge if `session`, and `git`'s badge if there's room. Returns
-/// where the terminal cursor goes while the prompt is open.
+/// session badge if `session`, and `git`'s badge if there's room. A
+/// terminal's hint says whether cue's shortcuts (`terminal_cue_keys`) or
+/// the shell gets keys. Returns where the terminal cursor goes while the
+/// prompt is open.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &Buffer,
     status: &Status,
@@ -224,6 +227,7 @@ pub fn draw(
     keymap: &Keymap,
     session: bool,
     git: Option<&GitBadge>,
+    terminal_cue_keys: bool,
 ) -> Option<(u32, u32)> {
     let colors = theme::colors();
     match status {
@@ -258,9 +262,12 @@ pub fn draw(
         }
         Status::Info(info) | Status::Terminal(info) | Status::EditorInfo { text: info, .. } => {
             frame.fill_rect(0, y, width, 1, colors.surface);
-            // In a terminal, those keys are the shell's.
+            // In a terminal, whether cue's shortcuts or the shell get keys.
             let hints: &[(Command, &str)] = match status {
-                Status::Terminal(_) => &[(Command::TerminalPrefix, "cue keys")],
+                Status::Terminal(_) if terminal_cue_keys => {
+                    &[(Command::ToggleTerminalKeys, "keys: cue")]
+                }
+                Status::Terminal(_) => &[(Command::ToggleTerminalKeys, "keys: shell")],
                 _ => &[(Command::Palette, "commands"), (Command::Quit, "quit")],
             };
             let hints: String = hints
@@ -288,7 +295,12 @@ pub fn draw(
             }
             frame.draw_text(&left, x, y, colors.text, None, Attributes::NONE);
             if hints_x as usize > x as usize + left.chars().count() {
-                frame.draw_text(hints, hints_x, y, colors.muted, None, Attributes::NONE);
+                // Stands out while the shell has every key.
+                let fg = match status {
+                    Status::Terminal(_) if !terminal_cue_keys => colors.accent,
+                    _ => colors.muted,
+                };
+                frame.draw_text(hints, hints_x, y, fg, None, Attributes::NONE);
             }
             if let Some(badge) = badge {
                 let (fg, bg) = (colors.on_accent, Some(colors.accent));

@@ -297,9 +297,9 @@ pub struct App {
     terminals: Vec<Rc<RefCell<Terminal>>>,
     /// The id for the next new terminal.
     next_terminal: u32,
-    /// The terminal prefix (Ctrl+`) was pressed: the next key is a cue
-    /// shortcut.
-    terminal_prefix: bool,
+    /// Whether cue's shortcuts keep their keys in terminals, or the shell
+    /// gets them. Ctrl+` toggles it, for every terminal.
+    terminal_cue_keys: bool,
     /// The panel the last input went to, if it may not be the active one:
     /// the wheel scrolls panels without making them active.
     input_panel: Option<PanelId>,
@@ -563,7 +563,7 @@ impl App {
             theme_stale: true,
             terminals: Vec::new(),
             next_terminal: 1,
-            terminal_prefix: false,
+            terminal_cue_keys: true,
             input_panel: None,
             focused_terminal: None,
             tabs: vec![Tab::new(0, 0)],
@@ -668,7 +668,6 @@ impl App {
             }
             return AppAction::Continue;
         }
-        let prefixed = std::mem::take(&mut self.terminal_prefix);
         // While its find bar has the keyboard, keys are the bar's.
         if let Some(terminal) = self
             .keyboard_terminal()
@@ -679,10 +678,7 @@ impl App {
                 return AppAction::Continue;
             }
             if terminal.borrow().exit().is_none() {
-                if prefixed {
-                    return self.prefixed_key(&terminal, key);
-                }
-                return match self.keymap.lookup_terminal(key) {
+                return match self.keymap.lookup_terminal(key, self.terminal_cue_keys) {
                     Some(command) => self.run(command, false),
                     None => {
                         terminal.borrow_mut().send_key(key);
@@ -699,10 +695,9 @@ impl App {
                 return AppAction::Continue;
             }
         }
-        // The shortcut that opened a terminal's find bar closes it, though
-        // Ctrl+Shift+F, there, is Find rather than Search Workspace.
+        // The shortcut that opened a terminal's find bar closes it.
         if self.finding_terminal().is_some()
-            && self.keymap.lookup_terminal(key) == Some(Command::Find)
+            && self.keymap.lookup_terminal(key, true) == Some(Command::Find)
         {
             return self.run(Command::Find, false);
         }
@@ -987,12 +982,15 @@ impl App {
                     self.focus = Focus::Editor;
                 }
             }
-            Command::TerminalPrefix if self.keyboard_terminal().is_some() => {
-                self.terminal_prefix = true;
-                let message = format!(
-                    "Next shortcut will go to cue. Press {0} again to send {0} to the shell.",
-                    self.shortcut(Command::TerminalPrefix)
-                );
+            Command::ToggleTerminalKeys => {
+                self.terminal_cue_keys = !self.terminal_cue_keys;
+                let toggle = self.shortcut(Command::ToggleTerminalKeys);
+                let message = match self.terminal_cue_keys {
+                    true => format!("cue's shortcuts work in terminals again ({toggle} toggles)."),
+                    false => {
+                        format!("Terminals get every key now; {toggle} gives cue's shortcuts back.")
+                    }
+                };
                 self.show_message(message, false);
             }
             Command::Copy | Command::Cut | Command::Paste if self.active_terminal().is_some() => {
@@ -1183,9 +1181,7 @@ impl App {
             return AppAction::Continue;
         };
         if let MouseKind::Press(_) = mouse.kind {
-            // Like a key press, a click dismisses messages, the terminal
-            // prefix, and prompts.
-            self.terminal_prefix = false;
+            // Like a key press, a click dismisses messages and prompts.
             self.tab_prompt = None;
             self.active_panel_mut().clear_message();
             if let Some(terminal) = self.active_terminal() {
@@ -1645,6 +1641,7 @@ impl App {
                 &self.keymap,
                 session,
                 git.as_ref(),
+                self.terminal_cue_keys,
             ) {
                 cursor = Some(prompt);
             }
@@ -5118,27 +5115,6 @@ impl App {
         self.active_terminal()
     }
 
-    /// A key after the terminal prefix: a cue shortcut, as if no terminal
-    /// had the keyboard. The prefix again goes to the shell, and Esc
-    /// cancels.
-    fn prefixed_key(&mut self, terminal: &Rc<RefCell<Terminal>>, key: Key) -> AppAction {
-        let command = self.keymap.lookup(key, Context::Editor);
-        if self.keymap.lookup_terminal(key) == Some(Command::TerminalPrefix) {
-            terminal.borrow_mut().send_key(key);
-            return AppAction::Continue;
-        }
-        if key == Key::new(KeyCode::Esc, Mods::NONE) {
-            return AppAction::Continue;
-        }
-        match command {
-            Some((command, select)) => self.run(command, select),
-            None => {
-                self.show_message(format!("{key} isn't a cue shortcut."), false);
-                AppAction::Continue
-            }
-        }
-    }
-
     /// Copies the active terminal's selection, or pastes the last text
     /// copied in cue into it. (The terminal cue runs in pastes its own
     /// clipboard itself.)
@@ -5595,12 +5571,6 @@ mod tests {
 
     fn ctrl(app: &mut App, c: char) -> AppAction {
         app.handle_key(Key::new(KeyCode::Char(c), Mods::CTRL))
-    }
-
-    /// Ctrl+`c` from a terminal, after the prefix that makes it cue's.
-    fn prefixed_ctrl(app: &mut App, c: char) -> AppAction {
-        app.handle_key(Key::new(KeyCode::Char('`'), Mods::CTRL));
-        ctrl(app, c)
     }
 
     fn type_text(app: &mut App, text: &str) {
@@ -6116,8 +6086,8 @@ mod tests {
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
         forward(&mut app);
         assert!(app.active_terminal().is_some());
-        // Ctrl+- is the shell's; the prefix makes it cue's.
-        prefixed_ctrl(&mut app, '-');
+        // From a terminal too.
+        ctrl(&mut app, '-');
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
 
         // Each panel has its own; a terminal another panel shows now is
@@ -6294,7 +6264,7 @@ mod tests {
         // From a terminal too.
         app.run(Command::NewTerminal, false);
         app.after_input();
-        prefixed_ctrl(&mut app, '\'');
+        ctrl(&mut app, '\'');
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
     }
 
@@ -6467,30 +6437,28 @@ mod tests {
         });
         assert!(!app.ed_is_shown(), "typing went to the shell");
 
-        // Ctrl+Shift reaches cue's Ctrl shortcut directly while the
-        // terminal has focus, including uppercase terminal reports.
-        app.handle_key(Key::new(KeyCode::Char('P'), ctrl_shift));
+        // cue's Ctrl shortcuts are cue's while the terminal has focus.
+        ctrl(&mut app, 'p');
         assert!(app.picker.is_some());
         key(&mut app, KeyCode::Esc);
         assert!(app.keyboard_terminal().is_some());
 
-        // Ctrl+P is the shell's, and cue's after the prefix, Ctrl+`, which
-        // the status bar hints.
-        assert!(screen(&app).contains("^` cue keys"), "{}", screen(&app));
-        let prefix = Key::new(KeyCode::Char('`'), Mods::CTRL);
-        app.handle_key(prefix);
-        assert!(screen(&app).contains("Next shortcut will go to cue"));
+        // Ctrl+`, which the status bar hints, gives them to the shell, and
+        // back.
+        assert!(screen(&app).contains("^` keys: cue"), "{}", screen(&app));
+        let toggle = Key::new(KeyCode::Char('`'), Mods::CTRL);
+        app.handle_key(toggle);
+        assert!(screen(&app).contains("Terminals get every key now"));
+        ctrl(&mut app, 'p');
+        assert!(app.picker.is_none());
+        assert!(screen(&app).contains("^` keys: shell"), "{}", screen(&app));
+        // Back down the history Ctrl+P went up.
+        ctrl(&mut app, 'n');
+        assert!(!app.ed_is_shown());
+        app.handle_key(toggle);
         ctrl(&mut app, 'p');
         assert!(app.picker.is_some());
         key(&mut app, KeyCode::Esc);
-        // Esc after it cancels; a key that's no shortcut says so.
-        app.handle_key(prefix);
-        key(&mut app, KeyCode::Esc);
-        assert!(!app.terminal_prefix);
-        app.handle_key(prefix);
-        ctrl(&mut app, 'j');
-        assert!(screen(&app).contains("Ctrl+J isn't a cue shortcut."));
-        assert!(app.picker.is_none());
 
         // A program running keeps quitting from being immediate.
         type_text(&mut app, "sleep 30");
@@ -6499,7 +6467,7 @@ mod tests {
         wait_until(&mut app, "sleep to run", |app| {
             app.terminals[0].borrow().program().as_deref() == Some("sleep")
         });
-        assert!(matches!(prefixed_ctrl(&mut app, 'q'), AppAction::Continue));
+        assert!(matches!(ctrl(&mut app, 'q'), AppAction::Continue));
         assert!(
             screen(&app).contains("sleep is running in a terminal."),
             "{}",
@@ -6520,7 +6488,7 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert!(app.active_terminal().is_some());
         // And from there, back to the file.
-        prefixed_ctrl(&mut app, 'p');
+        ctrl(&mut app, 'p');
         key(&mut app, KeyCode::Enter);
         assert!(app.ed().path().is_some_and(|path| path.ends_with("a.txt")));
     }
@@ -6549,9 +6517,9 @@ mod tests {
         };
         let before = shell_line(&app);
 
-        // Ctrl+Shift+F, Find from a terminal, opens the bar, which takes
+        // Ctrl+F, Find from a terminal, opens the bar, which takes
         // what's typed; the shell gets none of it.
-        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        ctrl(&mut app, 'f');
         type_text(&mut app, "found");
         assert_eq!(terminal.borrow().find_memory().unwrap().query.text, "found");
         assert!(screen(&app).contains("2 of 2"), "{}", screen(&app));
@@ -6575,11 +6543,11 @@ mod tests {
         assert!(terminal.borrow().find_open());
         assert!(!terminal.borrow().find_focused());
         // The shortcut focuses it again, then closes it; so does Esc.
-        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        ctrl(&mut app, 'f');
         assert!(terminal.borrow().find_focused());
-        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        ctrl(&mut app, 'f');
         assert!(!terminal.borrow().find_open());
-        app.handle_key(Key::new(KeyCode::Char('f'), ctrl_shift));
+        ctrl(&mut app, 'f');
         key(&mut app, KeyCode::Esc);
         assert!(!terminal.borrow().find_open());
         assert_eq!(shell_line(&app), before, "nothing went to the shell");
@@ -7999,7 +7967,7 @@ mod tests {
         wait_until(&mut app, "sleep to run", |app| {
             app.terminals[0].borrow().program().as_deref() == Some("sleep")
         });
-        prefixed_ctrl(&mut app, 'w');
+        ctrl(&mut app, 'w');
         assert_eq!(app.terminals.len(), 1);
         let text = screen(&app);
         assert!(text.contains("Close Terminal?"), "{text}");
@@ -8445,10 +8413,13 @@ mod tests {
         };
         app.handle_key(Key::new(KeyCode::Char('n'), ctrl_shift));
         let terminal = app.active_terminal().expect("a terminal");
-        // Ctrl+T is the shell's; after the prefix, it's cue's.
+        // Ctrl+T is cue's, unless Ctrl+` gave the shell its keys.
+        let toggle = Key::new(KeyCode::Char('`'), Mods::CTRL);
+        app.handle_key(toggle);
         ctrl(&mut app, 't');
         assert_eq!(app.tabs.len(), 1);
-        prefixed_ctrl(&mut app, 't');
+        app.handle_key(toggle);
+        ctrl(&mut app, 't');
         assert_eq!(app.tabs.len(), 2);
         assert!(app.active_terminal().is_none());
 
@@ -9622,7 +9593,7 @@ mod tests {
         wait_until(&mut app, "sleep to run", |app| {
             app.terminals[0].borrow().program().as_deref() == Some("sleep")
         });
-        assert!(matches!(prefixed_ctrl(&mut app, 'q'), AppAction::Detach));
+        assert!(matches!(ctrl(&mut app, 'q'), AppAction::Detach));
         app.end_session_now();
     }
 
