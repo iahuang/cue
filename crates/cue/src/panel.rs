@@ -1,5 +1,5 @@
 //! A panel: one area of the layout, showing an open file, an image, a
-//! terminal, or nothing yet.
+//! terminal, how a commit changed a file, or nothing yet.
 //!
 //! Panels have no tabs. Opening a file in a panel replaces what it shows,
 //! but the panel keeps an editor for each file it has shown, so going back
@@ -23,8 +23,10 @@ use std::time::Instant;
 
 use opentui::{Attributes, Buffer};
 
+use crate::commit_diff::CommitDiff;
 use crate::document::{Disk, Document};
 use crate::editor::Editor;
+use crate::git::{Change, Commit};
 use crate::icons::{self, Icon};
 use crate::image::ImageView;
 use crate::input::{Mouse, MouseKind};
@@ -76,6 +78,12 @@ pub enum Visit {
     Terminal(u32),
     /// An image file.
     Image(PathBuf),
+    /// How a commit, in the repository at `root`, changed a file.
+    Commit {
+        root: PathBuf,
+        commit: Commit,
+        change: Change,
+    },
 }
 
 impl Visit {
@@ -86,6 +94,18 @@ impl Visit {
             }
             (Visit::Terminal(a), Visit::Terminal(b)) => a == b,
             (Visit::Image(a), Visit::Image(b)) => a == b,
+            (
+                Visit::Commit {
+                    root,
+                    commit,
+                    change,
+                },
+                Visit::Commit {
+                    root: b_root,
+                    commit: b_commit,
+                    change: b_change,
+                },
+            ) => (root, &commit.hash, &change.path) == (b_root, &b_commit.hash, &b_change.path),
             _ => false,
         }
     }
@@ -111,6 +131,9 @@ pub struct Panel {
     /// The image on screen, if any. Unlike files and terminals, the panel
     /// owns it: it's gone once the panel moves on.
     image: Option<ImageView>,
+    /// How a commit changed a file, if that's on screen. The panel owns
+    /// it, as it does an image.
+    commit: Option<CommitDiff>,
     /// While empty, a message for the status bar until the next key press.
     message: Option<(String, bool)>,
     area: Rect,
@@ -125,6 +148,7 @@ impl Panel {
             current: None,
             terminal: None,
             image: None,
+            commit: None,
             message: None,
             area: Rect::default(),
             history: History::default(),
@@ -143,6 +167,9 @@ impl Panel {
         }
         if let Some(terminal) = &self.terminal {
             terminal.borrow_mut().set_area(body);
+        }
+        if let Some(commit) = &mut self.commit {
+            commit.set_size(body.width, body.height);
         }
     }
 
@@ -212,6 +239,7 @@ impl Panel {
         terminal.borrow_mut().set_area(self.body());
         self.terminal = Some(terminal);
         self.image = None;
+        self.commit = None;
         self.leave_editor();
     }
 
@@ -232,6 +260,7 @@ impl Panel {
         }
         self.image = Some(image);
         self.terminal = None;
+        self.commit = None;
         self.leave_editor();
     }
 
@@ -239,6 +268,37 @@ impl Panel {
     pub fn hide_image(&mut self) {
         self.leave();
         self.image = None;
+    }
+
+    /// How a commit changed a file, if that's on screen.
+    pub fn commit(&self) -> Option<&CommitDiff> {
+        self.commit.as_ref()
+    }
+
+    pub fn commit_mut(&mut self) -> Option<&mut CommitDiff> {
+        self.commit.as_mut()
+    }
+
+    /// Shows how a commit changed a file. An unnamed document left behind
+    /// that was never typed in is dropped.
+    pub fn show_commit(&mut self, mut commit: CommitDiff) {
+        let same = matches!(&self.commit, Some(shown)
+            if shown.is(commit.root(), &commit.commit().hash, &commit.change().path));
+        if !same {
+            self.leave();
+        }
+        let body = self.body();
+        commit.set_size(body.width, body.height);
+        self.commit = Some(commit);
+        self.image = None;
+        self.terminal = None;
+        self.leave_editor();
+    }
+
+    /// Stops showing how a commit changed a file, leaving the panel empty.
+    pub fn hide_commit(&mut self) {
+        self.leave();
+        self.commit = None;
     }
 
     /// Takes the editor off screen, for a terminal or an image, dropping it
@@ -265,7 +325,10 @@ impl Panel {
 
     /// Whether the panel shows nothing.
     pub fn is_empty(&self) -> bool {
-        self.current.is_none() && self.terminal.is_none() && self.image.is_none()
+        self.current.is_none()
+            && self.terminal.is_none()
+            && self.image.is_none()
+            && self.commit.is_none()
     }
 
     /// What's on screen, briefly, as the tab bar names it: the file's name,
@@ -279,6 +342,15 @@ impl Panel {
                 Some(program) if !terminal.is_renamed() => program,
                 _ => terminal.name(),
             });
+        }
+        if let Some(commit) = &self.commit {
+            let path = &commit.change().path;
+            let name = path.file_name().unwrap_or(path.as_os_str());
+            return Some(format!(
+                "{} @ {}",
+                name.to_string_lossy(),
+                commit.commit().short
+            ));
         }
         let path = match (&self.image, self.document()) {
             (Some(image), _) => image.path().to_path_buf(),
@@ -337,6 +409,7 @@ impl Panel {
         let left = self.current.replace(index);
         self.terminal = None;
         self.image = None;
+        self.commit = None;
         self.message = None;
         if let Some(left) = left.filter(|&left| left != index && self.editors[left].is_blank()) {
             self.editors.remove(left);
@@ -378,6 +451,7 @@ impl Panel {
         self.current = None;
         self.terminal = None;
         self.image = None;
+        self.commit = None;
         self.message = None;
     }
 
@@ -391,6 +465,13 @@ impl Panel {
         }
         if let Some(image) = &self.image {
             return Some(Visit::Image(image.path().to_path_buf()));
+        }
+        if let Some(commit) = &self.commit {
+            return Some(Visit::Commit {
+                root: commit.root().to_path_buf(),
+                commit: commit.commit().clone(),
+                change: commit.change().clone(),
+            });
         }
         let doc = self.document().filter(|doc| !doc.is_blank())?;
         Some(Visit::File(Rc::downgrade(doc), doc.path()))
@@ -478,6 +559,7 @@ impl Panel {
         self.leave_editor();
         self.terminal = None;
         self.image = None;
+        self.commit = None;
     }
 
     /// Takes the history out, so that showing a place from it doesn't
@@ -513,6 +595,9 @@ impl Panel {
         if let (Some(image), None) = (&self.image, &self.message) {
             return image.status(self.body());
         }
+        if let (Some(commit), None) = (&self.commit, &self.message) {
+            return commit.status();
+        }
         match (self.editor(), &self.message) {
             (Some(editor), _) => editor.status(),
             (None, Some((text, error))) => Status::Message {
@@ -543,6 +628,10 @@ impl Panel {
             y: mouse.y.saturating_sub(body.y),
             ..mouse
         };
+        if let Some(commit) = &mut self.commit {
+            commit.handle_mouse(local, now);
+            return;
+        }
         if let Some(editor) = self.editor_mut() {
             editor.handle_mouse(local, now);
         }
@@ -575,6 +664,13 @@ impl Panel {
                 let body = self.body();
                 frame.with_clip(body.x, body.y, body.width, body.height, || {
                     image.draw(frame, body)
+                });
+                return None;
+            }
+            if let Some(commit) = &self.commit {
+                let body = self.body();
+                frame.with_clip(body.x, body.y, body.width, body.height, || {
+                    commit.draw(frame, body)
                 });
                 return None;
             }
@@ -701,7 +797,8 @@ impl Panel {
 
     /// The file's name, with [+] if it has unsaved changes and a note if
     /// it changed on disk meanwhile or is gone, then dimmed, the folder
-    /// it's in. Images have only the name and folder.
+    /// it's in. Images have only the name and folder, and a file as a
+    /// commit changed it the commit after its name.
     fn draw_header(&self, frame: &Buffer, workspace: &Workspace, active: bool, preview: bool) {
         let colors = theme::colors();
         let area = self.area;
@@ -712,9 +809,13 @@ impl Panel {
         };
         frame.fill_rect(area.x, area.y, area.width, 1, bg);
         let width = self.title_width();
-        let (path, untitled, notes) = match (&self.image, self.document()) {
-            (Some(image), _) => (Some(image.path().to_path_buf()), None, String::new()),
-            (None, Some(doc)) => {
+        let (path, untitled, notes) = match (&self.commit, &self.image, self.document()) {
+            (Some(commit), _, _) => {
+                let notes = format!(" @ {}", commit.commit().short);
+                (Some(commit.change().path.clone()), None, notes)
+            }
+            (None, Some(image), _) => (Some(image.path().to_path_buf()), None, String::new()),
+            (None, None, Some(doc)) => {
                 let dirty = if doc.is_modified() { " [+]" } else { "" };
                 let disk = match doc.disk() {
                     Disk::Same => "",
@@ -723,7 +824,7 @@ impl Panel {
                 };
                 (doc.path(), doc.untitled_name(), format!("{dirty}{disk}"))
             }
-            (None, None) => {
+            (None, None, None) => {
                 frame.draw_text(
                     " No file",
                     area.x,

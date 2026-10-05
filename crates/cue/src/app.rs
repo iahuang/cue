@@ -74,6 +74,7 @@ use opentui::{Attributes, Buffer};
 
 use crate::alert::{Alert, AlertAction, Button};
 use crate::changes::ChangesView;
+use crate::commit_diff::{CommitDiff, Outcome};
 use crate::config::{self, Config, MIN_TREE_WIDTH};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
 use crate::document::{self, Disk, DiskChange, Document};
@@ -81,13 +82,14 @@ use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
 use crate::find;
-use crate::git::Git;
+use crate::git::{Change, Commit, Git};
 use crate::image::{self, ImageView};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
 use crate::layout::{self, Axis, Direction, Layout, PanelId, Rect};
 use crate::line_edit::Edit;
 use crate::location::{self, Position, Target};
+use crate::log::{LogAction, LogView};
 use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::recovery::{self, Orphan, Recovery};
@@ -207,6 +209,8 @@ enum Sidebar {
     Files,
     /// The files git says changed.
     Changes,
+    /// A repository's commits (see [`App::log`]).
+    Log,
 }
 
 /// What a context menu's commands act on.
@@ -314,6 +318,8 @@ pub struct App {
     /// and how wide, `tree_visible` and `tree_width` say.
     sidebar: Sidebar,
     changes: ChangesView,
+    /// The log the sidebar shows, or showed last.
+    log: Option<LogView>,
     /// What git says about the workspace's repositories.
     git: Git,
     width: u32,
@@ -531,6 +537,7 @@ impl App {
             symbols: SymbolIndex::new(&workspace),
             git: Git::new(workspace.roots()),
             changes: ChangesView::new(),
+            log: None,
             sidebar: Sidebar::Files,
             index_symbols_after_listing: false,
             watcher: Watcher::new(),
@@ -729,6 +736,10 @@ impl App {
             }
             None => {
                 if self.focus == Focus::Editor {
+                    if let Some(commit) = self.active_panel_mut().commit_mut() {
+                        let outcome = commit.type_key(key);
+                        return self.commit_outcome(outcome);
+                    }
                     if let Some(editor) = self.editor_mut() {
                         let action = editor.type_key(key);
                         return self.editor_action(action);
@@ -942,7 +953,9 @@ impl App {
                 }
             }
             Command::CloseFile => {
-                let file = self.editor().is_some() || self.active_panel().image().is_some();
+                let panel = self.active_panel();
+                let file =
+                    self.editor().is_some() || panel.image().is_some() || panel.commit().is_some();
                 if file && self.close_shown(Redo::Run(Command::CloseFile)) {
                     self.show_active_in_tree();
                 }
@@ -1056,7 +1069,7 @@ impl App {
                 let target = self.file_target();
                 return self.file_command(command, target, false);
             }
-            Command::TreeRefresh if self.sidebar == Sidebar::Changes => self.git.refresh(),
+            Command::TreeRefresh if self.sidebar != Sidebar::Files => self.git.refresh(),
             command if command.context() == Context::Tree => match self.sidebar {
                 Sidebar::Files => {
                     let action = self.tree.run(command);
@@ -1066,7 +1079,20 @@ impl App {
                     let action = self.changes.run(command);
                     self.changes_action(action);
                 }
+                Sidebar::Log => {
+                    if let Some(log) = &mut self.log {
+                        let action = log.run(command);
+                        return self.log_action(action);
+                    }
+                }
             },
+            command if self.active_panel().commit().is_some() => {
+                let Some(commit) = self.active_panel_mut().commit_mut() else {
+                    return AppAction::Continue;
+                };
+                let outcome = commit.run(command);
+                return self.commit_outcome(outcome);
+            }
             command => {
                 let Some(editor) = self.tabs[self.tab].active_panel_mut().editor_mut() else {
                     return AppAction::Continue;
@@ -1181,6 +1207,7 @@ impl App {
                             true => self.changes.selected(),
                             false => None,
                         },
+                        Sidebar::Log => None,
                     };
                     if let Some(target) = target {
                         self.open_menu(target, Some((mouse.x, mouse.y)));
@@ -1199,8 +1226,15 @@ impl App {
                             self.tree_action(action);
                         }
                         Sidebar::Changes => {
-                            let action = self.changes.click(mouse.y, double);
+                            let width = self.visible_tree_width();
+                            let action = self.changes.click(mouse.x, mouse.y, width, double);
                             self.changes_action(action);
+                        }
+                        Sidebar::Log => {
+                            if let Some(log) = &mut self.log {
+                                let action = log.click(mouse.y, double);
+                                return self.log_action(action);
+                            }
                         }
                     }
                 }
@@ -1212,6 +1246,11 @@ impl App {
                     match self.sidebar {
                         Sidebar::Files => self.tree.scroll(rows),
                         Sidebar::Changes => self.changes.scroll(rows),
+                        Sidebar::Log => {
+                            if let Some(log) = &mut self.log {
+                                log.scroll(rows);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -1549,6 +1588,11 @@ impl App {
             match self.sidebar {
                 Sidebar::Files => self.tree.draw(frame, 0, tree_width, focused),
                 Sidebar::Changes => self.changes.draw(frame, 0, tree_width, focused),
+                Sidebar::Log => {
+                    if let Some(log) = &self.log {
+                        log.draw(frame, 0, tree_width, focused);
+                    }
+                }
             }
             for y in 0..self.height.saturating_sub(1) {
                 frame.draw_text("│", tree_width, y, colors.divider, None, Attributes::NONE);
@@ -1698,6 +1742,17 @@ impl App {
     fn git_changed(&mut self) {
         let repos = self.git.repos();
         self.changes.set_repos(repos);
+        if let Some(log) = &mut self.log {
+            match repos.iter().find(|repo| repo.root == log.root()) {
+                Some(repo) => log.set_repo(repo),
+                None => {
+                    self.log = None;
+                    if self.sidebar == Sidebar::Log {
+                        self.sidebar = Sidebar::Changes;
+                    }
+                }
+            }
+        }
         self.tree.set_changes(repos);
         self.track_documents();
         self.watch_folders();
@@ -1982,6 +2037,7 @@ impl App {
                 !elsewhere.contains(id) && terminals.iter().any(|t| t.borrow().id() == *id)
             }
             Visit::Image(path) => path.is_file(),
+            Visit::Commit { root, .. } => root.is_dir(),
         };
         let Some(visit) = self.tabs[self.tab]
             .active_panel_mut()
@@ -2016,6 +2072,11 @@ impl App {
                     self.focus = Focus::Editor;
                 }
             }
+            Visit::Commit {
+                root,
+                commit,
+                change,
+            } => self.open_commit(&root, commit, change, true),
         }
         self.active_panel_mut().restore_history(history);
         true
@@ -2578,6 +2639,18 @@ impl App {
         let preview = doc.is_some_and(|doc| self.is_preview(doc));
         self.tree.set_active(path.as_deref(), preview);
         self.changes.set_active(path.as_deref(), preview);
+        let commit = self.tabs[self.tab].active_panel().commit();
+        if let Some(log) = &mut self.log {
+            let active = commit
+                .filter(|commit| commit.root() == log.root())
+                .map(|commit| {
+                    (
+                        commit.commit().hash.as_str(),
+                        commit.change().path.as_path(),
+                    )
+                });
+            log.set_active(active);
+        }
         self.note_recent();
     }
 
@@ -2681,6 +2754,10 @@ impl App {
         }
         if self.active_panel().image().is_some() {
             self.active_panel_mut().hide_image();
+            return true;
+        }
+        if self.active_panel().commit().is_some() {
+            self.active_panel_mut().hide_commit();
             return true;
         }
         let Some(doc) = self.active_panel().document().cloned() else {
@@ -3161,6 +3238,9 @@ impl App {
             for editor in panel.editors_mut() {
                 editor.restyle();
             }
+            if let Some(commit) = panel.commit_mut() {
+                commit.invalidate();
+            }
         }
         true
     }
@@ -3620,7 +3700,8 @@ impl App {
             tree_visible: self.tree_visible,
             tree_width: self.tree_width,
             tree_focused: self.focus == Focus::Tree,
-            changes_shown: self.sidebar == Sidebar::Changes,
+            // The log isn't kept: the changes it was opened from are.
+            changes_shown: self.sidebar != Sidebar::Files,
             tab: self.tab,
             tabs,
             documents,
@@ -4116,6 +4197,8 @@ impl App {
                     self.focus = Focus::Editor;
                 }
             }
+            // The tree has no logs.
+            TreeAction::Log(_) => {}
         }
     }
 
@@ -4123,13 +4206,14 @@ impl App {
     /// to how it changed, and a file that's gone isn't opened, as a new
     /// one.
     fn changes_action(&mut self, action: TreeAction) {
-        let TreeAction::Open {
-            path,
-            focus,
-            preview,
-        } = action
-        else {
-            return;
+        let (path, focus, preview) = match action {
+            TreeAction::None => return,
+            TreeAction::Log(root) => return self.show_log(&root),
+            TreeAction::Open {
+                path,
+                focus,
+                preview,
+            } => (path, focus, preview),
         };
         if !path.exists() {
             self.show_message(format!("{} was deleted.", file_name(&path)), false);
@@ -4137,6 +4221,82 @@ impl App {
         }
         if self.open_as(&path, preview, true) && focus {
             self.focus = Focus::Editor;
+        }
+    }
+
+    /// Shows the log of the repository at `root` in the sidebar, as it
+    /// was left if it was the last shown.
+    fn show_log(&mut self, root: &Path) {
+        if self.log.as_ref().is_none_or(|log| log.root() != root) {
+            let Some(repo) = self.git.repos().iter().find(|repo| repo.root == root) else {
+                return;
+            };
+            let name = self.changes.name_of(root).unwrap_or_default();
+            self.log = Some(LogView::open(repo, name));
+        }
+        self.sidebar = Sidebar::Log;
+        self.layout();
+        self.show_active_in_tree();
+    }
+
+    /// What the log asked for.
+    fn log_action(&mut self, action: LogAction) -> AppAction {
+        match action {
+            LogAction::None => {}
+            LogAction::Back => {
+                self.sidebar = Sidebar::Changes;
+                self.git.refresh();
+            }
+            LogAction::Open {
+                commit,
+                change,
+                focus,
+            } => {
+                let Some(root) = self.log.as_ref().map(|log| log.root().to_path_buf()) else {
+                    return AppAction::Continue;
+                };
+                self.open_commit(&root, commit, change, focus);
+            }
+        }
+        AppAction::Continue
+    }
+
+    /// Shows how `commit`, in the repository at `root`, made `change`, in
+    /// the active panel, and moves the keyboard there if `focus`.
+    fn open_commit(&mut self, root: &Path, commit: Commit, change: Change, focus: bool) {
+        let shown = self
+            .active_panel()
+            .commit()
+            .is_some_and(|shown| shown.is(root, &commit.hash, &change.path));
+        if !shown {
+            let had_terminal = self.active_terminal().is_some();
+            let diff = CommitDiff::open(root, commit, change);
+            self.active_panel_mut().show_commit(diff);
+            self.prune_documents();
+            if had_terminal {
+                self.prune_terminals();
+            }
+        }
+        if focus {
+            self.focus = Focus::Editor;
+        }
+        self.show_active_in_tree();
+    }
+
+    /// Finishes what a key or command did to how a commit changed a file.
+    fn commit_outcome(&mut self, outcome: Outcome) -> AppAction {
+        match outcome {
+            Outcome::Continue => AppAction::Continue,
+            Outcome::Copy(text) => {
+                let copied = format!("Copied {} characters.", text.chars().count());
+                self.show_message(copied, false);
+                self.clipboard = Some(text.clone());
+                AppAction::Copy(text)
+            }
+            Outcome::Message(text) => {
+                self.show_message(text.to_string(), false);
+                AppAction::Continue
+            }
         }
     }
 
@@ -4273,6 +4433,7 @@ impl App {
             .or_else(|| match self.sidebar {
                 Sidebar::Files => self.tree.selected_position(),
                 Sidebar::Changes => self.changes.selected_position(),
+                Sidebar::Log => None,
             })
             .unwrap_or((0, 0));
         let menu = ContextMenu::new(
@@ -4897,7 +5058,7 @@ impl App {
     /// Shows the changes in the sidebar, with the keyboard, or if they're
     /// showing, goes back to the files.
     fn toggle_changes(&mut self) {
-        if self.tree_visible && self.sidebar == Sidebar::Changes {
+        if self.tree_visible && self.sidebar != Sidebar::Files {
             self.sidebar = Sidebar::Files;
             // Pick up files created since it was last read.
             self.tree.refresh();
@@ -4916,6 +5077,7 @@ impl App {
         match self.sidebar {
             Sidebar::Files => self.tree.selected(),
             Sidebar::Changes => self.changes.selected(),
+            Sidebar::Log => None,
         }
     }
 
@@ -4924,7 +5086,7 @@ impl App {
     /// its branch. The repository is the one with the file on screen, or
     /// else the first.
     fn git_badge(&self) -> Option<GitBadge> {
-        if self.sidebar == Sidebar::Changes && self.visible_tree_width() > 0 {
+        if self.sidebar != Sidebar::Files && self.visible_tree_width() > 0 {
             return Some(GitBadge::Files);
         }
         let path = self.active_panel().path();
@@ -4994,6 +5156,9 @@ impl App {
         // The sidebar is as tall as the tab bar and panels together.
         self.tree.set_height(self.height.saturating_sub(1));
         self.changes.set_height(self.height.saturating_sub(1));
+        if let Some(log) = &mut self.log {
+            log.set_height(self.height.saturating_sub(1));
+        }
         if let Some(picker) = &mut self.picker {
             picker.set_size(self.width, self.height);
         }
@@ -5077,6 +5242,8 @@ fn visit_shown(visit: &Visit) -> Option<Shown> {
         Visit::File(doc, None) => Shown::Untitled(doc.upgrade()?.untitled.get()),
         Visit::Terminal(id) => Shown::Terminal(*id),
         Visit::Image(path) => Shown::Image(path.clone()),
+        // Read from git again easily enough, but not worth keeping.
+        Visit::Commit { .. } => return None,
     })
 }
 
@@ -6184,9 +6351,10 @@ mod tests {
         assert_eq!(app.sidebar, Sidebar::Changes);
         assert_eq!(app.focus, Focus::Tree);
         let changes = lines(&app);
-        assert!(changes[0].starts_with(" ▾ app-badge") && changes[0].ends_with("main"));
-        assert!(changes[1].starts_with("     a.txt") && changes[1].ends_with('M'));
-        assert!(changes[2].starts_with("     b.txt") && changes[2].ends_with('D'));
+        assert!(changes[0].starts_with(" main") && changes[0].ends_with("Log"));
+        assert_eq!(changes[1], " ▾ app-badge");
+        assert!(changes[2].starts_with("     a.txt") && changes[2].ends_with('M'));
+        assert!(changes[3].starts_with("     b.txt") && changes[3].ends_with('D'));
         assert!(
             status(&app).starts_with(" ‹ Files  Ln 1"),
             "{}",
@@ -6194,7 +6362,7 @@ mod tests {
         );
 
         // A file that's gone isn't opened as a new one.
-        left_click(&mut app, 6, 2);
+        left_click(&mut app, 6, 3);
         assert!(app.active_panel().path().is_none());
         assert!(status(&app).contains("b.txt was deleted."));
         key(&mut app, KeyCode::Up);
@@ -6243,7 +6411,7 @@ mod tests {
         assert!(!header(&app).contains(" Diff "), "b.txt didn't change");
 
         app.run(Command::ToggleChanges, false);
-        left_click(&mut app, 6, 1);
+        left_click(&mut app, 6, 2);
         assert_eq!(app.active_panel().path(), Some(root.join("a.txt")));
         assert!(app.ed().diffing());
         assert_eq!(app.focus, Focus::Tree, "a click previews");
@@ -6274,6 +6442,92 @@ mod tests {
         app.run(Command::ToggleDiff, false);
         let shown = screen(&app);
         assert!(shown.contains("- b") && shown.contains("+ xb"), "{shown}");
+    }
+
+    #[test]
+    fn the_gutter_marks_lines_changed_since_the_last_commit() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-gutter");
+        let mut app = app(&root, None);
+        wait_for_git(&mut app);
+        assert!(app.open_as(&root.join("a.txt"), false, false));
+        app.focus = Focus::Editor;
+        let body = app.active_panel().body();
+        // The column left of the text, on each of the file's rows.
+        let marks = |app: &App| -> String {
+            let gutter = body.x as usize + 3 + 1;
+            screen(app)
+                .lines()
+                .skip(body.y as usize)
+                .take(3)
+                .map(|line| line.chars().nth(gutter - 1).unwrap_or(' '))
+                .collect()
+        };
+        assert_eq!(marks(&app), "   ", "nothing changed");
+
+        // Unsaved edits count.
+        key(&mut app, KeyCode::Char('x'));
+        assert_eq!(marks(&app), "▎  ");
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(marks(&app), "   ");
+        key(&mut app, KeyCode::End);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(marks(&app), " ▎ ");
+        ctrl(&mut app, 's');
+        wait_for_git(&mut app);
+        assert_eq!(marks(&app), " ▎ ", "and saved ones");
+    }
+
+    #[test]
+    fn the_log_shows_how_each_commit_changed_files() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::history_repo("app-log");
+        let mut app = app(&root, None);
+        wait_for_git(&mut app);
+        let line = |app: &App, y: usize| screen(app).lines().nth(y).unwrap_or("").to_string();
+        app.run(Command::ToggleChanges, false);
+        let width = app.visible_tree_width();
+        left_click(&mut app, width - 3, 0);
+        assert_eq!(app.sidebar, Sidebar::Log);
+        assert!(line(&app, 0).starts_with(" ‹ app-log"), "{}", line(&app, 0));
+        assert!(line(&app, 1).starts_with(" ▸ third"), "{}", line(&app, 1));
+
+        // second: a.txt changed, b.txt renamed to c.txt, d.txt added.
+        left_click(&mut app, 3, 2);
+        left_click(&mut app, 6, 4);
+        let short = crate::git::log(&root, 1, 1)[0].short.clone();
+        let header = line(&app, 0);
+        assert!(header.contains(&format!("a.txt @ {short}")), "{header}");
+        let shown = screen(&app);
+        assert!(
+            shown.contains("+ more") && shown.contains("Diff  +1 −0"),
+            "{shown}"
+        );
+        assert_eq!(app.focus, Focus::Tree, "a click previews");
+        assert!(
+            app.active_panel().path().is_none(),
+            "it isn't the file as it is"
+        );
+
+        app.focus = Focus::Editor;
+        key(&mut app, KeyCode::Char('x'));
+        assert!(screen(&app).contains("it can't be edited"));
+        key(&mut app, KeyCode::Down);
+
+        left_click(&mut app, 6, 5);
+        assert!(
+            screen(&app).contains("No changes to the text."),
+            "renamed only"
+        );
+        app.run(Command::GoBack, false);
+        assert!(screen(&app).contains("+ more"), "back to the last");
+
+        left_click(&mut app, 1, 0);
+        assert_eq!(app.sidebar, Sidebar::Changes, "the top row goes back");
+        app.focus = Focus::Editor;
+        app.run(Command::CloseFile, false);
+        assert!(app.active_panel().is_empty());
     }
 
     #[test]

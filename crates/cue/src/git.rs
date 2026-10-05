@@ -167,13 +167,141 @@ impl Tracked {
             let Some(commit) = &self.commit else {
                 return Base::Missing;
             };
-            let spec = format!("{commit}:{}", self.old_path.to_string_lossy());
-            let output = git(&self.root).args(["cat-file", "blob", &spec]).output();
-            match output {
-                Ok(output) if output.status.success() => base_text(output.stdout),
-                _ => Base::Missing,
-            }
+            file_at(&self.root, commit, &self.old_path)
         })
+    }
+
+    /// What the file was in the last commit, if git was asked already.
+    pub fn base_if_read(&self) -> Option<&Base> {
+        self.base.get()
+    }
+}
+
+/// A commit, as the log lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub hash: String,
+    /// The hash as git abbreviates it.
+    pub short: String,
+    /// Its first parent, by hash; `None` for a repository's first commit.
+    pub parent: Option<String>,
+    pub author: String,
+    /// When it was made, in seconds since the Unix epoch.
+    pub time: i64,
+    /// The first line of its message.
+    pub subject: String,
+}
+
+/// The commits that led to what's checked out in the repository at
+/// `root`, newest first: `count` of them, after the first `skip`. None
+/// before the first commit.
+pub fn log(root: &Path, skip: usize, count: usize) -> Vec<Commit> {
+    let output = git(root)
+        .args([
+            "log",
+            "--no-color",
+            "--format=%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%s",
+        ])
+        .arg(format!("--skip={skip}"))
+        .arg(format!("--max-count={count}"))
+        .output();
+    match output {
+        Ok(output) if output.status.success() => parse_log(&output.stdout),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_log(output: &[u8]) -> Vec<Commit> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(6, '\x1f');
+            let mut next = || fields.next().map(str::to_string);
+            let (hash, short, parents, author, time) =
+                (next()?, next()?, next()?, next()?, next()?);
+            Some(Commit {
+                hash,
+                short,
+                parent: parents
+                    .split(' ')
+                    .next()
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string),
+                author,
+                time: time.parse().unwrap_or(0),
+                subject: next().unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// The files `commit`, in the repository at `root`, changed from its
+/// first parent, sorted by path, with renames found as `git status` finds
+/// them.
+pub fn commit_changes(root: &Path, commit: &Commit) -> Vec<Change> {
+    let parent = commit.parent.as_deref().unwrap_or(EMPTY_TREE);
+    let output = git(root)
+        .args([
+            "diff-tree",
+            "-r",
+            "-M",
+            "-z",
+            "--name-status",
+            "--no-commit-id",
+        ])
+        .args([parent, &commit.hash])
+        .output();
+    let mut changes = match output {
+        Ok(output) if output.status.success() => parse_name_status(root, &output.stdout),
+        _ => Vec::new(),
+    };
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    changes
+}
+
+/// `git diff-tree --name-status -z`'s output: a status, then a path, or
+/// for a rename or copy, the old path and the new.
+fn parse_name_status(root: &Path, output: &[u8]) -> Vec<Change> {
+    let mut fields = output
+        .split(|&byte| byte == 0)
+        .map(|field| String::from_utf8_lossy(field).into_owned());
+    let mut changes = Vec::new();
+    while let Some(status) = fields.next() {
+        let Some(path) = fields.next() else {
+            break;
+        };
+        let (kind, from, path) = match status.chars().next() {
+            Some('A') => (Kind::Added, None, path),
+            Some('D') => (Kind::Deleted, None, path),
+            Some('R') => match fields.next() {
+                Some(to) => (Kind::Renamed, Some(root.join(path)), to),
+                None => break,
+            },
+            // A copy is new, as far as what changed goes.
+            Some('C') => match fields.next() {
+                Some(to) => (Kind::Added, None, to),
+                None => break,
+            },
+            Some('U') => (Kind::Conflicted, None, path),
+            Some(_) => (Kind::Modified, None, path),
+            None => continue,
+        };
+        changes.push(Change {
+            path: root.join(path),
+            kind,
+            from,
+        });
+    }
+    changes
+}
+
+/// What the file at `path`, from `root`, was in `commit`.
+pub fn file_at(root: &Path, commit: &str, path: &Path) -> Base {
+    let spec = format!("{commit}:{}", path.to_string_lossy());
+    let output = git(root).args(["cat-file", "blob", &spec]).output();
+    match output {
+        Ok(output) if output.status.success() => base_text(output.stdout),
+        _ => Base::Missing,
     }
 }
 
@@ -596,6 +724,27 @@ pub(crate) mod tests {
         assert!(status.success(), "git {args:?}");
     }
 
+    /// Commits everything in the repository at `dir`, as `message`.
+    pub(crate) fn commit_all(dir: &Path, message: &str) {
+        run(dir, &["add", "-A"]);
+        run(dir, &["commit", "-q", "-m", message]);
+    }
+
+    /// A repository with three commits: `first`, of `a.txt` and `b.txt`;
+    /// `second`, which changes `a.txt`, renames `b.txt` to `c.txt`, and
+    /// adds `d.txt`; and `third`, which deletes `d.txt`.
+    pub(crate) fn history_repo(name: &str) -> PathBuf {
+        let dir = repo(name);
+        fs::write(dir.join("a.txt"), "a\nmore\n").unwrap();
+        run(&dir, &["mv", "b.txt", "c.txt"]);
+        fs::write(dir.join("d.txt"), "d\n").unwrap();
+        run(&dir, &["add", "."]);
+        run(&dir, &["commit", "-q", "-m", "second"]);
+        run(&dir, &["rm", "-q", "d.txt"]);
+        run(&dir, &["commit", "-q", "-m", "third"]);
+        dir
+    }
+
     /// A repository on `main` with one commit, of `a.txt` and `b.txt`.
     pub(crate) fn repo(name: &str) -> PathBuf {
         let dir = fixture(name);
@@ -730,5 +879,59 @@ pub(crate) mod tests {
         let mut git = Git::new(&[dir]);
         git.wait();
         assert!(git.repos().is_empty());
+    }
+
+    #[test]
+    fn reads_the_log_what_each_commit_changed_and_files_in_it() {
+        let dir = history_repo("history");
+        let log = log(&dir, 0, 10);
+        let subjects: Vec<&str> = log.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["third", "second", "first"]);
+        assert_eq!(log[0].parent.as_ref(), Some(&log[1].hash));
+        assert_eq!(log[2].parent, None);
+        assert_eq!(log[0].author, "cue");
+        assert!(log[0].hash.starts_with(&log[0].short));
+        let page: Vec<String> = super::log(&dir, 1, 1)
+            .into_iter()
+            .map(|c| c.subject)
+            .collect();
+        assert_eq!(page, ["second"]);
+
+        let changes = |commit: &Commit| -> Vec<(String, Kind, Option<String>)> {
+            let name = |path: &Path| path.strip_prefix(&dir).unwrap().display().to_string();
+            commit_changes(&dir, commit)
+                .iter()
+                .map(|c| (name(&c.path), c.kind, c.from.as_deref().map(name)))
+                .collect()
+        };
+        assert_eq!(
+            changes(&log[1]),
+            [
+                ("a.txt".to_string(), Kind::Modified, None),
+                (
+                    "c.txt".to_string(),
+                    Kind::Renamed,
+                    Some("b.txt".to_string())
+                ),
+                ("d.txt".to_string(), Kind::Added, None),
+            ]
+        );
+        assert_eq!(
+            changes(&log[0]),
+            [("d.txt".to_string(), Kind::Deleted, None)]
+        );
+        assert_eq!(changes(&log[2]).len(), 2, "the first commit, from nothing");
+
+        let text = |commit: &Commit, path: &str| file_at(&dir, &commit.hash, Path::new(path));
+        assert_eq!(text(&log[1], "a.txt"), Base::Text("a\nmore\n".into()));
+        assert_eq!(text(&log[2], "a.txt"), Base::Text("a\n".into()));
+        assert_eq!(text(&log[0], "d.txt"), Base::Missing);
+    }
+
+    #[test]
+    fn a_repository_without_commits_has_no_log() {
+        let dir = fixture("no-commits");
+        run(&dir, &["init", "-q"]);
+        assert!(log(&dir, 0, 10).is_empty());
     }
 }

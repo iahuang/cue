@@ -21,7 +21,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use opentui::{Attributes, Buffer, Rgba};
-use similar::{Algorithm, ChangeTag, DiffOp, InlineChangeOptions, TextDiff};
+use similar::{Algorithm, ChangeTag, DiffOp, DiffTag, InlineChangeOptions, TextDiff};
 use unicode_width::UnicodeWidthChar;
 
 use crate::config;
@@ -155,8 +155,21 @@ pub enum DiffEvent {
     Edit { line: u32, row: u32 },
 }
 
+/// What a diff is of.
+enum Source {
+    /// A document as it is now, against what it was in the last commit.
+    Live(Rc<Document>),
+    /// A file as a commit changed it: what it was before, and after.
+    Fixed {
+        old: Base,
+        new: Base,
+        path: PathBuf,
+        language: Option<&'static Language>,
+    },
+}
+
 pub struct DiffView {
-    doc: Rc<Document>,
+    source: Source,
     highlighter: RefCell<ExcerptHighlighter>,
     laid: RefCell<Option<(Key, Layout)>>,
     /// The row at the top of the view.
@@ -181,8 +194,29 @@ impl DiffView {
     /// A diff of `doc` that starts with file line `top`, or the first row
     /// after it, at the top.
     pub fn new(doc: Rc<Document>, top: u32) -> DiffView {
+        DiffView::of(Source::Live(doc), top)
+    }
+
+    /// A diff of the file at `path` from `old` to `new`, as a commit
+    /// changed it, from the top.
+    pub fn fixed(old: Base, new: Base, path: PathBuf) -> DiffView {
+        let first_line = |base: &Base| match base {
+            Base::Text(text) => text.lines().next().unwrap_or_default().to_string(),
+            _ => String::new(),
+        };
+        let language = crate::language::detect(Some(&path), || first_line(&new));
+        let source = Source::Fixed {
+            old,
+            new,
+            path,
+            language,
+        };
+        DiffView::of(source, 0)
+    }
+
+    fn of(source: Source, top: u32) -> DiffView {
         DiffView {
-            doc,
+            source,
             highlighter: RefCell::new(ExcerptHighlighter::new()),
             laid: RefCell::new(None),
             top: Cell::new(0),
@@ -202,9 +236,20 @@ impl DiffView {
         self.height = height;
     }
 
+    /// What git says of the document, for a diff of one.
+    fn tracked(&self) -> Option<Rc<Tracked>> {
+        match &self.source {
+            Source::Live(doc) => doc.tracked(),
+            Source::Fixed { .. } => None,
+        }
+    }
+
     fn key(&self, tracked: Option<&Rc<Tracked>>) -> Key {
         Key {
-            epoch: self.doc.buffer.content_epoch(),
+            epoch: match &self.source {
+                Source::Live(doc) => doc.buffer.content_epoch(),
+                Source::Fixed { .. } => 0,
+            },
             tracked: tracked.map(|tracked| Rc::as_ptr(tracked) as usize),
             kind: tracked.and_then(|tracked| tracked.kind.get()),
             width: self.width,
@@ -215,7 +260,7 @@ impl DiffView {
     /// Lays the text out again if it, the width, or the last commit
     /// changed, keeping the same file line at the top.
     fn sync(&self) {
-        let tracked = self.doc.tracked();
+        let tracked = self.tracked();
         let key = self.key(tracked.as_ref());
         let current = matches!(&*self.laid.borrow(), Some((laid, _)) if *laid == key);
         if !current {
@@ -239,6 +284,30 @@ impl DiffView {
     }
 
     fn lay_out(&self, tracked: Option<&Tracked>) -> Layout {
+        let width = self.width.max(1) as usize;
+        let tab = config::get().tab_width.max(1) as usize;
+        let lay_out = |old: &str, new: &str, path, language| {
+            let mut colorer = Colorer {
+                highlighter: &mut self.highlighter.borrow_mut(),
+                path,
+                language,
+            };
+            lay_out(old, new, width, tab, &self.unfolded, &mut colorer)
+        };
+        let doc = match &self.source {
+            Source::Live(doc) => doc,
+            Source::Fixed {
+                old,
+                new,
+                path,
+                language,
+            } => {
+                return match (fixed_text(old), fixed_text(new)) {
+                    (Some(old), Some(new)) => lay_out(old, new, path.clone(), *language),
+                    _ => Layout::note("Binary file."),
+                };
+            }
+        };
         let Some(tracked) = tracked else {
             return Layout::note("Not in a git repository.");
         };
@@ -251,22 +320,8 @@ impl DiffView {
             }
             Base::Missing => "",
         };
-        let path = self.doc.path().unwrap_or_else(|| PathBuf::from("untitled"));
-        let mut colorer = Colorer {
-            highlighter: &mut self.highlighter.borrow_mut(),
-            path,
-            language: self.doc.language.get(),
-        };
-        let width = self.width.max(1) as usize;
-        let tab = config::get().tab_width.max(1) as usize;
-        lay_out(
-            old,
-            &self.doc.buffer.text(),
-            width,
-            tab,
-            &self.unfolded,
-            &mut colorer,
-        )
+        let path = doc.path().unwrap_or_else(|| PathBuf::from("untitled"));
+        lay_out(old, &doc.buffer.text(), path, doc.language.get())
     }
 
     fn with_layout<R>(&self, f: impl FnOnce(&Layout) -> R) -> R {
@@ -397,7 +452,9 @@ impl DiffView {
                         self.unfolded.insert(start);
                         return None;
                     }
-                    Some((What::Line { .. }, line)) if count == 2 => {
+                    Some((What::Line { .. }, line))
+                        if count == 2 && matches!(self.source, Source::Live(_)) =>
+                    {
                         self.press = None;
                         return Some(DiffEvent::Edit { line, row: mouse.y });
                     }
@@ -442,10 +499,10 @@ impl DiffView {
             return;
         };
         let note = layout.note.or_else(|| {
-            layout
-                .rows
-                .is_empty()
-                .then_some("No changes since the last commit.")
+            layout.rows.is_empty().then_some(match self.source {
+                Source::Live(_) => "No changes since the last commit.",
+                Source::Fixed { .. } => "No changes to the text.",
+            })
         });
         if let Some(note) = note {
             frame.draw_text(note, x + 1, y, colors.muted, None, Attributes::NONE);
@@ -481,6 +538,213 @@ impl DiffView {
         let (added, removed) = self.with_layout(|layout| (layout.added, layout.removed));
         let line = self.top_line() + 1;
         Status::Info(format!("Diff  +{added} −{removed}  Ln {line}  {position}"))
+    }
+}
+
+/// How a stretch of lines changed since the last commit, as the editor's
+/// gutter marks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Added,
+    Changed,
+    /// Lines taken out from between two others.
+    Removed,
+}
+
+impl Mark {
+    /// As the tree colors files changed the same way.
+    pub fn hue(self) -> Hue {
+        match self {
+            Mark::Added => Kind::Added.hue(),
+            Mark::Changed => Kind::Modified.hue(),
+            Mark::Removed => Kind::Deleted.hue(),
+        }
+    }
+}
+
+/// A stretch of a file that changed since the last commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub mark: Mark,
+    /// The lines of the file it is. Lines taken out are none, at the line
+    /// that's after where they were.
+    pub lines: Range<u32>,
+}
+
+/// How a line of the file is marked in the editor's gutter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineMark {
+    /// It's in a hunk added or changed.
+    In(Mark),
+    /// Lines were taken out right after it.
+    RemovedBelow,
+    /// Lines were taken out right before it, the first line.
+    RemovedAbove,
+}
+
+/// How line `line` is marked, among `hunks`, in order. Being in a hunk
+/// counts before lines taken out next to it.
+pub fn line_mark(hunks: &[Hunk], line: u32) -> Option<LineMark> {
+    let after = hunks.partition_point(|hunk| hunk.lines.start <= line);
+    if let Some(hunk) = after.checked_sub(1).map(|i| &hunks[i]) {
+        if hunk.lines.contains(&line) {
+            return Some(LineMark::In(hunk.mark));
+        }
+    }
+    let removed_at = |hunk: &Hunk, at: u32| hunk.mark == Mark::Removed && hunk.lines.start == at;
+    if hunks
+        .get(after)
+        .is_some_and(|hunk| removed_at(hunk, line + 1))
+    {
+        return Some(LineMark::RemovedBelow);
+    }
+    if line == 0 && hunks.first().is_some_and(|hunk| removed_at(hunk, 0)) {
+        return Some(LineMark::RemovedAbove);
+    }
+    None
+}
+
+/// What [`Hunks`] were found from: when it changes, they're found again.
+struct HunksKey {
+    epoch: u64,
+    /// Held, not just compared by address, so a new record can't take the
+    /// old one's place in memory and pass for it.
+    tracked: Option<Rc<Tracked>>,
+    kind: Option<Kind>,
+    modified: bool,
+}
+
+impl PartialEq for HunksKey {
+    fn eq(&self, other: &HunksKey) -> bool {
+        let same_tracked = match (&self.tracked, &other.tracked) {
+            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        same_tracked
+            && (self.epoch, self.kind, self.modified) == (other.epoch, other.kind, other.modified)
+    }
+}
+
+/// A document's changes since the last commit, staged or not, with those
+/// not yet saved, for the editor's gutter. They're found again only when
+/// the text or what git says of it changes.
+#[derive(Default)]
+pub struct Hunks {
+    found: RefCell<Option<(HunksKey, Rc<[Hunk]>)>>,
+}
+
+impl Hunks {
+    /// `doc`'s hunks, in order: none if it isn't in a repository, git
+    /// ignores it, or it was binary in the last commit.
+    pub fn of(&self, doc: &Document) -> Rc<[Hunk]> {
+        let tracked = doc.tracked();
+        let key = HunksKey {
+            epoch: doc.buffer.content_epoch(),
+            kind: tracked.as_ref().and_then(|tracked| tracked.kind.get()),
+            tracked,
+            modified: doc.is_modified(),
+        };
+        if let Some((found, hunks)) = &*self.found.borrow() {
+            if *found == key {
+                return hunks.clone();
+            }
+        }
+        let hunks: Rc<[Hunk]> = key
+            .tracked
+            .as_deref()
+            .and_then(|tracked| hunk_base(tracked, key.modified))
+            .map_or_else(Vec::new, |old| hunks(old, &doc.buffer.text()))
+            .into();
+        *self.found.borrow_mut() = Some((key, hunks.clone()));
+        hunks
+    }
+}
+
+/// What `tracked`'s file was in the last commit, to find hunks against.
+/// git isn't asked for it while git and the editor both say the file's
+/// the same as it was.
+fn hunk_base(tracked: &Tracked, modified: bool) -> Option<&str> {
+    let kind = tracked.kind.get();
+    if kind.is_none() && !modified && tracked.base_if_read().is_none() {
+        return None;
+    }
+    match tracked.base() {
+        Base::Text(text) => Some(text),
+        Base::Binary => None,
+        // Ignored, or so git says.
+        Base::Missing if kind.is_none() => None,
+        Base::Missing => Some(""),
+    }
+}
+
+/// The stretches of `new` that differ from `old`, by line, as the diff
+/// view shows them.
+fn hunks(old: &str, new: &str) -> Vec<Hunk> {
+    let (old, new) = (with_newline(old), with_newline(new));
+    // They're found as the text's typed in, and an edit leaves most of a
+    // file as it was: only the lines between the first and last that
+    // differ are diffed, which keeps a long file quick to type in.
+    let (head, tail) = same_ends(&old, &new);
+    let skipped = old[..head].matches('\n').count() as u32;
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Patience)
+        .timeout(TIMEOUT)
+        .diff_lines(&old[head..old.len() - tail], &new[head..new.len() - tail]);
+    diff.ops()
+        .iter()
+        .filter_map(|op| {
+            let (tag, _, lines) = op.as_tag_tuple();
+            let lines = skipped + lines.start as u32..skipped + lines.end as u32;
+            let mark = match tag {
+                DiffTag::Equal => return None,
+                DiffTag::Insert => Mark::Added,
+                DiffTag::Delete => Mark::Removed,
+                DiffTag::Replace => Mark::Changed,
+            };
+            Some(Hunk { mark, lines })
+        })
+        .collect()
+}
+
+/// How many bytes of whole lines `old` and `new` start with that are the
+/// same, and how many they end with after those, each line ending with a
+/// newline.
+fn same_ends(old: &str, new: &str) -> (usize, usize) {
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let same = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let head = a[..same]
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .map_or(0, |i| i + 1);
+    let (a, b) = (&a[head..], &b[head..]);
+    let mut tail = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    // The lines in common start after a newline in both, or at the start.
+    let line_start = |text: &[u8], tail: usize| {
+        let at = text.len() - tail;
+        at == 0 || text[at - 1] == b'\n'
+    };
+    while tail > 0 && !(line_start(a, tail) && line_start(b, tail)) {
+        let rest = &a[a.len() - tail..];
+        tail -= rest
+            .iter()
+            .position(|&c| c == b'\n')
+            .map_or(tail, |i| i + 1);
+    }
+    (head, tail)
+}
+
+/// A side of a commit's diff as text: none if it was binary, and empty if
+/// the file wasn't there.
+fn fixed_text(base: &Base) -> Option<&str> {
+    match base {
+        Base::Text(text) => Some(text),
+        Base::Missing => Some(""),
+        Base::Binary => None,
     }
 }
 
@@ -1012,5 +1276,65 @@ mod tests {
             listing(&layout),
             ["+ _ 1     abcdefghijklmnopqrs", ". _ _ tuvwxyz"]
         );
+    }
+
+    #[test]
+    fn hunks_say_which_lines_were_added_changed_and_taken_out() {
+        let old = "a\nb\nc\nd\ne\n";
+        let new = "new\na\nB\nc\ne\n";
+        let hunk = |mark, lines: Range<u32>| Hunk { mark, lines };
+        let found = hunks(old, new);
+        assert_eq!(
+            found,
+            [
+                hunk(Mark::Added, 0..1),
+                hunk(Mark::Changed, 2..3),
+                hunk(Mark::Removed, 4..4),
+            ]
+        );
+        let marks: Vec<_> = (0..5).map(|line| line_mark(&found, line)).collect();
+        assert_eq!(
+            marks,
+            [
+                Some(LineMark::In(Mark::Added)),
+                None,
+                Some(LineMark::In(Mark::Changed)),
+                Some(LineMark::RemovedBelow),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn lines_taken_out_first_or_last_are_marked_at_the_edges() {
+        let found = hunks("a\nb\nc\n", "b\nc\n");
+        assert_eq!(line_mark(&found, 0), Some(LineMark::RemovedAbove));
+        let found = hunks("a\nb\n", "a\n");
+        assert_eq!(line_mark(&found, 0), Some(LineMark::RemovedBelow));
+        let found = hunks("a\nb\n", "");
+        assert_eq!(line_mark(&found, 0), Some(LineMark::RemovedAbove));
+        // Changed lines with lines taken out after them show as changed.
+        let found = hunks("a\nb\nc\n", "A\nc\n");
+        assert_eq!(line_mark(&found, 0), Some(LineMark::In(Mark::Changed)));
+        assert_eq!(hunks("a\nb\n", "a\nb"), []);
+    }
+
+    #[test]
+    fn only_lines_between_the_first_and_last_that_differ_are_diffed() {
+        assert_eq!(same_ends("a\nb\nc\n", "a\nB\nc\n"), (2, 2));
+        // Lines that end the same but start differently aren't in common.
+        assert_eq!(same_ends("a\nxb\nc\n", "a\nyb\nc\n"), (2, 2));
+        assert_eq!(same_ends("ab\n", "b\n"), (0, 0));
+        assert_eq!(same_ends("a\n", "a\n"), (2, 0));
+        assert_eq!(same_ends("a\n", "b\na\n"), (0, 2));
+        assert_eq!(same_ends("é\nb\n", "ê\nb\n"), (0, 2));
+        // Lines taken out deep in a long file are found where they were.
+        let old: String = (0..100).map(|n| format!("line {n}\n")).collect();
+        let new = old.replace("line 50\nline 51\n", "");
+        let removed = Hunk {
+            mark: Mark::Removed,
+            lines: 50..50,
+        };
+        assert_eq!(hunks(&old, &new), [removed]);
     }
 }

@@ -27,7 +27,7 @@ use opentui::{
 };
 
 use crate::config::{self, Config};
-use crate::diff::{DiffEvent, DiffView};
+use crate::diff::{self, DiffEvent, DiffView, Hunks, LineMark};
 #[cfg(test)]
 use crate::document::File;
 use crate::document::{Disk, Document};
@@ -134,6 +134,8 @@ pub struct Editor {
     reader: Option<Reader>,
     /// In diff mode, what shows instead of the text.
     diff: Option<DiffView>,
+    /// What changed since the last commit, for the gutter.
+    hunks: Hunks,
     /// A link clicked in reader mode, for the app to follow.
     link: Option<String>,
     /// The mode, the row at the top, and the text's epoch, when last
@@ -182,6 +184,7 @@ impl Editor {
             find: None,
             reader: None,
             diff: None,
+            hunks: Hunks::default(),
             link: None,
             seen: Cell::new(None),
         };
@@ -870,7 +873,8 @@ impl Editor {
     }
 
     /// Numbers the first row of each visible line in the `gutter` columns
-    /// left of the text, highlighting the cursor's line.
+    /// left of the text, highlighting the cursor's line, and marks the
+    /// lines changed since the last commit in the column next to the text.
     fn draw_line_numbers(&self, frame: &Buffer, gutter: u32) {
         let colors = theme::colors();
         if gutter == 0 {
@@ -878,7 +882,30 @@ impl Editor {
         }
         let (current, _) = self.cursor();
         let digits = gutter as usize - 3;
-        for (y, row) in self.view.visible_lines().iter().enumerate() {
+        let hunks = self.hunks.of(&self.doc);
+        let rows = self.view.visible_lines();
+        for (y, row) in rows.iter().enumerate() {
+            // A line wrapped onto several rows is marked down all of them,
+            // and lines taken out after it under the last.
+            let last_row = rows.get(y + 1).is_none_or(|next| next.line != row.line);
+            let mark = match diff::line_mark(&hunks, row.line) {
+                Some(LineMark::In(mark)) => Some(('▎', mark)),
+                Some(LineMark::RemovedBelow) if last_row => Some(('▁', diff::Mark::Removed)),
+                Some(LineMark::RemovedAbove) if row.wrap == 0 => Some(('▔', diff::Mark::Removed)),
+                _ => None,
+            };
+            if let Some((sign, mark)) = mark {
+                let x = self.x + gutter - 1;
+                let fg = colors.hue(mark.hue());
+                frame.draw_text(
+                    &sign.to_string(),
+                    x,
+                    self.y + y as u32,
+                    fg,
+                    None,
+                    Attributes::NONE,
+                );
+            }
             if row.wrap != 0 {
                 continue;
             }
