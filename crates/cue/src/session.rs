@@ -93,6 +93,13 @@ pub struct Visited {
     pub at: Option<(u32, u32)>,
 }
 
+/// The place in a file to jump back to, and the panel it was marked in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    pub panel: PanelId,
+    pub visited: Visited,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabState {
     pub name: Option<String>,
@@ -134,6 +141,8 @@ pub struct State {
     pub terminals: Vec<TerminalState>,
     /// What the picker lists first, most recent first.
     pub recent: Vec<Shown>,
+    /// The place in a file to jump back to, if marked.
+    pub mark: Option<Mark>,
     /// A terminal shows its screen there.
     pub attached: bool,
 }
@@ -607,18 +616,19 @@ fn shown_list(list: &[Shown]) -> Value {
     Value::Array(list.iter().map(shown_value).collect())
 }
 
+fn visited_value(visited: &Visited) -> Value {
+    let Value::Table(mut table) = shown_value(&visited.shown) else {
+        unreachable!()
+    };
+    if let Some((row, col)) = visited.at {
+        table.insert("row".into(), Value::Integer(row as i64));
+        table.insert("col".into(), Value::Integer(col as i64));
+    }
+    Value::Table(table)
+}
+
 fn visited_list(list: &[Visited]) -> Value {
-    let visited = list.iter().map(|visited| {
-        let Value::Table(mut table) = shown_value(&visited.shown) else {
-            unreachable!()
-        };
-        if let Some((row, col)) = visited.at {
-            table.insert("row".into(), Value::Integer(row as i64));
-            table.insert("col".into(), Value::Integer(col as i64));
-        }
-        Value::Table(table)
-    });
-    Value::Array(visited.collect())
+    Value::Array(list.iter().map(visited_value).collect())
 }
 
 /// `state` as `session.toml` has it.
@@ -640,6 +650,13 @@ pub fn encode(state: &State) -> String {
     root.insert("tree".into(), Value::Table(tree));
     root.insert("tab".into(), int(state.tab as u64));
     root.insert("recent".into(), shown_list(&state.recent));
+    if let Some(mark) = &state.mark {
+        let Value::Table(mut table) = visited_value(&mark.visited) else {
+            unreachable!()
+        };
+        table.insert("panel".into(), int(mark.panel as u64));
+        root.insert("mark".into(), Value::Table(table));
+    }
     let documents = state.documents.iter().map(|doc| {
         let mut table = Table::new();
         match &doc.path {
@@ -783,15 +800,14 @@ pub fn decode(text: &str) -> Option<State> {
     let shown_list = |table: &Table, key: &str| -> Vec<Shown> {
         get_array(table, key).filter_map(shown_from).collect()
     };
+    let visited_from = |visited: &Table| {
+        Some(Visited {
+            shown: shown_from(visited)?,
+            at: get_u32(visited, "row").zip(get_u32(visited, "col")),
+        })
+    };
     let visited_list = |table: &Table, key: &str| -> Vec<Visited> {
-        get_array(table, key)
-            .filter_map(|visited| {
-                Some(Visited {
-                    shown: shown_from(visited)?,
-                    at: get_u32(visited, "row").zip(get_u32(visited, "col")),
-                })
-            })
-            .collect()
+        get_array(table, key).filter_map(visited_from).collect()
     };
     let tree = root.get("tree").and_then(Value::as_table);
     let tree_flag = |key: &str| tree.and_then(|tree| tree.get(key)).and_then(Value::as_bool);
@@ -818,6 +834,12 @@ pub fn decode(text: &str) -> Option<State> {
         changes_shown: tree_flag("changes").unwrap_or(false),
         tab: get_u32(&root, "tab").unwrap_or(0) as usize,
         recent: shown_list(&root, "recent"),
+        mark: root.get("mark").and_then(Value::as_table).and_then(|mark| {
+            Some(Mark {
+                panel: get_u32(mark, "panel")?,
+                visited: visited_from(mark)?,
+            })
+        }),
         ..State::default()
     };
     state.documents = get_array(&root, "documents")
@@ -1009,6 +1031,13 @@ mod tests {
                 size: (100, 30),
             }],
             recent: vec![Shown::Terminal(2), Shown::File("/w/cue/b.rs".into())],
+            mark: Some(Mark {
+                panel: 4,
+                visited: Visited {
+                    shown: Shown::File("/w/cue/b.rs".into()),
+                    at: Some((7, 1)),
+                },
+            }),
             attached: true,
         }
     }

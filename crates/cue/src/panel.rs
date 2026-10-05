@@ -122,7 +122,7 @@ impl Visit {
     }
 
     /// Whether it shows what `other` does, wherever in a file.
-    fn shows_same(&self, other: &Visit) -> bool {
+    pub fn shows_same(&self, other: &Visit) -> bool {
         match (self, other) {
             (Visit::File(a, a_path, _), Visit::File(b, b_path, _)) => {
                 a.ptr_eq(b) || (a_path.is_some() && a_path == b_path)
@@ -577,6 +577,46 @@ impl Panel {
         };
         to.extend(current);
         Some(visit)
+    }
+
+    /// Where `visit` is in the history: whether back rather than forward,
+    /// and its index there. The latest place near it counts, or failing
+    /// that, the latest in the same file.
+    pub fn find_in_history(&self, visit: &Visit) -> Option<(bool, usize)> {
+        let History { back, forward } = &self.history;
+        [Visit::is, Visit::shows_same]
+            .into_iter()
+            .find_map(|matches| {
+                let latest = |list: &[Visit]| list.iter().rposition(|old| matches(old, visit));
+                latest(back)
+                    .map(|index| (true, index))
+                    .or_else(|| latest(forward).map(|index| (false, index)))
+            })
+    }
+
+    /// Goes back through the history (or forward, if not `back`) to the
+    /// place at `index` there, as going one place at a time would: what's
+    /// on screen and the places passed over go on the other side. The
+    /// caller shows the place, as for [`Panel::step_history`].
+    pub fn step_history_to(&mut self, back: bool, index: usize) -> Option<Visit> {
+        let current = self.visit();
+        let History {
+            back: behind,
+            forward: ahead,
+        } = &mut self.history;
+        let (from, to) = if back {
+            (behind, ahead)
+        } else {
+            (ahead, behind)
+        };
+        if index >= from.len() {
+            return None;
+        }
+        let passed = from.split_off(index + 1);
+        let visit = from.pop();
+        to.extend(current);
+        to.extend(passed.into_iter().rev());
+        visit
     }
 
     /// Drops `visit` from the places to go back to, as when it was closed

@@ -117,6 +117,8 @@ commands! {
     Pop => "panel:pop", "Pop";
     GoBack => "panel:go-back", "Go Back";
     GoForward => "panel:go-forward", "Go Forward";
+    SetMark => "mark:set", "Set Mark";
+    JumpToMark => "mark:jump", "Jump to Mark";
     FocusPanelLeft => "panel:focus-left", "Focus Panel Left";
     FocusPanelRight => "panel:focus-right", "Focus Panel Right";
     FocusPanelUp => "panel:focus-up", "Focus Panel Above";
@@ -236,11 +238,11 @@ impl Command {
             | GoToFile | GoToLine | GoToSymbol | GoToWorkspaceSymbol | GoToTerminal
             | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext | FindPrevious
             | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight | SplitDown
-            | ClosePanel | Pop | GoBack | GoForward | FocusPanelLeft | FocusPanelRight
-            | FocusPanelUp | FocusPanelDown | NewTerminal | NewTab | CloseTab | NextTab
-            | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2
-            | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9
-            | AddFolder => Context::Global,
+            | ClosePanel | Pop | GoBack | GoForward | SetMark | JumpToMark | FocusPanelLeft
+            | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal | NewTab | CloseTab
+            | NextTab | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1
+            | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8
+            | GoToTab9 | AddFolder => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
             | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu
             | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate
@@ -436,6 +438,12 @@ impl Default for Keymap {
         bindings.push((key(Char('-'), Mods::CTRL), GoBack));
         bindings.push((key(Char('_'), Mods::CTRL), GoBack));
         bindings.push((key(Char('='), Mods::CTRL), GoForward));
+        // Ctrl+' as Vim's ', which jumps to a mark. Some terminals report
+        // the shifted key, `"`. Legacy terminals can't send these; the
+        // kitty protocol can.
+        bindings.push((key(Char('\''), Mods::CTRL), JumpToMark));
+        bindings.push((key(Char('\''), CTRL_SHIFT), SetMark));
+        bindings.push((key(Char('"'), CTRL_SHIFT), SetMark));
         // As in VS Code and browsers. In a terminal, the shell has them.
         bindings.push((key(PageDown, Mods::CTRL), NextTab));
         bindings.push((key(PageUp, Mods::CTRL), PreviousTab));

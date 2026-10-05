@@ -118,6 +118,15 @@ const SESSION_INTERVAL: Duration = Duration::from_secs(1);
 /// And its terminals' screens at most this often, but when it's left.
 const SCREENS_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The place in a file to jump back to (see [`App::jump_to_mark`]).
+#[derive(Debug, Clone)]
+struct Mark {
+    /// The panel it was marked in.
+    panel: PanelId,
+    /// Always a [`Visit::File`].
+    visit: Visit,
+}
+
 /// Something a panel showed, for the picker to list first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Recent {
@@ -354,6 +363,8 @@ pub struct App {
     watching: Option<(u64, BTreeSet<PathBuf>)>,
     /// Files and terminals shown in the active panel, most recent first.
     recent: Vec<Recent>,
+    /// The place in a file to jump back to, once set.
+    mark: Option<Mark>,
     /// Workspace search, while open. Never open with the picker.
     search: Option<SearchModal>,
     /// The file dialog, while open. Never open with the picker or search.
@@ -576,6 +587,7 @@ impl App {
             last_tab_click: None,
             picker: None,
             recent: Vec::new(),
+            mark: None,
             search: None,
             dialog: None,
             menu: None,
@@ -904,6 +916,8 @@ impl App {
             Command::Pop => self.pop(),
             Command::GoBack => self.go_history(true),
             Command::GoForward => self.go_history(false),
+            Command::SetMark => self.set_mark(),
+            Command::JumpToMark => self.jump_to_mark(),
             Command::FocusPanelLeft => self.focus_panel(Direction::Left),
             Command::FocusPanelRight => self.focus_panel(Direction::Right),
             Command::FocusPanelUp => self.focus_panel(Direction::Up),
@@ -2030,12 +2044,7 @@ impl App {
             .collect();
         let (documents, terminals) = (&self.documents, &self.terminals);
         let usable = |visit: &Visit| match visit {
-            Visit::File(doc, path, _) => {
-                let open = doc
-                    .upgrade()
-                    .is_some_and(|doc| documents.iter().any(|d| Rc::ptr_eq(d, &doc)));
-                open || path.as_ref().is_some_and(|path| path.is_file())
-            }
+            Visit::File(doc, path, _) => file_usable(documents, doc, path.as_deref()),
             Visit::Terminal(id) => {
                 !elsewhere.contains(id) && terminals.iter().any(|t| t.borrow().id() == *id)
             }
@@ -2051,23 +2060,7 @@ impl App {
         let history = self.active_panel_mut().take_history();
         match visit {
             Visit::File(doc, path, spot) => {
-                let doc = doc
-                    .upgrade()
-                    .filter(|doc| self.documents.iter().any(|d| Rc::ptr_eq(d, doc)));
-                let shown = match (doc, path) {
-                    (Some(doc), _) => {
-                        self.show_document(&doc);
-                        self.active_panel().shows(&doc)
-                    }
-                    (None, Some(path)) => {
-                        let opened = self.open(&path, false);
-                        if opened {
-                            self.focus = Focus::Editor;
-                        }
-                        opened
-                    }
-                    (None, None) => false,
-                };
+                let shown = self.show_file(&doc, path.as_deref());
                 if let Some(editor) = self.editor_mut().filter(|_| shown) {
                     if let Some(spot) = spot {
                         editor.return_to(spot.at());
@@ -2093,6 +2086,110 @@ impl App {
         }
         self.active_panel_mut().restore_history(history);
         true
+    }
+
+    /// Shows `doc` in the active panel if it's open, or else opens `path`
+    /// again. Returns whether the panel shows it.
+    fn show_file(&mut self, doc: &Weak<Document>, path: Option<&Path>) -> bool {
+        let doc = doc
+            .upgrade()
+            .filter(|doc| self.documents.iter().any(|d| Rc::ptr_eq(d, doc)));
+        match (doc, path) {
+            (Some(doc), _) => {
+                self.show_document(&doc);
+                self.active_panel().shows(&doc)
+            }
+            (None, Some(path)) => {
+                let opened = self.open(path, false);
+                if opened {
+                    self.focus = Focus::Editor;
+                }
+                opened
+            }
+            (None, None) => false,
+        }
+    }
+
+    /// Marks where the cursor is in the active panel's file, to jump back
+    /// to from anywhere (see [`App::jump_to_mark`]). There's one mark: it
+    /// moves along with edits, as places in the history do.
+    fn set_mark(&mut self) {
+        let panel = self.active_panel();
+        match panel.visit() {
+            Some(visit @ Visit::File(..)) => {
+                self.mark = Some(Mark {
+                    panel: panel.id,
+                    visit,
+                });
+                self.show_message("Mark set.", false);
+            }
+            _ => self.show_message("Only a place in a file can be marked.", false),
+        }
+    }
+
+    /// Goes to the mark in the panel it was marked in, in whichever tab.
+    /// The mark stays put, to go to again; going back comes back.
+    ///
+    /// If the panel shows something else now, it goes back (or forward)
+    /// through its history to the file, as going back that many times
+    /// would, or failing that, opens the file again. If the panel is gone,
+    /// the file shows in the active panel instead. Going there is
+    /// somewhere to go back to.
+    fn jump_to_mark(&mut self) {
+        let Some(mark) = self.mark.clone() else {
+            let message = format!(
+                "No mark. Use {} to set one.",
+                self.shortcut(Command::SetMark)
+            );
+            self.show_message(message, false);
+            return;
+        };
+        let Visit::File(doc, path, spot) = &mark.visit else {
+            return;
+        };
+        if !file_usable(&self.documents, doc, path.as_deref()) {
+            self.mark = None;
+            self.show_message("The marked file is gone.", false);
+            return;
+        }
+        let tab = self
+            .tabs
+            .iter()
+            .position(|tab| tab.panels.iter().any(|panel| panel.id == mark.panel));
+        if let Some(tab) = tab {
+            if tab != self.tab {
+                self.switch_tab(tab);
+            }
+            self.activate(mark.panel);
+        }
+        let panel = self.active_panel();
+        let within = panel
+            .visit()
+            .is_some_and(|visit| visit.shows_same(&mark.visit));
+        let in_history = (!within && panel.id == mark.panel)
+            .then(|| panel.find_in_history(&mark.visit))
+            .flatten();
+        let shown = match in_history {
+            Some((back, index)) => {
+                let shown = self.active_panel_mut().step_history_to(back, index);
+                let history = self.active_panel_mut().take_history();
+                // Shows the marked file, which the place in the history is
+                // in, as it was found.
+                let shown = shown.is_some() && self.show_file(doc, path.as_deref());
+                self.active_panel_mut().restore_history(history);
+                shown
+            }
+            None => within || self.show_file(doc, path.as_deref()),
+        };
+        self.focus = Focus::Editor;
+        // Within the file, it's a jump for the history to note; to another
+        // file, the history has the file it left already.
+        if let (Some(editor), Some(spot)) = (self.editor_mut().filter(|_| shown), spot) {
+            match within {
+                true => editor.jump_to(spot.at()),
+                false => editor.return_to(spot.at()),
+            }
+        }
     }
 
     /// Moves the keyboard to the panel next to the active one in
@@ -3734,6 +3831,12 @@ impl App {
             documents,
             terminals,
             recent,
+            mark: self.mark.as_ref().and_then(|mark| {
+                Some(session::Mark {
+                    panel: mark.panel,
+                    visited: visited(&mark.visit)?,
+                })
+            }),
             attached: self.attached,
         })
     }
@@ -3965,6 +4068,12 @@ impl App {
                 );
             }
         }
+        self.mark = state.mark.as_ref().and_then(|mark| {
+            Some(Mark {
+                panel: mark.panel,
+                visit: visit(&mark.visited)?,
+            })
+        });
 
         self.recent = state
             .recent
@@ -5275,6 +5384,15 @@ fn running_programs(terminals: &[Rc<RefCell<Terminal>>]) -> Vec<String> {
         .collect()
 }
 
+/// Whether the file `doc` is, or failing that, `path`, can be shown: it's
+/// open in `documents`, or there to open again.
+fn file_usable(documents: &[Rc<Document>], doc: &Weak<Document>, path: Option<&Path>) -> bool {
+    let open = doc
+        .upgrade()
+        .is_some_and(|doc| documents.iter().any(|d| Rc::ptr_eq(d, &doc)));
+    open || path.is_some_and(Path::is_file)
+}
+
 /// What a session calls `visit`, if it's still about.
 fn visit_shown(visit: &Visit) -> Option<Shown> {
     Some(match visit {
@@ -6098,6 +6216,158 @@ mod tests {
         assert!(row(&app) > 100, "{}", row(&app));
         back(&mut app);
         assert_eq!(row(&app), 51);
+    }
+
+    #[test]
+    fn jumping_to_the_mark_goes_back_to_it() {
+        let _serial = crate::test_serial();
+        let text: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let root = fixture("mark", &[("a.txt", &text), ("b.txt", "b")]);
+        let mut app = app(&root, Some("a.txt"));
+        let row = |app: &App| app.ed().place().0;
+        let jump = |app: &mut App| ctrl(app, '\'');
+        let set = |app: &mut App| {
+            let shift = Mods {
+                shift: true,
+                ..Mods::CTRL
+            };
+            app.handle_key(Key::new(KeyCode::Char('\''), shift));
+        };
+        let go_to_line = |app: &mut App, line| {
+            app.picker_action(PickerAction::Accept(Choice::Line(Position::printed(
+                line, None,
+            ))));
+            app.after_input();
+        };
+
+        jump(&mut app);
+        assert!(screen(&app).contains("No mark."));
+
+        // Jumping goes to the mark, and going back comes back.
+        go_to_line(&mut app, 30);
+        set(&mut app);
+        assert!(screen(&app).contains("Mark set."));
+        go_to_line(&mut app, 150);
+        jump(&mut app);
+        assert_eq!(row(&app), 29);
+        ctrl(&mut app, '-');
+        assert_eq!(row(&app), 149);
+
+        // The mark stays put, to go to again.
+        go_to_line(&mut app, 100);
+        jump(&mut app);
+        assert_eq!(row(&app), 29);
+
+        // It follows edits made since.
+        app.handle_key(Key::new(KeyCode::Home, Mods::CTRL));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        jump(&mut app);
+        assert_eq!(row(&app), 31);
+
+        // From another file, it goes back to the marked one, which going
+        // forward comes back from.
+        app.open(&root.join("b.txt"), false);
+        app.after_input();
+        jump(&mut app);
+        assert_eq!(
+            (shown_name(&app).as_deref(), row(&app)),
+            (Some("a.txt"), 31)
+        );
+        ctrl(&mut app, '=');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+
+        // A file closed meanwhile opens again.
+        set(&mut app);
+        app.run(Command::CloseFile, false);
+        app.open(&root.join("a.txt"), false);
+        app.after_input();
+        let b_open = |app: &App| {
+            app.documents
+                .iter()
+                .any(|doc| doc.path().is_some_and(|path| path.ends_with("b.txt")))
+        };
+        assert!(!b_open(&app));
+        jump(&mut app);
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+
+        // From a terminal too.
+        app.run(Command::NewTerminal, false);
+        app.after_input();
+        prefixed_ctrl(&mut app, '\'');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+    }
+
+    #[test]
+    fn the_mark_goes_back_to_its_panel_and_through_its_history() {
+        let _serial = crate::test_serial();
+        let text: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let root = fixture(
+            "mark-panels",
+            &[("a.txt", &text), ("b.txt", "b"), ("c.txt", "c")],
+        );
+        let mut app = app(&root, Some("a.txt"));
+        let row = |app: &App| app.ed().place().0;
+        let jump = |app: &mut App| ctrl(app, '\'');
+        let open = |app: &mut App, name: &str| {
+            app.open(&root.join(name), false);
+            app.after_input();
+        };
+        let at = |app: &App| (app.tab, app.tab().active, shown_name(app));
+        app.picker_action(PickerAction::Accept(Choice::Line(Position::printed(
+            30, None,
+        ))));
+        app.after_input();
+        app.run(Command::SetMark, false);
+        let marked = at(&app);
+
+        // From another panel, it goes back to the marked one.
+        app.run(Command::SplitRight, false);
+        open(&mut app, "b.txt");
+        let split = at(&app);
+        jump(&mut app);
+        assert_eq!(at(&app), marked);
+        assert_eq!(row(&app), 29);
+
+        // And from another tab.
+        app.run(Command::NewTab, false);
+        open(&mut app, "c.txt");
+        jump(&mut app);
+        assert_eq!(at(&app), marked);
+
+        // Where the panel moved on since, it goes back through its history
+        // to the file, and what it passed over is ahead.
+        open(&mut app, "b.txt");
+        open(&mut app, "c.txt");
+        jump(&mut app);
+        assert_eq!(
+            (shown_name(&app).as_deref(), row(&app)),
+            (Some("a.txt"), 29)
+        );
+        ctrl(&mut app, '=');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        ctrl(&mut app, '=');
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
+
+        // And again.
+        jump(&mut app);
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        ctrl(&mut app, '=');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+
+        // With its panel closed, it shows in the active one.
+        app.switch_tab(0);
+        app.activate(split.1);
+        app.run(Command::SetMark, false);
+        app.run(Command::ClosePanel, false);
+        app.after_input();
+        let active = app.tab().active;
+        open(&mut app, "c.txt");
+        jump(&mut app);
+        assert_eq!(
+            (app.tab, app.tab().active, shown_name(&app).as_deref()),
+            (0, active, Some("b.txt"))
+        );
     }
 
     #[test]

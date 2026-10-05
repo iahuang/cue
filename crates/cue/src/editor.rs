@@ -418,6 +418,14 @@ impl Editor {
         }
     }
 
+    /// Puts the cursor at `row` and `col` as [`Editor::return_to`] does,
+    /// but as a jump, which the panel's history notes, as going to a line
+    /// is.
+    pub fn jump_to(&mut self, at: (u32, u32)) {
+        self.jump_from(self.cursor());
+        self.return_to(at);
+    }
+
     /// Notes that the cursor jumped from `from`, for the panel's history.
     /// Several jumps before it's taken go back to the first.
     fn jump_from(&mut self, from: (u32, u32)) {
