@@ -600,6 +600,26 @@ impl Picker {
         }
     }
 
+    /// The interactive area under the pointer, without changing selection.
+    pub fn hover_area(&self, x: u32, y: u32) -> Option<Area> {
+        let area = self.area();
+        if !area.contains(x, y)
+            || x <= area.x
+            || x + 1 >= area.x + area.width
+            || y < area.y + 3
+            || y + 1 >= area.y + area.height
+            || self.scroll + (y - area.y - 3) as usize >= self.matches.len()
+        {
+            return None;
+        }
+        Some(Area {
+            x: area.x + 1,
+            y,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        })
+    }
+
     /// Draws the popup over the top middle of the screen and returns where
     /// the terminal cursor goes: the end of the query. Draws nothing on a
     /// screen too small for it.

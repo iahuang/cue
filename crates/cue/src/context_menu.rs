@@ -146,6 +146,21 @@ impl ContextMenu {
         }
     }
 
+    /// The interactive area under the pointer, without changing selection.
+    pub fn hover_area(&self, x: u32, y: u32) -> Option<Area> {
+        self.item_at(x, y)?;
+        let area = self.area();
+        if area.width < 4 || area.height < 3 || y + 1 >= area.y + area.height {
+            return None;
+        }
+        Some(Area {
+            x: area.x + 1,
+            y,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        })
+    }
+
     /// Draws the menu next to where it was opened.
     pub fn draw(&self, frame: &Buffer) {
         let area = self.area();

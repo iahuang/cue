@@ -350,6 +350,13 @@ impl ChangesView {
         self.scroll = self.scroll.saturating_add_signed(rows).min(max);
     }
 
+    /// The interactive area under the pointer, without changing selection.
+    pub fn hover_row(&self, y: u32) -> bool {
+        self.rows
+            .get(self.scroll + y as usize)
+            .is_some_and(|row| row.what != What::Gap)
+    }
+
     /// Draws the list in the columns from `x` to `x + width`.
     pub fn draw(&self, frame: &Buffer, x: u32, width: u32, focused: bool) {
         frame.with_clip(x, 0, width, self.height as u32, || {

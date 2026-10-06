@@ -84,6 +84,31 @@ impl Buffer {
         unsafe { sys::bufferFillRect(self.handle, x, y, width, height, bg.as_ptr()) }
     }
 
+    /// Blends a tint into cell backgrounds without changing text or attributes.
+    pub fn tint_background(&self, x: u32, y: u32, width: u32, height: u32, tint: Rgba) {
+        let bg = unsafe { sys::bufferGetBgPtr(self.handle) };
+        if bg.is_null() || tint.a() == 0 {
+            return;
+        }
+        let share = tint.a() as f32 / 255.0;
+        for row in y..y.saturating_add(height).min(self.height()) {
+            for col in x..x.saturating_add(width).min(self.width()) {
+                let cell = unsafe { bg.add(row as usize * self.width() as usize + col as usize) };
+                let old = Rgba(unsafe { *cell });
+                let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * share).round() as u8;
+                let color = Rgba::rgba(
+                    mix(old.r(), tint.r()),
+                    mix(old.g(), tint.g()),
+                    mix(old.b(), tint.b()),
+                    old.a(),
+                );
+                unsafe {
+                    *cell = color.0;
+                }
+            }
+        }
+    }
+
     /// Draws a text buffer view with its top-left cell at (`x`, `y`).
     pub fn draw_text_buffer_view(&self, view: &TextBufferView<'_>, x: i32, y: i32) {
         unsafe { sys::bufferDrawTextBufferView(self.handle, view.raw_handle(), x, y) }

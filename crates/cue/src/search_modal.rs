@@ -326,6 +326,38 @@ impl SearchModal {
         true
     }
 
+    /// The interactive area under the pointer, without changing selection.
+    pub fn hover_area(&self, x: u32, y: u32) -> Option<Area> {
+        let area = self.area();
+        if !area.contains(x, y) || x <= area.x || x + 1 >= area.x + area.width {
+            return None;
+        }
+        if y == area.y + 1 {
+            let (_, columns) = self
+                .toggles(area)
+                .into_iter()
+                .find(|(_, columns)| columns.contains(&x))?;
+            return Some(Area {
+                x: columns.start,
+                y,
+                width: columns.end - columns.start,
+                height: 1,
+            });
+        }
+        if y < area.y + 3 || y + 1 >= area.y + area.height {
+            return None;
+        }
+        match self.rows.get(self.scroll + (y - area.y - 3) as usize) {
+            Some(Row::File(_) | Row::Line { .. }) => Some(Area {
+                x: area.x + 1,
+                y,
+                width: area.width.saturating_sub(2),
+                height: 1,
+            }),
+            _ => None,
+        }
+    }
+
     /// Draws the popup over the middle of the screen and returns where the
     /// terminal cursor goes: the end of the query. Draws nothing on a
     /// screen too small for it.

@@ -334,6 +334,8 @@ pub struct App {
     width: u32,
     height: u32,
     mouse_target: Option<MouseTarget>,
+    /// Last pointer position, independent of the pressed or dragged target.
+    hover: Option<(u32, u32)>,
     header_drag: Option<HeaderDrag>,
     /// A question to answer before going on, above everything else.
     alert: Option<Alert<Answer>>,
@@ -579,6 +581,7 @@ impl App {
             width,
             height,
             mouse_target: None,
+            hover: None,
             header_drag: None,
             alert: None,
             confirmed: false,
@@ -639,12 +642,14 @@ impl App {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
+        self.hover = None;
         self.width = width;
         self.height = height;
         self.layout();
     }
 
     pub fn handle_key(&mut self, key: Key) -> AppAction {
+        self.hover = None;
         let action = self.dispatch_key(key);
         self.after_input();
         action
@@ -1118,6 +1123,12 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> AppAction {
+        self.hover = (!matches!(mouse.kind, MouseKind::Press(_) | MouseKind::Drag(_)))
+            .then_some((mouse.x, mouse.y));
+        if mouse.kind == MouseKind::Move {
+            // Motion only updates appearance; it cannot focus or select anything.
+            return AppAction::Continue;
+        }
         let action = self.dispatch_mouse(mouse, now);
         self.after_input();
         action
@@ -1663,9 +1674,137 @@ impl App {
             // Over any popup it asks for.
             Some(alert) => {
                 alert.draw(frame);
+                self.draw_hover(frame);
                 None
             }
-            None => cursor,
+            None => {
+                self.draw_hover(frame);
+                cursor
+            }
+        }
+    }
+
+    /// Resolve against the current layout, so scrolling and popups cannot leave
+    /// a highlight on a stale target. The topmost popup owns hover exclusively.
+    fn hover_area(&self) -> Option<Rect> {
+        let (x, y) = self.hover?;
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let rect = |area: crate::picker::Area| Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: area.height,
+        };
+        if let Some(alert) = &self.alert {
+            return alert.hover_area(x, y).map(rect);
+        }
+        if let Some((menu, _)) = &self.menu {
+            return menu.hover_area(x, y).map(rect);
+        }
+        if let Some(search) = &self.search {
+            return search.hover_area(x, y).map(rect);
+        }
+        if let Some(picker) = &self.picker {
+            return picker.hover_area(x, y).map(rect);
+        }
+        if let Some(dialog) = &self.dialog {
+            return dialog.hover_area(x, y).map(rect);
+        }
+        let span = |columns: std::ops::Range<u32>| Rect {
+            x: columns.start,
+            y,
+            width: columns.end - columns.start,
+            height: 1,
+        };
+        match self.target_at(x, y)? {
+            MouseTarget::Tree => {
+                let row = match self.sidebar {
+                    Sidebar::Files => self.tree.hover_row(y),
+                    Sidebar::Changes => self.changes.hover_row(y),
+                    Sidebar::Log => self.log.as_ref().is_some_and(|log| log.hover_row(y)),
+                };
+                row.then(|| span(0..self.visible_tree_width()))
+            }
+            MouseTarget::Divider => Some(Rect {
+                x,
+                y: 0,
+                width: 1,
+                height: self.height.saturating_sub(1),
+            }),
+            MouseTarget::Handle(path) => self
+                .tab()
+                .layout
+                .handles(self.main_area())
+                .into_iter()
+                .find(|handle| handle.path == path)
+                .map(|handle| handle.rect),
+            MouseTarget::Tab(_) | MouseTarget::NewTab => tab::bar(&self.tabs, self.bar_area())
+                .into_iter()
+                .find(|(_, rect, _)| rect.contains(x, y))
+                .map(|(_, rect, _)| rect),
+            MouseTarget::Header(id) => self
+                .tab()
+                .panels
+                .iter()
+                .find(|panel| panel.id == id)?
+                .hover_header(x),
+            MouseTarget::GitBadge => status::git_badge(
+                &self.active_panel().status(),
+                self.git_badge().as_ref(),
+                self.width,
+            )
+            .map(span),
+            MouseTarget::Session => {
+                status::session_badge(&self.active_panel().status(), self.width).map(span)
+            }
+            MouseTarget::Language => {
+                let status = self.active_panel().status();
+                let offset = status::git_badge(&status, self.git_badge().as_ref(), self.width)
+                    .map_or(0, |badge| badge.end);
+                match status {
+                    status::Status::EditorInfo { language, .. } => {
+                        Some(span(language.start + offset..language.end + offset))
+                    }
+                    _ => None,
+                }
+            }
+            MouseTarget::Panel(id) => {
+                let panel = self.tab().panels.iter().find(|panel| panel.id == id)?;
+                if let Some(terminal) = panel.terminal() {
+                    terminal.borrow().hover_find(x, y)
+                } else {
+                    panel.editor()?.hover_find(x, y)
+                }
+            }
+        }
+    }
+
+    fn draw_hover(&self, frame: &Buffer) {
+        if let Some(area) = self.hover_area() {
+            let colors = theme::colors();
+            let divider = self.alert.is_none()
+                && self.menu.is_none()
+                && self.search.is_none()
+                && self.picker.is_none()
+                && self.dialog.is_none()
+                && self.hover.is_some_and(|(x, y)| {
+                    matches!(
+                        self.target_at(x, y),
+                        Some(MouseTarget::Divider | MouseTarget::Handle(_))
+                    )
+                });
+            if divider {
+                let fg = theme::mix(colors.divider, colors.text, 0.25);
+                for y in area.y..area.y + area.height {
+                    frame.draw_text("│", area.x, y, fg, None, Attributes::NONE);
+                }
+                return;
+            }
+            let accent = colors.accent;
+            let tint = opentui::Rgba::rgba(accent.r(), accent.g(), accent.b(), 36);
+            frame.tint_background(area.x, area.y, area.width, area.height, tint);
         }
     }
 
@@ -8589,6 +8728,84 @@ mod tests {
         let frame = OwnedBuffer::new(80, 24, false, WidthMethod::Unicode, "test").unwrap();
         app.draw(&frame);
         frame.to_text(true)
+    }
+
+    #[test]
+    fn hover_highlights_controls_without_selecting_or_focusing() {
+        let _serial = crate::test_serial();
+        let root = fixture("hover", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = tall_app(&root, Some("a.txt"));
+        let frame = OwnedBuffer::new(80, 24, false, WidthMethod::Unicode, "hover").unwrap();
+        app.draw(&frame);
+        let selected = app.tree.selected().unwrap().path;
+        let focus = app.focus;
+        let row = 2;
+        let bg = frame.bg_at(2, row);
+        let text = frame.to_text(true);
+        mouse_at(&mut app, MouseKind::Move, 2, row);
+        assert_eq!(app.tree.selected().unwrap().path, selected);
+        assert_eq!(app.focus, focus);
+        assert!(app.mouse_target.is_none());
+        app.draw(&frame);
+        assert_ne!(frame.bg_at(2, row), bg);
+        assert_eq!(frame.to_text(true), text);
+        mouse_at(&mut app, MouseKind::Move, 2, 20);
+        assert!(app.hover_area().is_none(), "empty sidebar space");
+        app.draw(&frame);
+        assert_eq!(frame.bg_at(2, row), bg);
+
+        let panel = app.active_panel();
+        let header_y = panel.area().y;
+        let back_x = (panel.area().x..panel.area().x + panel.area().width)
+            .find(|&x| panel.header_button(x) == Some(HeaderButton::Back))
+            .unwrap();
+        // The title is draggable, but a disabled history button isn't.
+        mouse_at(&mut app, MouseKind::Move, back_x, header_y);
+        assert!(app.hover_area().is_none());
+        ctrl(&mut app, 't');
+        let (_, tab_rect, _) = tab::bar(&app.tabs, app.bar_area())[0].clone();
+        let current = app.tab;
+        mouse_at(&mut app, MouseKind::Move, tab_rect.x, tab_rect.y);
+        assert_eq!(app.tab, current);
+        assert_eq!(app.hover_area(), Some(tab_rect));
+        app.resize(60, 20);
+        assert!(app.hover_area().is_none());
+    }
+
+    #[test]
+    fn hover_belongs_to_the_topmost_popup_and_does_not_accept_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("hover-popup", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = tall_app(&root, Some("a.txt"));
+        app.show_picker(Mode::Commands);
+        let frame = OwnedBuffer::new(80, 24, false, WidthMethod::Unicode, "hover").unwrap();
+        app.draw(&frame);
+        let picker = app.picker.as_ref().unwrap();
+        let selected = format!("{:?}", picker.selected_choice());
+        let mut hit = None;
+        for y in 0..24 {
+            for x in 0..80 {
+                if picker.hover_area(x, y).is_some() {
+                    hit = Some((x, y));
+                    break;
+                }
+            }
+            if hit.is_some() {
+                break;
+            }
+        }
+        let (x, y) = hit.expect("picker result");
+        let bg = frame.bg_at(x, y);
+        mouse_at(&mut app, MouseKind::Move, x, y);
+        app.draw(&frame);
+        assert_ne!(frame.bg_at(x, y), bg);
+        assert_eq!(
+            format!("{:?}", app.picker.as_ref().unwrap().selected_choice()),
+            selected
+        );
+        mouse_at(&mut app, MouseKind::Move, 0, 0);
+        assert!(app.hover_area().is_none(), "popup blocks underlying tree");
+        assert!(app.picker.is_some());
     }
 
     fn mouse_at(app: &mut App, kind: MouseKind, x: u32, y: u32) {

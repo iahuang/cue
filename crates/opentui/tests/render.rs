@@ -133,3 +133,25 @@ fn with_clip_keeps_drawing_inside_the_rectangle() {
     buffer.draw_text("after", 0, 1, Rgba::WHITE, None, Attributes::NONE);
     assert_eq!(buffer.to_text(true), "  cde   \nafter   \n");
 }
+
+#[test]
+fn background_tint_preserves_unicode_foregrounds_and_attributes() {
+    let _serial = serial();
+    for respect_alpha in [false, true] {
+        let frame = OwnedBuffer::new(8, 2, respect_alpha, WidthMethod::Unicode, "hover").unwrap();
+        frame.clear(Rgba::BLACK);
+        frame.draw_text("a界e\u{301}", 0, 0, Rgba::WHITE, None, Attributes::BOLD);
+        let text = frame.to_text(true);
+        let fg = frame.fg_at(1, 0);
+        let attrs = frame.attributes_at(1, 0);
+        frame.tint_background(1, 0, u32::MAX, 1, Rgba::rgba(255, 255, 255, 128));
+        assert_eq!(frame.to_text(true), text);
+        assert_eq!(frame.fg_at(1, 0), fg);
+        assert_eq!(frame.attributes_at(1, 0), attrs);
+        assert_eq!(frame.bg_at(0, 0), Some(Rgba::BLACK));
+        assert_eq!(frame.bg_at(7, 0), Some(Rgba::rgb(128, 128, 128)));
+        assert_eq!(frame.bg_at(7, 1), Some(Rgba::BLACK));
+        frame.tint_background(u32::MAX, u32::MAX, 2, 2, Rgba::WHITE);
+        assert_eq!(frame.to_text(true), text);
+    }
+}

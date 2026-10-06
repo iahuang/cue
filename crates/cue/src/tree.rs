@@ -424,6 +424,11 @@ impl FileTree {
         self.scroll = self.scroll.saturating_add_signed(rows).min(max);
     }
 
+    /// Whether this screen row has an interactive entry.
+    pub fn hover_row(&self, y: u32) -> bool {
+        self.row_at(y).is_some()
+    }
+
     /// Draws the tree in the columns from `x` to `x + width`. Deep or long
     /// rows are cut off at the right edge.
     pub fn draw(&self, frame: &Buffer, x: u32, width: u32, focused: bool) {

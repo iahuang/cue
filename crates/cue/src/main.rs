@@ -669,8 +669,8 @@ fn attached(
     renderer.use_kitty_image_files();
     // Until the terminal answers, unless OPENTUI_IMAGE_PROTOCOL says.
     math::set_images(renderer.draws_images());
-    // Clicks, drags, and the wheel; plain motion isn't needed.
-    renderer.enable_mouse(false);
+    // Report plain motion as well, for hover feedback.
+    renderer.enable_mouse(true);
     // Experimental, for slow links such as ssh: fewer bytes per frame.
     renderer.set_compact_output(env_flag("CUE_COMPACT_OUTPUT"));
     let mut parser = Parser::new();

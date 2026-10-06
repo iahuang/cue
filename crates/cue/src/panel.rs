@@ -840,6 +840,34 @@ impl Panel {
         self.area.width.saturating_sub(buttons)
     }
 
+    /// The interactive area under the pointer, without changing selection.
+    pub fn hover_header(&self, x: u32) -> Option<Rect> {
+        if let Some((button, label, start)) = self
+            .buttons()
+            .into_iter()
+            .find(|(_, label, start)| (*start..*start + label_width(label)).contains(&x))
+        {
+            if matches!(button, HeaderButton::Back) && !self.can_go(true)
+                || matches!(button, HeaderButton::Forward) && !self.can_go(false)
+            {
+                return None;
+            }
+            return Some(Rect {
+                x: start.max(self.area.x),
+                y: self.area.y,
+                width: (start + label_width(label))
+                    .min(self.area.x + self.area.width)
+                    .saturating_sub(start.max(self.area.x)),
+                height: 1,
+            });
+        }
+        Some(Rect {
+            width: self.title_width(),
+            height: 1,
+            ..self.area
+        })
+    }
+
     /// The header button at screen column `x`, if any.
     pub fn header_button(&self, x: u32) -> Option<HeaderButton> {
         self.buttons()

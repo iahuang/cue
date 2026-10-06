@@ -156,6 +156,28 @@ impl<T: Clone> Alert<T> {
         }
     }
 
+    /// The interactive area under the pointer, without changing selection.
+    pub fn hover_area(&self, x: u32, y: u32) -> Option<Area> {
+        let area = self.area();
+        if area.width < 4
+            || area.height < 3
+            || !area.contains(x, y)
+            || y != area.y + area.height - 2
+        {
+            return None;
+        }
+        let (x, width) = self
+            .button_spans(area)
+            .into_iter()
+            .find(|(start, width)| (*start..*start + width).contains(&x))?;
+        Some(Area {
+            x,
+            y,
+            width,
+            height: 1,
+        })
+    }
+
     /// Draws it in the middle of the screen, above the status bar.
     pub fn draw(&self, frame: &Buffer) {
         let area = self.area();

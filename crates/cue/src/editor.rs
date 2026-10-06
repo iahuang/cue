@@ -799,6 +799,24 @@ impl Editor {
         }
     }
 
+    /// The find button under the pointer, in screen coordinates.
+    pub fn hover_find(&self, x: u32, y: u32) -> Option<crate::layout::Rect> {
+        let (start, width, rows) = self.find_area()?;
+        if !(start..start + width).contains(&x) || !(self.y..self.y + rows).contains(&y) {
+            return None;
+        }
+        let columns = self.find.as_ref()?.hover_columns(x, y - self.y)?;
+        Some(crate::layout::Rect {
+            x: columns.start.max(start),
+            y,
+            width: columns
+                .end
+                .min(start + width)
+                .saturating_sub(columns.start.max(start)),
+            height: 1,
+        })
+    }
+
     /// A mouse event on the find bar, which it handles; returns false if
     /// it's elsewhere. A press elsewhere gives the text the keyboard. A
     /// drag from a field selects in it, wherever it goes.

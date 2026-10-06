@@ -465,6 +465,14 @@ impl FindBar {
         (text, colors.muted)
     }
 
+    pub fn hover_columns(&self, x: u32, row: u32) -> Option<Range<u32>> {
+        self.drawn
+            .borrow()
+            .iter()
+            .find(|(r, columns, _)| *r == row && columns.contains(&x))
+            .map(|(_, columns, _)| columns.clone())
+    }
+
     /// What's at screen column `x` of the bar's row `row`, as last drawn.
     pub fn target(&self, x: u32, row: u32) -> Target {
         let drawn = self.drawn.borrow();

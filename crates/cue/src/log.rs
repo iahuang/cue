@@ -200,6 +200,11 @@ impl LogView {
         self.read_more_near_end();
     }
 
+    /// The interactive area under the pointer, without changing selection.
+    pub fn hover_row(&self, y: u32) -> bool {
+        y == 0 || self.rows.get(self.scroll + y as usize - 1).is_some()
+    }
+
     /// Draws the log in the columns from `x` to `x + width`.
     pub fn draw(&self, frame: &Buffer, x: u32, width: u32, focused: bool) {
         frame.with_clip(x, 0, width, self.height as u32 + 1, || {
