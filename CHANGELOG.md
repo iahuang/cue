@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add Save All, line comment toggling, and configurable indentation guides.
+- Add Save All, line comment toggling, and configurable indentation guides (`e78cf8f`).
 
 ## v0.3.6 — 2026-10-05
 
