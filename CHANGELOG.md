@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Use VS Code word separators for double-click selection in the editor (`fd6db5a`)
+
 ## v0.3.8 — 2026-10-06
 
 - Treat buffers edited back to their saved text as unmodified (`fd4cdda`)
