@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.6 — 2026-10-05
 
 - Add mouse hover states (`60e36de`)
 - Add Quick Look previews in the sidebar with Space or Alt+click (`98f2cdb`)
