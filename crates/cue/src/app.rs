@@ -738,6 +738,7 @@ impl App {
                     && !matches!(
                         command,
                         Command::GoToFile
+                            | Command::GoToUnsaved
                             | Command::GoToLine
                             | Command::GoToSymbol
                             | Command::GoToWorkspaceSymbol
@@ -914,6 +915,7 @@ impl App {
             }
             Command::FocusEditor => self.focus = Focus::Editor,
             Command::GoToFile => self.show_picker(Mode::Files),
+            Command::GoToUnsaved => self.show_picker(Mode::Unsaved),
             Command::GoToLine => self.show_picker(Mode::Line),
             Command::GoToSymbol => self.show_picker(Mode::Symbols),
             Command::GoToWorkspaceSymbol => self.show_picker(Mode::WorkspaceSymbols),
@@ -2608,6 +2610,7 @@ impl App {
                     self.files.refresh();
                 }
                 let recent = self.recent_items();
+                let unsaved = self.unsaved_items();
                 // Terminal commands, for the terminal on screen, and
                 // session commands as it is one or not.
                 let terminal = self.active_terminal().is_some();
@@ -2627,6 +2630,7 @@ impl App {
                     self.width,
                     self.height,
                 ));
+                self.picker.as_mut().unwrap().set_unsaved(unsaved);
             }
         }
     }
@@ -2638,8 +2642,10 @@ impl App {
             PickerAction::CloseItem(choice) => {
                 self.close_item(choice);
                 let recent = self.recent_items();
+                let unsaved = self.unsaved_items();
                 if let Some(picker) = &mut self.picker {
                     picker.set_recent(recent);
+                    picker.set_unsaved(unsaved);
                 }
             }
             PickerAction::Accept(choice) => {
@@ -3112,6 +3118,19 @@ impl App {
             }
         }
         items
+    }
+
+    /// Every unsaved document, including the one on screen and files
+    /// outside the workspace or no longer in the recent history.
+    fn unsaved_items(&self) -> Vec<Item> {
+        self.documents
+            .iter()
+            .filter(|doc| doc.is_modified() || doc.path().is_none())
+            .map(|doc| match doc.path() {
+                Some(path) => Item::file(path, &self.workspace, "unsaved"),
+                None => Item::untitled(doc.untitled.get()),
+            })
+            .collect()
     }
 
     /// The open file at `path`, however it was named.
@@ -8019,6 +8038,68 @@ mod tests {
         if let Some(picker) = &mut app.picker {
             picker.set_files(&app.files);
         }
+    }
+
+    #[test]
+    fn picker_bang_lists_unsaved_documents_and_filters_by_name() {
+        let _serial = crate::test_serial();
+        let root = fixture("picker-unsaved", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        type_text(&mut app, "changed");
+        assert!(app.palette_has(Command::GoToUnsaved));
+        app.show_picker(Mode::Commands);
+        type_text(&mut app, "Go to Unsaved File");
+        assert_eq!(
+            app.picker.as_ref().unwrap().selected_choice(),
+            Some(&Choice::Command(Command::GoToUnsaved))
+        );
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.picker.as_ref().unwrap().mode(), Mode::Unsaved);
+        assert_eq!(
+            app.picker.as_ref().unwrap().selected_choice(),
+            Some(&Choice::File(root.join("a.txt")))
+        );
+        key(&mut app, KeyCode::Esc);
+        assert!(app.open(&root.join("b.txt"), false));
+        ctrl(&mut app, 'n');
+        // A blank untitled file is also unsaved, including when on screen.
+        go_to_file(&mut app);
+        type_text(&mut app, "!");
+        assert_eq!(app.picker.as_ref().unwrap().mode(), Mode::Unsaved);
+        let text = screen(&app);
+        assert!(text.contains("a.txt"), "{text}");
+        assert!(text.contains("Untitled-1"), "{text}");
+        assert!(!text.contains("b.txt"), "{text}");
+        type_text(&mut app, "a.txt");
+        assert_eq!(
+            app.picker.as_ref().unwrap().selected_choice(),
+            Some(&Choice::File(root.join("a.txt")))
+        );
+        key(&mut app, KeyCode::Enter);
+        assert!(app.ed().is_modified());
+        // The current file stays in the unsaved list.
+        go_to_file(&mut app);
+        type_text(&mut app, "!a.txt");
+        assert_eq!(
+            app.picker.as_ref().unwrap().selected_choice(),
+            Some(&Choice::File(root.join("a.txt")))
+        );
+        key(&mut app, KeyCode::Esc);
+        ctrl(&mut app, 's');
+        go_to_file(&mut app);
+        type_text(&mut app, "!a.txt");
+        assert!(app.picker.as_ref().unwrap().selected_choice().is_none());
+        // Closing an empty untitled file updates this mode immediately.
+        key(&mut app, KeyCode::Esc);
+        ctrl(&mut app, 'n');
+        go_to_file(&mut app);
+        type_text(&mut app, "!Untitled");
+        assert_eq!(
+            app.picker.as_ref().unwrap().selected_choice(),
+            Some(&Choice::Untitled(1))
+        );
+        ctrl(&mut app, 'w');
+        assert!(app.picker.as_ref().unwrap().selected_choice().is_none());
     }
 
     #[test]

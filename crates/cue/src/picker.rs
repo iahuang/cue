@@ -6,8 +6,9 @@
 //! As there, the query's first character can ask for something else: `@`
 //! for the symbols the file on screen defines (Ctrl+R), `#` for those the
 //! whole workspace does (Ctrl+Shift+R), `:` for a line to go to
-//! (Ctrl+L), and `$` for just the terminals. A file's name can end in a line to go to, as compilers print
-//! it: `main.rs:12` or `main.rs:12:5`.
+//! (Ctrl+L), `$` for just the terminals, or `!` for unsaved files. A file's
+//! name can end in a line to go to, as compilers print it: `main.rs:12` or
+//! `main.rs:12:5`.
 //!
 //! Matching is fuzzy: the query's characters must appear in order, so `abcr`
 //! finds `abracadabra.rs`. Matches at word starts, after `/`, and in runs
@@ -51,6 +52,8 @@ const MAX_ROWS: u32 = 14;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Files,
+    /// Open files with unsaved changes and untitled files.
+    Unsaved,
     Commands,
     Languages,
     Themes,
@@ -69,6 +72,7 @@ impl Mode {
     fn prefix(self) -> Option<char> {
         match self {
             Mode::Files | Mode::Languages | Mode::Themes => None,
+            Mode::Unsaved => Some('!'),
             Mode::Commands => Some('>'),
             Mode::Line => Some(':'),
             Mode::Symbols => Some('@'),
@@ -230,6 +234,8 @@ pub struct Picker {
     recent: Vec<Item>,
     /// The terminals among `recent`, in terminal mode.
     terminals: Vec<Item>,
+    /// Open documents that have not been saved, including the current one.
+    unsaved: Vec<Item>,
     /// The workspace's files, from the file index.
     files: Rc<Vec<Item>>,
     /// Positions in `files` of the recent files, ascending, so that each
@@ -305,6 +311,7 @@ impl Picker {
             query: String::new(),
             caret: Caret::default(),
             terminals: terminals(&recent),
+            unsaved: Vec::new(),
             recent,
             files: Rc::new(Vec::new()),
             duplicates: Vec::new(),
@@ -380,6 +387,7 @@ impl Picker {
             Mode::Symbols,
             Mode::WorkspaceSymbols,
             Mode::Terminals,
+            Mode::Unsaved,
         ]
         .into_iter()
         .find(|mode| first.is_some() && mode.prefix() == first)
@@ -431,6 +439,17 @@ impl Picker {
         self.indexing = indexing;
         if self.mode() == Mode::WorkspaceSymbols {
             self.refilter(selected);
+        }
+    }
+
+    /// Lists open documents that have not been saved.
+    pub fn set_unsaved(&mut self, items: Vec<Item>) {
+        self.unsaved = items;
+        if self.mode() == Mode::Unsaved {
+            let (selected, scroll) = (self.selected, self.scroll);
+            self.refilter(None);
+            self.scroll = scroll;
+            self.select(selected);
         }
     }
 
@@ -498,7 +517,7 @@ impl Picker {
                         .matches
                         .get(self.selected)
                         .is_some_and(|&i| i < self.recent.len()),
-                    Mode::Terminals => true,
+                    Mode::Terminals | Mode::Unsaved => true,
                     _ => false,
                 };
                 if let Some(item) = self.selected_item().filter(|_| recent) {
@@ -674,6 +693,7 @@ impl Picker {
     fn lists(&self) -> (&[Item], &[Item]) {
         match self.mode() {
             Mode::Files => (&self.recent, &self.files),
+            Mode::Unsaved => (&self.unsaved, &[]),
             Mode::Commands => (&self.commands, &[]),
             Mode::Languages => (&self.languages, &[]),
             Mode::Themes => (&self.themes, &[]),
@@ -852,6 +872,7 @@ impl Picker {
         } = area;
         let (title, noun) = match self.mode() {
             Mode::Files => ("Go to File", "files"),
+            Mode::Unsaved => ("Unsaved Files", "files"),
             Mode::Commands => ("Commands", "commands"),
             Mode::Languages => ("Syntax Highlighting", "languages"),
             Mode::Themes => ("Select Theme", "themes"),
@@ -867,6 +888,7 @@ impl Picker {
         let closable = match self.mode() {
             Mode::Files => !self.recent.is_empty(),
             Mode::Terminals => !self.terminals.is_empty(),
+            Mode::Unsaved => !self.unsaved.is_empty(),
             _ => false,
         };
         if closable && self.close_hint.chars().count() <= room {
@@ -894,6 +916,7 @@ impl Picker {
                 Mode::Files => {
                     "Search files by name. Type > for commands, @ for symbols, or $ for terminals."
                 }
+                Mode::Unsaved => "Search unsaved files by name.",
                 Mode::Commands => "Search commands",
                 Mode::Languages => "Search languages",
                 Mode::Themes => "Search themes",

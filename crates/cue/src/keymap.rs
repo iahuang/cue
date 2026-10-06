@@ -61,6 +61,7 @@ commands! {
     OpenFile => "file:open", "Open File…";
     CloseFile => "file:close", "Close File";
     GoToFile => "file:go-to", "Go to File";
+    GoToUnsaved => "file:go-to-unsaved", "Go to Unsaved File…";
     GoToLine => "editor:go-to-line", "Go to Line…";
     GoToSymbol => "editor:go-to-symbol", "Go to Symbol in File…";
     GoToWorkspaceSymbol => "search:symbols", "Go to Symbol in Workspace…";
@@ -238,14 +239,14 @@ impl Command {
         match self {
             Quit | Restart | KeepSession | Detach | EndSession | Palette | OpenSettings
             | ReloadSettings | SelectTheme | Save | SaveAll | SaveAs | NewFile | CreateFile
-            | OpenFile | GoToFile | GoToLine | GoToSymbol | GoToWorkspaceSymbol | GoToTerminal
-            | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext | FindPrevious
-            | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight | SplitDown
-            | ClosePanel | Pop | GoBack | GoForward | SetMark | JumpToMark | FocusPanelLeft
-            | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal | NewTab | CloseTab
-            | NextTab | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1
-            | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8
-            | GoToTab9 | AddFolder => Context::Global,
+            | OpenFile | GoToFile | GoToUnsaved | GoToLine | GoToSymbol | GoToWorkspaceSymbol
+            | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext
+            | FindPrevious | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight
+            | SplitDown | ClosePanel | Pop | GoBack | GoForward | SetMark | JumpToMark
+            | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal
+            | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft | MoveTabRight
+            | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6
+            | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
@@ -857,6 +858,8 @@ mod tests {
         const UNBOUND: &[Command] = &[
             // `$` in the file picker gets there too.
             Command::GoToTerminal,
+            // `!` in the file picker gets there too.
+            Command::GoToUnsaved,
             Command::OpenSettings,
             Command::ReloadSettings,
             Command::SelectTheme,
