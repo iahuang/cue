@@ -534,7 +534,7 @@ impl ChangesView {
         self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.height));
     }
 
-    /// Enter/Space/click: opens the selected file, or collapses or expands
+    /// Enter/Shift+Space/click: opens the selected file, or collapses or expands
     /// a folder.
     fn activate(&mut self, focus: bool, preview: bool) -> TreeAction {
         let Some(row) = self.rows.get(self.selected) else {

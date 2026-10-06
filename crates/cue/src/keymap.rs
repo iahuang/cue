@@ -149,6 +149,7 @@ commands! {
     TreeCollapse => "tree:collapse", "File Tree: Collapse";
     TreeOpen => "tree:open", "File Tree: Open";
     TreePreview => "tree:preview", "File Tree: Preview";
+    TreeQuickLook => "tree:quick-look", "File Tree: Quick Look";
     TreeFirst => "tree:first", "File Tree: Select First";
     TreeLast => "tree:last", "File Tree: Select Last";
     TreePageUp => "tree:page-up", "File Tree: Page Up";
@@ -243,11 +244,11 @@ impl Command {
             | NextTab | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1
             | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8
             | GoToTab9 | AddFolder => Context::Global,
-            TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview | TreeFirst
-            | TreeLast | TreePageUp | TreePageDown | TreeRefresh | TreeContextMenu
-            | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename | TreeDuplicate
-            | TreeTrash | TreeCopyPath | TreeCopyRelativePath | TreeReveal | TreeOpenInTerminal
-            | TreeRemoveFolder => Context::Tree,
+            TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
+            | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
+            | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
+            | TreeDuplicate | TreeTrash | TreeCopyPath | TreeCopyRelativePath | TreeReveal
+            | TreeOpenInTerminal | TreeRemoveFolder => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
@@ -513,7 +514,8 @@ impl Default for Keymap {
             (key(Right, Mods::NONE), TreeExpand),
             (key(Left, Mods::NONE), TreeCollapse),
             (key(Enter, Mods::NONE), TreeOpen),
-            (key(Char(' '), Mods::NONE), TreePreview),
+            (key(Char(' '), Mods::NONE), TreeQuickLook),
+            (key(Char(' '), SHIFT), TreePreview),
             (key(Home, Mods::NONE), TreeFirst),
             (key(End, Mods::NONE), TreeLast),
             (key(PageUp, Mods::NONE), TreePageUp),

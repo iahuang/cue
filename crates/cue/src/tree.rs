@@ -546,7 +546,7 @@ impl FileTree {
         }
     }
 
-    /// Enter/Space/click: opens the selected file, or expands/collapses a
+    /// Enter/Shift+Space/click: opens the selected file, or expands/collapses a
     /// folder.
     fn activate(&mut self, focus: bool, preview: bool) -> TreeAction {
         let Some(row) = self.rows.get(self.selected) else {

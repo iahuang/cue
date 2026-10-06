@@ -30,6 +30,7 @@ mod math;
 mod panel;
 mod picker;
 mod pty;
+mod quick_look;
 mod reader;
 mod recovery;
 mod resume;

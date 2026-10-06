@@ -10,9 +10,10 @@
 //! showing the same file share them. Each panel keeps its own cursor and
 //! scroll position in each file it has shown.
 //!
-//! As in VS Code, a file opened with a single click or Space is a preview:
-//! the next preview replaces it, so stepping through files doesn't keep them
-//! all open. Editing it, or opening it with Enter or a double click, keeps it.
+//! As in VS Code, a file opened with a single click or Shift+Space is a
+//! preview: the next preview replaces it, so stepping through files doesn't
+//! keep them all open. Editing it, or opening it with Enter or a double
+//! click, keeps it. Space only looks at the file (see [`crate::quick_look`]).
 //!
 //! The picker (Ctrl+P for files, Ctrl+K for commands) and workspace search
 //! (Ctrl+Shift+F) open over everything and have the keyboard until they
@@ -92,6 +93,7 @@ use crate::location::{self, Position, Target};
 use crate::log::{LogAction, LogView};
 use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
+use crate::quick_look::QuickLook;
 use crate::recovery::{self, Orphan, Recovery};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
@@ -251,6 +253,8 @@ enum MouseTarget {
     Tab(TabId),
     /// The tab bar's button for a new tab.
     NewTab,
+    /// Quick Look, floating over the rest.
+    QuickLook,
 }
 
 /// A panel's header being dragged. A header with a panel above it is also
@@ -348,6 +352,8 @@ pub struct App {
     last_tree_click: Option<(u32, Instant)>,
     /// The tab and time of the last click on the tab bar.
     last_tab_click: Option<(TabId, Instant)>,
+    /// A look at the sidebar's selection, floating over the panels.
+    quick_look: Option<QuickLook>,
     picker: Option<Picker>,
     /// Every file in the workspace, for the picker.
     files: FileIndex,
@@ -588,6 +594,7 @@ impl App {
             preview: None,
             last_tree_click: None,
             last_tab_click: None,
+            quick_look: None,
             picker: None,
             recent: Vec::new(),
             mark: None,
@@ -896,6 +903,11 @@ impl App {
                 }
             }
             Command::ToggleChanges => self.toggle_changes(),
+            // Esc puts Quick Look away, as in the Finder, and leaves the
+            // sidebar the keyboard.
+            Command::FocusEditor if self.focus == Focus::Tree && self.quick_look.is_some() => {
+                self.quick_look = None
+            }
             Command::FocusEditor => self.focus = Focus::Editor,
             Command::GoToFile => self.show_picker(Mode::Files),
             Command::GoToLine => self.show_picker(Mode::Line),
@@ -1087,6 +1099,7 @@ impl App {
                 return self.file_command(command, target, false);
             }
             Command::TreeRefresh if self.sidebar != Sidebar::Files => self.git.refresh(),
+            Command::TreeQuickLook => self.toggle_quick_look(),
             command if command.context() == Context::Tree => match self.sidebar {
                 Sidebar::Files => {
                     let action = self.tree.run(command);
@@ -1201,6 +1214,11 @@ impl App {
         }
 
         match target {
+            MouseTarget::QuickLook => {
+                if let Some(look) = &mut self.quick_look {
+                    look.handle_mouse(mouse, now);
+                }
+            }
             MouseTarget::Language => {
                 if let MouseKind::Press(MouseButton::Left) = mouse.kind {
                     self.show_picker(Mode::Languages);
@@ -1234,6 +1252,30 @@ impl App {
                         self.open_menu(target, Some((mouse.x, mouse.y)));
                     }
                 }
+                // Alt+click: Quick Look at the entry, without the panel
+                // previewing it first; again on it, puts Quick Look away.
+                MouseKind::Press(MouseButton::Left)
+                    if mouse.mods.alt && self.sidebar != Sidebar::Log =>
+                {
+                    self.focus = Focus::Tree;
+                    self.last_tree_click = None;
+                    let hit = match self.sidebar {
+                        Sidebar::Files => self.tree.select_at(mouse.y),
+                        _ => self.changes.select_at(mouse.y),
+                    };
+                    let entry = self.sidebar_selected().filter(|_| hit);
+                    let shown = self
+                        .quick_look
+                        .as_ref()
+                        .map(|look| look.path().to_path_buf());
+                    match entry {
+                        Some(entry) if shown.as_ref() == Some(&entry.path) => {
+                            self.quick_look = None
+                        }
+                        Some(entry) => self.look_at(&entry.path),
+                        None => {}
+                    }
+                }
                 MouseKind::Press(MouseButton::Left) => {
                     self.focus = Focus::Tree;
                     let double = self.last_tree_click.is_some_and(|(y, time)| {
@@ -1241,15 +1283,26 @@ impl App {
                     });
                     // A third click starts over rather than counting as another double.
                     self.last_tree_click = (!double).then_some((mouse.y, now));
+                    // With Quick Look open, a click only selects, and Quick
+                    // Look shows it; the panel keeps what it shows until a
+                    // double click opens the file.
+                    let looking = self.quick_look.is_some() && !double;
+                    let keep = |action: &TreeAction| {
+                        !(looking && matches!(action, TreeAction::Open { .. }))
+                    };
                     match self.sidebar {
                         Sidebar::Files => {
                             let action = self.tree.click(mouse.y, double);
-                            self.tree_action(action);
+                            if keep(&action) {
+                                self.tree_action(action);
+                            }
                         }
                         Sidebar::Changes => {
                             let width = self.visible_tree_width();
                             let action = self.changes.click(mouse.x, mouse.y, width, double);
-                            self.changes_action(action);
+                            if keep(&action) {
+                                self.changes_action(action);
+                            }
                         }
                         Sidebar::Log => {
                             if let Some(log) = &mut self.log {
@@ -1352,6 +1405,13 @@ impl App {
 
     /// What's at screen cell (`x`, `y`), if anything.
     fn target_at(&self, x: u32, y: u32) -> Option<MouseTarget> {
+        if self
+            .quick_look
+            .as_ref()
+            .is_some_and(|look| look.contains(x, y))
+        {
+            return Some(MouseTarget::QuickLook);
+        }
         let area = self.main_area();
         if y >= area.bottom() {
             if self.height > 1
@@ -1598,6 +1658,7 @@ impl App {
         self.watch_folders();
         self.feed_picker();
         self.follow_settings();
+        self.follow_quick_look();
     }
 
     /// Draws the frame and returns where the terminal cursor goes (0-based
@@ -1669,6 +1730,9 @@ impl App {
             let rect = drop.rect;
             frame.fill_rect(rect.x, rect.y, rect.width, rect.height, colors.drop_tint);
         }
+        if let Some(look) = &self.quick_look {
+            look.draw(frame, &self.keymap);
+        }
         let cursor = self.draw_popups(frame, cursor);
         match &self.alert {
             // Over any popup it asks for.
@@ -1719,6 +1783,7 @@ impl App {
             height: 1,
         };
         match self.target_at(x, y)? {
+            MouseTarget::QuickLook => None,
             MouseTarget::Tree => {
                 let row = match self.sidebar {
                     Sidebar::Files => self.tree.hover_row(y),
@@ -5477,9 +5542,80 @@ impl App {
         if let Some(alert) = &mut self.alert {
             alert.set_size(self.width, self.height);
         }
+        let bounds = self.quick_look_bounds();
+        if let Some(look) = &mut self.quick_look {
+            look.set_bounds(bounds);
+        }
         // Tabs off screen are laid out when they come back.
         let area = self.main_area();
         self.tab_mut().set_area(area);
+    }
+
+    /// Where Quick Look floats: over the panels, or the whole screen when
+    /// they're too narrow for it.
+    fn quick_look_bounds(&self) -> Rect {
+        let main = self.main_area();
+        if main.width >= 40 {
+            return main;
+        }
+        Rect {
+            x: 0,
+            y: 0,
+            width: self.width.max(1),
+            height: self.height.saturating_sub(1).max(1),
+        }
+    }
+
+    /// Space in the sidebar: puts Quick Look away, or shows it, of the
+    /// selection. The log has no files; there, it shows the commit.
+    fn toggle_quick_look(&mut self) {
+        if self.quick_look.take().is_some() {
+            return;
+        }
+        if self.sidebar == Sidebar::Log {
+            if let Some(log) = &mut self.log {
+                let action = log.run(Command::TreePreview);
+                self.log_action(action);
+            }
+            return;
+        }
+        if let Some(entry) = self.sidebar_selected() {
+            self.look_at(&entry.path);
+        }
+    }
+
+    fn look_at(&mut self, path: &Path) {
+        let shown = match path.parent() {
+            Some(folder) if self.workspace.root_of(path) != Some(path) => {
+                self.workspace.display_path(folder)
+            }
+            _ => String::new(),
+        };
+        let bounds = self.quick_look_bounds();
+        self.quick_look = Some(QuickLook::new(path, shown, &self.theme, bounds));
+    }
+
+    /// Keeps Quick Look on the sidebar's selection as it moves, and puts it
+    /// away once the sidebar loses the keyboard or something else pops up.
+    fn follow_quick_look(&mut self) {
+        let Some(look) = &self.quick_look else {
+            return;
+        };
+        let popup = self.alert.is_some()
+            || self.menu.is_some()
+            || self.search.is_some()
+            || self.picker.is_some()
+            || self.dialog.is_some()
+            || self.tab_prompt.is_some();
+        let selected = match self.focus {
+            Focus::Tree if !popup && self.visible_tree_width() > 0 => self.sidebar_selected(),
+            _ => None,
+        };
+        match selected {
+            None => self.quick_look = None,
+            Some(entry) if entry.path != look.path() => self.look_at(&entry.path),
+            Some(_) => {}
+        }
     }
 
     /// The tab on screen.
@@ -5851,6 +5987,83 @@ mod tests {
     }
 
     #[test]
+    fn space_in_the_tree_quick_looks_at_the_selection() {
+        let _serial = crate::test_serial();
+        let lines: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        let root = fixture(
+            "quick-look",
+            &[
+                ("a.txt", "alpha"),
+                ("b.rs", &lines),
+                ("doc.md", "# Title\n\n**bold**\n"),
+            ],
+        );
+        let mut app = app(&root, None);
+        app.resize(100, 24);
+        assert_eq!(app.focus, Focus::Tree);
+
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Char(' '));
+        let shown = screen_of(&app, 100, 24);
+        assert!(shown.contains(" a.txt "), "{shown}");
+        assert!(shown.contains("alpha"), "{shown}");
+        assert!(shown.contains("Space to close"), "{shown}");
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.ed().is_blank(), "nothing was opened");
+        assert!(app.documents.iter().all(|doc| doc.path().is_none()));
+
+        // It follows the selection.
+        key(&mut app, KeyCode::Down);
+        let shown = screen_of(&app, 100, 24);
+        assert!(shown.contains("line 1 "), "{shown}");
+        assert!(shown.contains("40 lines"), "{shown}");
+        assert!(!shown.contains("alpha"), "{shown}");
+
+        // The wheel scrolls it.
+        let area = app.quick_look.as_ref().unwrap().area();
+        let (x, y) = (area.x + 10, area.y + 6);
+        for _ in 0..3 {
+            mouse_at(&mut app, MouseKind::ScrollDown, x, y);
+        }
+        let shown = screen_of(&app, 100, 24);
+        assert!(!shown.contains("line 1 "), "{shown}");
+        assert!(app.quick_look.is_some());
+
+        // Markdown is read, not edited.
+        key(&mut app, KeyCode::Down);
+        let shown = screen_of(&app, 100, 24);
+        assert!(
+            shown.contains("Title") && !shown.contains("# Title"),
+            "{shown}"
+        );
+        assert!(!shown.contains("**bold**"), "{shown}");
+
+        // Space again puts it away, and so does Esc, leaving the tree the
+        // keyboard.
+        key(&mut app, KeyCode::Char(' '));
+        assert!(app.quick_look.is_none());
+        key(&mut app, KeyCode::Char(' '));
+        assert!(app.quick_look.is_some());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.quick_look.is_none());
+        assert_eq!(app.focus, Focus::Tree);
+
+        // A folder lists what's in it.
+        key(&mut app, KeyCode::Home);
+        key(&mut app, KeyCode::Char(' '));
+        let shown = screen_of(&app, 100, 24);
+        assert!(shown.contains("3 items"), "{shown}");
+        assert!(shown.contains("doc.md"), "{shown}");
+
+        // Opening the file puts it away.
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.quick_look.is_none());
+        assert_eq!(app.ed().path(), Some(root.join("a.txt")));
+    }
+
+    #[test]
     fn switching_files_keeps_unsaved_edits_and_quit_lists_them() {
         let _serial = crate::test_serial();
         let root = fixture("switch", &[("a.txt", "alpha"), ("b.txt", "beta")]);
@@ -5858,10 +6071,10 @@ mod tests {
         assert_eq!(app.focus, Focus::Editor);
         type_text(&mut app, "1");
 
-        // Ctrl+E, then Space previews b.txt without leaving the tree.
+        // Ctrl+E, then previewing b.txt doesn't leave the tree.
         ctrl(&mut app, 'e');
         key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Char(' '));
+        app.run(Command::TreePreview, false);
         assert_eq!(app.focus, Focus::Tree);
         assert_eq!(
             app.ed().path().as_deref(),
@@ -7574,14 +7787,73 @@ mod tests {
     }
 
     #[test]
+    fn clicks_in_the_tree_only_select_while_quick_looking() {
+        let _serial = crate::test_serial();
+        let root = fixture("quick-look-click", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = app(&root, None);
+        app.resize(100, 24);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Char(' '));
+
+        // A click moves Quick Look, not the panel.
+        left_click(&mut app, 6, 2);
+        assert_eq!(app.quick_look.as_ref().unwrap().path(), root.join("b.txt"));
+        assert!(app.ed().is_blank(), "the panel shows what it did");
+        assert!(app.documents.iter().all(|doc| doc.path().is_none()));
+        assert_eq!(app.focus, Focus::Tree);
+
+        // Closing it leaves the panel alone too.
+        key(&mut app, KeyCode::Esc);
+        assert!(app.ed().is_blank());
+
+        // A double click opens the file, and puts Quick Look away.
+        key(&mut app, KeyCode::Char(' '));
+        left_click(&mut app, 6, 1);
+        left_click(&mut app, 6, 1);
+        assert!(app.quick_look.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.ed().path(), Some(root.join("a.txt")));
+
+        // From the editor, Alt+click looks without the panel previewing,
+        // and again on the same entry puts Quick Look away.
+        alt_click(&mut app, 6, 2);
+        assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(app.quick_look.as_ref().unwrap().path(), root.join("b.txt"));
+        assert_eq!(app.ed().path(), Some(root.join("a.txt")));
+        alt_click(&mut app, 6, 1);
+        assert_eq!(app.quick_look.as_ref().unwrap().path(), root.join("a.txt"));
+        alt_click(&mut app, 6, 1);
+        assert!(app.quick_look.is_none());
+        assert_eq!(app.documents.len(), 1);
+    }
+
+    fn alt_click(app: &mut App, x: u32, y: u32) {
+        let mods = Mods {
+            alt: true,
+            ..Mods::NONE
+        };
+        for kind in [
+            MouseKind::Press(MouseButton::Left),
+            MouseKind::Release(MouseButton::Left),
+        ] {
+            app.handle_mouse(Mouse { kind, x, y, mods }, Instant::now());
+        }
+    }
+
+    /// Shift+Space, which previews the tree's selection in the editor.
+    fn shift_space(app: &mut App) {
+        app.handle_key(Key::new(KeyCode::Char(' '), Mods::SHIFT));
+    }
+
+    #[test]
     fn previews_replace_each_other_until_kept() {
         let _serial = crate::test_serial();
         let root = fixture("preview", &[("a.txt", ""), ("b.txt", ""), ("c.txt", "")]);
         let mut app = app(&root, None);
-        // Space steps through the files, one preview at a time.
+        // Shift+Space steps through the files, one preview at a time.
         for _ in 0..3 {
             key(&mut app, KeyCode::Down);
-            key(&mut app, KeyCode::Char(' '));
+            shift_space(&mut app);
         }
         assert_eq!(open_paths(&app), ["c.txt"]);
         assert_eq!(preview(&app), Some("c.txt".into()));
@@ -7593,9 +7865,9 @@ mod tests {
         assert!(!app.tree.active_is_preview());
         ctrl(&mut app, 'e');
         key(&mut app, KeyCode::Up);
-        key(&mut app, KeyCode::Char(' '));
+        shift_space(&mut app);
         key(&mut app, KeyCode::Up);
-        key(&mut app, KeyCode::Char(' '));
+        shift_space(&mut app);
         assert_eq!(open_paths(&app), ["c.txt", "a.txt"]);
 
         // Editing keeps it too.
@@ -7604,7 +7876,7 @@ mod tests {
         assert_eq!(preview(&app), None);
         ctrl(&mut app, 'e');
         key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Char(' '));
+        shift_space(&mut app);
         assert_eq!(open_paths(&app), ["c.txt", "a.txt", "b.txt"]);
     }
 
@@ -7616,7 +7888,7 @@ mod tests {
         assert_eq!(preview(&app), None);
         ctrl(&mut app, 'e');
         key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Char(' '));
+        shift_space(&mut app);
         assert_eq!(open_paths(&app), ["a.txt", "b.txt"]);
     }
 
@@ -8450,12 +8722,12 @@ mod tests {
         let root = fixture("preview-panels", &[("a.txt", ""), ("b.txt", "")]);
         let mut app = app(&root, None);
         key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Char(' '));
+        shift_space(&mut app);
         assert_eq!(preview(&app), Some("a.txt".into()));
         ctrl(&mut app, '\\');
         ctrl(&mut app, 'e');
         key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Char(' '));
+        shift_space(&mut app);
         assert_eq!(open_paths(&app), ["a.txt", "b.txt"]);
         assert_eq!(preview(&app), Some("b.txt".into()));
         assert!(cells(&app, 0, 0..80).contains("a.txt"), "{}", screen(&app));
