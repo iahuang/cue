@@ -1,9 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add unsaved file filtering and a command palette action (`fac771f`)
+
 ## v0.3.7 — 2026-10-06
 
-- Add configurable lines per scroll, defaulting to 2 (`0c2aa9c`).
-- Add Save All, line comment toggling, and configurable indentation guides (`e78cf8f`).
+- Add configurable lines per scroll, defaulting to 2 (`0c2aa9c`)
+- Add Save All, line comment toggling, and configurable indentation guides (`e78cf8f`)
 
 ## v0.3.6 — 2026-10-05
 
