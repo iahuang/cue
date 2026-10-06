@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Treat buffers edited back to their saved text as unmodified (`fd4cdda`)
-- Add unsaved file filtering and a command palette action (`fac771f`)
+- Add unsaved file filtering and a corresponding command palette action (`fac771f`)
 
 ## v0.3.7 — 2026-10-06
 
@@ -19,7 +19,7 @@
 
 - Track cursor position as part of panel history (`8416862`)
 - Add a persistent mark to jump back to (`1d93a19`)
-- Toggle terminal key passthrough with Ctrl+` (`eb15d08`)
+- Toggle terminal key passthrough with Ctrl+Space (`eb15d08`)
 - Refine interface wording and help text (`aef78cb`)
 - Allow marking and jumping back to terminals (`30e664d`)
 
