@@ -9,7 +9,7 @@ see README.md
 
 ## Unreleased
 
-- Add xyz
+- Add xyz (`02f4f84`)
 
 ## vX.Y.Z — YYYY-MM-DD
 
