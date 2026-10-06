@@ -2,7 +2,7 @@
 
 ## v0.3.7 — 2026-10-06
 
-- Add configurable lines per scroll, defaulting to 2, and remove an unused indentation helper (`0c2aa9c`).
+- Add configurable lines per scroll, defaulting to 2 (`0c2aa9c`).
 - Add Save All, line comment toggling, and configurable indentation guides (`e78cf8f`).
 
 ## v0.3.6 — 2026-10-05
