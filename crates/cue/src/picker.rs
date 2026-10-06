@@ -45,8 +45,6 @@ use crate::workspace::Workspace;
 const MAX_WIDTH: u32 = 90;
 /// The most results shown at once.
 const MAX_ROWS: u32 = 14;
-/// Rows the mouse wheel scrolls.
-const WHEEL_ROWS: usize = 3;
 
 /// What the picker lists. Outside language selection, the query's first
 /// character decides (see [`Mode::prefix`]).
@@ -588,12 +586,14 @@ impl Picker {
                 PickerAction::Continue
             }
             MouseKind::ScrollUp if inside => {
-                self.scroll = self.scroll.saturating_sub(WHEEL_ROWS);
+                self.scroll = self
+                    .scroll
+                    .saturating_sub(crate::config::get().scroll_lines as usize);
                 PickerAction::Continue
             }
             MouseKind::ScrollDown if inside => {
                 let max = self.matches.len().saturating_sub(self.rows() as usize);
-                self.scroll = (self.scroll + WHEEL_ROWS).min(max);
+                self.scroll = (self.scroll + crate::config::get().scroll_lines as usize).min(max);
                 PickerAction::Continue
             }
             _ => PickerAction::Continue,
@@ -1427,14 +1427,14 @@ mod tests {
         };
         let area = picker.area();
         picker.handle_mouse(at(MouseKind::ScrollDown, 40, area.y + 5), Instant::now());
-        assert_eq!(picker.scroll, WHEEL_ROWS);
+        assert_eq!(picker.scroll, crate::config::get().scroll_lines as usize);
         // The first result row is below the top border, query, and rule.
         assert_eq!(
             picker.handle_mouse(
                 at(MouseKind::Press(MouseButton::Left), 40, area.y + 4),
                 Instant::now()
             ),
-            PickerAction::Accept(Choice::File(root.join("f04.rs")))
+            PickerAction::Accept(Choice::File(root.join("f03.rs")))
         );
         assert_eq!(
             picker.handle_mouse(

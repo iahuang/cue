@@ -64,7 +64,6 @@ pub fn current_match() -> SelectionColors {
 /// Tags the find bar's highlights.
 const FIND_HIGHLIGHTS: u16 = 1;
 
-const WHEEL_LINES: u32 = 3;
 /// Line numbers are hidden when they would leave the text less room than this.
 const MIN_TEXT_WIDTH: u32 = 20;
 
@@ -740,6 +739,7 @@ impl Editor {
             self.drag = None;
             return;
         }
+        let wheel_lines = config::get().scroll_lines as i64;
         // Clicks on the line numbers go to the start of the line.
         let at = (
             mouse.x.saturating_sub(text_x).min(text_w - 1),
@@ -792,12 +792,12 @@ impl Editor {
                     self.finish_drag(drag);
                 }
             }
-            MouseKind::ScrollUp if mouse.mods.shift => self.scroll(-(WHEEL_LINES as i64), 0),
-            MouseKind::ScrollDown if mouse.mods.shift => self.scroll(WHEEL_LINES as i64, 0),
-            MouseKind::ScrollUp => self.scroll(0, -(WHEEL_LINES as i64)),
-            MouseKind::ScrollDown => self.scroll(0, WHEEL_LINES as i64),
-            MouseKind::ScrollLeft => self.scroll(-(WHEEL_LINES as i64), 0),
-            MouseKind::ScrollRight => self.scroll(WHEEL_LINES as i64, 0),
+            MouseKind::ScrollUp if mouse.mods.shift => self.scroll(-wheel_lines, 0),
+            MouseKind::ScrollDown if mouse.mods.shift => self.scroll(wheel_lines, 0),
+            MouseKind::ScrollUp => self.scroll(0, -wheel_lines),
+            MouseKind::ScrollDown => self.scroll(0, wheel_lines),
+            MouseKind::ScrollLeft => self.scroll(-wheel_lines, 0),
+            MouseKind::ScrollRight => self.scroll(wheel_lines, 0),
             _ => {}
         }
     }
@@ -3233,13 +3233,13 @@ mod tests {
             mouse(&mut editor, MouseKind::ScrollDown, 0, 0, now);
         }
         let (lines, cursor) = screen_lines(&editor, 60, 6);
-        assert_eq!(lines[0], " 13  line 12");
+        assert_eq!(lines[0], "  9  line 8");
         assert_eq!(cursor, None, "the cursor is out of view");
         assert_eq!((eb.cursor().row, eb.cursor().col), (0, 0));
         // Resizing leaves the view where it is too.
         editor.set_area(0, 0, 60, 8);
         let (lines, _) = screen_lines(&editor, 60, 8);
-        assert_eq!(lines[0], " 13  line 12");
+        assert_eq!(lines[0], "  9  line 8");
 
         for _ in 0..10 {
             mouse(&mut editor, MouseKind::ScrollUp, 0, 0, now);
@@ -3268,6 +3268,29 @@ mod tests {
     }
 
     #[test]
+    fn wheel_uses_reloaded_scroll_lines_in_existing_views() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text(&vec!["0123456789".repeat(20); 40].join("\n"));
+        let mut editor = Editor::new(eb, unnamed(), theme(), 40, 6).unwrap();
+        editor.set_wrap(WrapMode::None);
+        let now = Instant::now();
+        mouse(&mut editor, MouseKind::ScrollDown, 0, 0, now);
+        assert_eq!(editor.view.viewport().y, 2);
+        config::set(config::Config {
+            scroll_lines: 5,
+            ..Default::default()
+        });
+        mouse(&mut editor, MouseKind::ScrollDown, 0, 0, now);
+        assert_eq!(editor.view.viewport().y, 7);
+        mouse(&mut editor, MouseKind::ScrollUp, 0, 0, now);
+        assert_eq!(editor.view.viewport().y, 2);
+        mouse(&mut editor, MouseKind::ScrollRight, 0, 0, now);
+        screen_lines(&editor, 40, 6);
+        assert_eq!(editor.view.viewport().x, 5);
+    }
+
+    #[test]
     fn taking_the_cursor_back_keeps_the_view_scrolled_away_from_it() {
         let _serial = serial();
         let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
@@ -3285,7 +3308,7 @@ mod tests {
         first.attach();
         mouse(&mut first, MouseKind::ScrollDown, 0, 0, now);
         let (lines, cursor) = screen_lines(&first, 60, 6);
-        assert_eq!(lines[0], " 16  line 15");
+        assert_eq!(lines[0], " 11  line 10");
         assert_eq!(cursor, None);
         assert_eq!(eb.cursor().row, 0);
     }
@@ -3311,13 +3334,16 @@ mod tests {
             screen_lines(editor, 40, 6)
         };
         let (lines, _) = wheel(&mut editor, MouseKind::ScrollRight, Mods::NONE);
-        assert_eq!(editor.view.viewport().x, WHEEL_LINES);
-        assert!(lines[0].starts_with(" 1  3456789"), "{lines:?}");
+        assert_eq!(editor.view.viewport().x, crate::config::get().scroll_lines);
+        assert!(lines[0].starts_with(" 1  23456789"), "{lines:?}");
         wheel(&mut editor, MouseKind::ScrollDown, Mods::SHIFT);
-        assert_eq!(editor.view.viewport().x, 2 * WHEEL_LINES);
+        assert_eq!(
+            editor.view.viewport().x,
+            2 * crate::config::get().scroll_lines
+        );
         assert_eq!(editor.view.viewport().y, 0);
         wheel(&mut editor, MouseKind::ScrollUp, Mods::SHIFT);
-        assert_eq!(editor.view.viewport().x, WHEEL_LINES);
+        assert_eq!(editor.view.viewport().x, crate::config::get().scroll_lines);
         wheel(&mut editor, MouseKind::ScrollLeft, Mods::NONE);
         assert_eq!(editor.view.viewport().x, 0);
         wheel(&mut editor, MouseKind::ScrollLeft, Mods::NONE);
@@ -3326,7 +3352,7 @@ mod tests {
         // A floating find bar must let horizontal wheel events through.
         editor.show_find(&find::Memory::default(), false);
         wheel(&mut editor, MouseKind::ScrollRight, Mods::NONE);
-        assert_eq!(editor.view.viewport().x, WHEEL_LINES);
+        assert_eq!(editor.view.viewport().x, crate::config::get().scroll_lines);
         editor.close_find();
 
         // Wrapping already fits the text to the viewport.

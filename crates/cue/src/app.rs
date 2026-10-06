@@ -6650,7 +6650,7 @@ mod tests {
 
         // A click far off is a jump.
         let body = app.active_panel().body();
-        for _ in 0..20 {
+        for _ in 0..30 {
             mouse_at(&mut app, MouseKind::ScrollDown, body.x + 10, body.y + 2);
         }
         left_click(&mut app, body.x + 10, body.y + 2);

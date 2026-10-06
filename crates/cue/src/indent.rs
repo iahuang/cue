@@ -55,11 +55,6 @@ impl Indent {
         }
     }
 
-    /// `line` indented one level more. Empty lines stay empty.
-    pub fn indent(self, line: &str) -> Option<String> {
-        (!line.is_empty()).then(|| self.unit() + line)
-    }
-
     /// How many bytes to take off the start of `line` to outdent it one
     /// level: a tab, or spaces back to the previous multiple of the width.
     /// Zero if it isn't indented.
@@ -164,7 +159,5 @@ mod tests {
         assert_eq!(four.outdent("x"), 0);
         assert_eq!(four.outdent("\t\tx"), 1);
         assert_eq!(Indent::Tabs.outdent("    x"), 4);
-        assert_eq!(four.indent(""), None);
-        assert_eq!(Indent::Tabs.indent("x").as_deref(), Some("\tx"));
     }
 }

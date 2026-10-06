@@ -28,9 +28,6 @@ use crate::keymap::Command;
 use crate::theme;
 use crate::workspace::{deepest_root, root_names};
 
-/// Rows the mouse wheel scrolls.
-const WHEEL_ROWS: usize = 3;
-
 /// Entries never shown, here or in the file picker and workspace search,
 /// with those the `files.exclude` setting names.
 const HIDDEN: &[&str] = &[".git", ".DS_Store"];
@@ -419,7 +416,7 @@ impl FileTree {
 
     /// Scrolls by `rows` without moving the selection.
     pub fn scroll(&mut self, rows: isize) {
-        let rows = rows * WHEEL_ROWS as isize;
+        let rows = rows * crate::config::get().scroll_lines as isize;
         let max = self.rows.len().saturating_sub(self.height);
         self.scroll = self.scroll.saturating_add_signed(rows).min(max);
     }
@@ -1077,6 +1074,10 @@ mod tests {
 
     #[test]
     fn the_folders_scrolled_past_stick_to_the_top() {
+        crate::config::set(crate::config::Config {
+            scroll_lines: 3,
+            ..Default::default()
+        });
         let _serial = crate::test_serial();
         let files: Vec<String> = (0..8)
             .map(|i| format!("a/b/{i}.rs"))

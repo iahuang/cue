@@ -25,8 +25,6 @@ use crate::workspace::Workspace;
 
 /// The widest the popup gets, in columns.
 const MAX_WIDTH: u32 = 160;
-/// Rows the mouse wheel scrolls.
-const WHEEL_ROWS: usize = 3;
 /// Columns a tab takes up to.
 const TAB_WIDTH: usize = 4;
 /// Left of a match scrolled into view sideways, this many columns show.
@@ -267,11 +265,14 @@ impl SearchModal {
                 self.click_row(row)
             }
             MouseKind::ScrollUp if inside => {
-                self.scroll = self.scroll.saturating_sub(WHEEL_ROWS);
+                self.scroll = self
+                    .scroll
+                    .saturating_sub(crate::config::get().scroll_lines as usize);
                 SearchAction::Continue
             }
             MouseKind::ScrollDown if inside => {
-                self.scroll = (self.scroll + WHEEL_ROWS).min(self.max_scroll());
+                self.scroll = (self.scroll + crate::config::get().scroll_lines as usize)
+                    .min(self.max_scroll());
                 SearchAction::Continue
             }
             _ => SearchAction::Continue,

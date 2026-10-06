@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use opentui::{Attributes, Buffer};
 
-use crate::changes::{draw_look, file_rows, Look, WHEEL_ROWS};
+use crate::changes::{draw_look, file_rows, Look};
 use crate::git::{self, Change, Commit, Kind, Repo};
 use crate::icons;
 use crate::keymap::Command;
@@ -194,7 +194,7 @@ impl LogView {
 
     /// Scrolls by `rows` without moving the selection.
     pub fn scroll(&mut self, rows: isize) {
-        let rows = rows * WHEEL_ROWS as isize;
+        let rows = rows * crate::config::get().scroll_lines as isize;
         let max = self.rows.len().saturating_sub(self.height);
         self.scroll = self.scroll.saturating_add_signed(rows).min(max);
         self.read_more_near_end();

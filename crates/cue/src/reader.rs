@@ -38,8 +38,6 @@ use crate::theme::{self, Colors, Hue, SyntaxColor};
 /// Prose wraps at most this many columns wide, however wide the panel is.
 /// Tables and code blocks may use the panel's whole width.
 const MEASURE: usize = 100;
-/// Rows a step of the wheel scrolls.
-const WHEEL_ROWS: usize = 3;
 /// Columns a tab in a code block takes.
 const TAB_WIDTH: usize = 4;
 /// List bullets, by how deeply the list is nested.
@@ -1924,8 +1922,8 @@ impl Reader {
                 }
                 return Some(ReaderEvent::Link(link.to_string()));
             }
-            MouseKind::ScrollUp => self.scroll(-(WHEEL_ROWS as i64)),
-            MouseKind::ScrollDown => self.scroll(WHEEL_ROWS as i64),
+            MouseKind::ScrollUp => self.scroll(-(crate::config::get().scroll_lines as i64)),
+            MouseKind::ScrollDown => self.scroll(crate::config::get().scroll_lines as i64),
             _ => {}
         }
         None

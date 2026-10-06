@@ -38,6 +38,8 @@ pub struct Config {
     /// `editor.scroll_margin`: the part of the view, up to half, kept
     /// between the cursor and the view's edges.
     pub scroll_margin: f32,
+    /// `ui.scroll_lines`: lines moved per mouse wheel event.
+    pub scroll_lines: u32,
     /// `ui.theme`: the colors, by a theme's name, or one for when the
     /// terminal is dark and one for when it's light.
     pub theme: ThemeSetting,
@@ -76,6 +78,7 @@ impl Default for Config {
             indent_guides: true,
             wrap: true,
             scroll_margin: 0.15,
+            scroll_lines: 2,
             theme: ThemeSetting::default(),
             terminal_background: true,
             cursor_color: true,
@@ -105,6 +108,7 @@ pub const TEMPLATE: &str = r#"# Uncomment settings to customize. Save in cue or 
 # scroll_margin = 0.15        # Cursor margin as a fraction of the view (0–0.5).
 
 [ui]
+# scroll_lines = 2           # Lines per scroll (1–100); applies across views.
 # Browse themes with Select Theme in the command palette.
 # theme = "Terminal"
 # theme = { dark = "Cue Dark", light = "GitHub Light" }
@@ -263,6 +267,9 @@ impl Config {
                     return Err(Some(EXPECTED));
                 }
                 self.scroll_margin = margin as f32;
+            }
+            "ui.scroll_lines" => {
+                self.scroll_lines = int(value, 1..=100).ok_or("a whole number from 1 to 100")?;
             }
             "ui.theme" => {
                 const EXPECTED: &str =
@@ -601,6 +608,7 @@ mod tests {
             wrap = false
             scroll_margin = 0
             [ui]
+            scroll_lines = 5
             theme = "catppuccin mocha"
             terminal_background = false
             cursor_color = false
@@ -623,6 +631,7 @@ mod tests {
                 indent_guides: false,
                 wrap: false,
                 scroll_margin: 0.0,
+                scroll_lines: 5,
                 theme: ThemeSetting::one(ThemeId::named("Catppuccin Mocha").unwrap()),
                 terminal_background: false,
                 cursor_color: false,
@@ -636,6 +645,24 @@ mod tests {
             }
         );
         assert_eq!(parse("editor.indent = 2").0.indent, Indent::Spaces(2));
+    }
+
+    #[test]
+    fn scroll_lines_validate_and_keep_the_default_on_mistakes() {
+        assert_eq!(Config::default().scroll_lines, 2);
+        for lines in [1, 2, 3, 100] {
+            let (config, warnings) = parse(&format!("ui.scroll_lines = {lines}"));
+            assert!(warnings.is_empty());
+            assert_eq!(config.scroll_lines, lines);
+        }
+        for value in ["0", "-1", "101", "2.5", "true", "\"2\""] {
+            let (config, warnings) = parse(&format!("ui.scroll_lines = {value}"));
+            assert_eq!(config.scroll_lines, 2);
+            assert_eq!(
+                warnings,
+                ["ui.scroll_lines should be a whole number from 1 to 100"]
+            );
+        }
     }
 
     #[test]

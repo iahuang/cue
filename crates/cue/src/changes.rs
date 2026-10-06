@@ -21,8 +21,6 @@ use crate::theme;
 use crate::tree::{truncate, Entry, TreeAction};
 use crate::workspace::root_names;
 
-/// Rows the mouse wheel scrolls.
-pub(crate) const WHEEL_ROWS: usize = 3;
 /// The button on a repository's first row that shows its log.
 const LOG_BUTTON: &str = "Log";
 
@@ -345,7 +343,7 @@ impl ChangesView {
 
     /// Scrolls by `rows` without moving the selection.
     pub fn scroll(&mut self, rows: isize) {
-        let rows = rows * WHEEL_ROWS as isize;
+        let rows = rows * crate::config::get().scroll_lines as isize;
         let max = self.rows.len().saturating_sub(self.height);
         self.scroll = self.scroll.saturating_add_signed(rows).min(max);
     }

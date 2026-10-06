@@ -47,8 +47,6 @@ use crate::tree;
 const MAX_WIDTH: u32 = 90;
 /// The most entries shown at once.
 const MAX_ROWS: u32 = 16;
-/// Rows the mouse wheel scrolls.
-const WHEEL_ROWS: usize = 3;
 
 /// What the dialog chooses a path for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,12 +344,14 @@ impl FileDialog {
                 }
             }
             MouseKind::ScrollUp if inside => {
-                self.scroll = self.scroll.saturating_sub(WHEEL_ROWS);
+                self.scroll = self
+                    .scroll
+                    .saturating_sub(crate::config::get().scroll_lines as usize);
                 DialogAction::Continue
             }
             MouseKind::ScrollDown if inside => {
                 let max = self.rows.len().saturating_sub(self.rows() as usize);
-                self.scroll = (self.scroll + WHEEL_ROWS).min(max);
+                self.scroll = (self.scroll + crate::config::get().scroll_lines as usize).min(max);
                 DialogAction::Continue
             }
             _ => DialogAction::Continue,

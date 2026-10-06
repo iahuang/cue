@@ -53,8 +53,6 @@ use crate::theme;
 /// At most this much output is read per poll, so a flood of it can't keep
 /// the screen from being drawn, or keys from being read.
 const READ_BUDGET: usize = 256 * 1024;
-/// Rows the wheel scrolls.
-const WHEEL_ROWS: i32 = 3;
 /// How much of a terminal's text a session keeps, at most, to show again
 /// when it's restored: the end of it.
 const MAX_SAVED_TEXT: usize = 1024 * 1024;
@@ -659,15 +657,16 @@ impl Terminal {
                         return;
                     }
                 }
+                let wheel_rows = config::get().scroll_lines as i32;
                 if self.vt.is_alternate_screen() {
                     // Full-screen programs have no scrollback; less and man
                     // scroll with the arrow keys.
                     let code = if up { KeyCode::Up } else { KeyCode::Down };
-                    for _ in 0..WHEEL_ROWS {
+                    for _ in 0..wheel_rows {
                         self.send_key(Key::new(code, Mods::NONE));
                     }
                 } else {
-                    self.vt.scroll(if up { -WHEEL_ROWS } else { WHEEL_ROWS });
+                    self.vt.scroll(if up { -wheel_rows } else { wheel_rows });
                 }
             }
             MouseKind::ScrollLeft | MouseKind::ScrollRight | MouseKind::Move => {}

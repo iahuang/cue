@@ -36,7 +36,6 @@ use crate::theme::{self, Colors, Hue, SyntaxColor};
 
 /// Unchanged lines shown before and after each change.
 const CONTEXT: usize = 3;
-const WHEEL_ROWS: i64 = 3;
 /// How long diffing may take before it settles for a rougher diff.
 const TIMEOUT: Duration = Duration::from_millis(200);
 /// Line numbers are left out when they'd leave the text less room than
@@ -482,8 +481,8 @@ impl DiffView {
                 }
             }
             MouseKind::Release(MouseButton::Left) => self.press = None,
-            MouseKind::ScrollUp => self.scroll(-WHEEL_ROWS),
-            MouseKind::ScrollDown => self.scroll(WHEEL_ROWS),
+            MouseKind::ScrollUp => self.scroll(-(crate::config::get().scroll_lines as i64)),
+            MouseKind::ScrollDown => self.scroll(crate::config::get().scroll_lines as i64),
             _ => {}
         }
         None

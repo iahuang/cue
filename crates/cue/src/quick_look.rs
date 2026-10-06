@@ -34,8 +34,6 @@ const MAX_WIDTH: u32 = 120;
 const MIN_WIDTH: u32 = 30;
 /// Files larger than this aren't read.
 const MAX_BYTES: u64 = 16 << 20;
-/// Rows the mouse wheel scrolls a folder.
-const WHEEL_ROWS: usize = 3;
 
 /// What's shown inside the box.
 enum Body {
@@ -139,8 +137,12 @@ impl QuickLook {
             Body::Folder(entries, scroll) => {
                 let max = entries.len().saturating_sub(area.height as usize);
                 match mouse.kind {
-                    MouseKind::ScrollUp => *scroll = scroll.saturating_sub(WHEEL_ROWS),
-                    MouseKind::ScrollDown => *scroll = (*scroll + WHEEL_ROWS).min(max),
+                    MouseKind::ScrollUp => {
+                        *scroll = scroll.saturating_sub(crate::config::get().scroll_lines as usize)
+                    }
+                    MouseKind::ScrollDown => {
+                        *scroll = (*scroll + crate::config::get().scroll_lines as usize).min(max)
+                    }
                     _ => {}
                 }
             }
