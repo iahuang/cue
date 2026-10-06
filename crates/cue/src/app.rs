@@ -123,7 +123,7 @@ const SCREENS_INTERVAL: Duration = Duration::from_secs(60);
 struct Mark {
     /// The panel it was marked in.
     panel: PanelId,
-    /// Always a [`Visit::File`].
+    /// Always a [`Visit::File`] or a [`Visit::Terminal`].
     visit: Visit,
 }
 
@@ -2107,20 +2107,21 @@ impl App {
         }
     }
 
-    /// Marks where the cursor is in the active panel's file, to jump back
-    /// to from anywhere (see [`App::jump_to_mark`]). There's one mark: it
-    /// moves along with edits, as places in the history do.
+    /// Marks where the cursor is in the active panel's file, or the
+    /// terminal it shows, to jump back to from anywhere (see
+    /// [`App::jump_to_mark`]). There's one mark: in a file, it moves along
+    /// with edits, as places in the history do.
     fn set_mark(&mut self) {
         let panel = self.active_panel();
         match panel.visit() {
-            Some(visit @ Visit::File(..)) => {
+            Some(visit @ (Visit::File(..) | Visit::Terminal(_))) => {
                 self.mark = Some(Mark {
                     panel: panel.id,
                     visit,
                 });
                 self.show_message("Mark set.", false);
             }
-            _ => self.show_message("Marks can only be set in files.", false),
+            _ => self.show_message("Marks can only be set in files and terminals.", false),
         }
     }
 
@@ -2128,10 +2129,11 @@ impl App {
     /// The mark stays put, to go to again; going back comes back.
     ///
     /// If the panel shows something else now, it goes back (or forward)
-    /// through its history to the file, as going back that many times
-    /// would, or failing that, opens the file again. If the panel is gone,
-    /// the file shows in the active panel instead. Going there is
-    /// somewhere to go back to.
+    /// through its history to the file or terminal, as going back that
+    /// many times would, or failing that, shows it again. If the panel is
+    /// gone, it shows in the active panel instead. A terminal shows in one
+    /// panel at a time: where another shows it now, it's gone to there.
+    /// Going there is somewhere to go back to.
     fn jump_to_mark(&mut self) {
         let Some(mark) = self.mark.clone() else {
             let message = format!(
@@ -2141,51 +2143,88 @@ impl App {
             self.show_message(message, false);
             return;
         };
-        let Visit::File(doc, path, spot) = &mark.visit else {
-            return;
-        };
-        if !file_usable(&self.documents, doc, path.as_deref()) {
-            self.mark = None;
-            self.show_message("Marked file no longer exists.", false);
-            return;
+        let mut panel = mark.panel;
+        match &mark.visit {
+            Visit::File(doc, path, _) => {
+                if !file_usable(&self.documents, doc, path.as_deref()) {
+                    self.mark = None;
+                    self.show_message("Marked file no longer exists.", false);
+                    return;
+                }
+            }
+            Visit::Terminal(id) => {
+                if !self.terminals.iter().any(|t| t.borrow().id() == *id) {
+                    self.mark = None;
+                    self.show_message("Marked terminal no longer exists.", false);
+                    return;
+                }
+                let showing = tab::all_panels(&self.tabs).find(|panel| {
+                    panel
+                        .terminal()
+                        .is_some_and(|terminal| terminal.borrow().id() == *id)
+                });
+                if let Some(showing) = showing {
+                    panel = showing.id;
+                }
+            }
+            _ => return,
         }
         let tab = self
             .tabs
             .iter()
-            .position(|tab| tab.panels.iter().any(|panel| panel.id == mark.panel));
+            .position(|tab| tab.panels.iter().any(|p| p.id == panel));
         if let Some(tab) = tab {
             if tab != self.tab {
                 self.switch_tab(tab);
             }
-            self.activate(mark.panel);
+            self.activate(panel);
         }
-        let panel = self.active_panel();
-        let within = panel
+        let active = self.active_panel();
+        let within = active
             .visit()
             .is_some_and(|visit| visit.shows_same(&mark.visit));
-        let in_history = (!within && panel.id == mark.panel)
-            .then(|| panel.find_in_history(&mark.visit))
+        let in_history = (!within && active.id == mark.panel)
+            .then(|| active.find_in_history(&mark.visit))
             .flatten();
         let shown = match in_history {
             Some((back, index)) => {
                 let shown = self.active_panel_mut().step_history_to(back, index);
                 let history = self.active_panel_mut().take_history();
-                // Shows the marked file, which the place in the history is
-                // in, as it was found.
-                let shown = shown.is_some() && self.show_file(doc, path.as_deref());
+                // Shows what's marked, which the place in the history is
+                // of, as it was found.
+                let shown = shown.is_some() && self.show_marked(&mark.visit);
                 self.active_panel_mut().restore_history(history);
                 shown
             }
-            None => within || self.show_file(doc, path.as_deref()),
+            None => within || self.show_marked(&mark.visit),
         };
         self.focus = Focus::Editor;
         // Within the file, it's a jump for the history to note; to another
         // file, the history has the file it left already.
-        if let (Some(editor), Some(spot)) = (self.editor_mut().filter(|_| shown), spot) {
-            match within {
-                true => editor.jump_to(spot.at()),
-                false => editor.return_to(spot.at()),
+        if let Visit::File(_, _, Some(spot)) = &mark.visit {
+            if let Some(editor) = self.editor_mut().filter(|_| shown) {
+                match within {
+                    true => editor.jump_to(spot.at()),
+                    false => editor.return_to(spot.at()),
+                }
             }
+        }
+    }
+
+    /// Shows the file or terminal `visit` marks in the active panel.
+    /// Returns whether the panel shows it.
+    fn show_marked(&mut self, visit: &Visit) -> bool {
+        match visit {
+            Visit::File(doc, path, _) => self.show_file(doc, path.as_deref()),
+            Visit::Terminal(id) => {
+                let terminal = self.terminals.iter().find(|t| t.borrow().id() == *id);
+                let Some(terminal) = terminal.cloned() else {
+                    return false;
+                };
+                self.show_terminal(terminal);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -6338,6 +6377,58 @@ mod tests {
             (app.tab, app.tab().active, shown_name(&app).as_deref()),
             (0, active, Some("b.txt"))
         );
+    }
+
+    #[test]
+    fn terminals_can_be_marked() {
+        let _serial = crate::test_serial();
+        let root = fixture("mark-terminal", &[("a.txt", "a"), ("b.txt", "b")]);
+        let mut app = app(&root, Some("a.txt"));
+        let jump = |app: &mut App| ctrl(app, '\'');
+        let shown_terminal = |app: &App| {
+            app.active_panel()
+                .terminal()
+                .map(|terminal| terminal.borrow().id())
+        };
+        app.run(Command::NewTerminal, false);
+        app.after_input();
+        let id = shown_terminal(&app).unwrap();
+        let marked = app.tab().active;
+        // cue's shortcuts work from the terminal.
+        let shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('\''), shift));
+        assert!(screen(&app).contains("Mark set."));
+
+        // Where the panel moved on since, it goes back through its history
+        // to the terminal.
+        app.open(&root.join("a.txt"), false);
+        app.after_input();
+        app.open(&root.join("b.txt"), false);
+        app.after_input();
+        jump(&mut app);
+        assert_eq!(shown_terminal(&app), Some(id));
+        ctrl(&mut app, '=');
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+
+        // Where another panel shows it now, it goes there.
+        app.run(Command::SplitRight, false);
+        app.after_input();
+        let split = app.tab().active;
+        let terminal = app.terminals[0].clone();
+        app.show_terminal(terminal);
+        app.activate(marked);
+        jump(&mut app);
+        assert_eq!((app.tab().active, shown_terminal(&app)), (split, Some(id)));
+
+        // Once it's closed, there's nothing to go to.
+        let terminal = app.terminals[0].clone();
+        app.destroy_terminal(&terminal);
+        app.after_input();
+        jump(&mut app);
+        assert!(screen(&app).contains("Marked terminal no longer exists."));
     }
 
     #[test]
