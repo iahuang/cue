@@ -55,34 +55,22 @@ pub const SelectionRange = struct {
     end: u32,
 };
 
-/// Ghostty-style boundaries for double-click selection. NUL is omitted because
-/// OpenTUI text buffers do not use it for unwritten terminal cells.
+/// VS Code-style classes for double-click selection: its default
+/// `editor.wordSeparators`, whitespace, and everything else as word characters.
 /// Keep this policy separate from `utf8.findChunkLayoutInfo`: wrap and editor
-/// motion split on `/`, `-`, and CJK/ASCII transitions, but selection does not.
+/// motion split on CJK/ASCII transitions, but selection does not.
 /// Wrapping also permits breaks between adjacent CJK characters.
 /// Selection groups consecutive graphemes by this class, so space and tab runs
-/// are selectable instead of mapping to an adjacent word.
-const default_word_boundaries = [_]u21{
-    ' ',
-    '\t',
-    '\'',
-    '"',
-    '│',
-    '`',
-    '|',
-    ':',
-    ';',
-    ',',
-    '(',
-    ')',
-    '[',
-    ']',
-    '{',
-    '}',
-    '<',
-    '>',
-    '$',
-};
+/// and separator runs such as `::` are selectable on their own.
+const SelectionWordClass = enum { word, whitespace, separator };
+
+const word_separators = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+
+fn selectionWordClass(cp: u21) SelectionWordClass {
+    if (cp == ' ' or cp == '\t') return .whitespace;
+    if (cp < 0x80 and std.mem.indexOfScalar(u8, word_separators, @intCast(cp)) != null) return .separator;
+    return .word;
+}
 
 const SelectionEndpoints = struct {
     anchor: u32,
@@ -917,25 +905,26 @@ pub const UnifiedTextBufferView = struct {
         };
     }
 
-    /// Word at `offset`. Null on newline or end-of-buffer. `/` is not a boundary.
+    /// Word at `offset`: the run of graphemes in its `SelectionWordClass`.
+    /// Null on newline or end-of-buffer.
     pub fn selectWord(self: *Self, offset: u32) ?SelectionRange {
         const grapheme = self.selectionGraphemeAt(offset) orelse return null;
         if (grapheme.is_break) return null;
 
-        const expect_boundary = isWordBoundary(grapheme.first_cp);
+        const class = selectionWordClass(grapheme.first_cp);
         var start = grapheme.start;
         var end = grapheme.end;
 
         while (self.prevSelectionGrapheme(start)) |prev| {
             if (prev.is_break) break;
-            if (isWordBoundary(prev.first_cp) != expect_boundary) break;
+            if (selectionWordClass(prev.first_cp) != class) break;
             if (prev.start >= start) break;
             start = prev.start;
         }
 
         while (self.selectionGraphemeAt(end)) |next| {
             if (next.is_break) break;
-            if (isWordBoundary(next.first_cp) != expect_boundary) break;
+            if (selectionWordClass(next.first_cp) != class) break;
             if (next.end <= end) break;
             end = next.end;
         }
@@ -1085,10 +1074,6 @@ pub const UnifiedTextBufferView = struct {
     fn prevSelectionGrapheme(self: *Self, offset: u32) ?SelectionGrapheme {
         if (offset == 0) return null;
         return self.selectionGraphemeAt(offset - 1);
-    }
-
-    fn isWordBoundary(cp: u21) bool {
-        return std.mem.indexOfScalar(u21, &default_word_boundaries, cp) != null;
     }
 
     /// Derive the exclusive highlight/copy/delete range from stored endpoints.

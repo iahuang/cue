@@ -90,12 +90,31 @@ test "selectWord - zero-width prefix does not hang" {
     try expectSelected(pair.view, pair.view.selectLine(0), "\u{200B}hello");
 }
 
-test "selectWord - slash is not a boundary unlike wrap breaks" {
-    const pair = try initView("foo/bar");
+test "selectWord - VS Code separators split words" {
+    const pair = try initView("self.foo_bar-baz/qux");
     defer deinitView(pair);
 
-    try expectSelected(pair.view, pair.view.selectWord(0), "foo/bar");
-    try expectSelected(pair.view, pair.view.selectWord(3), "foo/bar");
+    try expectSelected(pair.view, pair.view.selectWord(0), "self");
+    try expectSelected(pair.view, pair.view.selectWord(4), ".");
+    try expectSelected(pair.view, pair.view.selectWord(6), "foo_bar");
+    try expectSelected(pair.view, pair.view.selectWord(13), "baz");
+    try expectSelected(pair.view, pair.view.selectWord(17), "qux");
+}
+
+test "selectWord - separator and whitespace runs select apart" {
+    const pair = try initView("a::b(), \tc");
+    defer deinitView(pair);
+
+    try expectSelected(pair.view, pair.view.selectWord(1), "::");
+    try expectSelected(pair.view, pair.view.selectWord(5), "(),");
+    try expectSelected(pair.view, pair.view.selectWord(7), " \t");
+}
+
+test "selectWord - non-ASCII punctuation is part of a word" {
+    const pair = try initView("a│b");
+    defer deinitView(pair);
+
+    try expectSelected(pair.view, pair.view.selectWord(0), "a│b");
 }
 
 test "selectWord - wrapped hello world still selects world" {
