@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add Save All, line comment toggling, and configurable indentation guides.
+
 ## v0.3.6 — 2026-10-05
 
 - Add mouse hover states (`60e36de`)

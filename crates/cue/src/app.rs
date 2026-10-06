@@ -142,6 +142,7 @@ enum Recent {
 /// Something that asked first with an alert, to do again once answered.
 #[derive(Clone)]
 enum Redo {
+    SavedAll,
     /// A command that closes something, or quits.
     Run(Command),
     /// Closing this tab.
@@ -377,6 +378,8 @@ pub struct App {
     search: Option<SearchModal>,
     /// The file dialog, while open. Never open with the picker or search.
     dialog: Option<FileDialog>,
+    /// Save All waiting for an untitled file to get a name.
+    saving: Option<Saving>,
     /// A context menu, while open, and what its commands act on. Never
     /// open with another popup.
     menu: Option<(ContextMenu, MenuFor)>,
@@ -600,6 +603,7 @@ impl App {
             mark: None,
             search: None,
             dialog: None,
+            saving: None,
             menu: None,
             search_memory: Memory::default(),
             find_memory: find::Memory::default(),
@@ -920,6 +924,18 @@ impl App {
             Command::OpenFile => self.show_dialog(Purpose::Open),
             Command::CreateFile => self.show_dialog(Purpose::Create),
             Command::AddFolder => self.show_dialog(Purpose::AddFolder),
+            Command::SaveAll => {
+                let docs = self
+                    .documents
+                    .iter()
+                    .filter(|doc| doc.is_modified())
+                    .cloned()
+                    .collect();
+                return self.save_then_go(Saving {
+                    docs,
+                    redo: Redo::SavedAll,
+                });
+            }
             Command::SaveAs => self.show_dialog(Purpose::SaveAs),
             Command::SplitRight => self.split(Axis::Horizontal),
             Command::PreviewToSide => self.preview_to_side(),
@@ -2581,6 +2597,7 @@ impl App {
         self.menu = None;
         self.close_search();
         self.dialog = None;
+        self.saving = None;
         match &mut self.picker {
             Some(picker) if picker.mode() == mode => self.picker = None,
             Some(picker) => picker.set_mode(mode),
@@ -2751,6 +2768,7 @@ impl App {
         self.menu = None;
         self.picker = None;
         self.dialog = None;
+        self.saving = None;
         let selected = self
             .editor()
             .and_then(Editor::selected_text)
@@ -2784,6 +2802,7 @@ impl App {
         self.menu = None;
         self.picker = None;
         self.dialog = None;
+        self.saving = None;
         self.close_search();
     }
 
@@ -3321,7 +3340,12 @@ impl App {
         let Saving { mut docs, redo } = saving;
         while !docs.is_empty() {
             let doc = docs.remove(0);
-            let Some(path) = doc.path() else { continue };
+            let Some(path) = doc.path() else {
+                self.show_document(&doc);
+                self.show_dialog(Purpose::SaveAs);
+                self.saving = Some(Saving { docs, redo });
+                return AppAction::Continue;
+            };
             // It may have changed since the alert was put up.
             doc.check_disk();
             if doc.disk() == Disk::Changed {
@@ -3341,6 +3365,11 @@ impl App {
     fn go(&mut self, redo: Redo) -> AppAction {
         self.confirmed = true;
         let action = match redo {
+            Redo::SavedAll => {
+                self.editor_action(Action::Saved);
+                self.show_message("Saved all files.", false);
+                AppAction::Continue
+            }
             Redo::Run(command) => self.run(command, false),
             Redo::CloseTab(id) => {
                 if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
@@ -4385,6 +4414,7 @@ impl App {
     /// Opens the file dialog for `purpose`, or closes it if it's open for
     /// that. Saving, it suggests the file's name.
     fn show_dialog(&mut self, purpose: Purpose) {
+        self.saving = None;
         self.close_search();
         self.picker = None;
         if self
@@ -4460,7 +4490,10 @@ impl App {
     fn dialog_action(&mut self, action: DialogAction) -> AppAction {
         match action {
             DialogAction::Continue => {}
-            DialogAction::Close => self.dialog = None,
+            DialogAction::Close => {
+                self.dialog = None;
+                self.saving = None;
+            }
             DialogAction::Accept(path) => {
                 let Some(mut dialog) = self.dialog.take() else {
                     return AppAction::Continue;
@@ -4488,7 +4521,18 @@ impl App {
                     },
                 };
                 match result {
-                    Ok(action) => return action,
+                    Ok(action) => {
+                        if let Some(saving) = self.saving.take() {
+                            if self
+                                .active_panel()
+                                .document()
+                                .is_some_and(|doc| !doc.is_modified())
+                            {
+                                return self.save_then_go(saving);
+                            }
+                        }
+                        return action;
+                    }
                     // The dialog stays, to choose another path.
                     Err(error) => {
                         dialog.show_error(error);
@@ -6339,6 +6383,42 @@ mod tests {
         ctrl(&mut app, 's');
         assert!(app.alert.is_none());
         assert_eq!(fs::read_to_string(&file).unwrap(), "xyalpha\nbeta\n");
+    }
+
+    #[test]
+    fn save_all_names_untitled_files_and_saves_hidden_documents() {
+        let _serial = crate::test_serial();
+        let root = fixture("save-all-command", &[("a.txt", "a\n")]);
+        let mut app = app(&root, Some("a.txt"));
+        type_text(&mut app, "x");
+        app.new_untitled();
+        type_text(&mut app, "draft");
+        app.run(Command::SaveAll, false);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "xa\n");
+        assert!(app.dialog.is_some());
+        app.dialog_action(DialogAction::Accept(root.join("b.txt")));
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "draft");
+        assert!(app.documents.iter().all(|doc| !doc.is_modified()));
+        assert!(app.saving.is_none());
+        assert!(matches!(
+            app.run(Command::SaveAll, false),
+            AppAction::Continue
+        ));
+        type_text(&mut app, "x");
+        fs::write(root.join("b.txt"), "external").unwrap();
+        app.run(Command::SaveAll, false);
+        assert!(app.alert.is_some());
+        assert!(matches!(
+            key(&mut app, KeyCode::Char('o')),
+            AppAction::Continue
+        ));
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "draftx");
+        app.new_untitled();
+        type_text(&mut app, "cancelled");
+        app.run(Command::SaveAll, false);
+        app.dialog_action(DialogAction::Close);
+        assert!(app.saving.is_none());
+        assert!(app.ed().is_modified());
     }
 
     #[test]

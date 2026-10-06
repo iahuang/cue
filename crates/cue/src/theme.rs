@@ -211,6 +211,8 @@ pub struct Colors {
     pub border: Rgba,
     /// Between panels.
     pub divider: Rgba,
+    /// Indentation guides: a subtle blend toward the text color.
+    pub indent_guide: Rgba,
     /// The status bar, the tab that's showing, and the header of the panel
     /// the keyboard is in.
     pub surface: Rgba,
@@ -653,6 +655,7 @@ fn derive(name: &'static str, base: &Base, ui: &[(Role, u32)], syntax: &[(&str, 
         faint: set(Role::Faint).unwrap_or(tint(0.4)),
         border: set(Role::Border).unwrap_or(tint(0.28)),
         divider: set(Role::Divider).unwrap_or(tint(0.18)),
+        indent_guide: tint(0.1),
         surface,
         surface_inactive: set(Role::SurfaceInactive).unwrap_or(tint(0.05)),
         selected: set(Role::Selected).unwrap_or(mix(bg, accent, 0.3)),

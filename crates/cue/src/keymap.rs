@@ -54,6 +54,7 @@ commands! {
     ReloadSettings => "app:reload-settings", "Reload Settings";
     SelectTheme => "app:select-theme", "Select Theme";
     Save => "file:save", "Save";
+    SaveAll => "file:save-all", "Save All";
     SaveAs => "file:save-as", "Save As…";
     NewFile => "file:new", "New File";
     CreateFile => "file:create", "New File…";
@@ -87,6 +88,7 @@ commands! {
     NewLine => "editor:newline", "Insert Line Break";
     InsertTab => "editor:insert-tab", "Insert Tab";
     Indent => "editor:indent", "Indent Lines";
+    ToggleComment => "editor:toggle-comment", "Toggle Line Comment";
     Outdent => "editor:outdent", "Outdent Lines";
     DeleteBackward => "editor:delete-backward", "Delete Backward";
     DeleteForward => "editor:delete-forward", "Delete Forward";
@@ -235,8 +237,8 @@ impl Command {
         use Command::*;
         match self {
             Quit | Restart | KeepSession | Detach | EndSession | Palette | OpenSettings
-            | ReloadSettings | SelectTheme | Save | SaveAs | NewFile | CreateFile | OpenFile
-            | GoToFile | GoToLine | GoToSymbol | GoToWorkspaceSymbol | GoToTerminal
+            | ReloadSettings | SelectTheme | Save | SaveAll | SaveAs | NewFile | CreateFile
+            | OpenFile | GoToFile | GoToLine | GoToSymbol | GoToWorkspaceSymbol | GoToTerminal
             | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext | FindPrevious
             | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight | SplitDown
             | ClosePanel | Pop | GoBack | GoForward | SetMark | JumpToMark | FocusPanelLeft
@@ -371,6 +373,7 @@ impl Default for Keymap {
             ('t', NewTab),
             // Legacy terminals send it as itself, unlike most Ctrl+Shift keys.
             ('u', ToggleReader),
+            ('/', ToggleComment),
         ] {
             bindings.push((key(Char(c), Mods::CTRL), command));
             bindings.push((key(Char(c), SUPER), command));
@@ -858,6 +861,7 @@ mod tests {
             Command::ReloadSettings,
             Command::SelectTheme,
             Command::ToggleWrap,
+            Command::SaveAll,
             Command::PreviewToSide,
             Command::CloseFile,
             Command::ClearTerminal,

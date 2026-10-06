@@ -31,6 +31,8 @@ pub struct Config {
     /// can't be told, and its language has no custom: a number of spaces,
     /// or `"tabs"`.
     pub indent: Indent,
+    /// `editor.indent_guides`: whether to show indentation guides.
+    pub indent_guides: bool,
     /// `editor.wrap`: whether long lines wrap, at first.
     pub wrap: bool,
     /// `editor.scroll_margin`: the part of the view, up to half, kept
@@ -71,6 +73,7 @@ impl Default for Config {
         Config {
             tab_width: 4,
             indent: Indent::Spaces(4),
+            indent_guides: true,
             wrap: true,
             scroll_margin: 0.15,
             theme: ThemeSetting::default(),
@@ -97,6 +100,7 @@ pub const TEMPLATE: &str = r#"# Uncomment settings to customize. Save in cue or 
 [editor]
 # tab_width = 4
 # indent = 4                  # Fallback indentation: spaces or "tabs".
+# indent_guides = true
 # wrap = true
 # scroll_margin = 0.15        # Cursor margin as a fraction of the view (0–0.5).
 
@@ -245,6 +249,9 @@ impl Config {
                 };
             }
             "editor.wrap" => self.wrap = value.as_bool().ok_or("true or false")?,
+            "editor.indent_guides" => {
+                self.indent_guides = value.as_bool().ok_or("true or false")?
+            }
             "editor.scroll_margin" => {
                 const EXPECTED: &str = "a number from 0 to 0.5";
                 let margin = match value {
@@ -590,6 +597,7 @@ mod tests {
             [editor]
             tab_width = 8
             indent = "tabs"
+            indent_guides = false
             wrap = false
             scroll_margin = 0
             [ui]
@@ -612,6 +620,7 @@ mod tests {
             Config {
                 tab_width: 8,
                 indent: Indent::Tabs,
+                indent_guides: false,
                 wrap: false,
                 scroll_margin: 0.0,
                 theme: ThemeSetting::one(ThemeId::named("Catppuccin Mocha").unwrap()),
@@ -637,6 +646,7 @@ mod tests {
             [editor]
             tab_width = 0
             wrap = "yes"
+            indent_guides = "yes"
             tabwidth = 2
             indent = 2
             [terminal]
@@ -653,6 +663,7 @@ mod tests {
                 "Expected a [theme] section.",
                 "editor.tab_width should be a number from 1 to 16",
                 "editor.wrap should be true or false",
+                "editor.indent_guides should be true or false",
                 "Unknown setting: editor.tabwidth",
                 "terminal.scrollback should be a size such as \"10MB\", or a number of bytes",
                 "Unknown setting: colors.red",

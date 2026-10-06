@@ -564,6 +564,7 @@ impl Editor {
             | Command::InsertTab
             | Command::Indent
             | Command::Outdent
+            | Command::ToggleComment
             | Command::DeleteBackward
             | Command::DeleteForward
             | Command::DeleteWordBackward
@@ -607,6 +608,7 @@ impl Editor {
             | Command::InsertTab
             | Command::Indent
             | Command::Outdent
+            | Command::ToggleComment
             | Command::DeleteBackward
             | Command::DeleteForward
             | Command::DeleteWordBackward
@@ -659,6 +661,7 @@ impl Editor {
             // With lines selected, Tab indents them, as in most editors.
             Command::InsertTab if self.selection_spans_lines() => self.indent_lines(Forward),
             Command::InsertTab => self.insert_indent(),
+            Command::ToggleComment => self.change_lines(None),
             Command::Indent => self.indent_lines(Forward),
             Command::Outdent => self.indent_lines(Backward),
             Command::DeleteBackward if self.delete_indent() => {}
@@ -910,6 +913,7 @@ impl Editor {
         let (gutter, _, _) = self.text_area();
         let text_x = self.x + gutter;
         frame.draw_editor_view(&self.view, text_x as i32, self.y as i32);
+        self.draw_indent_guides(frame, text_x);
         self.draw_line_numbers(frame, gutter);
         let find_cursor = self
             .find
@@ -949,6 +953,51 @@ impl Editor {
         let lines = self.view.visible_lines();
         if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
             highlighter.sync(&self.buffer, first.line..last.line + 1);
+        }
+    }
+
+    /// Guides occupy only leading whitespace on a line's first visual row.
+    fn draw_indent_guides(&self, frame: &Buffer, text_x: u32) {
+        let config = config::get();
+        if !config.indent_guides {
+            return;
+        }
+        let vp = self.view.viewport();
+        let width = self.doc.indent.get().width();
+        let tab_width = config.tab_width;
+        let left = if self.wrap == WrapMode::None { vp.x } else { 0 };
+        for (y, row) in self.view.visible_lines().iter().enumerate() {
+            if row.wrap != 0 {
+                continue;
+            }
+            let start = self.buffer.position_to_offset(row.line, 0);
+            let end = start.saturating_add(left + vp.width + width);
+            let line = self.buffer.text_range(start, end);
+            let columns = line
+                .chars()
+                .take_while(|c| matches!(c, ' ' | '\t'))
+                .fold(
+                    0,
+                    |col, c| {
+                        if c == '\t' {
+                            col + tab_width
+                        } else {
+                            col + 1
+                        }
+                    },
+                );
+            for col in (0..columns / width * width).step_by(width as usize) {
+                if let Some(x) = col.checked_sub(left).filter(|&x| x < vp.width) {
+                    frame.draw_text(
+                        "│",
+                        text_x + x,
+                        self.y + y as u32,
+                        theme::colors().indent_guide,
+                        None,
+                        Attributes::NONE,
+                    );
+                }
+            }
         }
     }
 
@@ -1108,6 +1157,22 @@ impl Editor {
     /// level, as one undo step. The cursor and selection stay on their text;
     /// a selection from the start of a line takes in the indentation added.
     fn indent_lines(&mut self, direction: Direction) {
+        self.change_lines(Some(direction));
+    }
+
+    fn change_lines(&mut self, direction: Option<Direction>) {
+        let token = match direction {
+            Some(_) => None,
+            None => match self
+                .doc
+                .language
+                .get()
+                .and_then(|language| language.line_comment())
+            {
+                Some(token) => Some(token),
+                None => return,
+            },
+        };
         let indent = self.doc.indent.get();
         let buffer = self.buffer.clone();
         let eb = &*buffer;
@@ -1142,29 +1207,55 @@ impl Editor {
         };
 
         let text = eb.text();
+        let uncomment = token.is_some_and(|token| {
+            text.split('\n')
+                .skip(first as usize)
+                .take((last - first + 1) as usize)
+                .filter(|line| !line.trim().is_empty())
+                .all(|line| line.trim_start_matches([' ', '\t']).starts_with(token))
+        });
         let mut changed = String::with_capacity(text.len());
-        // Bytes each changed line gained (or with a minus, lost), by row.
-        let mut shifts: Vec<(u32, isize)> = Vec::new();
+        // The insertion point and bytes removed/added on each changed line.
+        let mut shifts: Vec<(u32, usize, usize, usize)> = Vec::new();
         for (row, line) in text.split('\n').enumerate() {
             let row = row as u32;
             if row > 0 {
                 changed.push('\n');
             }
-            let new = match direction {
-                _ if !(first..=last).contains(&row) => None,
-                Direction::Forward => indent.indent(line),
-                Direction::Backward => {
-                    let cut = indent.outdent(line);
-                    (cut > 0).then(|| line[cut..].to_string())
+            let (at, removed, added) = if !(first..=last).contains(&row) {
+                (0, 0, String::new())
+            } else if let Some(token) = token {
+                let trimmed = line.trim_start_matches([' ', '\t']);
+                let at = line.len() - trimmed.len();
+                if trimmed.trim().is_empty() {
+                    (at, 0, String::new())
+                } else if uncomment {
+                    let removed =
+                        token.len() + usize::from(trimmed[token.len()..].starts_with(' '));
+                    (at, removed, String::new())
+                } else {
+                    (at, 0, format!("{token} "))
+                }
+            } else {
+                match direction.unwrap() {
+                    Direction::Forward => (
+                        0,
+                        0,
+                        if line.is_empty() {
+                            String::new()
+                        } else {
+                            indent.unit()
+                        },
+                    ),
+                    Direction::Backward => (0, indent.outdent(line), String::new()),
                 }
             };
-            match new {
-                Some(new) => {
-                    shifts.push((row, new.len() as isize - line.len() as isize));
-                    changed.push_str(&new);
-                }
-                None => changed.push_str(line),
+            if removed > 0 || !added.is_empty() {
+                shifts.push((row, at, removed, added.len()));
             }
+            changed.push_str(&line[..at]);
+            changed.push_str(&added);
+            changed.push_str(&line[at + removed..]);
         }
         if shifts.is_empty() {
             return;
@@ -1178,10 +1269,12 @@ impl Editor {
         // A selection's start at the start of its line stays there.
         let shift = |(row, byte): (u32, usize)| {
             let keep_start = selection.is_some() && (row, byte) == start && byte == 0;
-            let byte = match shifts.iter().find(|&&(r, _)| r == row) {
+            let byte = match shifts.iter().find(|&&(r, ..)| r == row) {
                 Some(_) if keep_start => 0,
-                Some(&(_, gained)) => byte.saturating_add_signed(gained),
-                None => byte,
+                Some(&(_, at, removed, added)) if byte >= at => {
+                    at + byte.saturating_sub(at + removed) + added
+                }
+                _ => byte,
             };
             eb.set_cursor(row, 0);
             step_bytes(eb, byte)
@@ -2623,6 +2716,83 @@ mod tests {
         eb.set_text(text);
         let editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 8).unwrap();
         (eb, editor)
+    }
+
+    #[test]
+    fn line_comments_keep_selection_and_undo_as_one_edit() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of("  café();\n\n  next();\nlast();");
+        editor.doc.set_language(crate::language::detect(
+            Some(std::path::Path::new("a.rs")),
+            String::new,
+        ));
+        eb.set_cursor(0, 0);
+        shift(&mut editor, KeyCode::Down);
+        shift(&mut editor, KeyCode::Down);
+        shift(&mut editor, KeyCode::Down);
+        ctrl(&mut editor, '/');
+        assert_eq!(eb.text(), "  // café();\n\n  // next();\nlast();");
+        assert_eq!(
+            editor.view.selected_text(),
+            "  // café();\n\n  // next();\n"
+        );
+        ctrl(&mut editor, '/');
+        assert_eq!(eb.text(), "  café();\n\n  next();\nlast();");
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "  // café();\n\n  // next();\nlast();");
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "  café();\n\n  next();\nlast();");
+
+        editor.view.clear_selection();
+        editor.anchor = None;
+        editor.doc.set_language(crate::language::detect(
+            Some(std::path::Path::new("a.py")),
+            String::new,
+        ));
+        eb.set_cursor(0, 4);
+        ctrl(&mut editor, '/');
+        assert!(eb.text().starts_with("  # café();"));
+        assert_eq!(pos(&eb), (0, 6));
+        ctrl(&mut editor, '/');
+        assert_eq!(pos(&eb), (0, 4));
+        editor.doc.set_language(None);
+        ctrl(&mut editor, '/');
+        assert_eq!(eb.text(), "  café();\n\n  next();\nlast();");
+    }
+
+    #[test]
+    fn indent_guides_follow_tabs_and_horizontal_scroll() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of(&format!("    first\n\t\tlast{}", "x".repeat(80)));
+        eb.set_tab_width(4);
+        editor.set_wrap(WrapMode::None);
+        editor.doc.indent.set(Indent::Spaces(4));
+        let screen = OwnedBuffer::new(60, 8, false, WidthMethod::Unicode, "guides").unwrap();
+        draw(&editor, &screen);
+        assert!(screen
+            .to_text(true)
+            .lines()
+            .next()
+            .unwrap()
+            .contains("│   first"));
+        assert!(
+            screen
+                .to_text(true)
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("│   │   last"),
+            "{}",
+            screen.to_text(true)
+        );
+        editor.set_wrap(WrapMode::None);
+        editor.view.scroll_away_from_cursor(2, 0);
+        draw(&editor, &screen);
+        assert_eq!(editor.view.viewport().x, 2);
+        let rendered = screen.to_text(true);
+        let row = rendered.lines().nth(1).unwrap();
+        assert_eq!(row.chars().nth(GUTTER as usize), Some(' '));
+        assert_eq!(row.chars().nth(GUTTER as usize + 2), Some('│'));
     }
 
     #[test]

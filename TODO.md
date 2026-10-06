@@ -6,12 +6,9 @@
 
 # qol
 
-- indentation guides in editor
 - configurable indent from auto guessing indent
-- toggle comment (comment token from tree-sitter / language table)
 - select next occurrence (ctrl+D style) + highlight other occurrences of the word under the cursor
 - bracket matching: highlight the pair, jump to matching bracket
-- save all
 - `.editorconfig` support (final newline, trailing whitespace, indent)
 - CLI: open multiple files (`cue a.rs b.rs` currently errors), read stdin (`git diff | cue -`)
 

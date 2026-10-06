@@ -40,6 +40,23 @@ pub struct Syntax {
 }
 
 impl Language {
+    /// Languages with a line-comment token. Others leave the text alone.
+    pub fn line_comment(&self) -> Option<&'static str> {
+        match self.name {
+            "Rust" | "JavaScript" | "TypeScript" | "TSX" | "Go" | "C" | "C++" | "Zig" | "Java"
+            | "Kotlin" | "Swift" | "Dart" | "PHP" | "GLSL" | "Typst" => Some("//"),
+            "Python" | "TOML" | "YAML" | "Shell" | "Ruby" | "Perl" | "Elixir" | "R" | "GraphQL"
+            | "PowerShell" | "GDScript" | "Dockerfile" | "Makefile" | "CMake" | "Nginx"
+            | "Requirements" => Some("#"),
+            "Haskell" | "SQL" => Some("--"),
+            "Clojure" | "Scheme" | "Common Lisp" | "Assembly" => Some(";"),
+            "Vim script" => Some("\""),
+            "LaTeX" | "BibTeX" => Some("%"),
+            "Mermaid" => Some("%%"),
+            _ => None,
+        }
+    }
+
     const fn highlighted(
         self,
         grammar: fn() -> tree_sitter::Language,
