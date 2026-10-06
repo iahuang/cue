@@ -2500,6 +2500,42 @@ mod tests {
     }
 
     #[test]
+    fn editing_back_to_the_saved_text_is_unmodified() {
+        let _serial = serial();
+        let path = temp_path("back.txt");
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("one\n");
+        let file = File {
+            path: Some(path.clone()),
+            line_ending: LineEnding::Lf,
+        };
+        let mut editor = Editor::new(eb.clone(), file, theme(), 60, 4).unwrap();
+        eb.set_cursor(1, 0);
+        press(&mut editor, "x");
+        assert!(editor.is_modified());
+        key(&mut editor, KeyCode::Backspace);
+        assert!(!editor.is_modified());
+
+        // After a save, it compares with the text as saved.
+        press(&mut editor, "two");
+        ctrl(&mut editor, 's');
+        key(&mut editor, KeyCode::Backspace);
+        assert!(editor.is_modified());
+        press(&mut editor, "o");
+        assert!(!editor.is_modified());
+
+        // Undo steps through changes, back to the save point and past it.
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "one\ntw");
+        assert!(editor.is_modified());
+        ctrl(&mut editor, 'z');
+        assert!(!editor.is_modified());
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "one\n");
+        assert!(editor.is_modified());
+    }
+
+    #[test]
     fn saving_an_unnamed_file_asks_where() {
         let _serial = serial();
         let path = temp_path("named.txt");

@@ -122,6 +122,26 @@ struct OnDisk {
     disk: Disk,
 }
 
+/// The text as last loaded or saved, so that edits which put it back, like
+/// typing a character and deleting it, leave nothing unsaved.
+#[derive(Default)]
+struct Saved {
+    /// Its length and [`content_hash`]; `None` if unknown.
+    text: Option<(usize, u64)>,
+    /// The buffer's content epoch when last compared, and whether it
+    /// differed then.
+    compared: Option<(u64, bool)>,
+}
+
+impl Saved {
+    fn of(text: &str) -> Saved {
+        Saved {
+            text: Some((text.len(), content_hash(text.as_bytes()))),
+            compared: None,
+        }
+    }
+}
+
 /// An open file, shared by the editors showing it.
 pub struct Document {
     pub buffer: Rc<EditBuffer>,
@@ -144,6 +164,7 @@ pub struct Document {
     /// The text the parked cursors point into, and its content epoch.
     parked_text: RefCell<(u64, String)>,
     on_disk: RefCell<OnDisk>,
+    saved: RefCell<Saved>,
     /// What git says of the file, if it's in a repository, as the app last
     /// heard (see [`Document::set_tracked`]).
     tracked: RefCell<Option<Rc<Tracked>>>,
@@ -275,6 +296,7 @@ impl Document {
         doc.restore_text(text);
         doc.rename(path);
         doc.history.borrow_mut().mark_unsaved();
+        *doc.saved.borrow_mut() = Saved::default();
         Ok(doc)
     }
 
@@ -284,7 +306,8 @@ impl Document {
         buffer.set_default_fg(Some(theme::colors().text));
         let language = detect_language(&buffer, file.path.as_deref());
         let syntax = language.and_then(|language| Highlighter::new(language, &theme));
-        let indent = Indent::infer(&buffer.text(), language);
+        let text = buffer.text();
+        let indent = Indent::infer(&text, language);
         Document {
             buffer,
             file: RefCell::new(file),
@@ -299,6 +322,7 @@ impl Document {
             parked: RefCell::default(),
             parked_text: RefCell::default(),
             on_disk: RefCell::default(),
+            saved: RefCell::new(Saved::of(&text)),
             tracked: RefCell::default(),
         }
     }
@@ -424,8 +448,29 @@ impl Document {
             .is_some_and(|open| same_file(open, path))
     }
 
+    /// Whether the text differs from the saved state: undoing back to it,
+    /// or editing the text back to what it was, leaves it unmodified.
     pub fn is_modified(&self) -> bool {
-        self.history.borrow().is_modified()
+        self.history.borrow().is_modified() && self.differs_from_saved()
+    }
+
+    /// Whether the text differs from the text as last loaded or saved, or
+    /// that is unknown or in use.
+    fn differs_from_saved(&self) -> bool {
+        let Ok(mut saved) = self.saved.try_borrow_mut() else {
+            return true;
+        };
+        let Some((len, hash)) = saved.text else {
+            return true;
+        };
+        let epoch = self.buffer.content_epoch();
+        if let Some((_, differs)) = saved.compared.filter(|&(at, _)| at == epoch) {
+            return differs;
+        }
+        let text = self.buffer.text();
+        let differs = text.len() != len || content_hash(text.as_bytes()) != hash;
+        saved.compared = Some((epoch, differs));
+        differs
     }
 
     /// The text, if it has unsaved changes. Safe to call while unwinding
@@ -434,7 +479,8 @@ impl Document {
         let modified = self
             .history
             .try_borrow()
-            .map_or(true, |history| history.is_modified());
+            .map_or(true, |history| history.is_modified())
+            && self.differs_from_saved();
         modified.then(|| self.buffer.text())
     }
 
@@ -476,8 +522,10 @@ impl Document {
     /// it saved.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let line_ending = self.file.borrow().line_ending;
-        let stamp = save(path, &self.buffer.text(), line_ending)?;
+        let text = self.buffer.text();
+        let stamp = save(path, &text, line_ending)?;
         self.history.borrow_mut().mark_saved();
+        *self.saved.borrow_mut() = Saved::of(&text);
         *self.on_disk.borrow_mut() = OnDisk {
             stamp: Some(stamp),
             disk: Disk::Same,
@@ -575,6 +623,7 @@ impl Document {
         if took {
             history.record_reload(steps, join);
             self.file.borrow_mut().line_ending = loaded.line_ending;
+            *self.saved.borrow_mut() = Saved::of(&loaded.text);
             *self.on_disk.borrow_mut() = OnDisk {
                 stamp: loaded.stamp,
                 disk: Disk::Same,
