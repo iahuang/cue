@@ -362,7 +362,7 @@ impl Chooser {
             } else if !self.all {
                 format!("No sessions in {}. Press Tab to show all.", self.folder)
             } else {
-                "There are no sessions.".to_string()
+                "No sessions found.".to_string()
             };
             let text = truncate(&text, width.saturating_sub(4) as usize);
             frame.draw_text(&text, 3, LIST_TOP, colors.muted, None, Attributes::NONE);

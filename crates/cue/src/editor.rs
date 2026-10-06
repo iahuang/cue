@@ -2014,7 +2014,7 @@ impl Editor {
             return;
         }
         if !self.is_markdown() {
-            self.show_message("Reader mode is for Markdown files.", false);
+            self.show_message("Reader mode only supports Markdown files.", false);
             return;
         }
         let top = match self.diff.take() {

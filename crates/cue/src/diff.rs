@@ -313,10 +313,10 @@ impl DiffView {
         };
         let old = match tracked.base() {
             Base::Text(text) => text.as_str(),
-            Base::Binary => return Layout::note("Binary in the last commit."),
+            Base::Binary => return Layout::note("The file was binary in the last commit."),
             // Ignored, or so git says.
             Base::Missing if tracked.kind.get().is_none() => {
-                return Layout::note("Not in the last commit.")
+                return Layout::note("File not found in the last commit.")
             }
             Base::Missing => "",
         };
@@ -501,7 +501,7 @@ impl DiffView {
         let note = layout.note.or_else(|| {
             layout.rows.is_empty().then_some(match self.source {
                 Source::Live(_) => "No changes since the last commit.",
-                Source::Fixed { .. } => "No changes to the text.",
+                Source::Fixed { .. } => "No text changes.",
             })
         });
         if let Some(note) = note {

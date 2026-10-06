@@ -150,4 +150,4 @@ impl CommitDiff {
     }
 }
 
-const READ_ONLY: &str = "This is how a commit changed the file: it can't be edited.";
+const READ_ONLY: &str = "Commit diffs are read-only.";

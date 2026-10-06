@@ -986,9 +986,9 @@ impl App {
                 self.terminal_cue_keys = !self.terminal_cue_keys;
                 let toggle = self.shortcut(Command::ToggleTerminalKeys);
                 let message = match self.terminal_cue_keys {
-                    true => format!("cue's shortcuts work in terminals again ({toggle} toggles)."),
+                    true => format!("cue shortcuts enabled in terminals. Press {toggle} to send all keys to the shell."),
                     false => {
-                        format!("Terminals get every key now; {toggle} gives cue's shortcuts back.")
+                        format!("All keys go to the shell. Press {toggle} to enable cue shortcuts.")
                     }
                 };
                 self.show_message(message, false);
@@ -1896,7 +1896,7 @@ impl App {
             return;
         };
         if !editor.is_markdown() {
-            self.show_message("Previews are for Markdown files.", false);
+            self.show_message("Only Markdown files can be previewed.", false);
             return;
         }
         let doc = editor.document().clone();
@@ -2120,7 +2120,7 @@ impl App {
                 });
                 self.show_message("Mark set.", false);
             }
-            _ => self.show_message("Only a place in a file can be marked.", false),
+            _ => self.show_message("Marks can only be set in files.", false),
         }
     }
 
@@ -2146,7 +2146,7 @@ impl App {
         };
         if !file_usable(&self.documents, doc, path.as_deref()) {
             self.mark = None;
-            self.show_message("The marked file is gone.", false);
+            self.show_message("Marked file no longer exists.", false);
             return;
         }
         let tab = self
@@ -4469,14 +4469,14 @@ impl App {
             }
             Action::ReadOnly => {
                 let (mode, command) = match self.editor().is_some_and(Editor::diffing) {
-                    true => ("the diff", Command::ToggleDiff),
-                    false => ("reader mode", Command::ToggleReader),
+                    true => ("Diff view", Command::ToggleDiff),
+                    false => ("Reader mode", Command::ToggleReader),
                 };
                 let how = match self.keymap.shortcut(command) {
-                    Some(key) => format!("double-click or press {key}"),
-                    None => "double-click, or click Edit above,".to_string(),
+                    Some(key) => format!("Double-click or press {key}"),
+                    None => "Double-click or click Edit".to_string(),
                 };
-                self.show_message(format!("This is {mode}: {how} to edit."), false);
+                self.show_message(format!("{mode}. {how} to edit."), false);
                 AppAction::Continue
             }
         }
@@ -6448,7 +6448,7 @@ mod tests {
         assert!(screen(&app).contains("^` keys: cue"), "{}", screen(&app));
         let toggle = Key::new(KeyCode::Char('`'), Mods::CTRL);
         app.handle_key(toggle);
-        assert!(screen(&app).contains("Terminals get every key now"));
+        assert!(screen(&app).contains("All keys go to the shell"));
         ctrl(&mut app, 'p');
         assert!(app.picker.is_none());
         assert!(screen(&app).contains("^` keys: shell"), "{}", screen(&app));
@@ -6882,14 +6882,11 @@ mod tests {
 
         app.focus = Focus::Editor;
         key(&mut app, KeyCode::Char('x'));
-        assert!(screen(&app).contains("it can't be edited"));
+        assert!(screen(&app).contains("Commit diffs are read-only."));
         key(&mut app, KeyCode::Down);
 
         left_click(&mut app, 6, 5);
-        assert!(
-            screen(&app).contains("No changes to the text."),
-            "renamed only"
-        );
+        assert!(screen(&app).contains("No text changes."), "renamed only");
         app.run(Command::GoBack, false);
         assert!(screen(&app).contains("+ more"), "back to the last");
 
@@ -9748,7 +9745,7 @@ mod tests {
         key(&mut app, KeyCode::Char('x'));
         let message = status_message(&app).unwrap_or_default();
         assert!(
-            message.contains("reader mode") && message.contains("Ctrl+U"),
+            message.contains("Reader mode") && message.contains("Ctrl+U"),
             "{message:?}"
         );
         app.paste("pasted");
