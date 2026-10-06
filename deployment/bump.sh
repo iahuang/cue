@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Bumps cue's version, commits Cargo.toml + Cargo.lock, tags v<version>, and
-# pushes main and the tag to origin (which triggers the release workflow).
+# Bumps cue's version, renames CHANGELOG.md's "## Unreleased" header to
+# "## v<version> — <date>" (Eastern Time), commits Cargo.toml + Cargo.lock +
+# CHANGELOG.md, tags v<version>, and pushes main and the tag to origin (which
+# triggers the release workflow).
 #
 #   deployment/bump.sh major|minor|patch
 #
@@ -10,6 +12,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 manifest=crates/cue/Cargo.toml
+changelog=CHANGELOG.md
 cd "$root"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -38,24 +41,28 @@ esac
 tag=v$new
 
 git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "tag $tag already exists"
+grep -qx '## Unreleased' "$changelog" || die "no '## Unreleased' header in $changelog"
+date=$(TZ=America/New_York date +%Y-%m-%d)
 
-echo "cue $old -> $new"
+echo "cue $old -> $new ($date)"
 ((ahead == 0)) || { echo "also pushing $ahead unpushed commit(s):"; git log --oneline origin/main..HEAD; }
 read -r -p "Commit, tag $tag, and push to origin (starts a release)? [y/N] " answer
 [[ $answer == [yY] ]] || { echo "aborted"; exit 1; }
 
 # Undo the edits if anything fails before the commit lands.
-trap 'git checkout -- "$manifest" Cargo.lock' EXIT
+trap 'git checkout -- "$manifest" Cargo.lock "$changelog"' EXIT
 
 tmp=$(mktemp)
 awk -v new="$new" '!done && /^version = "/ { $0 = "version = \"" new "\""; done = 1 } 1' "$manifest" >"$tmp"
-cat "$tmp" >"$manifest" && rm "$tmp"
+cat "$tmp" >"$manifest"
+awk -v header="## $tag — $date" '!done && $0 == "## Unreleased" { $0 = header; done = 1 } 1' "$changelog" >"$tmp"
+cat "$tmp" >"$changelog" && rm "$tmp"
 
 cargo update --workspace --quiet
 cargo metadata --locked --format-version 1 >/dev/null  # fails if the lockfile is still stale
 git diff --quiet Cargo.lock && die "Cargo.lock didn't change; expected cue's version in it to update"
 
-git commit --quiet -m "$tag" -- "$manifest" Cargo.lock
+git commit --quiet -m "$tag" -- "$manifest" Cargo.lock "$changelog"
 trap - EXIT
 
 git tag -a "$tag" -m "$tag"
