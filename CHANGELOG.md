@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.8 — 2026-10-06
 
 - Treat buffers edited back to their saved text as unmodified (`fd4cdda`)
 - Add unsaved file filtering and a corresponding command palette action (`fac771f`)
