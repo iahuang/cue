@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.10 — 2026-10-07
 
 - Indent new lines and closing brackets as you type (`334f3de`)
 - Add a commit view for staging and committing changes (`ac5f5af`)
