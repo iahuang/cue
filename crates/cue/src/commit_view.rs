@@ -178,6 +178,8 @@ pub struct CommitView {
     branch: String,
     /// The repository has no commits yet, so there's none to amend.
     initial: bool,
+    /// A merge can be committed without any staged file differences.
+    merging: bool,
     /// Sorted by path, as git lists them.
     changes: Vec<Change>,
     /// Folders collapsed, by path; the repository's, for all of them.
@@ -226,6 +228,7 @@ impl CommitView {
             name,
             branch: String::new(),
             initial: false,
+            merging: false,
             changes: Vec::new(),
             collapsed: HashSet::new(),
             rows: Vec::new(),
@@ -264,6 +267,7 @@ impl CommitView {
         }
         self.branch = repo.head.name().to_string();
         self.initial = repo.commit.is_none();
+        self.merging = repo.merging;
         if self.initial {
             self.amend = false;
         }
@@ -753,7 +757,7 @@ impl CommitView {
         if self.message.text.trim().is_empty() {
             return Err(CantCommit::NoMessage);
         }
-        if !self.amend && self.staged_count() == 0 {
+        if !self.amend && !self.merging && self.staged_count() == 0 {
             return Err(CantCommit::NothingStaged);
         }
         let (sender, receiver) = mpsc::channel();
@@ -922,7 +926,7 @@ impl CommitView {
         if button_x > x + 3 + AMEND.len() as u32 {
             let ready = !self.committing()
                 && !self.message.text.trim().is_empty()
-                && (self.amend || self.staged_count() > 0);
+                && (self.amend || self.merging || self.staged_count() > 0);
             let (fg, attributes) = match ready {
                 true => (colors.accent, Attributes::BOLD),
                 false => (colors.faint, Attributes::NONE),
@@ -1488,6 +1492,7 @@ mod tests {
             git_dir: root.join(".git"),
             head: Head::Branch("main".into()),
             commit: Some("0123456".into()),
+            merging: false,
             changes: changes
                 .iter()
                 .map(|&(path, kind, staged)| Change {
@@ -1804,6 +1809,53 @@ mod tests {
                 stage: true,
             }
         );
+    }
+
+    #[test]
+    fn commits_a_merge_resolved_to_the_current_tree() {
+        let root = git::tests::repo("commit-merge-ours");
+        git::tests::commit_as_cue(&root);
+        git::switch(&root, &git::SwitchTo::New("topic".into())).unwrap();
+        std::fs::write(root.join("a.txt"), "topic\n").unwrap();
+        git::tests::commit_all(&root, "topic");
+        git::switch(&root, &git::SwitchTo::Branch("main".into())).unwrap();
+        std::fs::write(root.join("a.txt"), "ours\n").unwrap();
+        git::tests::commit_all(&root, "ours");
+        let merge = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["merge", "topic"])
+            .output()
+            .unwrap();
+        assert!(!merge.status.success());
+        assert!(root.join(".git/MERGE_HEAD").is_file());
+        std::fs::write(root.join("a.txt"), "ours\n").unwrap();
+        git::stage(&root, &[root.join("a.txt")]).unwrap();
+        let mut git = git::Git::new(std::slice::from_ref(&root));
+        git.wait();
+        assert!(git.repos()[0].changes.is_empty());
+        let mut view = CommitView::open(&git.repos()[0], "cue".into());
+        view.edit(Edit::Insert("Resolve using ours"), false);
+        assert_eq!(view.commit(), Ok(()));
+        view.wait().unwrap().unwrap();
+        assert!(!root.join(".git/MERGE_HEAD").exists());
+        let parents = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-list", "--parents", "-1", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(parents.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&parents.stdout).split_whitespace().count(),
+            3,
+            "the commit has two parents"
+        );
+        git.restart();
+        git.wait();
+        view.set_repo(&git.repos()[0]);
+        view.edit(Edit::Insert("No further changes"), false);
+        assert_eq!(view.commit(), Err(CantCommit::NothingStaged));
     }
 
     #[test]

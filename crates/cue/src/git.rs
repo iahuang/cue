@@ -133,6 +133,8 @@ pub struct Repo {
     pub head: Head,
     /// The commit checked out, by its hash; `None` before the first.
     pub commit: Option<String>,
+    /// A merge needs a commit, even if its tree is unchanged from HEAD.
+    pub merging: bool,
     /// Sorted by path; past [`MAX_CHANGES`], the rest aren't listed.
     pub changes: Vec<Change>,
     /// Lines added since the last commit, staged or not, and in new files.
@@ -969,6 +971,7 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     Some(Repo {
         root: top.to_path_buf(),
+        merging: git_dir.join("MERGE_HEAD").is_file(),
         git_dir,
         head,
         commit,

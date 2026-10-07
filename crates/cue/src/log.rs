@@ -580,6 +580,7 @@ mod tests {
             added: 0,
             removed: 0,
             stashes: Vec::new(),
+            merging: false,
         }
     }
 

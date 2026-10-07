@@ -687,6 +687,7 @@ mod tests {
             git_dir: root.join(".git"),
             head: Head::Branch("main".into()),
             commit: None,
+            merging: false,
             changes: changes
                 .iter()
                 .map(|&(path, kind)| Change {
