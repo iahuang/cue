@@ -552,12 +552,35 @@ fn stash_name(root: &Path, hash: &str) -> Result<String, String> {
 pub struct Branch {
     /// Its name: `main`, or a remote's, `origin/main`.
     pub name: String,
-    /// It's a remote's, with no branch of its own here yet.
-    pub remote: bool,
+    /// The remote it's of, if it's a remote's, with no branch of its own
+    /// here yet.
+    pub remote: Option<String>,
     /// It's checked out.
     pub current: bool,
     /// When its last commit was made, in seconds since the Unix epoch.
     pub time: i64,
+}
+
+impl Branch {
+    /// Its name here, or a remote's once switched to: `main`, for
+    /// `origin/main`.
+    pub fn local_name(&self) -> &str {
+        match &self.remote {
+            Some(remote) => &self.name[remote.len() + 1..],
+            None => &self.name,
+        }
+    }
+
+    /// What switching to it is.
+    pub fn switch_to(&self) -> SwitchTo {
+        match &self.remote {
+            Some(remote) => SwitchTo::Track {
+                remote: remote.clone(),
+                name: self.local_name().to_string(),
+            },
+            None => SwitchTo::Branch(self.name.clone()),
+        }
+    }
 }
 
 /// The branches of the repository at `root`: its own, and the remotes' it
@@ -577,6 +600,7 @@ pub fn branches(root: &Path) -> Vec<Branch> {
         Ok(output) if output.status.success() => output.stdout,
         _ => return Vec::new(),
     };
+    let remotes = remotes(root);
     let text = String::from_utf8_lossy(&output);
     let mut branches: Vec<Branch> = text
         .lines()
@@ -593,9 +617,13 @@ pub fn branches(root: &Path) -> Vec<Branch> {
             if !symref.is_empty() {
                 return None;
             }
+            let remote = match full.starts_with("refs/remotes/") {
+                true => Some(remote_of(name, &remotes)?),
+                false => None,
+            };
             Some(Branch {
                 name: name.to_string(),
-                remote: full.starts_with("refs/remotes/"),
+                remote,
                 current: head == "*",
                 time: time.parse().unwrap_or(0),
             })
@@ -603,19 +631,42 @@ pub fn branches(root: &Path) -> Vec<Branch> {
         .collect();
     let local: HashSet<String> = branches
         .iter()
-        .filter(|branch| !branch.remote)
+        .filter(|branch| branch.remote.is_none())
         .map(|branch| branch.name.clone())
         .collect();
-    branches.retain(|branch| {
-        !branch.remote
-            || branch
-                .name
-                .split_once('/')
-                .is_some_and(|(_, name)| !local.contains(name))
-    });
+    branches.retain(|branch| branch.remote.is_none() || !local.contains(branch.local_name()));
     // The one checked out first, to say where it's switching from.
     branches.sort_by_key(|branch| !branch.current);
     branches
+}
+
+/// The names of the remotes of the repository at `root`.
+fn remotes(root: &Path) -> Vec<String> {
+    match git(root).arg("remote").output() {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The remote of `remotes` whose branch `name`, `origin/main`, is: the
+/// longest that's its start, as a remote's name can have a `/` too. A
+/// remote that's gone is taken to be up to the first `/`.
+fn remote_of(name: &str, remotes: &[String]) -> Option<String> {
+    let starts = |remote: &&String| {
+        name.strip_prefix(remote.as_str())
+            .is_some_and(|rest| rest.len() > 1 && rest.starts_with('/'))
+    };
+    let longest = remotes
+        .iter()
+        .filter(starts)
+        .max_by_key(|remote| remote.len());
+    match longest {
+        Some(remote) => Some(remote.clone()),
+        None => name.split_once('/').map(|(remote, _)| remote.to_string()),
+    }
 }
 
 /// Where to switch a repository to.
@@ -624,16 +675,19 @@ pub enum SwitchTo {
     Branch(String),
     /// A new branch, by this name, at the commit checked out.
     New(String),
-    /// A branch of its own for this remote's branch, which tracks it.
-    Track(String),
+    /// A branch of its own for a remote's branch, which tracks it: the
+    /// remote, and the branch's name there.
+    Track {
+        remote: String,
+        name: String,
+    },
 }
 
 impl SwitchTo {
     /// The name of the branch it switches to.
     pub fn name(&self) -> &str {
         match self {
-            SwitchTo::Branch(name) | SwitchTo::New(name) => name,
-            SwitchTo::Track(remote) => remote.split_once('/').map_or(remote, |(_, name)| name),
+            SwitchTo::Branch(name) | SwitchTo::New(name) | SwitchTo::Track { name, .. } => name,
         }
     }
 }
@@ -665,7 +719,9 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
         match to {
             SwitchTo::Branch(name) => command.args(["--", name]),
             SwitchTo::New(name) => command.args(["-c", name]),
-            SwitchTo::Track(remote) => command.args(["--track", &format!("refs/remotes/{remote}")]),
+            SwitchTo::Track { remote, name } => {
+                command.args(["--track", &format!("refs/remotes/{remote}/{name}")])
+            }
         };
         run_with_input(command, b"").map(drop)
     };
@@ -1621,19 +1677,34 @@ pub(crate) mod tests {
         assert!(!listed.iter().any(|branch| branch.name == "origin/main"));
         for (name, remote) in [("main", false), ("origin/topic", true)] {
             let branch = listed.iter().find(|branch| branch.name == name).unwrap();
-            assert_eq!(branch.remote, remote);
-            let to = if remote {
-                SwitchTo::Track(branch.name.clone())
-            } else {
-                SwitchTo::Branch(branch.name.clone())
-            };
-            assert_eq!(switch(&dir, &to), Ok(Carried::Along));
+            assert_eq!(branch.remote.is_some(), remote);
+            assert_eq!(switch(&dir, &branch.switch_to()), Ok(Carried::Along));
         }
         let upstream = git(&dir)
             .args(["rev-parse", "--symbolic-full-name", "@{upstream}"])
             .output()
             .unwrap();
         assert_eq!(upstream.stdout, b"refs/remotes/origin/topic\n");
+    }
+
+    #[test]
+    fn switches_to_branches_of_remotes_with_slashes_in_their_names() {
+        let dir = repo("switch-remote-slash");
+        run(&dir, &["remote", "add", "my/fork", "."]);
+        run(&dir, &["update-ref", "refs/remotes/my/fork/main", "HEAD"]);
+        run(&dir, &["update-ref", "refs/remotes/my/fork/topic", "HEAD"]);
+        let listed = branches(&dir);
+        let names: Vec<&str> = listed.iter().map(|branch| branch.name.as_str()).collect();
+        assert_eq!(names, ["main", "my/fork/topic"], "main is here already");
+        let topic = &listed[1];
+        assert_eq!(topic.remote.as_deref(), Some("my/fork"));
+        assert_eq!(topic.switch_to().name(), "topic");
+        assert_eq!(switch(&dir, &topic.switch_to()), Ok(Carried::Along));
+        let upstream = git(&dir)
+            .args(["rev-parse", "--symbolic-full-name", "@{upstream}"])
+            .output()
+            .unwrap();
+        assert_eq!(upstream.stdout, b"refs/remotes/my/fork/topic\n");
     }
 
     #[test]
@@ -1658,7 +1729,7 @@ pub(crate) mod tests {
 
         let mut listed: Vec<(String, bool, bool)> = branches(&dir)
             .into_iter()
-            .map(|branch| (branch.name, branch.remote, branch.current))
+            .map(|branch| (branch.name, branch.remote.is_some(), branch.current))
             .collect();
         listed.sort();
         let branch = |name: &str, remote, current| (name.to_string(), remote, current);
@@ -1752,7 +1823,10 @@ pub(crate) mod tests {
         let new = SwitchTo::New("fresh".to_string());
         assert_eq!(switch(&dir, &new), Ok(Carried::Along));
         assert_eq!(head(&dir), "fresh");
-        let track = SwitchTo::Track("origin/feature".to_string());
+        let track = SwitchTo::Track {
+            remote: "origin".to_string(),
+            name: "feature".to_string(),
+        };
         assert_eq!(track.name(), "feature");
         assert_eq!(switch(&dir, &track), Ok(Carried::Along));
         assert_eq!(head(&dir), "feature");

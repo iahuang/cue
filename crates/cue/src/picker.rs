@@ -226,26 +226,19 @@ impl Item {
     /// as of `now`, in seconds since the Unix epoch.
     pub fn branch(branch: &Branch, now: i64) -> Item {
         // A remote's name is dimmed.
-        let remote = match branch.remote {
-            true => branch
-                .name
-                .split_once('/')
-                .map_or(0, |(remote, _)| remote.chars().count() + 1),
-            false => 0,
-        };
+        let remote = branch
+            .remote
+            .as_ref()
+            .map_or(0, |remote| remote.chars().count() + 1);
         let detail = match branch.current {
             true => "current".to_string(),
             false => format!("{} ago", crate::log::ago(now - branch.time)),
-        };
-        let to = match branch.remote {
-            true => SwitchTo::Track(branch.name.clone()),
-            false => SwitchTo::Branch(branch.name.clone()),
         };
         Item {
             text: branch.name.clone(),
             dim: 0..remote,
             detail,
-            choice: Choice::Branch(to),
+            choice: Choice::Branch(branch.switch_to()),
             color: None,
         }
     }
@@ -1319,16 +1312,16 @@ mod tests {
     fn lists_branches_and_offers_a_new_one_last() {
         let root = fixture("branches", &[]);
         let mut picker = picker(&root, Mode::Branches, Vec::new());
-        let branch = |name: &str, remote, current| Branch {
+        let branch = |name: &str, remote: Option<&str>, current| Branch {
             name: name.to_string(),
-            remote,
+            remote: remote.map(str::to_string),
             current,
             time: 0,
         };
         picker.set_branches(vec![
-            Item::branch(&branch("main", false, true), 60),
-            Item::branch(&branch("feature", false, false), 7200),
-            Item::branch(&branch("origin/fix", true, false), 60),
+            Item::branch(&branch("main", None, true), 60),
+            Item::branch(&branch("feature", None, false), 7200),
+            Item::branch(&branch("origin/fix", Some("origin"), false), 60),
         ]);
         assert_eq!(listed(&picker), ["main", "feature", "origin/fix"]);
         assert_eq!(picker.status("branches"), " 3 branches ");
@@ -1345,7 +1338,10 @@ mod tests {
         assert_eq!(listed(&picker), ["origin/fix"], "switching to it makes it");
         assert_eq!(
             picker.selected_choice(),
-            Some(&Choice::Branch(SwitchTo::Track("origin/fix".into())))
+            Some(&Choice::Branch(SwitchTo::Track {
+                remote: "origin".into(),
+                name: "fix".into()
+            }))
         );
         picker.select_all();
         picker.edit(Edit::Insert("brand new"));
