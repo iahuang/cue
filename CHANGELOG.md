@@ -4,6 +4,7 @@
 
 - Use VS Code word separators for double-click selection in the editor (`fd6db5a`)
 - Swap keybindings for set mark and clear mark (`4d0112b`)
+- Select between caret positions when drag selecting in the editor (`86cb2ec`)
 
 ## v0.3.8 — 2026-10-06
 
