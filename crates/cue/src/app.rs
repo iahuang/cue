@@ -5295,6 +5295,12 @@ impl App {
                 let message = format!("Switched to {name}, bringing your changes.");
                 self.show_message(message, false);
             }
+            Ok(Carried::Unstaged) => {
+                let message = format!(
+                    "Switched to {name}, bringing your changes, but they had to be unstaged."
+                );
+                self.show_message(message, false);
+            }
             Ok(Carried::Conflicts(err)) => {
                 let message = format!(
                     "Switched to {name}, but your changes didn't all go back cleanly. \

@@ -645,6 +645,9 @@ pub enum Carried {
     Along,
     /// Stashed, then put back once switched.
     Stashed,
+    /// Stashed, then put back once switched, but not staged: what was
+    /// staged didn't apply to the branch's as it was.
+    Unstaged,
     /// Stashed, and not put back cleanly: what git said. The stash is kept.
     Conflicts(String),
 }
@@ -680,11 +683,28 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
         // no stash was made, and an older one must not be popped.
         return Err(err);
     };
+    // Whether what was staged is again: if it doesn't apply to what's
+    // staged now, git puts nothing back, so it all goes back unstaged.
     let restore = || {
-        let mut apply = writing(root);
-        apply.args(["stash", "apply", "--index", &created.commit.hash]);
-        run_with_input(apply, b"")?;
-        drop_stash(root, &created.commit.hash)
+        let apply = |index: bool| {
+            let mut apply = writing(root);
+            apply.args(["stash", "apply"]);
+            if index {
+                apply.arg("--index");
+            }
+            apply.arg(&created.commit.hash);
+            run_with_input(apply, b"")
+        };
+        let staged = match apply(true) {
+            Ok(_) => true,
+            Err(err) if err.contains("Try without --index") => {
+                apply(false)?;
+                false
+            }
+            Err(err) => return Err(err),
+        };
+        drop_stash(root, &created.commit.hash)?;
+        Ok(staged)
     };
     if let Err(err) = run() {
         // Back as they were.
@@ -692,7 +712,8 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
         return Err(err);
     }
     match restore() {
-        Ok(_) => Ok(Carried::Stashed),
+        Ok(true) => Ok(Carried::Stashed),
+        Ok(false) => Ok(Carried::Unstaged),
         Err(err) => Ok(Carried::Conflicts(err)),
     }
 }
@@ -1680,6 +1701,17 @@ pub(crate) mod tests {
             ],
             "the staged and unstaged changes stay separate"
         );
+        assert!(stashes(&dir).is_empty());
+        run(&dir, &["reset", "-q", "--hard"]);
+        run(&dir, &["switch", "-q", "main"]);
+
+        // A staged change whose lines around it the branch changed: it
+        // goes back unstaged.
+        fs::write(dir.join("a.txt"), "1\n2\n3\nfour\n5\n").unwrap();
+        stage(&dir, &[dir.join("a.txt")]).unwrap();
+        assert_eq!(switch(&dir, &to("other")), Ok(Carried::Unstaged));
+        assert_eq!(a(&dir), "one\n2\n3\nfour\n5\n");
+        assert_eq!(staged(&dir), [("a.txt".to_string(), Staged::No)]);
         assert!(stashes(&dir).is_empty());
         run(&dir, &["reset", "-q", "--hard"]);
         run(&dir, &["switch", "-q", "main"]);
