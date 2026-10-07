@@ -698,7 +698,7 @@ mod tests {
                 .collect(),
             added: 0,
             removed: 0,
-            stashes: 0,
+            stashes: Vec::new(),
             root,
         }
     }

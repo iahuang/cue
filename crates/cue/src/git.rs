@@ -139,8 +139,8 @@ pub struct Repo {
     pub added: usize,
     /// Lines removed since the last commit, staged or not.
     pub removed: usize,
-    /// How many changes are stashed.
-    pub stashes: usize,
+    /// The changes stashed, newest first.
+    pub stashes: Vec<Stash>,
 }
 
 /// What git says of a file: the repository it's in, how it changed since
@@ -931,7 +931,6 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
             "status",
             "--porcelain=v2",
             "--branch",
-            "--show-stash",
             "-z",
             "--untracked-files=all",
         ])
@@ -941,7 +940,7 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
         return None;
     }
     let (head, commit, changes) = parse_status(&output.stdout);
-    let stashes = parse_stash_count(&output.stdout);
+    let stashes = stashes(top);
     let (mut added, removed) = diff_lines(top, commit.is_none());
     let untracked = changes
         .iter()
@@ -1099,16 +1098,6 @@ fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>) {
         }
     };
     (head, commit, changes)
-}
-
-/// How many changes are stashed, as `git status --show-stash` says, in a
-/// header of its own.
-fn parse_stash_count(output: &[u8]) -> usize {
-    output
-        .split(|&byte| byte == 0)
-        .find_map(|field| field.strip_prefix(b"# stash "))
-        .and_then(|count| std::str::from_utf8(count).ok()?.parse().ok())
-        .unwrap_or(0)
 }
 
 /// How much of a changed entry is staged, from the `XY` its line starts
@@ -1523,11 +1512,11 @@ pub(crate) mod tests {
         run(&dir, &["reset", "-q", "--hard"]);
         let mut git = Git::new(std::slice::from_ref(&dir));
         git.wait();
-        assert_eq!(git.repos()[0].stashes, 0);
+        assert!(git.repos()[0].stashes.is_empty());
         stash(&dir, "again", false).unwrap();
         git.restart();
         git.wait();
-        assert_eq!(git.repos()[0].stashes, 1, "git status says how many");
+        assert_eq!(git.repos()[0].stashes, stashes(&dir));
     }
 
     #[test]

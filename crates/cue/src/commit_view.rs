@@ -205,9 +205,6 @@ pub struct CommitView {
     active_preview: bool,
     /// The changes stashed, newest first.
     stashes: Vec<Stash>,
-    /// How many git said were stashed when they were read: once it says
-    /// another number, they're read again.
-    stash_count: Option<usize>,
     /// The stashes collapsed under the row above them.
     stashes_collapsed: bool,
     /// The files each stash opened changed, by hash, read when it's first
@@ -244,7 +241,6 @@ impl CommitView {
             active: None,
             active_preview: false,
             stashes: Vec::new(),
-            stash_count: None,
             stashes_collapsed: false,
             stash_files: HashMap::new(),
             open_stashes: HashSet::new(),
@@ -272,9 +268,8 @@ impl CommitView {
             self.amend = false;
         }
         self.changes = repo.changes.clone();
-        if self.stash_count != Some(repo.stashes) {
-            self.read_stashes();
-            self.stash_count = Some(repo.stashes);
+        if self.stashes != repo.stashes {
+            self.set_stashes(repo.stashes.clone());
         }
         self.rebuild();
     }
@@ -282,8 +277,11 @@ impl CommitView {
     /// Reads the stashes again, as after stashing, applying, or dropping
     /// one, keeping those still there open.
     pub fn read_stashes(&mut self) {
-        self.stashes = git::stashes(&self.root);
-        self.stash_count = Some(self.stashes.len());
+        self.set_stashes(git::stashes(&self.root));
+    }
+
+    fn set_stashes(&mut self, stashes: Vec<Stash>) {
+        self.stashes = stashes;
         let hashes: HashSet<&String> = self.stashes.iter().map(|s| &s.commit.hash).collect();
         self.open_stashes.retain(|hash| hashes.contains(hash));
         self.stash_files.retain(|hash, _| hashes.contains(hash));
@@ -1498,7 +1496,7 @@ mod tests {
                 .collect(),
             added: 0,
             removed: 0,
-            stashes: 0,
+            stashes: Vec::new(),
             root,
         }
     }
@@ -1554,6 +1552,28 @@ mod tests {
                 format!("{}{wraps}", &text[line.range])
             })
             .collect()
+    }
+
+    #[test]
+    fn refreshes_a_stash_replaced_without_changing_the_count() {
+        let root = git::tests::repo("stash-replaced");
+        git::tests::commit_as_cue(&root);
+        std::fs::write(root.join("a.txt"), "old\n").unwrap();
+        git::stash(&root, "old stash", false).unwrap();
+        let mut git = git::Git::new(std::slice::from_ref(&root));
+        git.wait();
+        let before = git.repos()[0].clone();
+        let mut view = CommitView::open(&before, "cue".into());
+        git::drop_stash(&root, &view.stashes[0].commit.hash).unwrap();
+        std::fs::write(root.join("a.txt"), "new\n").unwrap();
+        git::stash(&root, "new stash", false).unwrap();
+        git.restart();
+        git.wait();
+        let after = &git.repos()[0];
+        assert_ne!(&before, after, "stash replacement changes the snapshot");
+        view.set_repo(after);
+        assert_eq!(view.stashes.len(), 1);
+        assert_eq!(view.stashes[0].commit.subject, "new stash");
     }
 
     #[test]

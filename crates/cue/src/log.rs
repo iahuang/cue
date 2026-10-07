@@ -579,7 +579,7 @@ mod tests {
             changes: Vec::new(),
             added: 0,
             removed: 0,
-            stashes: 0,
+            stashes: Vec::new(),
         }
     }
 
