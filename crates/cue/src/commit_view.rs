@@ -262,8 +262,8 @@ impl CommitView {
     /// Catches up with what git says of the repository now, keeping the
     /// selection on the same entry while it's still listed.
     pub fn set_repo(&mut self, repo: &Repo) {
-        if self.branch != repo.head.name() && self.amend {
-            self.toggle_amend();
+        if self.branch != repo.head.name() {
+            self.clear_amend();
         }
         self.branch = repo.head.name().to_string();
         self.initial = repo.commit.is_none();
@@ -745,6 +745,14 @@ impl CommitView {
             self.message = Message::default();
         }
         self.show_cursor();
+    }
+
+    /// Leaves Amend after switching branches, before the next repository
+    /// refresh. Keeps a message the user edited, as turning Amend off does.
+    pub fn clear_amend(&mut self) {
+        if self.amend {
+            self.toggle_amend();
+        }
     }
 
     /// Starts committing what's staged, with the message written, in the

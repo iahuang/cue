@@ -5274,7 +5274,13 @@ impl App {
             return;
         }
         let name = to.name().to_string();
-        match git::switch(root, to) {
+        let result = git::switch(root, to);
+        if result.is_ok() {
+            if let Some(view) = self.commit_view_of(root) {
+                view.clear_amend();
+            }
+        }
+        match result {
             Ok(Carried::Along) => self.show_message(format!("Switched to {name}."), false),
             Ok(Carried::Stashed) => {
                 let message = format!("Switched to {name}, bringing your changes.");
@@ -10092,6 +10098,43 @@ mod tests {
         assert_eq!(git::log(&root, 0, 1)[0].subject, "Stay on main");
         app.switch_branch(root.clone(), to);
         assert_eq!(branch(), "topic");
+    }
+
+    #[test]
+    fn switching_branches_clears_amend_before_the_git_refresh() {
+        let _serial = crate::test_serial();
+        for edited in [false, true] {
+            let root = crate::git::tests::repo(&format!("app-amend-switch-{edited}"));
+            crate::git::tests::commit_as_cue(&root);
+            git::switch(&root, &SwitchTo::New("other".into())).unwrap();
+            fs::write(root.join("b.txt"), "other branch\n").unwrap();
+            git::stage(&root, &[root.join("b.txt")]).unwrap();
+            git::commit(&root, "Other branch commit", false).unwrap();
+            let before = git::log(&root, 0, 1)[0].hash.clone();
+            git::switch(&root, &SwitchTo::Branch("main".into())).unwrap();
+
+            let mut app = tall_app(&root, Some("a.txt"));
+            wait_for_git(&mut app);
+            app.run(Command::TreeCommit, false);
+            app.commit_views[0].toggle_amend();
+            if edited {
+                app.commit_views[0].edit(Edit::Insert("My draft: "), false);
+            }
+            let message = app.commit_views[0].message().to_string();
+
+            app.show_branches(root.clone());
+            type_text(&mut app, "other");
+            key(&mut app, KeyCode::Enter);
+            // Input can arrive before the background status refresh, or
+            // in the same batch as the key that accepted the branch.
+            app.handle_key(Key::new(KeyCode::Enter, Mods::CTRL));
+            assert!(!app.commit_views[0].committing());
+            assert_eq!(git::log(&root, 0, 1)[0].hash, before);
+            assert_eq!(
+                app.commit_views[0].message(),
+                if edited { message.as_str() } else { "" }
+            );
+        }
     }
 
     #[test]
