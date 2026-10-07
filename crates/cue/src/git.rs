@@ -656,9 +656,12 @@ pub enum Carried {
 /// committed along. If git won't switch with them, as when the branch
 /// changed the same files, they're stashed first, and put back after.
 pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
+    // What git says is matched on below, so it's to say it in English.
     let run = || {
         let mut command = writing(root);
-        command.args(["switch", "--no-overwrite-ignore"]);
+        command
+            .env("LC_ALL", "C")
+            .args(["switch", "--no-overwrite-ignore"]);
         match to {
             SwitchTo::Branch(name) => command.args(["--", name]),
             SwitchTo::New(name) => command.args(["-c", name]),
@@ -690,7 +693,7 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
     let restore = || {
         let apply = |index: bool| {
             let mut apply = writing(root);
-            apply.args(["stash", "apply"]);
+            apply.env("LC_ALL", "C").args(["stash", "apply"]);
             if index {
                 apply.arg("--index");
             }
