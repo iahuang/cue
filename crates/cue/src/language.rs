@@ -57,6 +57,12 @@ impl Language {
         }
     }
 
+    /// Whether a line ending in `:` opens a block, which goes one level
+    /// deeper, as in Python.
+    pub fn colon_opens_block(&self) -> bool {
+        matches!(self.name, "Python" | "GDScript" | "YAML")
+    }
+
     const fn highlighted(
         self,
         grammar: fn() -> tree_sitter::Language,

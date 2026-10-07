@@ -25,6 +25,7 @@ use opentui::{
     SelectionOccupancy, Viewport, WrapMode,
 };
 
+use crate::autoindent;
 use crate::config::{self, Config};
 use crate::diff::{self, DiffEvent, DiffView, Hunks, LineMark};
 #[cfg(test)]
@@ -40,6 +41,7 @@ use crate::location::Position;
 use crate::reader::{Reader, ReaderEvent};
 use crate::search::Toggle;
 use crate::status::Status;
+use crate::syntax::Region;
 use crate::theme;
 #[cfg(test)]
 use crate::theme::Theme;
@@ -506,7 +508,13 @@ impl Editor {
             if key.mods.is_plain() {
                 let mut utf8 = [0u8; 4];
                 let text: &str = c.encode_utf8(&mut utf8);
-                self.edit(EditKind::Type(c), |eb| eb.insert_text(text));
+                let indent = self.closer_indent(c);
+                self.edit(EditKind::Type(c), |eb| {
+                    let outdented = indent.map_or(0, |(row, from, indent)| {
+                        eb.delete_range((row, 0), (row, from)) + eb.insert_text(&indent)
+                    });
+                    outdented + eb.insert_text(text)
+                });
                 self.sync_find();
             }
         }
@@ -656,7 +664,7 @@ impl Editor {
             Command::ToggleWrap => self.toggle_wrap(),
             Command::ToggleReader => self.set_reading(true),
             Command::ToggleDiff => self.set_diffing(true),
-            Command::NewLine => self.edit(EditKind::Other, EditBuffer::new_line),
+            Command::NewLine => self.new_line(),
             // With lines selected, Tab indents them, as in most editors.
             Command::InsertTab if self.selection_spans_lines() => self.indent_lines(Forward),
             Command::InsertTab => self.insert_indent(),
@@ -1107,6 +1115,70 @@ impl Editor {
         self.history().break_group();
         let steps = eb.delete_range(start, end);
         self.history().record(EditKind::Other, steps);
+    }
+
+    /// Enter: breaks the line, indenting the new one as [`autoindent`]
+    /// does, as one undo step.
+    fn new_line(&mut self) {
+        let replaced = self.delete_selection();
+        let indent = self.doc.indent.get().unit();
+        let colon_opens = self
+            .doc
+            .language
+            .get()
+            .is_some_and(|language| language.colon_opens_block());
+        let cursor = self.buffer.cursor();
+        let line_start = self.buffer.position_to_offset(cursor.row, 0);
+        let column = self.buffer.text_range(line_start, cursor.offset).len();
+        let line_break = self.with_regions(|text, region| {
+            let at = autoindent::line_start(text, cursor.row) + column;
+            autoindent::line_break(text, at, &indent, colon_opens, region)
+        });
+        let eb = &*self.buffer;
+        let replace = &line_break.replace;
+        let ends = eb.bytes_to_cursors(&[replace.start as u32, replace.end as u32]);
+        let steps = eb.delete_range((ends[0].row, ends[0].col), (ends[1].row, ends[1].col))
+            + eb.insert_text(&line_break.insert);
+        let to = replace.start + line_break.cursor;
+        if to != replace.start + line_break.insert.len() {
+            let at = eb.bytes_to_cursors(&[to as u32])[0];
+            eb.set_cursor(at.row, at.col);
+        }
+        self.history().record(EditKind::Other, replaced + steps);
+    }
+
+    /// Where typing `c` at the cursor moves its line to, as [`autoindent`]
+    /// does closing brackets: the line, the column its text starts at, and
+    /// its new indentation. `None` if it stays.
+    fn closer_indent(&self, c: char) -> Option<(u32, u32, String)> {
+        if !matches!(c, ')' | ']' | '}') || self.has_selection() {
+            return None;
+        }
+        let cursor = self.buffer.cursor();
+        let line_start = self.buffer.position_to_offset(cursor.row, 0);
+        let before = self.buffer.text_range(line_start, cursor.offset);
+        if before.is_empty() || !before.bytes().all(|b| b == b' ' || b == b'\t') {
+            return None;
+        }
+        let indent = self.with_regions(|text, region| {
+            let at = autoindent::line_start(text, cursor.row) + before.len();
+            autoindent::closer_indent(text, at, c, region).map(str::to_string)
+        })?;
+        (indent != before).then_some((cursor.row, cursor.col, indent))
+    }
+
+    /// Runs `f` on the text and what's at each byte of it, by the syntax
+    /// tree; text that isn't highlighted is all code.
+    fn with_regions<T>(&self, f: impl FnOnce(&str, &dyn Fn(usize) -> Region) -> T) -> T {
+        let mut syntax = self.doc.syntax.borrow_mut();
+        let result = match syntax
+            .as_mut()
+            .and_then(|syntax| syntax.regions(&self.buffer))
+        {
+            Some((text, region)) => f(text, &region),
+            None => f(&self.buffer.text(), &|_| Region::Code),
+        };
+        result
     }
 
     /// Tab: inserts a tab, or spaces to the next multiple of the indent
@@ -2768,6 +2840,79 @@ mod tests {
         eb.set_text(text);
         let editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 8).unwrap();
         (eb, editor)
+    }
+
+    #[test]
+    fn enter_and_closing_brackets_indent_as_one_edit_each() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of("");
+        press(&mut editor, "fn f() {");
+        key(&mut editor, KeyCode::Enter);
+        press(&mut editor, "x");
+        key(&mut editor, KeyCode::Enter);
+        assert_eq!(eb.text(), "fn f() {\n    x\n    ");
+        press(&mut editor, "}");
+        assert_eq!(eb.text(), "fn f() {\n    x\n}");
+        assert_eq!(pos(&eb), (2, 1));
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "fn f() {\n    x\n    ");
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "fn f() {\n    x");
+
+        // Between a pair, the closing one goes on a line of its own.
+        eb.set_text("  g(a, {})");
+        eb.set_cursor(0, 8);
+        key(&mut editor, KeyCode::Enter);
+        assert_eq!(eb.text(), "  g(a, {\n      \n  })");
+        assert_eq!(pos(&eb), (1, 6));
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "  g(a, {})");
+
+        // Enter replaces the selection.
+        eb.set_text("  a(bc)");
+        eb.set_cursor(0, 4);
+        shift(&mut editor, KeyCode::Right);
+        key(&mut editor, KeyCode::Enter);
+        assert_eq!(eb.text(), "  a(\n      c)");
+    }
+
+    #[test]
+    fn brackets_in_comments_and_strings_dont_indent() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of("");
+        let rust = crate::language::detect(Some(std::path::Path::new("a.rs")), String::new);
+        editor.doc.set_language(rust);
+        let enter_at_end = |editor: &mut Editor, text: &str| {
+            eb.set_text(text);
+            eb.set_cursor(0, u32::MAX);
+            key(editor, KeyCode::Enter);
+            eb.text()
+        };
+        assert_eq!(
+            enter_at_end(&mut editor, "if x { // {"),
+            "if x { // {\n    "
+        );
+        assert_eq!(enter_at_end(&mut editor, "// see {"), "// see {\n");
+        assert_eq!(
+            enter_at_end(&mut editor, "let s = \"{\";"),
+            "let s = \"{\";\n"
+        );
+        assert_eq!(enter_at_end(&mut editor, "f(\"{\""), "f(\"{\"\n");
+
+        // A closing bracket in a comment stays where it's typed.
+        eb.set_text("{\n/*\n    \n*/");
+        eb.set_cursor(2, 4);
+        press(&mut editor, "}");
+        assert_eq!(eb.text(), "{\n/*\n    }\n*/");
+
+        // Python opens blocks with a colon.
+        let python = crate::language::detect(Some(std::path::Path::new("a.py")), String::new);
+        editor.doc.set_language(python);
+        assert_eq!(enter_at_end(&mut editor, "def f():"), "def f():\n    ");
+        assert_eq!(
+            enter_at_end(&mut editor, "x = 1  # note:"),
+            "x = 1  # note:\n"
+        );
     }
 
     #[test]

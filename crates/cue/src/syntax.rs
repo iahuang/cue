@@ -820,21 +820,8 @@ impl Highlighter {
     /// Highlights `buffer`'s lines `visible`, and a screen's worth either
     /// side, reparsing first if its text changed.
     pub fn sync(&mut self, buffer: &EditBuffer, visible: Range<u32>) {
-        if self.gave_up || visible.is_empty() {
+        if visible.is_empty() || !self.catch_up(buffer) {
             return;
-        }
-        let epoch = buffer.content_epoch();
-        if self.epoch != Some(epoch) {
-            self.epoch = Some(epoch);
-            self.painted.clear();
-            if !self.reparse(buffer.text()) {
-                self.gave_up = true;
-                self.tree = None;
-                self.text = String::new();
-                self.line_starts = vec![0];
-                buffer.remove_highlights(HIGHLIGHTS);
-                return;
-            }
         }
         if let Some(i) = self
             .painted
@@ -868,6 +855,41 @@ impl Highlighter {
             .collect();
         self.colorer.forget_unused();
         buffer.replace_highlights(HIGHLIGHTS, &highlights);
+    }
+
+    /// The text as the tree has it, and what's at each byte of it, brought
+    /// up to date with `buffer` first. `None` if it isn't parsed.
+    pub fn regions<'a>(
+        &'a mut self,
+        buffer: &EditBuffer,
+    ) -> Option<(&'a str, impl Fn(usize) -> Region + 'a)> {
+        if !self.catch_up(buffer) {
+            return None;
+        }
+        let tree = self.tree.as_ref()?;
+        Some((self.text.as_str(), |byte| region_at(tree, byte)))
+    }
+
+    /// Reparses `buffer`'s text if it changed since. False, leaving it
+    /// plain, if it's given up on.
+    fn catch_up(&mut self, buffer: &EditBuffer) -> bool {
+        if self.gave_up {
+            return false;
+        }
+        let epoch = buffer.content_epoch();
+        if self.epoch != Some(epoch) {
+            self.epoch = Some(epoch);
+            self.painted.clear();
+            if !self.reparse(buffer.text()) {
+                self.gave_up = true;
+                self.tree = None;
+                self.text = String::new();
+                self.line_starts = vec![0];
+                buffer.remove_highlights(HIGHLIGHTS);
+                return false;
+            }
+        }
+        true
     }
 
     /// Parses `text`, reusing the tree of the text before for what didn't
@@ -963,6 +985,38 @@ impl Highlighter {
         }
         highlights
     }
+}
+
+/// What a byte of text is part of, as far as indenting goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    Code,
+    Comment,
+    String,
+}
+
+/// What byte `byte` of the text `tree` is the tree of is in, going by the
+/// names of the nodes around it: grammars name theirs `line_comment`,
+/// `string_literal`, and so on. Code interpolated into a string, as in
+/// `f"{x}"`, is code.
+fn region_at(tree: &Tree, byte: usize) -> Region {
+    let mut node = tree.root_node().descendant_for_byte_range(byte, byte);
+    while let Some(n) = node {
+        if n.start_byte() <= byte && byte < n.end_byte() {
+            let kind = n.kind();
+            if kind.contains("interpolation") || kind.contains("substitution") {
+                return Region::Code;
+            }
+            if kind.contains("comment") {
+                return Region::Comment;
+            }
+            if kind.contains("string") {
+                return Region::String;
+            }
+        }
+        node = n.parent();
+    }
+    Region::Code
 }
 
 /// A node a query captured, and the style `S` it gets.

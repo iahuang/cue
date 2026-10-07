@@ -3,6 +3,7 @@
 mod alert;
 mod app;
 mod attach;
+mod autoindent;
 mod changes;
 mod client;
 mod commit_diff;
