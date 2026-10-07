@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Use VS Code word separators for double-click selection in the editor (`fd6db5a`)
-- Swap mark shortcuts: Ctrl+' sets the mark, Ctrl+Shift+' jumps to it (`4d0112b`)
+- Swap keybindings for set mark and clear mark (`4d0112b`)
 
 ## v0.3.8 — 2026-10-06
 
