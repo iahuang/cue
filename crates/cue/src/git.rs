@@ -653,7 +653,7 @@ pub enum Carried {
 pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
     let run = || {
         let mut command = writing(root);
-        command.arg("switch");
+        command.args(["switch", "--no-overwrite-ignore"]);
         match to {
             SwitchTo::Branch(name) => command.args(["--", name]),
             SwitchTo::New(name) => command.args(["-c", name]),
@@ -670,17 +670,26 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
         return Err(err);
     }
     let message = format!("Switching to {}", to.name());
+    let before = stashes(root).first().map(|stash| stash.commit.hash.clone());
     stash(root, &message, false)?;
+    let created = stashes(root).into_iter().next();
+    let Some(created) = created.filter(|stash| Some(&stash.commit.hash) != before.as_ref()) else {
+        // Ignored files aren't stashed. If they're all that's in the way,
+        // no stash was made, and an older one must not be popped.
+        return Err(err);
+    };
+    let restore = || {
+        let mut apply = writing(root);
+        apply.args(["stash", "apply", "--index", &created.commit.hash]);
+        run_with_input(apply, b"")?;
+        drop_stash(root, &created.commit.hash)
+    };
     if let Err(err) = run() {
         // Back as they were.
-        let mut pop = writing(root);
-        pop.args(["stash", "pop", "--index"]);
-        let _ = run_with_input(pop, b"");
+        let _ = restore();
         return Err(err);
     }
-    let mut pop = writing(root);
-    pop.args(["stash", "pop", "--index"]);
-    match run_with_input(pop, b"") {
+    match restore() {
         Ok(_) => Ok(Carried::Stashed),
         Err(err) => Ok(Carried::Conflicts(err)),
     }
@@ -1517,6 +1526,57 @@ pub(crate) mod tests {
         git.restart();
         git.wait();
         assert_eq!(git.repos()[0].stashes, stashes(&dir));
+    }
+
+    #[test]
+    fn switching_preserves_ignored_files_and_existing_stashes() {
+        let dir = repo("switch-ignored");
+        commit_as_cue(&dir);
+        fs::write(dir.join(".gitignore"), "config.local\n").unwrap();
+        commit_all(&dir, "ignore local config");
+        run(&dir, &["switch", "-q", "-c", "other"]);
+        fs::write(dir.join("config.local"), "other branch\n").unwrap();
+        run(&dir, &["add", "-f", "config.local"]);
+        commit_all(&dir, "track config");
+        run(&dir, &["switch", "-q", "main"]);
+
+        fs::write(dir.join("a.txt"), "older stash\n").unwrap();
+        stash(&dir, "keep this stash", false).unwrap();
+        let before = stashes(&dir);
+        fs::write(dir.join("config.local"), "local edits\n").unwrap();
+        // With only ignored changes, stash push succeeds without creating
+        // a stash. With other changes, those must be put back on failure.
+        for dirty in [false, true] {
+            if dirty {
+                fs::write(dir.join("b.txt"), "staged\n").unwrap();
+                stage(&dir, &[dir.join("b.txt")]).unwrap();
+                fs::write(dir.join("b.txt"), "unstaged\n").unwrap();
+                fs::write(dir.join("new.txt"), "new\n").unwrap();
+            }
+            let changes = staged(&dir);
+            let err = switch(&dir, &SwitchTo::Branch("other".into())).unwrap_err();
+            assert!(err.contains("config.local"), "{err}");
+            assert_eq!(
+                fs::read_to_string(dir.join("config.local")).unwrap(),
+                "local edits\n"
+            );
+            assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
+            assert_eq!(stashes(&dir), before, "an older stash is never popped");
+            assert_eq!(staged(&dir), changes);
+            let head = git(&dir).args(["branch", "--show-current"]).output().unwrap();
+            assert_eq!(head.stdout, b"main\n");
+            if dirty {
+                assert_eq!(
+                    fs::read_to_string(dir.join("b.txt")).unwrap(),
+                    "unstaged\n"
+                );
+                assert_eq!(
+                    file_at(&dir, "", Path::new("b.txt")),
+                    Base::Text("staged\n".into())
+                );
+                assert_eq!(fs::read_to_string(dir.join("new.txt")).unwrap(), "new\n");
+            }
+        }
     }
 
     #[test]
