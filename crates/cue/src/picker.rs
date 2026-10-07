@@ -737,7 +737,11 @@ impl Picker {
         let name = self.needle().trim();
         let new = self.mode() == Mode::Branches
             && !name.is_empty()
-            && !self.branches.iter().any(|item| item.text == name);
+            && !self.branches.iter().any(|item| {
+                // Switching to a remote's makes a branch by its name.
+                let to = matches!(&item.choice, Choice::Branch(to) if to.name() == name);
+                item.text == name || to
+            });
         self.new_branch = match new {
             true => vec![Item {
                 text: format!("Create branch “{name}”"),
@@ -1338,6 +1342,7 @@ mod tests {
         assert_eq!(listed(&picker), ["feature"], "it's there already");
         picker.select_all();
         picker.edit(Edit::Insert("fix"));
+        assert_eq!(listed(&picker), ["origin/fix"], "switching to it makes it");
         assert_eq!(
             picker.selected_choice(),
             Some(&Choice::Branch(SwitchTo::Track("origin/fix".into())))
