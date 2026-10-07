@@ -154,6 +154,11 @@ enum Redo {
     Trash(PathBuf),
     /// Staging these files, in the repository at this root.
     Stage(PathBuf, Vec<PathBuf>),
+    /// Stashing the changes in the repository at this root, as this
+    /// message: all of them.
+    Stash(PathBuf, String),
+    /// Dropping the stash with this hash, in the repository at this root.
+    DropStash(PathBuf, String),
 }
 
 /// An answer to an alert.
@@ -237,6 +242,8 @@ enum MenuFor {
     File(Entry),
     /// The session, from the status bar's badge.
     Session,
+    /// What's selected in the sidebar, which its commands act on.
+    Sidebar,
 }
 
 /// Where a mouse press landed; drags and the release go there too.
@@ -1289,7 +1296,20 @@ impl App {
                             true => self.changes.selected(),
                             false => None,
                         },
-                        Sidebar::Log | Sidebar::Commit => None,
+                        Sidebar::Commit => {
+                            let hit = self
+                                .commit_views
+                                .first_mut()
+                                .is_some_and(|view| view.select_at(mouse.y));
+                            let view = self.commit_views.first().filter(|_| hit);
+                            if view.is_some_and(CommitView::stash_selected) {
+                                self.open_stash_menu(Some((mouse.x, mouse.y)));
+                                None
+                            } else {
+                                view.and_then(CommitView::selected)
+                            }
+                        }
+                        Sidebar::Log => None,
                     };
                     if let Some(target) = target {
                         self.open_menu(target, Some((mouse.x, mouse.y)));
@@ -3109,10 +3129,17 @@ impl App {
         let preview = doc.is_some_and(|doc| self.is_preview(doc));
         self.tree.set_active(path.as_deref(), preview);
         self.changes.set_active(path.as_deref(), preview);
+        let commit = self.tabs[self.tab].active_panel().commit();
         for view in &mut self.commit_views {
             view.set_active(path.as_deref(), preview);
+            let stashed = commit
+                .filter(|commit| commit.root() == view.root())
+                .map(|commit| {
+                    let path = commit.change().path.as_path();
+                    (commit.commit().hash.as_str(), path)
+                });
+            view.set_active_stashed(stashed);
         }
-        let commit = self.tabs[self.tab].active_panel().commit();
         if let Some(log) = &mut self.log {
             let active = commit
                 .filter(|commit| commit.root() == log.root())
@@ -3487,6 +3514,14 @@ impl App {
             }
             Redo::Stage(root, paths) => {
                 self.stage_now(&root, &paths, true);
+                AppAction::Continue
+            }
+            Redo::Stash(root, message) => {
+                self.stash_now(&root, &message, false);
+                AppAction::Continue
+            }
+            Redo::DropStash(root, hash) => {
+                self.drop_stash(&root, &hash);
                 AppAction::Continue
             }
         };
@@ -4977,6 +5012,20 @@ impl App {
             }),
             CommitAction::Stage { paths, stage } => return self.stage(root, paths, stage),
             CommitAction::Commit => self.commit(),
+            CommitAction::Stash { message, staged } => return self.stash(root, message, staged),
+            CommitAction::ApplyStash { hash, pop } => self.apply_stash(&root, &hash, pop),
+            CommitAction::DropStash { hash, subject } => {
+                let message = "Its changes will be lost.";
+                let redo = Redo::DropStash(root, hash);
+                let buttons = vec![Button::new("&Drop", Answer::Go(redo)).danger()];
+                let title = format!("Drop “{subject}”?");
+                self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
+            }
+            CommitAction::OpenStashed {
+                commit,
+                change,
+                focus,
+            } => self.open_commit(&root, commit, change, focus),
         }
         AppAction::Continue
     }
@@ -5063,21 +5112,104 @@ impl App {
                 self.show_message(format!("Committed {hash}."), false);
                 self.git.restart();
             }
-            Err(err) => {
-                const MAX_LINES: usize = 20;
-                let mut message: Vec<&str> = err.lines().take(MAX_LINES).collect();
-                if err.lines().count() > MAX_LINES {
-                    message.push("…");
-                }
-                let message = match message.is_empty() {
-                    true => "git didn't say why.".to_string(),
-                    false => message.join("\n"),
-                };
-                let mut alert =
-                    Alert::new("Can't Commit", message, Vec::new(), self.width, self.height);
-                alert.set_cancel_label("OK");
-                self.alert = Some(alert);
+            Err(err) => self.show_git_error("Can't Commit", &err),
+        }
+    }
+
+    /// Says, in an alert titled `title`, what git, or a hook, said went
+    /// wrong.
+    fn show_git_error(&mut self, title: &str, err: &str) {
+        const MAX_LINES: usize = 20;
+        let mut message: Vec<&str> = err.lines().take(MAX_LINES).collect();
+        if err.lines().count() > MAX_LINES {
+            message.push("…");
+        }
+        let message = match message.is_empty() {
+            true => "git didn't say why.".to_string(),
+            false => message.join("\n"),
+        };
+        let mut alert = Alert::new(title, message, Vec::new(), self.width, self.height);
+        alert.set_cancel_label("OK");
+        self.alert = Some(alert);
+    }
+
+    /// The commit view of the repository at `root`, if it was shown.
+    fn commit_view_of(&mut self, root: &Path) -> Option<&mut CommitView> {
+        self.commit_views
+            .iter_mut()
+            .find(|view| view.root() == root)
+    }
+
+    /// Stashes the changes in the repository at `root`, as `message`: what's
+    /// staged, if `staged`, or else all of them, saving those with unsaved
+    /// changes first, so what's stashed is what's shown.
+    fn stash(&mut self, root: PathBuf, message: String, staged: bool) -> AppAction {
+        if !staged {
+            let docs: Vec<Rc<Document>> = self
+                .documents
+                .iter()
+                .filter(|doc| doc.is_modified())
+                .filter(|doc| {
+                    let path = doc.path().and_then(|path| path.canonicalize().ok());
+                    path.is_some_and(|path| path.starts_with(&root))
+                })
+                .cloned()
+                .collect();
+            if !docs.is_empty() {
+                let redo = Redo::Stash(root, message);
+                return self.save_then_go(Saving { docs, redo });
             }
+        }
+        self.stash_now(&root, &message, staged);
+        AppAction::Continue
+    }
+
+    fn stash_now(&mut self, root: &Path, message: &str, staged: bool) {
+        match git::stash(root, message, staged) {
+            Ok(()) => {
+                if let Some(view) = self.commit_view_of(root) {
+                    view.stashed();
+                }
+                let what = if staged {
+                    "the staged changes"
+                } else {
+                    "the changes"
+                };
+                self.show_message(format!("Stashed {what}."), false);
+            }
+            Err(err) => self.show_git_error("Can't Stash", &err),
+        }
+        self.git.restart();
+    }
+
+    /// Puts the changes stashed as `hash`, in the repository at `root`,
+    /// back, and if `pop`, drops the stash.
+    fn apply_stash(&mut self, root: &Path, hash: &str, pop: bool) {
+        let result = git::apply_stash(root, hash, pop);
+        if let Some(view) = self.commit_view_of(root) {
+            view.read_stashes();
+        }
+        self.git.restart();
+        match result {
+            Ok(()) if pop => self.show_message("Popped the stash.", false),
+            Ok(()) => self.show_message("Applied the stash.", false),
+            Err(err) if err.contains("CONFLICT") => {
+                self.show_git_error("Stash Applied with Conflicts", &err)
+            }
+            Err(err) => self.show_git_error("Can't Apply Stash", &err),
+        }
+    }
+
+    /// Drops the stash `hash`, in the repository at `root`.
+    fn drop_stash(&mut self, root: &Path, hash: &str) {
+        let result = git::drop_stash(root, hash);
+        if let Some(view) = self.commit_view_of(root) {
+            view.read_stashes();
+        }
+        self.git.restart();
+        match result {
+            Ok(()) => self.show_message("Dropped the stash.", false),
+            Err(err) => self.show_git_error("Can't Drop Stash", &err),
         }
     }
 
@@ -5198,9 +5330,44 @@ impl App {
         if self.focus != Focus::Tree {
             return;
         }
-        if let Some(target) = self.sidebar_selected() {
+        let stash = self
+            .commit_views
+            .first()
+            .is_some_and(CommitView::stash_selected);
+        if self.sidebar == Sidebar::Commit && stash {
+            self.open_stash_menu(None);
+        } else if let Some(target) = self.sidebar_selected() {
             self.open_menu(target, None);
         }
+    }
+
+    /// Opens the context menu of the stash selected in the commit view, at
+    /// the cell right-clicked, or from the keyboard, next to it.
+    fn open_stash_menu(&mut self, at: Option<(u32, u32)>) {
+        use Command::*;
+        let item = |command, label: &str| MenuItem::Command(command, label.to_string());
+        let items = vec![
+            item(TreeApplyStash, "Apply"),
+            item(TreePopStash, "Pop"),
+            MenuItem::Separator,
+            item(TreeDropStash, "Drop…"),
+        ];
+        let position = self
+            .commit_views
+            .first()
+            .and_then(CommitView::selected_position);
+        let (x, y) = at.or(position).unwrap_or((0, 0));
+        let menu = ContextMenu::new(
+            items,
+            &self.keymap,
+            x,
+            y,
+            at.is_some(),
+            self.width,
+            self.height,
+        );
+        self.close_popups();
+        self.menu = Some((menu, MenuFor::Sidebar));
     }
 
     /// Opens the context menu of the file or folder `target`, at the cell
@@ -5253,7 +5420,11 @@ impl App {
             .or_else(|| match self.sidebar {
                 Sidebar::Files => self.tree.selected_position(),
                 Sidebar::Changes => self.changes.selected_position(),
-                Sidebar::Log | Sidebar::Commit => None,
+                Sidebar::Commit => self
+                    .commit_views
+                    .first()
+                    .and_then(CommitView::selected_position),
+                Sidebar::Log => None,
             })
             .unwrap_or((0, 0));
         let menu = ContextMenu::new(
@@ -5302,7 +5473,7 @@ impl App {
             }
             MenuAction::Accept(command) => match self.menu.take() {
                 Some((_, MenuFor::File(target))) => self.file_command(command, target, true),
-                Some((_, MenuFor::Session)) => self.run(command, false),
+                Some((_, MenuFor::Session | MenuFor::Sidebar)) => self.run(command, false),
                 None => AppAction::Continue,
             },
         }
@@ -9680,7 +9851,12 @@ mod tests {
         assert_eq!(hover(&mut app, width - 2, 0), Some(width - 5..width));
         assert_eq!(hover(&mut app, 5, 2), None, "the message box");
         assert_eq!(hover(&mut app, 2, 4), Some(0..9), "Amend");
-        assert_eq!(hover(&mut app, 15, 4), None);
+        assert_eq!(hover(&mut app, 10, 4), None);
+        assert_eq!(
+            hover(&mut app, 15, 4),
+            Some(width - 19..width - 8),
+            "Stash all"
+        );
         assert_eq!(
             hover(&mut app, width - 2, 4),
             Some(width - 8..width),
@@ -9693,6 +9869,65 @@ mod tests {
             "its mark"
         );
         assert_eq!(hover(&mut app, 2, 8), None, "below the files");
+    }
+
+    #[test]
+    fn stashes_from_the_commit_view_and_puts_them_back() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-stash");
+        crate::git::tests::commit_as_cue(&root);
+        fs::write(root.join("a.txt"), "changed\n").unwrap();
+        fs::write(root.join("c.txt"), "new\n").unwrap();
+        let mut app = tall_app(&root, None);
+        wait_for_git(&mut app);
+        app.run(Command::ToggleChanges, false);
+        key(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "wip");
+        key(&mut app, KeyCode::Esc);
+        assert!(tall_screen(&app).contains("Stash all"));
+        let row_with = |app: &App, text: &str| -> u32 {
+            let screen = tall_screen(app);
+            let row = screen.lines().position(|line| line.contains(text));
+            row.unwrap_or_else(|| panic!("no {text:?} in\n{screen}")) as u32
+        };
+
+        let width = app.visible_tree_width();
+        let y = row_with(&app, "Stash all");
+        left_click(&mut app, width - 15, y);
+        assert!(tall_screen(&app).contains("Stashed the changes."));
+        assert!(!root.join("c.txt").exists(), "new files go too");
+        assert_eq!(app.commit_views[0].message(), "", "the box is emptied");
+        wait_for_git(&mut app);
+        assert!(tall_screen(&app).contains("No changes."));
+
+        // It opens to its buttons and files; a file opens to its diff.
+        let y = row_with(&app, "wip");
+        left_click(&mut app, 4, y);
+        let actions = row_with(&app, "Apply  Pop  Drop");
+        let y = row_with(&app, "c.txt");
+        left_click(&mut app, 8, y);
+        let shown = tall_screen(&app);
+        assert!(
+            shown.contains("c.txt @") && shown.contains("+ new"),
+            "{shown}"
+        );
+
+        left_click(&mut app, 12, actions);
+        assert!(tall_screen(&app).contains("Popped the stash."));
+        assert_eq!(fs::read_to_string(root.join("c.txt")).unwrap(), "new\n");
+        wait_for_git(&mut app);
+        assert!(!tall_screen(&app).contains("Stashes"), "none left");
+
+        // Dropping asks first.
+        app.run(Command::TreeStash, false);
+        wait_for_git(&mut app);
+        let y = row_with(&app, "WIP on main");
+        left_click(&mut app, 4, y);
+        app.run(Command::TreeDropStash, false);
+        assert!(tall_screen(&app).contains("Its changes will be lost."));
+        key(&mut app, KeyCode::Enter);
+        assert!(tall_screen(&app).contains("Dropped the stash."));
+        assert!(git::stashes(&root).is_empty());
     }
 
     #[test]

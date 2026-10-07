@@ -138,6 +138,8 @@ pub struct Repo {
     pub added: usize,
     /// Lines removed since the last commit, staged or not.
     pub removed: usize,
+    /// How many changes are stashed.
+    pub stashes: usize,
 }
 
 /// What git says of a file: the repository it's in, how it changed since
@@ -366,7 +368,10 @@ fn change_index(root: &Path, args: &[&str], paths: &[PathBuf]) -> Result<(), Str
         spec.push(0);
     }
     let mut command = writing(root);
+    // Only here: `git stash -u` with it leaves the new files it stashed
+    // behind.
     command
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .args(args)
         .args(["--pathspec-from-file=-", "--pathspec-file-nul"]);
     run_with_input(command, &spec).map(drop)
@@ -401,6 +406,144 @@ pub fn commit(root: &Path, message: &str, amend: bool) -> Result<String, String>
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Changes put away, as `git stash` keeps them: a commit of the files as
+/// they were, whose first parent is the commit checked out then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stash {
+    /// Its subject is what it was stashed as, without the branch it was
+    /// stashed on.
+    pub commit: Commit,
+    /// The commit git keeps the new files it didn't know of in, by hash,
+    /// if they were stashed too.
+    pub untracked: Option<String>,
+}
+
+/// The changes stashed in the repository at `root`, newest first.
+pub fn stashes(root: &Path) -> Vec<Stash> {
+    let output = git(root)
+        .args([
+            "stash",
+            "list",
+            "--format=%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%gs",
+        ])
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output.stdout,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(6, '\x1f');
+            let mut next = || fields.next().map(str::to_string);
+            let (hash, short, parents, author, time) =
+                (next()?, next()?, next()?, next()?, next()?);
+            let subject = next().unwrap_or_default();
+            let mut parents = parents.split(' ').map(str::to_string);
+            let parent = parents.next().filter(|p| !p.is_empty());
+            Some(Stash {
+                commit: Commit {
+                    hash,
+                    short,
+                    parent,
+                    author,
+                    time: time.parse().unwrap_or(0),
+                    subject: stash_subject(&subject),
+                },
+                untracked: parents.nth(1),
+            })
+        })
+        .collect()
+}
+
+/// What a stash was stashed as, from what git says of it: `On main: what`
+/// with a message, and `WIP on main: 0123abc subject` without.
+fn stash_subject(subject: &str) -> String {
+    match subject
+        .strip_prefix("On ")
+        .and_then(|rest| rest.split_once(": "))
+    {
+        Some((_, message)) => message.to_string(),
+        None => subject.to_string(),
+    }
+}
+
+/// The files `stash`, in the repository at `root`, changed, each with the
+/// commit that has it as it was stashed: the stash's own, or for a new
+/// file git didn't know of, the one it keeps those in. Sorted by path.
+pub fn stash_changes(root: &Path, stash: &Stash) -> Vec<(Commit, Change)> {
+    let mut changes: Vec<(Commit, Change)> = commit_changes(root, &stash.commit)
+        .into_iter()
+        .map(|change| (stash.commit.clone(), change))
+        .collect();
+    if let Some(untracked) = &stash.untracked {
+        let commit = Commit {
+            hash: untracked.clone(),
+            short: untracked.chars().take(stash.commit.short.len()).collect(),
+            parent: None,
+            ..stash.commit.clone()
+        };
+        let new = commit_changes(root, &commit);
+        changes.extend(new.into_iter().map(|change| (commit.clone(), change)));
+    }
+    changes.sort_by(|(_, a), (_, b)| a.path.cmp(&b.path));
+    changes
+}
+
+/// Stashes the changes in the repository at `root`, as `message`, if
+/// there is one: only what's staged, if `staged`, and otherwise all of
+/// them, new files git doesn't know of included.
+pub fn stash(root: &Path, message: &str, staged: bool) -> Result<(), String> {
+    let mut command = writing(root);
+    command.args(["stash", "push", "--quiet"]);
+    command.arg(if staged {
+        "--staged"
+    } else {
+        "--include-untracked"
+    });
+    let message = message.trim();
+    if !message.is_empty() {
+        command.args(["-m", message]);
+    }
+    run_with_input(command, b"").map(drop)
+}
+
+/// Puts the changes stashed as `hash`, in the repository at `root`, back,
+/// and if `pop`, drops the stash, unless they don't go back cleanly.
+/// Returns what git said went wrong: conflicts, or files in the way.
+pub fn apply_stash(root: &Path, hash: &str, pop: bool) -> Result<(), String> {
+    let name = stash_name(root, hash)?;
+    let mut command = writing(root);
+    // Not quiet: what conflicted is said along the way.
+    command.args(["stash", if pop { "pop" } else { "apply" }, &name]);
+    run_with_input(command, b"").map(drop)
+}
+
+/// Drops the changes stashed as `hash`, in the repository at `root`.
+pub fn drop_stash(root: &Path, hash: &str) -> Result<(), String> {
+    let name = stash_name(root, hash)?;
+    let mut command = writing(root);
+    command.args(["stash", "drop", "--quiet", &name]);
+    run_with_input(command, b"").map(drop)
+}
+
+/// What git calls the stash `hash` now, `stash@{2}`: by where it is in
+/// the list, which changes as stashes come and go.
+fn stash_name(root: &Path, hash: &str) -> Result<String, String> {
+    let output = git(root)
+        .args(["stash", "list", "--format=%H %gd"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(hash)?
+                .strip_prefix(' ')
+                .map(str::to_string)
+        })
+        .ok_or_else(|| "The stash is gone.".to_string())
+}
+
 /// `git` for something that changes the repository at `dir`: as [`git`],
 /// but in a session of its own, without the terminal, so a hook or a
 /// signing program that asks for something can't read from it or draw
@@ -409,7 +552,6 @@ fn writing(dir: &Path) -> Command {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new("git");
     command
-        .arg("--literal-pathspecs")
         .arg("-C")
         .arg(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -647,6 +789,7 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
             "status",
             "--porcelain=v2",
             "--branch",
+            "--show-stash",
             "-z",
             "--untracked-files=all",
         ])
@@ -656,6 +799,7 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
         return None;
     }
     let (head, commit, changes) = parse_status(&output.stdout);
+    let stashes = parse_stash_count(&output.stdout);
     let (mut added, removed) = diff_lines(top, commit.is_none());
     let untracked = changes
         .iter()
@@ -681,6 +825,7 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
         changes,
         added,
         removed,
+        stashes,
     })
 }
 
@@ -812,6 +957,16 @@ fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>) {
         }
     };
     (head, commit, changes)
+}
+
+/// How many changes are stashed, as `git status --show-stash` says, in a
+/// header of its own.
+fn parse_stash_count(output: &[u8]) -> usize {
+    output
+        .split(|&byte| byte == 0)
+        .find_map(|field| field.strip_prefix(b"# stash "))
+        .and_then(|count| std::str::from_utf8(count).ok()?.parse().ok())
+        .unwrap_or(0)
 }
 
 /// How much of a changed entry is staged, from the `XY` its line starts
@@ -1162,6 +1317,75 @@ pub(crate) mod tests {
         unstage(&dir, &[dir.join("a.txt")], true).unwrap();
         assert_eq!(staged(&dir), [("a.txt".to_string(), Staged::No)]);
         assert!(last_message(&dir).is_none());
+    }
+
+    #[test]
+    fn stashes_applies_and_drops() {
+        let dir = repo("stash");
+        commit_as_cue(&dir);
+        fs::write(dir.join("a.txt"), "staged\n").unwrap();
+        fs::write(dir.join("b.txt"), "not staged\n").unwrap();
+        stage(&dir, &[dir.join("a.txt")]).unwrap();
+        stash(&dir, "  just a  ", true).unwrap();
+        assert_eq!(
+            staged(&dir),
+            [("b.txt".to_string(), Staged::No)],
+            "only what was staged"
+        );
+        fs::write(dir.join("new.txt"), "new\n").unwrap();
+        stash(&dir, "", false).unwrap();
+        assert!(staged(&dir).is_empty(), "everything, new files too");
+
+        let list = stashes(&dir);
+        let subjects: Vec<&str> = list.iter().map(|s| s.commit.subject.as_str()).collect();
+        assert!(subjects[0].starts_with("WIP on main: "), "{subjects:?}");
+        assert_eq!(subjects[1], "just a");
+        assert!(list[0].untracked.is_some() && list[1].untracked.is_none());
+        let files = |stash: &Stash| -> Vec<(String, Kind)> {
+            stash_changes(&dir, stash)
+                .into_iter()
+                .map(|(commit, change)| {
+                    let name = change.path.strip_prefix(&dir).unwrap().display();
+                    let text = match file_at(&dir, &commit.hash, Path::new(&name.to_string())) {
+                        Base::Text(text) => text,
+                        _ => String::new(),
+                    };
+                    (format!("{name}: {}", text.trim()), change.kind)
+                })
+                .collect()
+        };
+        assert_eq!(
+            files(&list[0]),
+            [
+                ("b.txt: not staged".to_string(), Kind::Modified),
+                ("new.txt: new".to_string(), Kind::Added),
+            ]
+        );
+
+        apply_stash(&dir, &list[0].commit.hash, true).unwrap();
+        assert_eq!(stashes(&dir).len(), 1, "popped");
+        assert_eq!(fs::read_to_string(dir.join("new.txt")).unwrap(), "new\n");
+        // a.txt changed again, so the other doesn't go back cleanly.
+        fs::write(dir.join("a.txt"), "in the way\n").unwrap();
+        stage(&dir, &[dir.join("a.txt")]).unwrap();
+        commit(&dir, "In the way", false).unwrap();
+        let err = apply_stash(&dir, &list[1].commit.hash, false).unwrap_err();
+        assert!(err.contains("CONFLICT"), "{err}");
+        drop_stash(&dir, &list[1].commit.hash).unwrap();
+        assert!(stashes(&dir).is_empty());
+        assert_eq!(
+            drop_stash(&dir, &list[1].commit.hash).unwrap_err(),
+            "The stash is gone."
+        );
+
+        run(&dir, &["reset", "-q", "--hard"]);
+        let mut git = Git::new(std::slice::from_ref(&dir));
+        git.wait();
+        assert_eq!(git.repos()[0].stashes, 0);
+        stash(&dir, "again", false).unwrap();
+        git.restart();
+        git.wait();
+        assert_eq!(git.repos()[0].stashes, 1, "git status says how many");
     }
 
     #[test]

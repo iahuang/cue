@@ -525,7 +525,7 @@ impl LogView {
 
 /// How long `seconds` is, briefly, as the log says how long ago a commit
 /// was made.
-fn ago(seconds: i64) -> String {
+pub(crate) fn ago(seconds: i64) -> String {
     const MINUTE: i64 = 60;
     const HOUR: i64 = 60 * MINUTE;
     const DAY: i64 = 24 * HOUR;
@@ -557,6 +557,7 @@ mod tests {
             changes: Vec::new(),
             added: 0,
             removed: 0,
+            stashes: 0,
         }
     }
 

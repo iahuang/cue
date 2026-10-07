@@ -5,6 +5,7 @@
 - Indent new lines and closing brackets as you type (`334f3de`)
 - Add a commit view for staging and committing changes (`ac5f5af`)
 - Limit hover highlights in the Git sidebar views to rows and buttons that can be clicked (`ac5f5af`)
+- Add stashing, and applying, popping, and dropping stashes, to the commit view
 
 ## v0.3.9 — 2026-10-06
 

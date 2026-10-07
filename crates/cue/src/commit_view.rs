@@ -11,20 +11,27 @@
 //! mark of the row above them all, is of the files in it. Clicking a mark,
 //! or `s`, stages them all, or unstages them if they all were.
 //!
+//! Next to the button that commits is one that stashes, with the message
+//! written: what's staged, if anything is, and otherwise everything. Under
+//! the changes are the stashes, which open, as the log's commits do, to
+//! buttons to apply, pop, or drop them, and the files they changed.
+//!
 //! git commits in the background, since hooks may take a while.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use opentui::{Attributes, Buffer};
 
 use crate::changes::{button_area, draw_look, file_rows, Look};
-use crate::git::{self, Change, Kind, Repo, Staged};
+use crate::git::{self, Change, Commit, Kind, Repo, Staged, Stash};
 use crate::icons;
 use crate::keymap::Command;
 use crate::line_edit::{Caret, Edit};
+use crate::log::ago;
 use crate::theme;
 use crate::tree::{truncate, Entry};
 
@@ -38,6 +45,19 @@ const AMEND: &str = "Amend";
 const PLACEHOLDER: &str = "Message";
 /// What went wrong if git went away without saying.
 const STOPPED: &str = "git stopped unexpectedly.";
+/// The buttons on the row under an open stash.
+const STASH_BUTTONS: [(&str, StashButton); 3] = [
+    ("Apply", StashButton::Apply),
+    ("Pop", StashButton::Pop),
+    ("Drop", StashButton::Drop),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StashButton {
+    Apply,
+    Pop,
+    Drop,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitAction {
@@ -59,6 +79,29 @@ pub enum CommitAction {
     },
     /// Commit what's staged, with the message written.
     Commit,
+    /// Stash the changes as `message`: only what's staged, if `staged`.
+    Stash {
+        message: String,
+        staged: bool,
+    },
+    /// Put the changes stashed as `hash` back, and if `pop`, drop the
+    /// stash.
+    ApplyStash {
+        hash: String,
+        pop: bool,
+    },
+    /// Drop the stash `hash`, stashed as `subject`, once that's confirmed.
+    DropStash {
+        hash: String,
+        subject: String,
+    },
+    /// Show how a stash, as `commit`, made `change`, and move focus there
+    /// if `focus`.
+    OpenStashed {
+        commit: Commit,
+        change: Change,
+        focus: bool,
+    },
 }
 
 /// Why there's nothing to commit yet.
@@ -70,21 +113,43 @@ pub enum CantCommit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum What {
-    /// The row above all the files, which collapses them.
+    /// The row above all the changed files, which collapses them.
     All,
     Folder,
     File(Kind),
+    /// Under that row, when nothing changed; it can't be selected.
+    Note,
+    /// The row above the stashes, which collapses them.
+    Stashes,
+    /// The stash at this index, which opens.
+    Stash(usize),
+    /// The buttons under an open stash.
+    StashActions(usize),
+    StashFolder(usize),
+    /// A file the stash changed, and the commit that has it as stashed.
+    StashFile(usize, Commit, Change),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
     what: What,
-    /// The repository's top folder, for the row above all the files.
+    /// A folder's or file's path; the repository's top folder for the
+    /// row above all the changed files.
     path: PathBuf,
     name: String,
     depth: usize,
-    /// How much of the files it's of are staged.
+    /// How much of the changed files it's of are staged.
     staged: Staged,
+    /// The hash of the stash it's of, if it is.
+    stash: Option<String>,
+}
+
+impl Row {
+    /// Whether it's the same entry as `other`, laid out again.
+    fn same(&self, other: &Row) -> bool {
+        (&self.path, &self.stash) == (&other.path, &other.stash)
+            && std::mem::discriminant(&self.what) == std::mem::discriminant(&other.what)
+    }
 }
 
 /// The commit's message as it's written, and where in it the cursor is.
@@ -136,6 +201,22 @@ pub struct CommitView {
     active: Option<PathBuf>,
     /// The active file is a preview, shown in italics.
     active_preview: bool,
+    /// The changes stashed, newest first.
+    stashes: Vec<Stash>,
+    /// How many git said were stashed when they were read: once it says
+    /// another number, they're read again.
+    stash_count: Option<usize>,
+    /// The stashes collapsed under the row above them.
+    stashes_collapsed: bool,
+    /// The files each stash opened changed, by hash, read when it's first
+    /// opened.
+    stash_files: HashMap<String, Vec<(Commit, Change)>>,
+    /// The stashes opened, by hash.
+    open_stashes: HashSet<String>,
+    /// The folders collapsed in stashes, by hash and path.
+    stash_collapsed: HashSet<(String, PathBuf)>,
+    /// The stashed file shown in the editor, by its commit's hash and path.
+    active_stashed: Option<(String, PathBuf)>,
 }
 
 impl CommitView {
@@ -160,6 +241,13 @@ impl CommitView {
             committing: None,
             active: None,
             active_preview: false,
+            stashes: Vec::new(),
+            stash_count: None,
+            stashes_collapsed: false,
+            stash_files: HashMap::new(),
+            open_stashes: HashSet::new(),
+            stash_collapsed: HashSet::new(),
+            active_stashed: None,
         };
         view.set_repo(repo);
         view
@@ -179,7 +267,30 @@ impl CommitView {
             self.amend = false;
         }
         self.changes = repo.changes.clone();
+        if self.stash_count != Some(repo.stashes) {
+            self.read_stashes();
+            self.stash_count = Some(repo.stashes);
+        }
         self.rebuild();
+    }
+
+    /// Reads the stashes again, as after stashing, applying, or dropping
+    /// one, keeping those still there open.
+    pub fn read_stashes(&mut self) {
+        self.stashes = git::stashes(&self.root);
+        self.stash_count = Some(self.stashes.len());
+        let hashes: HashSet<&String> = self.stashes.iter().map(|s| &s.commit.hash).collect();
+        self.open_stashes.retain(|hash| hashes.contains(hash));
+        self.stash_files.retain(|hash, _| hashes.contains(hash));
+        self.rebuild();
+    }
+
+    /// The changes were stashed: the message box is emptied.
+    pub fn stashed(&mut self) {
+        self.message = Message::default();
+        self.amend = false;
+        self.filled = None;
+        self.read_stashes();
     }
 
     /// Marks the files at `paths` staged, or not, as they are once git's
@@ -208,6 +319,12 @@ impl CommitView {
         self.active_preview = preview;
     }
 
+    /// Highlights the file `commit` changed at `path`, if it's a stash's,
+    /// as the one in the editor.
+    pub fn set_active_stashed(&mut self, active: Option<(&str, &Path)>) {
+        self.active_stashed = active.map(|(hash, path)| (hash.to_string(), path.to_path_buf()));
+    }
+
     /// Whether the keyboard is in the message box.
     pub fn editing(&self) -> bool {
         self.editing
@@ -218,9 +335,12 @@ impl CommitView {
         self.editing = editing;
     }
 
-    /// The selected file or folder, if any.
+    /// The selected changed file or folder, if any.
     pub fn selected(&self) -> Option<Entry> {
         let row = self.rows.get(self.selected)?;
+        if !matches!(row.what, What::All | What::Folder | What::File(_)) {
+            return None;
+        }
         Some(Entry {
             path: row.path.clone(),
             is_dir: !matches!(row.what, What::File(_)),
@@ -240,11 +360,44 @@ impl CommitView {
         self.committing.is_some()
     }
 
+    /// Whether a stash, or something in one, is selected.
+    pub fn stash_selected(&self) -> bool {
+        self.selected_stash().is_some()
+    }
+
+    /// Selects the entry on screen row `y`, as a right click does, without
+    /// opening it. Returns false if there's none there.
+    pub fn select_at(&mut self, y: u32) -> bool {
+        let Some(row) = y.checked_sub(self.list_top() as u32) else {
+            return false;
+        };
+        let index = self.scroll + row as usize;
+        if self
+            .rows
+            .get(index)
+            .is_none_or(|row| row.what == What::Note)
+        {
+            return false;
+        }
+        self.editing = false;
+        self.select(index);
+        true
+    }
+
+    /// Where the selected entry's name is on screen: the column, from the
+    /// view's left edge, and the row. `None` if it's scrolled out of view.
+    pub fn selected_position(&self) -> Option<(u32, u32)> {
+        let row = self.rows.get(self.selected)?;
+        let y = self.selected.checked_sub(self.scroll)?;
+        let x = 3 + 2 * row.depth as u32;
+        (y < self.list_height()).then_some((x, (self.list_top() + y) as u32))
+    }
+
     pub fn run(&mut self, command: Command) -> CommitAction {
         let page = self.list_height().saturating_sub(1).max(1);
         match command {
-            Command::TreeUp => self.select(self.selected.saturating_sub(1)),
-            Command::TreeDown => self.select(self.selected + 1),
+            Command::TreeUp => self.step(-1),
+            Command::TreeDown => self.step(1),
             Command::TreePageUp => self.select(self.selected.saturating_sub(page)),
             Command::TreePageDown => self.select(self.selected + page),
             Command::TreeFirst => self.select(0),
@@ -254,9 +407,47 @@ impl CommitView {
             Command::TreeOpen => return self.activate(true, false),
             Command::TreePreview => return self.activate(false, true),
             Command::TreeToggleStaged => return self.toggle_staged(self.selected),
+            Command::TreeStash => return self.stash(),
+            Command::TreeApplyStash => return self.stash_button(StashButton::Apply),
+            Command::TreePopStash => return self.stash_button(StashButton::Pop),
+            Command::TreeDropStash => return self.stash_button(StashButton::Drop),
             _ => {}
         }
         CommitAction::None
+    }
+
+    /// Stashes the changes, with the message written: what's staged, if
+    /// anything is, or else all of them.
+    fn stash(&self) -> CommitAction {
+        if self.changes.is_empty() || self.committing() {
+            return CommitAction::None;
+        }
+        CommitAction::Stash {
+            message: self.message.text.clone(),
+            staged: self.staged_count() > 0,
+        }
+    }
+
+    /// The stash the selected row is of, if it is.
+    fn selected_stash(&self) -> Option<&Stash> {
+        let hash = self.rows.get(self.selected)?.stash.as_ref()?;
+        self.stashes.iter().find(|stash| &stash.commit.hash == hash)
+    }
+
+    /// What `button` does to the selected stash.
+    fn stash_button(&self, button: StashButton) -> CommitAction {
+        let Some(stash) = self.selected_stash() else {
+            return CommitAction::None;
+        };
+        let hash = stash.commit.hash.clone();
+        match button {
+            StashButton::Apply => CommitAction::ApplyStash { hash, pop: false },
+            StashButton::Pop => CommitAction::ApplyStash { hash, pop: true },
+            StashButton::Drop => CommitAction::DropStash {
+                hash,
+                subject: stash.commit.subject.clone(),
+            },
+        }
     }
 
     /// A left click at column `x` of screen row `y`, from the view's top
@@ -293,19 +484,29 @@ impl CommitView {
         if y == actions {
             if self.amend_area().contains(&x) {
                 self.toggle_amend();
+            } else if self.stash_area().contains(&x) {
+                return self.stash();
             } else if self.commit_area().contains(&x) {
                 return CommitAction::Commit;
             }
             return CommitAction::None;
         }
-        self.editing = false;
-        let index = self.scroll + (y - actions - 1) as usize;
-        if index >= self.rows.len() {
+        if !self.select_at(y) {
             return CommitAction::None;
         }
-        self.select(index);
-        if self.mark_area().contains(&x) {
-            return self.toggle_staged(index);
+        let row = &self.rows[self.selected];
+        match row.what {
+            What::StashActions(_) => {
+                let buttons = self.stash_buttons(row.depth);
+                return match buttons.into_iter().find(|(area, _)| area.contains(&x)) {
+                    Some((_, button)) => self.stash_button(button),
+                    None => CommitAction::None,
+                };
+            }
+            What::All | What::Folder | What::File(_) if self.mark_area().contains(&x) => {
+                return self.toggle_staged(self.selected);
+            }
+            _ => {}
         }
         self.activate(double, !double)
     }
@@ -324,11 +525,20 @@ impl CommitView {
         let actions = self.message_rows() as u32 + 3;
         let areas = match y {
             0 => vec![self.back_area(), self.log_area()],
-            y if y == actions => vec![self.amend_area(), self.commit_area()],
+            y if y == actions => vec![self.amend_area(), self.stash_area(), self.commit_area()],
             y if y > actions => {
-                self.rows.get(self.scroll + (y - actions - 1) as usize)?;
-                let row = 0..self.mark_area().start;
-                vec![row, self.mark_area()]
+                let row = self.rows.get(self.scroll + (y - actions - 1) as usize)?;
+                match row.what {
+                    What::Note => return None,
+                    What::All | What::Folder | What::File(_) => {
+                        vec![0..self.mark_area().start, self.mark_area()]
+                    }
+                    What::StashActions(_) => {
+                        let buttons = self.stash_buttons(row.depth).into_iter();
+                        buttons.map(|(area, _)| area).collect()
+                    }
+                    _ => return Some(0..self.width),
+                }
             }
             _ => return None,
         };
@@ -366,6 +576,32 @@ impl CommitView {
         let width = self.button_label().chars().count() as u32;
         let start = self.width.saturating_sub(width + 1);
         button_area(start..start + width)
+    }
+
+    /// The button that stashes, before the one that commits, if there's
+    /// room for it.
+    fn stash_area(&self) -> Range<u32> {
+        let commit = self.commit_area();
+        let width = self.stash_label().chars().count() as u32;
+        let start = (commit.start + 1).saturating_sub(width + 2);
+        match start > self.amend_area().end {
+            true => button_area(start..start + width),
+            false => 0..0,
+        }
+    }
+
+    /// Where the buttons under a stash at `depth` are, and which each is.
+    fn stash_buttons(&self, depth: usize) -> Vec<(Range<u32>, StashButton)> {
+        let mut x = 1 + 2 * depth as u32;
+        STASH_BUTTONS
+            .iter()
+            .map(|&(label, button)| {
+                let columns = x..x + label.len() as u32;
+                x = columns.end + 2;
+                (button_area(columns), button)
+            })
+            .filter(|(area, _)| area.end <= self.width)
+            .collect()
     }
 
     /// A row's mark, at the end of the list's rows.
@@ -541,15 +777,13 @@ impl CommitView {
             cursor = self.draw_message(frame, x, focused && self.editing);
             self.draw_actions(frame, x);
             let top = self.list_top() as u32;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
             let visible = self.scroll..self.rows.len();
             for (index, y) in visible.zip(top..self.height) {
                 let selected = (index == self.selected).then_some(focused && !self.editing);
-                self.draw_row(frame, index, (x, y, width), selected);
-            }
-            if self.changes.is_empty() && top + 1 < self.height {
-                let colors = theme::colors();
-                let note = truncate("No changes.", width.saturating_sub(2) as usize);
-                frame.draw_text(&note, x + 1, top + 1, colors.faint, None, Attributes::NONE);
+                self.draw_row(frame, index, (x, y, width), selected, now);
             }
         });
         cursor
@@ -665,6 +899,24 @@ impl CommitView {
             };
             frame.draw_text(&label, button_x, y, fg, None, attributes);
         }
+        let stash = self.stash_area();
+        if !stash.is_empty() {
+            let fg = match self.changes.is_empty() || self.committing() {
+                true => colors.faint,
+                false => colors.text,
+            };
+            let label = self.stash_label();
+            frame.draw_text(&label, x + stash.start + 1, y, fg, None, Attributes::NONE);
+        }
+    }
+
+    /// What the button that stashes says: how many files it stashes, if
+    /// some are staged, or that it stashes all of them.
+    fn stash_label(&self) -> String {
+        match self.staged_count() {
+            0 => "Stash all".to_string(),
+            count => format!("Stash {count}"),
+        }
     }
 
     /// What the button that commits says.
@@ -681,37 +933,99 @@ impl CommitView {
         }
     }
 
-    fn draw_row(&self, frame: &Buffer, index: usize, at: (u32, u32, u32), selected: Option<bool>) {
+    fn draw_row(
+        &self,
+        frame: &Buffer,
+        index: usize,
+        at: (u32, u32, u32),
+        selected: Option<bool>,
+        now: i64,
+    ) {
         let colors = theme::colors();
         let row = &self.rows[index];
-        let active = self.active.as_ref() == Some(&row.path);
+        let active = match &row.what {
+            What::StashFile(_, commit, change) => self
+                .active_stashed
+                .as_ref()
+                .is_some_and(|(hash, path)| *hash == commit.hash && *path == change.path),
+            What::File(_) => self.active.as_ref() == Some(&row.path),
+            _ => false,
+        };
+        let kind = match &row.what {
+            What::File(kind) => Some(*kind),
+            What::StashFile(_, _, change) => Some(change.kind),
+            _ => None,
+        };
         let (fg, mut attributes) = match &row.what {
-            What::All => (colors.text, Attributes::BOLD),
-            _ if active && self.active_preview => {
+            What::All | What::Stashes => (colors.text, Attributes::BOLD),
+            What::Note | What::StashActions(_) => (colors.faint, Attributes::NONE),
+            _ if active && self.active_preview && row.stash.is_none() => {
                 (colors.accent, Attributes::BOLD | Attributes::ITALIC)
             }
             _ if active => (colors.accent, Attributes::BOLD),
-            What::File(kind) => (colors.hue(kind.hue()), Attributes::NONE),
-            What::Folder => (colors.text, Attributes::NONE),
+            _ => match kind {
+                Some(kind) => (colors.hue(kind.hue()), Attributes::NONE),
+                None => (colors.text, Attributes::NONE),
+            },
         };
-        if row.what == What::File(Kind::Deleted) {
+        if kind == Some(Kind::Deleted) {
             attributes |= Attributes::STRIKETHROUGH;
         }
-        let open = !self.collapsed.contains(&row.path);
-        let letter;
-        let (open, icon, right) = match &row.what {
-            What::All => (Some(open), None, None),
-            What::Folder => (Some(open), Some(icons::folder(open)), None),
-            What::File(kind) => {
-                letter = kind.letter().to_string();
-                let right = Some((letter.as_str(), colors.hue(kind.hue())));
-                (None, Some(icons::file(&row.name)), right)
+        if let What::StashActions(_) = row.what {
+            if let Some(focused) = selected {
+                let bg = match focused {
+                    true => colors.selected,
+                    false => colors.selected_unfocused,
+                };
+                frame.fill_rect(at.0, at.1, at.2, 1, bg);
             }
+            for (&(label, _), (area, _)) in STASH_BUTTONS.iter().zip(self.stash_buttons(row.depth))
+            {
+                frame.draw_text(
+                    label,
+                    at.0 + area.start + 1,
+                    at.1,
+                    colors.muted,
+                    None,
+                    Attributes::NONE,
+                );
+            }
+            return;
+        }
+        let letter;
+        let ago_text;
+        let count;
+        let right = match &row.what {
+            _ if kind.is_some() => {
+                let kind = kind.unwrap_or(Kind::Modified);
+                letter = kind.letter().to_string();
+                Some((letter.as_str(), colors.hue(kind.hue())))
+            }
+            What::Stash(i) => {
+                ago_text = ago(now - self.stashes[*i].commit.time);
+                Some((ago_text.as_str(), colors.muted))
+            }
+            What::Stashes => {
+                count = self.stashes.len().to_string();
+                Some((count.as_str(), colors.muted))
+            }
+            _ => None,
         };
-        let mark = match row.staged {
-            Staged::Yes => ("●", colors.accent),
-            Staged::Partly => ("◐", colors.accent),
-            Staged::No => ("○", colors.muted),
+        let open = self.is_open(row);
+        let icon = match &row.what {
+            What::Folder | What::StashFolder(_) => Some(icons::folder(open == Some(true))),
+            What::File(_) | What::StashFile(..) => Some(icons::file(&row.name)),
+            _ => None,
+        };
+        let mark = match (&row.what, row.staged) {
+            (What::All | What::Folder | What::File(_), Staged::Yes) => Some(("●", colors.accent)),
+            (What::All | What::Folder | What::File(_), Staged::Partly) => {
+                Some(("◐", colors.accent))
+            }
+            (What::All | What::Folder | What::File(_), Staged::No) => Some(("○", colors.muted)),
+            // So how a stash changed a file lines up with how files changed.
+            (What::StashFile(..), _) => Some((" ", colors.muted)),
+            _ => None,
         };
         let look = Look {
             depth: row.depth,
@@ -722,9 +1036,53 @@ impl CommitView {
             fg,
             attributes,
             right,
-            mark: Some(mark),
+            mark,
         };
         draw_look(frame, &look, at, selected);
+    }
+
+    /// Whether `row` is open, if it opens: the rows above the changes and
+    /// the stashes, folders, and stashes.
+    fn is_open(&self, row: &Row) -> Option<bool> {
+        let hash = row.stash.clone().unwrap_or_default();
+        match &row.what {
+            What::All | What::Folder => Some(!self.collapsed.contains(&row.path)),
+            What::Stashes => Some(!self.stashes_collapsed),
+            What::Stash(_) => Some(self.open_stashes.contains(&hash)),
+            What::StashFolder(_) => Some(!self.stash_collapsed.contains(&(hash, row.path.clone()))),
+            _ => None,
+        }
+    }
+
+    /// Opens `row`, or closes it if it's open, reading a stash's files the
+    /// first time it opens.
+    fn toggle(&mut self, row: &Row) {
+        let hash = row.stash.clone().unwrap_or_default();
+        match &row.what {
+            What::All | What::Folder => {
+                if !self.collapsed.remove(&row.path) {
+                    self.collapsed.insert(row.path.clone());
+                }
+            }
+            What::Stashes => self.stashes_collapsed = !self.stashes_collapsed,
+            What::Stash(i) => {
+                if !self.open_stashes.remove(&hash) {
+                    if !self.stash_files.contains_key(&hash) {
+                        let files = git::stash_changes(&self.root, &self.stashes[*i]);
+                        self.stash_files.insert(hash.clone(), files);
+                    }
+                    self.open_stashes.insert(hash);
+                }
+            }
+            What::StashFolder(_) => {
+                let key = (hash, row.path.clone());
+                if !self.stash_collapsed.remove(&key) {
+                    self.stash_collapsed.insert(key);
+                }
+            }
+            _ => return,
+        }
+        self.rebuild();
     }
 
     // --- layout ---------------------------------------------------------------
@@ -774,18 +1132,26 @@ impl CommitView {
 
     // --- rows -----------------------------------------------------------------
 
-    /// Lists the rows again, from the changes and what's collapsed,
-    /// keeping the selection on the same entry while it's still listed.
+    /// Lists the rows again, from the changes, the stashes, and what's
+    /// open, keeping the selection on the same entry while it's still
+    /// listed.
     fn rebuild(&mut self) {
         let selected = self.rows.get(self.selected).cloned();
+        let row = |what, path: PathBuf, name: &str, depth| Row {
+            what,
+            path,
+            name: name.to_string(),
+            depth,
+            staged: Staged::No,
+            stash: None,
+        };
         let mut rows = vec![Row {
-            what: What::All,
-            path: self.root.clone(),
-            name: "Changes".to_string(),
-            depth: 0,
             staged: staged_under(&self.changes, &self.root),
+            ..row(What::All, self.root.clone(), "Changes", 0)
         }];
-        if !self.collapsed.contains(&self.root) {
+        if self.changes.is_empty() {
+            rows.push(row(What::Note, PathBuf::new(), "No changes.", 0));
+        } else if !self.collapsed.contains(&self.root) {
             let collapsed = |path: &Path| self.collapsed.contains(path);
             for file in file_rows(&self.changes, &self.root, 1, &collapsed) {
                 let (what, staged) = match file.kind {
@@ -793,21 +1159,57 @@ impl CommitView {
                     None => (What::Folder, staged_under(&self.changes, &file.path)),
                 };
                 rows.push(Row {
-                    what,
-                    path: file.path,
-                    name: file.name,
-                    depth: file.depth,
                     staged,
+                    ..row(what, file.path, &file.name, file.depth)
                 });
             }
         }
+        if !self.stashes.is_empty() {
+            rows.push(row(What::Stashes, PathBuf::new(), "Stashes", 0));
+        }
+        for (i, stash) in self.stashes.iter().enumerate() {
+            if self.stashes_collapsed {
+                break;
+            }
+            let hash = &stash.commit.hash;
+            let of_stash = |row: Row| Row {
+                stash: Some(hash.clone()),
+                ..row
+            };
+            rows.push(of_stash(row(
+                What::Stash(i),
+                PathBuf::new(),
+                &stash.commit.subject,
+                1,
+            )));
+            if !self.open_stashes.contains(hash) {
+                continue;
+            }
+            rows.push(of_stash(row(What::StashActions(i), PathBuf::new(), "", 2)));
+            let files = self.stash_files.get(hash).map_or(&[][..], Vec::as_slice);
+            let changes: Vec<Change> = files.iter().map(|(_, change)| change.clone()).collect();
+            let collapsed = |path: &Path| {
+                self.stash_collapsed
+                    .contains(&(hash.clone(), path.to_path_buf()))
+            };
+            for file in file_rows(&changes, &self.root, 2, &collapsed) {
+                let what = match file.kind {
+                    None => What::StashFolder(i),
+                    Some(_) => {
+                        let Some((commit, change)) =
+                            files.iter().find(|(_, change)| change.path == file.path)
+                        else {
+                            continue;
+                        };
+                        What::StashFile(i, commit.clone(), change.clone())
+                    }
+                };
+                rows.push(of_stash(row(what, file.path, &file.name, file.depth)));
+            }
+        }
         self.rows = rows;
-        let same = |row: &Row, other: &Row| {
-            row.path == other.path
-                && std::mem::discriminant(&row.what) == std::mem::discriminant(&other.what)
-        };
         if let Some(index) =
-            selected.and_then(|selected| self.rows.iter().position(|row| same(row, &selected)))
+            selected.and_then(|selected| self.rows.iter().position(|row| row.same(&selected)))
         {
             self.selected = index;
         }
@@ -835,6 +1237,7 @@ impl CommitView {
         let changes: Vec<&Change> = match row.what {
             What::File(_) => self.change(&row.path).into_iter().collect(),
             What::All | What::Folder => changes_under(&self.changes, &row.path).collect(),
+            _ => Vec::new(),
         };
         if changes.is_empty() || self.committing() {
             return CommitAction::None;
@@ -859,10 +1262,37 @@ impl CommitView {
 
     // --- navigation -----------------------------------------------------------
 
-    /// Selects row `index` (clamped) and scrolls it into view.
+    /// Selects row `index` (clamped), or if that's the note that nothing
+    /// changed, the row next to it, and scrolls it into view.
     fn select(&mut self, index: usize) {
-        self.selected = index.min(self.rows.len().saturating_sub(1));
+        let mut index = index.min(self.rows.len().saturating_sub(1));
+        if self
+            .rows
+            .get(index)
+            .is_some_and(|row| row.what == What::Note)
+        {
+            index = match index + 1 < self.rows.len() {
+                true => index + 1,
+                false => index - 1,
+            };
+        }
+        self.selected = index;
         self.scroll_into_view();
+    }
+
+    /// Moves the selection `by` rows, over the note that nothing changed.
+    fn step(&mut self, by: isize) {
+        let mut index = self.selected.saturating_add_signed(by);
+        if self
+            .rows
+            .get(index)
+            .is_some_and(|row| row.what == What::Note)
+        {
+            index = index.saturating_add_signed(by.signum());
+        }
+        if index < self.rows.len() {
+            self.select(index);
+        }
     }
 
     fn scroll_into_view(&mut self) {
@@ -875,61 +1305,62 @@ impl CommitView {
         self.scroll = self.scroll.min(self.rows.len().saturating_sub(height));
     }
 
-    /// Enter/Shift+Space/click: opens the selected file, or collapses or
-    /// expands a folder.
+    /// Enter/Shift+Space/click: opens the selected file, or a stash's, or
+    /// opens or closes what opens.
     fn activate(&mut self, focus: bool, preview: bool) -> CommitAction {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
             return CommitAction::None;
         };
-        if let What::File(_) = row.what {
-            return CommitAction::Open {
-                path: row.path.clone(),
+        match row.what {
+            What::File(_) => CommitAction::Open {
+                path: row.path,
                 focus,
                 preview,
-            };
+            },
+            What::StashFile(_, commit, change) => CommitAction::OpenStashed {
+                commit,
+                change,
+                focus,
+            },
+            _ => {
+                self.toggle(&row);
+                CommitAction::None
+            }
         }
-        let path = row.path.clone();
-        if !self.collapsed.remove(&path) {
-            self.collapsed.insert(path);
-        }
-        self.rebuild();
-        CommitAction::None
     }
 
-    /// Right: expands a collapsed folder, or steps into an expanded one.
+    /// Right: opens what's selected, if it's closed, or steps into it.
     fn expand_or_enter(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
             return;
         };
-        if let What::File(_) = row.what {
-            return;
-        }
-        if self.collapsed.remove(&row.path) {
-            self.rebuild();
-        } else if self
-            .rows
-            .get(self.selected + 1)
-            .is_some_and(|next| next.depth > row.depth)
-        {
-            self.select(self.selected + 1);
+        match self.is_open(&row) {
+            Some(false) => self.toggle(&row),
+            Some(true)
+                if self
+                    .rows
+                    .get(self.selected + 1)
+                    .is_some_and(|next| next.depth > row.depth) =>
+            {
+                self.select(self.selected + 1)
+            }
+            _ => {}
         }
     }
 
-    /// Left: collapses an expanded folder, or steps out to the parent.
+    /// Left: closes what's selected, if it's open, or steps out to what
+    /// it's in.
     fn collapse_or_leave(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
             return;
         };
-        let collapses = !matches!(row.what, What::File(_));
-        if collapses && !self.collapsed.contains(&row.path) {
-            self.collapsed.insert(row.path.clone());
-            self.rebuild();
+        if self.is_open(&row) == Some(true) {
+            self.toggle(&row);
             return;
         }
-        let depth = row.depth;
         if let Some(parent) = self.rows[..self.selected]
             .iter()
-            .rposition(|row| row.depth < depth)
+            .rposition(|other| other.depth < row.depth)
         {
             self.select(parent);
         }
@@ -1038,6 +1469,7 @@ mod tests {
                 .collect(),
             added: 0,
             removed: 0,
+            stashes: 0,
             root,
         }
     }

@@ -173,6 +173,10 @@ commands! {
     TreeRemoveFolder => "tree:remove-folder", "File Tree: Remove Folder from Workspace";
     TreeToggleStaged => "tree:toggle-staged", "Changes: Stage or Unstage";
     TreeCommit => "tree:commit", "Changes: Commit…";
+    TreeStash => "tree:stash", "Changes: Stash";
+    TreeApplyStash => "tree:apply-stash", "Changes: Apply Stash";
+    TreePopStash => "tree:pop-stash", "Changes: Pop Stash";
+    TreeDropStash => "tree:drop-stash", "Changes: Drop Stash…";
     GitCommit => "git:commit", "Commit Staged Changes";
     PickerUp => "picker:up", "Picker: Select Previous";
     PickerDown => "picker:down", "Picker: Select Next";
@@ -257,9 +261,8 @@ impl Command {
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
             | TreeDuplicate | TreeTrash | TreeCopyPath | TreeCopyRelativePath | TreeReveal
-            | TreeOpenInTerminal | TreeRemoveFolder | TreeToggleStaged | TreeCommit => {
-                Context::Tree
-            }
+            | TreeOpenInTerminal | TreeRemoveFolder | TreeToggleStaged | TreeCommit | TreeStash
+            | TreeApplyStash | TreePopStash | TreeDropStash => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
@@ -902,6 +905,11 @@ mod tests {
             Command::ToggleChanges,
             // So does the button in a changed file's header.
             Command::ToggleDiff,
+            // The commit view's buttons, and a stash's menu, get there too.
+            Command::TreeStash,
+            Command::TreeApplyStash,
+            Command::TreePopStash,
+            Command::TreeDropStash,
         ];
         let keymap = Keymap::default();
         for &command in Command::ALL {
