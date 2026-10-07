@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Indent new lines and closing brackets as you type
-- Add a commit view for staging and committing changes
-- Limit hover highlights in the Git sidebar views to rows and buttons that can be clicked
+- Indent new lines and closing brackets as you type (`334f3de`)
+- Add a commit view for staging and committing changes (`ac5f5af`)
+- Limit hover highlights in the Git sidebar views to rows and buttons that can be clicked (`ac5f5af`)
 
 ## v0.3.9 — 2026-10-06
 
