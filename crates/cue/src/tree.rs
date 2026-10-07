@@ -71,6 +71,9 @@ pub enum TreeAction {
     },
     /// Show the log of the repository at this root, from the changes.
     Log(PathBuf),
+    /// Show the commit view of the repository at this root, from the
+    /// changes.
+    Commit(PathBuf),
 }
 
 /// An entry in the tree, as the file commands see it.

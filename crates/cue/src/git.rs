@@ -82,6 +82,16 @@ impl Kind {
     }
 }
 
+/// How much of a file's change is staged, to go in the next commit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Staged {
+    #[default]
+    No,
+    /// Some of it: it changed again since it was staged.
+    Partly,
+    Yes,
+}
+
 /// A file changed since the last commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
@@ -90,6 +100,8 @@ pub struct Change {
     pub kind: Kind,
     /// Where it was, if it was renamed.
     pub from: Option<PathBuf>,
+    /// How much of it is staged; [`Staged::No`] for a commit's.
+    pub staged: Staged,
 }
 
 /// What a repository has checked out.
@@ -290,6 +302,7 @@ fn parse_name_status(root: &Path, output: &[u8]) -> Vec<Change> {
             path: root.join(path),
             kind,
             from,
+            staged: Staged::No,
         });
     }
     changes
@@ -320,6 +333,121 @@ fn base_text(bytes: Vec<u8>) -> Base {
         true => Base::Text(text.replace("\r\n", "\n")),
         false => Base::Text(text),
     }
+}
+
+/// Stages the files at `paths`, in the repository at `root`, as they are
+/// on disk: changed, new, or gone.
+pub fn stage(root: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    change_index(root, &["add", "-A"], paths)
+}
+
+/// Unstages the files at `paths`, in the repository at `root`, leaving them
+/// as they are on disk. A repository with no commits yet (`initial`) has
+/// nothing to put back, so they're only taken out of the index.
+pub fn unstage(root: &Path, paths: &[PathBuf], initial: bool) -> Result<(), String> {
+    match initial {
+        true => change_index(
+            root,
+            &["rm", "--cached", "-r", "-q", "--ignore-unmatch"],
+            paths,
+        ),
+        false => change_index(root, &["restore", "--staged"], paths),
+    }
+}
+
+/// Runs `git` with `args` on the files at `paths`, in the repository at
+/// `root`, given on its input, however many there are, and taken as they
+/// are, not as patterns. Returns what git said if it failed.
+fn change_index(root: &Path, args: &[&str], paths: &[PathBuf]) -> Result<(), String> {
+    let mut spec = Vec::new();
+    for path in paths {
+        let path = path.strip_prefix(root).unwrap_or(path);
+        spec.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        spec.push(0);
+    }
+    let mut command = writing(root);
+    command
+        .args(args)
+        .args(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+    run_with_input(command, &spec).map(drop)
+}
+
+/// The full message of the last commit in the repository at `root`, if
+/// there is one.
+pub fn last_message(root: &Path) -> Option<String> {
+    let output = git(root).args(["log", "-1", "--format=%B"]).output().ok()?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string()
+    })
+}
+
+/// Commits what's staged in the repository at `root`, with `message`, or
+/// replaces the last commit with it, if `amend`. Hooks run, and the commit
+/// is signed if git's set up to sign. Returns the new commit's abbreviated
+/// hash, or what git, or a hook, said went wrong.
+pub fn commit(root: &Path, message: &str, amend: bool) -> Result<String, String> {
+    let mut command = writing(root);
+    command.args(["commit", "-F", "-"]);
+    if amend {
+        command.arg("--amend");
+    }
+    run_with_input(command, message.as_bytes())?;
+    let output = git(root)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// `git` for something that changes the repository at `dir`: as [`git`],
+/// but in a session of its own, without the terminal, so a hook or a
+/// signing program that asks for something can't read from it or draw
+/// over the screen.
+fn writing(dir: &Path) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new("git");
+    command
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GPG_TTY");
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command
+}
+
+/// Runs `command` with `input`, and returns what it printed, or if it
+/// failed, what it said: its errors, or else what it printed.
+fn run_with_input(mut command: Command, input: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("Can't run git: {err}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // git reads all of it before it writes much, if anything.
+        let _ = stdin.write_all(input);
+    }
+    let output = child.wait_with_output().map_err(|err| err.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(match stderr.is_empty() {
+        true => stdout,
+        false => stderr,
+    })
 }
 
 pub struct Git {
@@ -400,6 +528,13 @@ impl Git {
         if self.running.is_none() && !soon {
             self.start();
         }
+    }
+
+    /// Asks git again now, dropping a run in progress, which may have
+    /// read the repositories before this app changed them.
+    pub fn restart(&mut self) {
+        self.running = None;
+        self.start();
     }
 
     /// Takes the result of a run that ended, and starts another if one was
@@ -524,16 +659,17 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
     let (mut added, removed) = diff_lines(top, commit.is_none());
     let untracked = changes
         .iter()
-        .filter(|(_, kind, _)| *kind == Kind::Untracked)
+        .filter(|(_, kind, ..)| *kind == Kind::Untracked)
         .map(|(path, ..)| top.join(path));
     added += count_lines(untracked);
     let mut changes: Vec<Change> = changes
         .into_iter()
         .take(MAX_CHANGES)
-        .map(|(path, kind, from)| Change {
+        .map(|(path, kind, from, staged)| Change {
             path: top.join(path),
             kind,
             from: from.map(|from| top.join(from)),
+            staged,
         })
         .collect();
     changes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -609,9 +745,9 @@ fn count_lines(paths: impl Iterator<Item = PathBuf>) -> usize {
     lines
 }
 
-/// A changed file's path in the working tree, how it changed, and if it
-/// was renamed, its path before.
-type Entry = (PathBuf, Kind, Option<PathBuf>);
+/// A changed file's path in the working tree, how it changed, if it was
+/// renamed, its path before, and how much of it is staged.
+type Entry = (PathBuf, Kind, Option<PathBuf>, Staged);
 
 /// What `git status --porcelain=v2 --branch -z` says: the head, the commit
 /// checked out, unless there's none yet, and the files changed.
@@ -636,12 +772,12 @@ fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>) {
             continue;
         };
         let change = match kind {
-            "?" => Some((rest.to_string(), Kind::Untracked, None)),
+            "?" => Some((rest.to_string(), Kind::Untracked, None, Staged::No)),
             // XY sub mH mI mW hH hI path
             "1" => rest
                 .splitn(8, ' ')
                 .nth(7)
-                .map(|path| (path.to_string(), ordinary(rest), None)),
+                .map(|path| (path.to_string(), ordinary(rest), None, staged(rest))),
             // XY sub mH mI mW hH hI Xscore path, then the old path.
             "2" => {
                 let mut parts = rest.splitn(9, ' ').skip(7);
@@ -653,17 +789,18 @@ fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>) {
                     true => (Kind::Added, None),
                     false => (Kind::Renamed, from),
                 };
-                path.map(|path| (path, kind, from))
+                path.map(|path| (path, kind, from, staged(rest)))
             }
             // XY sub m1 m2 m3 mW h1 h2 h3 path
             "u" => rest
                 .splitn(10, ' ')
                 .nth(9)
-                .map(|path| (path.to_string(), Kind::Conflicted, None)),
+                .map(|path| (path.to_string(), Kind::Conflicted, None, Staged::No)),
             _ => None,
         };
-        if let Some((path, kind, from)) = change {
-            changes.push((PathBuf::from(path), kind, from.map(PathBuf::from)));
+        if let Some((path, kind, from, staged)) = change {
+            let from = from.map(PathBuf::from);
+            changes.push((PathBuf::from(path), kind, from, staged));
         }
     }
     let commit = oid.clone().filter(|oid| oid != "(initial)");
@@ -675,6 +812,18 @@ fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>) {
         }
     };
     (head, commit, changes)
+}
+
+/// How much of a changed entry is staged, from the `XY` its line starts
+/// with: what changed in the index (X), and in the working tree since (Y).
+fn staged(rest: &str) -> Staged {
+    let mut xy = rest.chars();
+    let (x, y) = (xy.next().unwrap_or('.'), xy.next().unwrap_or('.'));
+    match (x != '.', y != '.') {
+        (false, _) => Staged::No,
+        (true, true) => Staged::Partly,
+        (true, false) => Staged::Yes,
+    }
 }
 
 /// How an ordinary changed entry changed, from the `XY` its line starts
@@ -760,6 +909,7 @@ pub(crate) mod tests {
     fn parses_each_kind_of_entry() {
         let output = b"# branch.oid 0123456789abcdef\0# branch.head main\0\
             1 .M N... 100644 100644 100644 aaa bbb src/a b.rs\0\
+            1 MM N... 100644 100644 100644 aaa bbb half.rs\0\
             1 A. N... 000000 100644 100644 000 bbb new.rs\0\
             1 .D N... 100644 100644 000000 aaa aaa gone.rs\0\
             2 R. N... 100644 100644 100644 aaa aaa R100 to.rs\0from.rs\0\
@@ -770,17 +920,20 @@ pub(crate) mod tests {
         assert_eq!(head, Head::Branch("main".into()));
         assert_eq!(commit.as_deref(), Some("0123456789abcdef"));
         let expected = [
-            ("src/a b.rs", Kind::Modified, None),
-            ("new.rs", Kind::Added, None),
-            ("gone.rs", Kind::Deleted, None),
-            ("to.rs", Kind::Renamed, Some("from.rs")),
-            ("copy.rs", Kind::Added, None),
-            ("both.rs", Kind::Conflicted, None),
-            ("notes.txt", Kind::Untracked, None),
+            ("src/a b.rs", Kind::Modified, None, Staged::No),
+            ("half.rs", Kind::Modified, None, Staged::Partly),
+            ("new.rs", Kind::Added, None, Staged::Yes),
+            ("gone.rs", Kind::Deleted, None, Staged::No),
+            ("to.rs", Kind::Renamed, Some("from.rs"), Staged::Yes),
+            ("copy.rs", Kind::Added, None, Staged::Yes),
+            ("both.rs", Kind::Conflicted, None, Staged::No),
+            ("notes.txt", Kind::Untracked, None, Staged::No),
         ];
         let expected: Vec<Entry> = expected
             .into_iter()
-            .map(|(path, kind, from)| (PathBuf::from(path), kind, from.map(PathBuf::from)))
+            .map(|(path, kind, from, staged)| {
+                (PathBuf::from(path), kind, from.map(PathBuf::from), staged)
+            })
             .collect();
         assert_eq!(changes, expected);
     }
@@ -926,6 +1079,89 @@ pub(crate) mod tests {
         assert_eq!(text(&log[1], "a.txt"), Base::Text("a\nmore\n".into()));
         assert_eq!(text(&log[2], "a.txt"), Base::Text("a\n".into()));
         assert_eq!(text(&log[0], "d.txt"), Base::Missing);
+    }
+
+    /// Sets the repository at `dir` up to commit as cue, unsigned and
+    /// without hooks, whatever the user's git does.
+    pub(crate) fn commit_as_cue(dir: &Path) {
+        run(dir, &["config", "user.name", "cue"]);
+        run(dir, &["config", "user.email", "cue@example.com"]);
+        run(dir, &["config", "commit.gpgsign", "false"]);
+        run(dir, &["config", "core.hooksPath", ".no-hooks"]);
+    }
+
+    /// What git says of each file changed in the repository at `dir`, by
+    /// name: how much of it is staged.
+    fn staged(dir: &Path) -> Vec<(String, Staged)> {
+        let mut git = Git::new(&[dir.to_path_buf()]);
+        git.wait();
+        git.repos()[0]
+            .changes
+            .iter()
+            .map(|change| {
+                let name = change.path.strip_prefix(dir).unwrap();
+                (name.display().to_string(), change.staged)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stages_unstages_and_commits() {
+        let dir = repo("stage");
+        commit_as_cue(&dir);
+        fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        fs::remove_file(dir.join("b.txt")).unwrap();
+        fs::write(dir.join("[new].txt"), "new\n").unwrap();
+        fs::write(dir.join("n.txt"), "not this one\n").unwrap();
+        let paths = ["a.txt", "b.txt", "[new].txt"].map(|name| dir.join(name));
+        stage(&dir, &paths).unwrap();
+        fs::write(dir.join("a.txt"), "changed again\n").unwrap();
+        let s = |name: &str, staged| (name.to_string(), staged);
+        assert_eq!(
+            staged(&dir),
+            [
+                s("[new].txt", Staged::Yes),
+                s("a.txt", Staged::Partly),
+                s("b.txt", Staged::Yes),
+                s("n.txt", Staged::No),
+            ],
+            "taken as they're named, not as patterns"
+        );
+        unstage(&dir, &paths[..1], false).unwrap();
+        assert_eq!(staged(&dir)[1], s("a.txt", Staged::No));
+
+        let hash = commit(&dir, "Remove b\n\nAnd add [new].", false).unwrap();
+        let last = super::log(&dir, 0, 1).remove(0);
+        assert_eq!((last.short, last.subject.as_str()), (hash, "Remove b"));
+        assert_eq!(
+            last_message(&dir).as_deref(),
+            Some("Remove b\n\nAnd add [new].")
+        );
+        assert_eq!(
+            staged(&dir),
+            [s("a.txt", Staged::No), s("n.txt", Staged::No)]
+        );
+
+        stage(&dir, &[dir.join("a.txt")]).unwrap();
+        commit(&dir, "Remove b, change a", true).unwrap();
+        let log = super::log(&dir, 0, 10);
+        let subjects: Vec<&str> = log.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["Remove b, change a", "first"], "amended");
+
+        let err = commit(&dir, "Nothing", false).unwrap_err();
+        assert!(err.contains("nothing added to commit"), "{err}");
+    }
+
+    #[test]
+    fn unstages_before_the_first_commit() {
+        let dir = fixture("stage-initial");
+        run(&dir, &["init", "-q"]);
+        fs::write(dir.join("a.txt"), "a\n").unwrap();
+        stage(&dir, &[dir.join("a.txt")]).unwrap();
+        assert_eq!(staged(&dir), [("a.txt".to_string(), Staged::Yes)]);
+        unstage(&dir, &[dir.join("a.txt")], true).unwrap();
+        assert_eq!(staged(&dir), [("a.txt".to_string(), Staged::No)]);
+        assert!(last_message(&dir).is_none());
     }
 
     #[test]

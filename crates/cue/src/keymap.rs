@@ -171,6 +171,9 @@ commands! {
     TreeOpenInTerminal => "tree:open-in-terminal", "File Tree: Open in Terminal";
     AddFolder => "workspace:add-folder", "Add Folder to Workspace…";
     TreeRemoveFolder => "tree:remove-folder", "File Tree: Remove Folder from Workspace";
+    TreeToggleStaged => "tree:toggle-staged", "Changes: Stage or Unstage";
+    TreeCommit => "tree:commit", "Changes: Commit…";
+    GitCommit => "git:commit", "Commit Staged Changes";
     PickerUp => "picker:up", "Picker: Select Previous";
     PickerDown => "picker:down", "Picker: Select Next";
     PickerPageUp => "picker:page-up", "Picker: Page Up";
@@ -210,6 +213,9 @@ pub enum Context {
     /// A terminal, which gets every key but a few (see
     /// [`Keymap::lookup_terminal`]).
     Terminal,
+    /// The commit view's message box, while it has focus. The editor's
+    /// keys for moving and deleting work there too.
+    Message,
 }
 
 impl Context {
@@ -251,7 +257,9 @@ impl Command {
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
             | TreeDuplicate | TreeTrash | TreeCopyPath | TreeCopyRelativePath | TreeReveal
-            | TreeOpenInTerminal | TreeRemoveFolder => Context::Tree,
+            | TreeOpenInTerminal | TreeRemoveFolder | TreeToggleStaged | TreeCommit => {
+                Context::Tree
+            }
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
@@ -259,6 +267,7 @@ impl Command {
             FindSwitchField | FindClose => Context::Find,
             ClearTerminal | RenameTerminal | ToggleTerminalKeys => Context::Terminal,
             Replace | ReplaceAll => Context::Replace,
+            GitCommit => Context::Message,
             _ => Context::Editor,
         }
     }
@@ -535,6 +544,11 @@ impl Default for Keymap {
             // Cmd+Backspace as in the Finder.
             (key(Delete, Mods::NONE), TreeTrash),
             (key(Backspace, SUPER), TreeTrash),
+            (key(Char('s'), Mods::NONE), TreeToggleStaged),
+            (key(Char('c'), Mods::NONE), TreeCommit),
+            // As in VS Code's commit message box.
+            (key(Enter, Mods::CTRL), GitCommit),
+            (key(Enter, SUPER), GitCommit),
             (key(Up, Mods::NONE), PickerUp),
             (key(Down, Mods::NONE), PickerDown),
             (key(PageUp, Mods::NONE), PickerPageUp),

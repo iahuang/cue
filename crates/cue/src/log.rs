@@ -9,6 +9,7 @@
 //! next once the list gets near the end of those read.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -200,9 +201,17 @@ impl LogView {
         self.read_more_near_end();
     }
 
-    /// The interactive area under the pointer, without changing selection.
-    pub fn hover_row(&self, y: u32) -> bool {
-        y == 0 || self.rows.get(self.scroll + y as usize - 1).is_some()
+    /// The columns of what's under the pointer on screen row `y`, that a
+    /// click does something to, in a list `width` wide: the top row, or a
+    /// commit, folder, or file. A commit's hash and author are only shown.
+    pub fn hover(&self, y: u32, width: u32) -> Option<Range<u32>> {
+        if y == 0 {
+            return Some(0..width);
+        }
+        match self.rows.get(self.scroll + y as usize - 1)?.what {
+            What::Info(_) => None,
+            _ => Some(0..width),
+        }
     }
 
     /// Draws the log in the columns from `x` to `x + width`.
@@ -272,6 +281,7 @@ impl LogView {
                     fg: colors.text,
                     attributes: Attributes::NONE,
                     right: Some((&right, colors.muted)),
+                    mark: None,
                 }
             }
             What::Info(_) => Look {
@@ -283,6 +293,7 @@ impl LogView {
                 fg: colors.muted,
                 attributes: Attributes::NONE,
                 right: None,
+                mark: None,
             },
             What::Folder(i) => {
                 let key = (self.commits[*i].hash.clone(), row.path.clone());
@@ -296,6 +307,7 @@ impl LogView {
                     fg: colors.text,
                     attributes: Attributes::NONE,
                     right: None,
+                    mark: None,
                 }
             }
             What::File(i, change) => {
@@ -321,6 +333,7 @@ impl LogView {
                     fg,
                     attributes,
                     right: Some((&right, colors.hue(change.kind.hue()))),
+                    mark: None,
                 }
             }
         };
@@ -595,6 +608,10 @@ mod tests {
                 "> first"
             ]
         );
+        assert_eq!(view.hover(0, 20), Some(0..20), "back");
+        assert_eq!(view.hover(2, 20), Some(0..20), "a commit");
+        assert_eq!(view.hover(3, 20), None, "its hash and author");
+        assert_eq!(view.hover(8, 20), None, "below the commits");
         let LogAction::Open {
             commit,
             change,

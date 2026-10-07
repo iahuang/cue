@@ -2,14 +2,16 @@
 //! shown in the sidebar in place of the file tree.
 //!
 //! Each repository the workspace's folders are in is listed, under a row
-//! for what it does as a whole: the branch it's on, and a button to its
-//! log. Under its name are its changed files in their folders, each marked
-//! with how it changed. A folder holding only another folder shows as one
-//! row, `src/git`, as VS Code's compact folders do. Keys and the mouse
-//! work as in the tree: a click previews a file, and a double click or
-//! Enter opens it.
+//! for what it does as a whole: the branch it's on, and buttons to its
+//! commit view, where changes are staged and committed, and to its log.
+//! Under its name are its changed files in their folders, each marked with
+//! how it changed. A folder holding only another folder shows as one row,
+//! `src/git`, as VS Code's compact folders do. Keys and the mouse work as
+//! in the tree: a click previews a file, and a double click or Enter opens
+//! it.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use opentui::{Attributes, Buffer, Rgba};
@@ -23,6 +25,10 @@ use crate::workspace::root_names;
 
 /// The button on a repository's first row that shows its log.
 const LOG_BUTTON: &str = "Log";
+/// The button before it, which shows the commit view.
+const COMMIT_BUTTON: &str = "Commit";
+/// Both, as they're drawn.
+const BUTTONS: &str = "Commit  Log";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
@@ -169,6 +175,9 @@ pub(crate) struct Look<'a> {
     pub attributes: Attributes,
     /// What goes at the right end, if anything, and its color.
     pub right: Option<(&'a str, Rgba)>,
+    /// A one-column mark past that, at the very end, and its color: how
+    /// much of a change is staged.
+    pub mark: Option<(&'a str, Rgba)>,
 }
 
 /// Draws a row as `look` has it, at (`x`, `y`), `width` wide, on the
@@ -196,7 +205,13 @@ pub(crate) fn draw_look(
     if let Some(icon) = look.icon.filter(|_| icons::enabled()) {
         name_x = icon.draw(frame, name_x, y, None);
     }
-    let end = x + width;
+    let mut end = x + width;
+    if let Some((mark, fg)) = look.mark {
+        end = end.saturating_sub(2);
+        if end > name_x {
+            frame.draw_text(mark, end, y, fg, None, Attributes::NONE);
+        }
+    }
     let (right, right_fg) = look.right.unwrap_or(("", colors.muted));
     let right_width = right.chars().count() as u32;
     let gap = if right_width > 0 { right_width + 2 } else { 1 };
@@ -327,18 +342,30 @@ impl ChangesView {
     /// left edge, `width` wide: selects the entry there, then collapses or
     /// expands a folder, or opens a file: a single click previews it and
     /// keeps focus here; a `double` click keeps it open and moves focus to
-    /// it. On a repository's first row, only its button does anything.
+    /// it. On a repository's first row, only its buttons do anything.
     pub fn click(&mut self, x: u32, y: u32, width: u32, double: bool) -> TreeAction {
         if !self.select_at(y) {
             return TreeAction::None;
         }
         if let What::Header(_) = self.rows[self.selected].what {
-            let button = log_button(width);
-            if x + 1 < button.start || x > button.end {
-                return TreeAction::None;
-            }
+            let root = self.rows[self.selected].path.clone();
+            return match header_button(x, width) {
+                Some(LOG_BUTTON) => TreeAction::Log(root),
+                Some(_) => TreeAction::Commit(root),
+                None => TreeAction::None,
+            };
         }
         self.activate(double, !double)
+    }
+
+    /// The top folder of the repository the selected entry is in.
+    pub fn selected_repo(&self) -> Option<PathBuf> {
+        let path = &self.rows.get(self.selected)?.path;
+        self.repos
+            .iter()
+            .filter(|repo| path.starts_with(&repo.root))
+            .max_by_key(|repo| repo.root.components().count())
+            .map(|repo| repo.root.clone())
     }
 
     /// Scrolls by `rows` without moving the selection.
@@ -348,11 +375,18 @@ impl ChangesView {
         self.scroll = self.scroll.saturating_add_signed(rows).min(max);
     }
 
-    /// The interactive area under the pointer, without changing selection.
-    pub fn hover_row(&self, y: u32) -> bool {
-        self.rows
-            .get(self.scroll + y as usize)
-            .is_some_and(|row| row.what != What::Gap)
+    /// The columns of what's under the pointer at column `x` of screen row
+    /// `y`, that a click does something to, in a list `width` wide: a row,
+    /// or a button on a repository's first row.
+    pub fn hover(&self, x: u32, y: u32, width: u32) -> Option<Range<u32>> {
+        match self.rows.get(self.scroll + y as usize)?.what {
+            What::Gap => None,
+            What::Header(_) => header_button(x, width).map(|button| match button {
+                LOG_BUTTON => button_area(log_button(width)),
+                _ => button_area(commit_button(width)),
+            }),
+            _ => Some(0..width),
+        }
     }
 
     /// Draws the list in the columns from `x` to `x + width`.
@@ -413,11 +447,7 @@ impl ChangesView {
         let letter;
         let (open, icon, right) = match &row.what {
             What::Gap => return,
-            What::Header(_) => (
-                None,
-                Some(icons::branch()),
-                Some((LOG_BUTTON, colors.muted)),
-            ),
+            What::Header(_) => (None, Some(icons::branch()), Some((BUTTONS, colors.muted))),
             What::Repo => (Some(open), Some(icons::folder(open)), None),
             What::Folder => (Some(open), Some(icons::folder(open)), None),
             What::File(kind) => {
@@ -436,6 +466,7 @@ impl ChangesView {
             fg,
             attributes,
             right,
+            mark: None,
         };
         let selected = (index == self.selected).then_some(focused);
         draw_look(frame, &look, (x, y, width), selected);
@@ -600,15 +631,39 @@ impl ChangesView {
 
 /// The columns of a repository's log button, from the list's left edge,
 /// in a list `width` wide.
-fn log_button(width: u32) -> std::ops::Range<u32> {
+fn log_button(width: u32) -> Range<u32> {
     let start = width.saturating_sub(LOG_BUTTON.len() as u32 + 1);
     start..start + LOG_BUTTON.len() as u32
+}
+
+/// The button on a repository's first row at column `x`, from the list's
+/// left edge, in a list `width` wide, if there's one there.
+fn header_button(x: u32, width: u32) -> Option<&'static str> {
+    if button_area(log_button(width)).contains(&x) {
+        Some(LOG_BUTTON)
+    } else if button_area(commit_button(width)).contains(&x) {
+        Some(COMMIT_BUTTON)
+    } else {
+        None
+    }
+}
+
+/// Where a click on a button that's at `columns` counts: there, and a
+/// column either side.
+pub(crate) fn button_area(columns: Range<u32>) -> Range<u32> {
+    columns.start.saturating_sub(1)..columns.end + 1
+}
+
+/// The columns of a repository's commit button, as [`log_button`]'s.
+fn commit_button(width: u32) -> Range<u32> {
+    let start = width.saturating_sub(BUTTONS.len() as u32 + 1);
+    start..start + COMMIT_BUTTON.len() as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::{Change, Head};
+    use crate::git::{Change, Head, Staged};
     use opentui::Rgba;
 
     fn repo(root: &str, changes: &[(&str, Kind)]) -> Repo {
@@ -623,6 +678,7 @@ mod tests {
                     path: root.join(path),
                     kind,
                     from: None,
+                    staged: Staged::No,
                 })
                 .collect(),
             added: 0,
@@ -735,10 +791,13 @@ mod tests {
             TreeAction::None,
             "below the rows"
         );
-        // On the first row, the button at its right end shows the log.
+        // On the first row, the buttons at its right end show the log and
+        // the commit view.
         assert_eq!(view.click(3, 0, 20, false), TreeAction::None);
         let log = TreeAction::Log(PathBuf::from("/w/cue"));
         assert_eq!(view.click(17, 0, 20, false), log);
+        let commit = TreeAction::Commit(PathBuf::from("/w/cue"));
+        assert_eq!(view.click(10, 0, 20, false), commit);
         assert_eq!(view.run(Command::TreeOpen), log, "as Enter on it does");
         assert_eq!(
             view.click(3, 1, 20, false),
@@ -765,7 +824,7 @@ mod tests {
         assert_eq!(
             lines[..4],
             [
-                " main           Log",
+                " main   Commit  Log",
                 " ▾ cue",
                 "     a-long-name… A",
                 "     a.rs         M"

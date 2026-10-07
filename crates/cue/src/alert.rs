@@ -73,6 +73,8 @@ pub struct Alert<T> {
     buttons: Vec<Button<T>>,
     /// The selected button; `buttons.len()` is Cancel.
     selected: usize,
+    /// What Cancel says.
+    cancel: &'static str,
     screen_width: u32,
     screen_height: u32,
 }
@@ -92,9 +94,16 @@ impl<T: Clone> Alert<T> {
             message: message.into(),
             buttons,
             selected: 0,
+            cancel: "Cancel",
             screen_width: width,
             screen_height: height,
         }
+    }
+
+    /// Labels Cancel `label`, as OK for an alert that only tells
+    /// something.
+    pub fn set_cancel_label(&mut self, label: &'static str) {
+        self.cancel = label;
     }
 
     /// Puts `button` before the others, selected.
@@ -203,7 +212,7 @@ impl<T: Clone> Alert<T> {
         self.buttons
             .iter()
             .map(|button| button.label.as_str())
-            .chain(["Cancel"])
+            .chain([self.cancel])
     }
 
     /// Each button is its label with a space either side.

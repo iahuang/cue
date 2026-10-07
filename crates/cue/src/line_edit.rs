@@ -64,6 +64,19 @@ impl Caret {
         self.anchor = None;
     }
 
+    /// Puts the cursor at byte `at` of `text`, or with `select`, extends
+    /// the selection to there.
+    pub fn move_to(&mut self, text: &str, at: usize, select: bool) {
+        let anchor = match (select, self.anchor) {
+            (false, _) => None,
+            (true, Some(anchor)) => Some(floor_boundary(text, anchor)),
+            (true, None) => Some(self.at(text)),
+        };
+        let at = floor_boundary(text, at);
+        self.set(text, at);
+        self.anchor = anchor.filter(|&anchor| anchor != at);
+    }
+
     fn set(&mut self, text: &str, at: usize) {
         self.at = (at < text.len()).then_some(at);
     }

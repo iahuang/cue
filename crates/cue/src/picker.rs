@@ -292,8 +292,9 @@ impl Picker {
     ) -> Picker {
         let commands = Command::ALL
             .iter()
-            // Moving through the picker, search options, and the find bar's
-            // and file dialog's own keys aren't something to pick from it.
+            // Moving through the picker, search options, and the find bar's,
+            // file dialog's, and message box's own keys aren't something to
+            // pick from it.
             .filter(|command| {
                 !matches!(
                     command.context(),
@@ -302,6 +303,7 @@ impl Picker {
                         | Context::SearchOptions
                         | Context::Find
                         | Context::Dialog
+                        | Context::Message
                 )
             })
             .filter(|&&command| available(command))

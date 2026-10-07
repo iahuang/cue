@@ -7,6 +7,7 @@ mod autoindent;
 mod changes;
 mod client;
 mod commit_diff;
+mod commit_view;
 mod config;
 mod diff;
 mod context_menu;
