@@ -84,7 +84,7 @@ use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
 use crate::find;
-use crate::git::{self, Change, Commit, Git};
+use crate::git::{self, Carried, Change, Commit, Git, SwitchTo};
 use crate::image::{self, ImageView};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
@@ -159,6 +159,8 @@ enum Redo {
     Stash(PathBuf, String),
     /// Dropping the stash with this hash, in the repository at this root.
     DropStash(PathBuf, String),
+    /// Switching the repository at this root to a branch.
+    Switch(PathBuf, SwitchTo),
 }
 
 /// An answer to an alert.
@@ -350,6 +352,8 @@ pub struct App {
     /// The commit views shown, each with the message written in it: the
     /// one the sidebar shows, or showed last, first.
     commit_views: Vec<CommitView>,
+    /// The repository whose branches the picker lists, while it does.
+    branch_root: Option<PathBuf>,
     /// What git says about the workspace's repositories.
     git: Git,
     width: u32,
@@ -577,6 +581,7 @@ impl App {
             changes: ChangesView::new(),
             log: None,
             commit_views: Vec::new(),
+            branch_root: None,
             sidebar: Sidebar::Files,
             index_symbols_after_listing: false,
             watcher: Watcher::new(),
@@ -1369,8 +1374,9 @@ impl App {
                             }
                         }
                         Sidebar::Log => {
+                            let width = self.visible_tree_width();
                             if let Some(log) = &mut self.log {
-                                let action = log.click(mouse.y, double);
+                                let action = log.click(mouse.x, mouse.y, width, double);
                                 return self.log_action(action);
                             }
                         }
@@ -1879,7 +1885,7 @@ impl App {
                 let columns = match self.sidebar {
                     Sidebar::Files => self.tree.hover_row(y).then_some(0..width),
                     Sidebar::Changes => self.changes.hover(x, y, width),
-                    Sidebar::Log => self.log.as_ref().and_then(|log| log.hover(y, width)),
+                    Sidebar::Log => self.log.as_ref().and_then(|log| log.hover(x, y, width)),
                     Sidebar::Commit => self.commit_views.first().and_then(|view| view.hover(x, y)),
                 };
                 columns.map(|columns| span(columns.start..columns.end.min(width)))
@@ -2797,6 +2803,11 @@ impl App {
                             self.show_document(&doc);
                         }
                     }
+                    Choice::Branch(to) => {
+                        if let Some(root) = self.branch_root.take() {
+                            return self.switch_branch(root, to);
+                        }
+                    }
                 }
             }
         }
@@ -3327,7 +3338,8 @@ impl App {
             | Choice::Symbol(..)
             | Choice::Command(_)
             | Choice::Language(_)
-            | Choice::Theme(_) => {}
+            | Choice::Theme(_)
+            | Choice::Branch(_) => {}
         }
     }
 
@@ -3522,6 +3534,10 @@ impl App {
             }
             Redo::DropStash(root, hash) => {
                 self.drop_stash(&root, &hash);
+                AppAction::Continue
+            }
+            Redo::Switch(root, to) => {
+                self.switch_now(&root, &to);
                 AppAction::Continue
             }
         };
@@ -4770,8 +4786,8 @@ impl App {
                     self.focus = Focus::Editor;
                 }
             }
-            // The tree has no logs or commits.
-            TreeAction::Log(_) | TreeAction::Commit(_) => {}
+            // The tree has no logs, commits, or branches.
+            TreeAction::Log(_) | TreeAction::Commit(_) | TreeAction::Branches(_) => {}
         }
     }
 
@@ -4783,6 +4799,7 @@ impl App {
             TreeAction::None => return,
             TreeAction::Log(root) => return self.show_log(&root),
             TreeAction::Commit(root) => return self.show_commit_view(&root),
+            TreeAction::Branches(root) => return self.show_branches(root),
             TreeAction::Open {
                 path,
                 focus,
@@ -4820,6 +4837,11 @@ impl App {
             LogAction::Back => {
                 self.sidebar = Sidebar::Changes;
                 self.git.refresh();
+            }
+            LogAction::Branches => {
+                if let Some(root) = self.log.as_ref().map(|log| log.root().to_path_buf()) {
+                    self.show_branches(root);
+                }
             }
             LogAction::Open {
                 commit,
@@ -5001,6 +5023,7 @@ impl App {
                 self.git.refresh();
             }
             CommitAction::Log => self.show_log(&root),
+            CommitAction::Branches => self.show_branches(root),
             CommitAction::Open {
                 path,
                 focus,
@@ -5198,6 +5221,74 @@ impl App {
             }
             Err(err) => self.show_git_error("Can't Apply Stash", &err),
         }
+    }
+
+    /// Lists the branches of the repository at `root`, to switch to one,
+    /// or to a new one.
+    fn show_branches(&mut self, root: PathBuf) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64);
+        let items = git::branches(&root)
+            .iter()
+            .map(|branch| Item::branch(branch, now))
+            .collect();
+        self.show_picker(Mode::Branches);
+        if let Some(picker) = &mut self.picker {
+            picker.set_branches(items);
+            self.branch_root = Some(root);
+        }
+    }
+
+    /// Switches the repository at `root` to `to`, saving the files in it
+    /// with unsaved changes first, so they come along.
+    fn switch_branch(&mut self, root: PathBuf, to: SwitchTo) -> AppAction {
+        let current = self.git.repos().iter().find(|repo| repo.root == root);
+        if let (Some(repo), SwitchTo::Branch(name)) = (current, &to) {
+            if repo.head == git::Head::Branch(name.clone()) {
+                self.show_message(format!("Already on {name}."), false);
+                return AppAction::Continue;
+            }
+        }
+        let docs: Vec<Rc<Document>> = self
+            .documents
+            .iter()
+            .filter(|doc| doc.is_modified())
+            .filter(|doc| {
+                let path = doc.path().and_then(|path| path.canonicalize().ok());
+                path.is_some_and(|path| path.starts_with(&root))
+            })
+            .cloned()
+            .collect();
+        if !docs.is_empty() {
+            let redo = Redo::Switch(root, to);
+            return self.save_then_go(Saving { docs, redo });
+        }
+        self.switch_now(&root, &to);
+        AppAction::Continue
+    }
+
+    fn switch_now(&mut self, root: &Path, to: &SwitchTo) {
+        let name = to.name().to_string();
+        match git::switch(root, to) {
+            Ok(Carried::Along) => self.show_message(format!("Switched to {name}."), false),
+            Ok(Carried::Stashed) => {
+                let message = format!("Switched to {name}, bringing your changes.");
+                self.show_message(message, false);
+            }
+            Ok(Carried::Conflicts(err)) => {
+                let message = format!(
+                    "Switched to {name}, but your changes didn't all go back cleanly. \
+                     They're kept in a stash too.\n\n{err}"
+                );
+                self.show_git_error("Changes Conflicted", &message);
+            }
+            Err(err) => self.show_git_error("Can't Switch Branch", &err),
+        }
+        if let Some(view) = self.commit_view_of(root) {
+            view.read_stashes();
+        }
+        self.git.restart();
     }
 
     /// Drops the stash `hash`, in the repository at `root`.
@@ -9837,17 +9928,20 @@ mod tests {
             mouse_at(app, MouseKind::Move, x, y);
             app.hover_area().map(|rect| rect.x..rect.x + rect.width)
         };
-        // A repository's first row: its buttons, not the branch.
-        assert_eq!(hover(&mut app, 2, 0), None);
+        // A repository's first row: the branch and the buttons, not the
+        // space between.
+        assert_eq!(hover(&mut app, 2, 0), Some(0..6), "the branch");
+        assert_eq!(hover(&mut app, 8, 0), None);
         assert_eq!(hover(&mut app, width - 2, 0), Some(width - 5..width));
         assert_eq!(hover(&mut app, width - 8, 0), Some(width - 13..width - 5));
         assert_eq!(hover(&mut app, 2, 2), Some(0..width), "a file");
 
         left_click(&mut app, width - 8, 0);
         assert_eq!(app.sidebar, Sidebar::Commit);
-        // The top row's buttons: back, by the name, and the log.
+        // The top row's buttons: back, by the name, the branch, and the log.
         assert_eq!(hover(&mut app, 2, 0), Some(0..13));
-        assert_eq!(hover(&mut app, 16, 0), None, "the branch");
+        assert_eq!(hover(&mut app, 16, 0), Some(13..19), "the branch");
+        assert_eq!(hover(&mut app, 20, 0), None);
         assert_eq!(hover(&mut app, width - 2, 0), Some(width - 5..width));
         assert_eq!(hover(&mut app, 5, 2), None, "the message box");
         assert_eq!(hover(&mut app, 2, 4), Some(0..9), "Amend");
@@ -9928,6 +10022,56 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert!(tall_screen(&app).contains("Dropped the stash."));
         assert!(git::stashes(&root).is_empty());
+    }
+
+    #[test]
+    fn the_branch_in_the_sidebar_switches_branches_bringing_changes() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-branches");
+        crate::git::tests::commit_as_cue(&root);
+        fs::write(root.join("a.txt"), "changed\n").unwrap();
+        let mut app = tall_app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+        let branch = || {
+            let output = std::process::Command::new("git")
+                .args(["-C", &root.to_string_lossy(), "branch", "--show-current"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        app.run(Command::ToggleChanges, false);
+        left_click(&mut app, 2, 0);
+        assert_eq!(app.picker.as_ref().map(Picker::mode), Some(Mode::Branches));
+        let shown = tall_screen(&app);
+        assert!(
+            shown.contains("Switch Branch") && shown.contains("current"),
+            "{shown}"
+        );
+
+        type_text(&mut app, "topic");
+        assert!(tall_screen(&app).contains("Create branch “topic”"));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(branch(), "topic");
+        assert!(tall_screen(&app).contains("Switched to topic."));
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "changed\n");
+
+        // From the commit view, with an unsaved edit, which is saved and
+        // comes along.
+        wait_for_git(&mut app);
+        app.focus = Focus::Editor;
+        key(&mut app, KeyCode::Char('x'));
+        app.run(Command::TreeCommit, false);
+        key(&mut app, KeyCode::Esc);
+        left_click(&mut app, 17, 0);
+        assert_eq!(app.picker.as_ref().map(Picker::mode), Some(Mode::Branches));
+        type_text(&mut app, "main");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(branch(), "main");
+        assert!(!app.documents[0].is_modified());
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "xchanged\n"
+        );
     }
 
     #[test]

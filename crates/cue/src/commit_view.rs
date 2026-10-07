@@ -66,6 +66,8 @@ pub enum CommitAction {
     Back,
     /// Show the log.
     Log,
+    /// Show the repository's branches, to switch to one.
+    Branches,
     /// Show this file in the editor, and move focus there if `focus`.
     Open {
         path: PathBuf,
@@ -461,10 +463,14 @@ impl CommitView {
         let rows = self.message_rows() as u32;
         let actions = rows + 3;
         if y == 0 {
-            return match (self.back_area().contains(&x), self.log_area().contains(&x)) {
-                (true, _) => CommitAction::Back,
-                (_, true) => CommitAction::Log,
-                _ => CommitAction::None,
+            return if self.back_area().contains(&x) {
+                CommitAction::Back
+            } else if self.log_area().contains(&x) {
+                CommitAction::Log
+            } else if self.branch_area().contains(&x) {
+                CommitAction::Branches
+            } else {
+                CommitAction::None
             };
         }
         if y < actions {
@@ -524,7 +530,7 @@ impl CommitView {
     pub fn hover(&self, x: u32, y: u32) -> Option<Range<u32>> {
         let actions = self.message_rows() as u32 + 3;
         let areas = match y {
-            0 => vec![self.back_area(), self.log_area()],
+            0 => vec![self.back_area(), self.branch_area(), self.log_area()],
             y if y == actions => vec![self.amend_area(), self.stash_area(), self.commit_area()],
             y if y > actions => {
                 let row = self.rows.get(self.scroll + (y - actions - 1) as usize)?;
@@ -552,6 +558,27 @@ impl CommitView {
     fn back_area(&self) -> Range<u32> {
         let name = truncate(&self.name, self.name_room());
         0..4 + name.chars().count() as u32
+    }
+
+    /// The branch on the top row, after the repository's name, which shows
+    /// the branches, and the column it starts at, its icon's if it has one;
+    /// `None` if there's no room for it.
+    fn top_branch(&self) -> Option<(String, u32)> {
+        let name = truncate(&self.name, self.name_room());
+        let start = 3 + name.chars().count() as u32 + 2;
+        let log = self.log_area().start + 1;
+        let room = log.saturating_sub(start + icons::width() + 1) as usize;
+        (room > 0).then(|| (truncate(&self.branch, room), start))
+    }
+
+    /// The top row's button that shows the branches: the branch.
+    fn branch_area(&self) -> Range<u32> {
+        match self.top_branch() {
+            Some((branch, start)) => {
+                button_area(start..start + icons::width() + branch.chars().count() as u32)
+            }
+            None => 0..0,
+        }
     }
 
     /// The top row's button to the log.
@@ -799,12 +826,11 @@ impl CommitView {
         let name_x = x + 3;
         let name = truncate(&self.name, self.name_room());
         frame.draw_text(&name, name_x, 0, colors.text, None, Attributes::BOLD);
-        let mut at = name_x + name.chars().count() as u32 + 2;
-        if at + icons::width() + 1 < log_x {
+        if let Some((branch, start)) = self.top_branch() {
+            let mut at = x + start;
             if icons::enabled() {
                 at = icons::branch().draw(frame, at, 0, None);
             }
-            let branch = truncate(&self.branch, log_x.saturating_sub(at + 1) as usize);
             frame.draw_text(&branch, at, 0, colors.muted, None, Attributes::NONE);
         }
         if log_x > name_x + name.chars().count() as u32 {

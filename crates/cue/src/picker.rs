@@ -33,6 +33,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::file_index::FileIndex;
+use crate::git::{Branch, SwitchTo};
 use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Context, Keymap};
@@ -65,13 +66,15 @@ pub enum Mode {
     WorkspaceSymbols,
     /// The terminals, as listed among what was shown recently.
     Terminals,
+    /// A repository's branches, to switch to, or a new one.
+    Branches,
 }
 
 impl Mode {
     /// The character that starts a query for this mode.
     fn prefix(self) -> Option<char> {
         match self {
-            Mode::Files | Mode::Languages | Mode::Themes => None,
+            Mode::Files | Mode::Languages | Mode::Themes | Mode::Branches => None,
             Mode::Unsaved => Some('!'),
             Mode::Commands => Some('>'),
             Mode::Line => Some(':'),
@@ -101,6 +104,8 @@ pub enum Choice {
     Terminal(u32),
     /// An untitled file, by its number.
     Untitled(u32),
+    /// A branch to switch to.
+    Branch(SwitchTo),
 }
 
 /// What the app should do after the picker handled input.
@@ -217,6 +222,34 @@ impl Item {
         }
     }
 
+    /// `branch`, to switch to, with how long ago its last commit was made,
+    /// as of `now`, in seconds since the Unix epoch.
+    pub fn branch(branch: &Branch, now: i64) -> Item {
+        // A remote's name is dimmed.
+        let remote = match branch.remote {
+            true => branch
+                .name
+                .split_once('/')
+                .map_or(0, |(remote, _)| remote.chars().count() + 1),
+            false => 0,
+        };
+        let detail = match branch.current {
+            true => "current".to_string(),
+            false => format!("{} ago", crate::log::ago(now - branch.time)),
+        };
+        let to = match branch.remote {
+            true => SwitchTo::Track(branch.name.clone()),
+            false => SwitchTo::Branch(branch.name.clone()),
+        };
+        Item {
+            text: branch.name.clone(),
+            dim: 0..remote,
+            detail,
+            choice: Choice::Branch(to),
+            color: None,
+        }
+    }
+
     /// The file it is, if it's one.
     pub fn path(&self) -> Option<&Path> {
         match &self.choice {
@@ -250,6 +283,11 @@ pub struct Picker {
     commands: Vec<Item>,
     languages: Vec<Item>,
     themes: Vec<Item>,
+    /// A repository's branches, once given.
+    branches: Vec<Item>,
+    /// In branch mode, the branch the query names, to make, if there's
+    /// none by that name: listed after the branches that match.
+    new_branch: Vec<Item>,
     /// The mode it's in when that isn't what the query starts with.
     fixed_mode: Option<Mode>,
     /// The symbols the file on screen defines, once given.
@@ -350,6 +388,8 @@ impl Picker {
                     color: None,
                 })
                 .collect(),
+            branches: Vec::new(),
+            new_branch: Vec::new(),
             fixed_mode: None,
             outline: None,
             workspace_symbols: Rc::new(Vec::new()),
@@ -399,7 +439,8 @@ impl Picker {
     /// Switches to listing `mode`, keeping what was typed.
     pub fn set_mode(&mut self, mode: Mode) {
         let needle = self.needle().to_string();
-        self.fixed_mode = matches!(mode, Mode::Languages | Mode::Themes).then_some(mode);
+        let fixed = matches!(mode, Mode::Languages | Mode::Themes | Mode::Branches);
+        self.fixed_mode = fixed.then_some(mode);
         self.query = match mode.prefix() {
             Some(prefix) => format!("{prefix}{needle}"),
             None => needle,
@@ -442,6 +483,12 @@ impl Picker {
         if self.mode() == Mode::WorkspaceSymbols {
             self.refilter(selected);
         }
+    }
+
+    /// Lists `items` as the branches, in order, selecting the first.
+    pub fn set_branches(&mut self, items: Vec<Item>) {
+        self.branches = items;
+        self.query_changed();
     }
 
     /// Lists open documents that have not been saved.
@@ -687,6 +734,20 @@ impl Picker {
             Mode::Line => line_item(self.needle()).into_iter().collect(),
             _ => Vec::new(),
         };
+        let name = self.needle().trim();
+        let new = self.mode() == Mode::Branches
+            && !name.is_empty()
+            && !self.branches.iter().any(|item| item.text == name);
+        self.new_branch = match new {
+            true => vec![Item {
+                text: format!("Create branch “{name}”"),
+                dim: 0..0,
+                detail: String::new(),
+                choice: Choice::Branch(SwitchTo::New(name.to_string())),
+                color: None,
+            }],
+            false => Vec::new(),
+        };
         self.refilter(None);
     }
 
@@ -703,6 +764,7 @@ impl Picker {
             Mode::Symbols => (self.outline.as_deref().unwrap_or_default(), &[]),
             Mode::WorkspaceSymbols => (&self.workspace_symbols, &[]),
             Mode::Terminals => (&self.terminals, &[]),
+            Mode::Branches => (&self.branches, &self.new_branch),
         }
     }
 
@@ -774,6 +836,12 @@ impl Picker {
         }
         drop(matcher);
         self.matches = scored.into_iter().map(|(i, _)| i).collect();
+        // A new branch is made only when none listed is the one wanted.
+        if !self.new_branch.is_empty() {
+            let new = self.branches.len();
+            self.matches.retain(|&i| i != new);
+            self.matches.push(new);
+        }
         if let Some(text) = selected {
             if let Some(index) = self.matches.iter().position(|&i| self.item(i).text == text) {
                 self.selected = index;
@@ -882,6 +950,7 @@ impl Picker {
             Mode::Symbols => ("Go to Symbol in File", "symbols"),
             Mode::WorkspaceSymbols => ("Go to Symbol in Workspace", "symbols"),
             Mode::Terminals => ("Go to Terminal", "terminals"),
+            Mode::Branches => ("Switch Branch", "branches"),
         };
         draw_frame(frame, area, title);
         let status = self.status(noun);
@@ -926,6 +995,7 @@ impl Picker {
                 Mode::Symbols => "Search symbols in this file",
                 Mode::WorkspaceSymbols => "Search symbols in the workspace",
                 Mode::Terminals => "Search terminals by name or running program.",
+                Mode::Branches => "Search branches, or name a new one.",
             };
             let hint: String = hint
                 .chars()
@@ -977,6 +1047,7 @@ impl Picker {
         if self.mode() == Mode::Files {
             total -= self.duplicates.len();
         }
+        total -= self.new_branch.len();
         let listing = if self.listing() {
             " listing…"
         } else if self.indexing && self.mode() == Mode::WorkspaceSymbols {
@@ -1004,6 +1075,7 @@ impl Picker {
             )),
             Choice::Untitled(_) => Some(icons::file("")),
             Choice::Terminal(_) => Some(icons::terminal()),
+            Choice::Branch(_) => Some(icons::branch()),
             _ => None,
         };
         let (x, room) = match icon.filter(|_| icons::enabled() && room > 2 * icons::WIDTH as usize)
@@ -1237,6 +1309,46 @@ mod tests {
 
     fn selected(picker: &Picker) -> &str {
         &picker.item(picker.matches[picker.selected]).text
+    }
+
+    #[test]
+    fn lists_branches_and_offers_a_new_one_last() {
+        let root = fixture("branches", &[]);
+        let mut picker = picker(&root, Mode::Branches, Vec::new());
+        let branch = |name: &str, remote, current| Branch {
+            name: name.to_string(),
+            remote,
+            current,
+            time: 0,
+        };
+        picker.set_branches(vec![
+            Item::branch(&branch("main", false, true), 60),
+            Item::branch(&branch("feature", false, false), 7200),
+            Item::branch(&branch("origin/fix", true, false), 60),
+        ]);
+        assert_eq!(listed(&picker), ["main", "feature", "origin/fix"]);
+        assert_eq!(picker.status("branches"), " 3 branches ");
+        picker.edit(Edit::Insert("fe"));
+        assert_eq!(listed(&picker), ["feature", "Create branch “fe”"]);
+        assert_eq!(
+            picker.selected_choice(),
+            Some(&Choice::Branch(SwitchTo::Branch("feature".into())))
+        );
+        picker.edit(Edit::Insert("ature"));
+        assert_eq!(listed(&picker), ["feature"], "it's there already");
+        picker.select_all();
+        picker.edit(Edit::Insert("fix"));
+        assert_eq!(
+            picker.selected_choice(),
+            Some(&Choice::Branch(SwitchTo::Track("origin/fix".into())))
+        );
+        picker.select_all();
+        picker.edit(Edit::Insert("brand new"));
+        assert_eq!(listed(&picker), ["Create branch “brand new”"]);
+        assert_eq!(
+            picker.accept(),
+            PickerAction::Accept(Choice::Branch(SwitchTo::New("brand new".into())))
+        );
     }
 
     #[test]

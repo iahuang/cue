@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use opentui::{Attributes, Buffer};
 
-use crate::changes::{draw_look, file_rows, Look};
+use crate::changes::{button_area, draw_look, file_rows, Look};
 use crate::git::{self, Change, Commit, Kind, Repo};
 use crate::icons;
 use crate::keymap::Command;
@@ -55,6 +55,8 @@ pub enum LogAction {
     None,
     /// Go back to the changes.
     Back,
+    /// Show the repository's branches, to switch to one.
+    Branches,
     /// Show how `commit` changed a file, and move focus there if `focus`.
     Open {
         commit: Commit,
@@ -175,13 +177,17 @@ impl LogView {
         action
     }
 
-    /// A left click on screen row `y`: the top row goes back to the
-    /// changes; another selects the entry there, then opens or closes a
+    /// A left click at column `x` of screen row `y`, in a list `width`
+    /// wide: on the top row, the branch shows the branches, and elsewhere,
+    /// goes back to the changes; another selects the entry there, then opens or closes a
     /// commit or folder, or shows a file: a `double` click moves focus to
     /// it.
-    pub fn click(&mut self, y: u32, double: bool) -> LogAction {
+    pub fn click(&mut self, x: u32, y: u32, width: u32, double: bool) -> LogAction {
         if y == 0 {
-            return LogAction::Back;
+            return match self.branch_area(width).contains(&x) {
+                true => LogAction::Branches,
+                false => LogAction::Back,
+            };
         }
         let index = self.scroll + y as usize - 1;
         if index >= self.rows.len() {
@@ -204,9 +210,13 @@ impl LogView {
     /// The columns of what's under the pointer on screen row `y`, that a
     /// click does something to, in a list `width` wide: the top row, or a
     /// commit, folder, or file. A commit's hash and author are only shown.
-    pub fn hover(&self, y: u32, width: u32) -> Option<Range<u32>> {
+    pub fn hover(&self, x: u32, y: u32, width: u32) -> Option<Range<u32>> {
         if y == 0 {
-            return Some(0..width);
+            let branch = self.branch_area(width);
+            return match branch.contains(&x) {
+                true => Some(branch),
+                false => Some(0..branch.start),
+            };
         }
         match self.rows.get(self.scroll + y as usize - 1)?.what {
             What::Info(_) => None,
@@ -237,12 +247,8 @@ impl LogView {
     fn draw_top(&self, frame: &Buffer, x: u32, width: u32) {
         let colors = theme::colors();
         frame.draw_text("‹", x + 1, 0, colors.muted, None, Attributes::NONE);
-        let end = x + width;
-        let branch_room = (width / 2).saturating_sub(2) as usize;
-        let branch = truncate(&self.branch, branch_room);
-        let icon_width = icons::width();
-        let branch_width = branch.chars().count() as u32 + icon_width;
-        let branch_x = end.saturating_sub(branch_width + 1);
+        let (branch, branch_x) = self.top_branch(width);
+        let branch_x = x + branch_x;
         let name_x = x + 3;
         let room = branch_x.saturating_sub(name_x + 1) as usize;
         let name = truncate(&self.name, room);
@@ -254,6 +260,22 @@ impl LogView {
             }
             frame.draw_text(&branch, at, 0, colors.muted, None, Attributes::NONE);
         }
+    }
+
+    /// The branch as the top row shows it, at its right end, in a list
+    /// `width` wide, and the column it starts at, its icon's if it has one.
+    fn top_branch(&self, width: u32) -> (String, u32) {
+        let branch_room = (width / 2).saturating_sub(2) as usize;
+        let branch = truncate(&self.branch, branch_room);
+        let branch_width = branch.chars().count() as u32 + icons::width();
+        let branch_x = width.saturating_sub(branch_width + 1);
+        (branch, branch_x)
+    }
+
+    /// The top row's button that shows the branches: the branch.
+    fn branch_area(&self, width: u32) -> Range<u32> {
+        let (branch, start) = self.top_branch(width);
+        button_area(start..start + icons::width() + branch.chars().count() as u32)
     }
 
     fn draw_row(
@@ -596,7 +618,7 @@ mod tests {
         );
         assert!(view.complete);
 
-        assert_eq!(view.click(2, false), LogAction::None);
+        assert_eq!(view.click(2, 2, 20, false), LogAction::None);
         assert_eq!(
             listing(&view),
             [
@@ -609,15 +631,17 @@ mod tests {
                 "> first"
             ]
         );
-        assert_eq!(view.hover(0, 20), Some(0..20), "back");
-        assert_eq!(view.hover(2, 20), Some(0..20), "a commit");
-        assert_eq!(view.hover(3, 20), None, "its hash and author");
-        assert_eq!(view.hover(8, 20), None, "below the commits");
+        assert_eq!(view.hover(2, 0, 20), Some(0..14), "back");
+        assert_eq!(view.hover(16, 0, 20), Some(14..20), "the branch");
+        assert_eq!(view.click(16, 0, 20, false), LogAction::Branches);
+        assert_eq!(view.hover(2, 2, 20), Some(0..20), "a commit");
+        assert_eq!(view.hover(2, 3, 20), None, "its hash and author");
+        assert_eq!(view.hover(2, 8, 20), None, "below the commits");
         let LogAction::Open {
             commit,
             change,
             focus,
-        } = view.click(5, false)
+        } = view.click(2, 5, 20, false)
         else {
             panic!("a file opens");
         };
@@ -627,7 +651,7 @@ mod tests {
         );
         assert_eq!(change.from, Some(root.join("b.txt")));
         assert!(matches!(
-            view.click(5, true),
+            view.click(2, 5, 20, true),
             LogAction::Open { focus: true, .. }
         ));
 
@@ -637,7 +661,7 @@ mod tests {
         view.run(Command::TreeCollapse);
         assert_eq!(listing(&view), ["> third", "> second", "> first"]);
         assert_eq!(
-            view.click(0, false),
+            view.click(2, 0, 20, false),
             LogAction::Back,
             "the top row goes back"
         );
@@ -648,7 +672,7 @@ mod tests {
         let root = crate::git::tests::repo("log-view-new");
         let mut view = LogView::open(&repo(&root), "log-view-new".into());
         view.set_height(20);
-        view.click(1, false);
+        view.click(2, 1, 20, false);
         assert_eq!(
             listing(&view),
             ["v first", "  (info)", "  a.txt A", "  b.txt A"]

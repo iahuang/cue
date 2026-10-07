@@ -17,6 +17,7 @@
 //! run it again.
 
 use std::cell::{Cell, OnceCell};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -542,6 +543,147 @@ fn stash_name(root: &Path, hash: &str) -> Result<String, String> {
                 .map(str::to_string)
         })
         .ok_or_else(|| "The stash is gone.".to_string())
+}
+
+/// A branch to switch to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Branch {
+    /// As git shortens it: `main`, or a remote's, `origin/main`.
+    pub name: String,
+    /// It's a remote's, with no branch of its own here yet.
+    pub remote: bool,
+    /// It's checked out.
+    pub current: bool,
+    /// When its last commit was made, in seconds since the Unix epoch.
+    pub time: i64,
+}
+
+/// The branches of the repository at `root`: its own, and the remotes' it
+/// has none of its own for. The one checked out is first, then those with
+/// the latest commits.
+pub fn branches(root: &Path) -> Vec<Branch> {
+    let output = git(root)
+        .args([
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)%1f%(refname:short)%1f%(HEAD)%1f%(committerdate:unix)%1f%(symref)",
+            "refs/heads",
+            "refs/remotes",
+        ])
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output.stdout,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output);
+    let mut branches: Vec<Branch> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\x1f');
+            let (full, name, head, time, symref) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            // A remote's HEAD only says which of its branches is the main one.
+            if !symref.is_empty() {
+                return None;
+            }
+            Some(Branch {
+                name: name.to_string(),
+                remote: full.starts_with("refs/remotes/"),
+                current: head == "*",
+                time: time.parse().unwrap_or(0),
+            })
+        })
+        .collect();
+    let local: HashSet<String> = branches
+        .iter()
+        .filter(|branch| !branch.remote)
+        .map(|branch| branch.name.clone())
+        .collect();
+    branches.retain(|branch| {
+        !branch.remote
+            || branch
+                .name
+                .split_once('/')
+                .is_some_and(|(_, name)| !local.contains(name))
+    });
+    // The one checked out first, to say where it's switching from.
+    branches.sort_by_key(|branch| !branch.current);
+    branches
+}
+
+/// Where to switch a repository to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchTo {
+    Branch(String),
+    /// A new branch, by this name, at the commit checked out.
+    New(String),
+    /// A branch of its own for this remote's branch, which tracks it.
+    Track(String),
+}
+
+impl SwitchTo {
+    /// The name of the branch it switches to.
+    pub fn name(&self) -> &str {
+        match self {
+            SwitchTo::Branch(name) | SwitchTo::New(name) => name,
+            SwitchTo::Track(remote) => remote.split_once('/').map_or(remote, |(_, name)| name),
+        }
+    }
+}
+
+/// How the changes not committed came along when switching branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Carried {
+    /// As they were, since the branch didn't change the files they did.
+    Along,
+    /// Stashed, then put back once switched.
+    Stashed,
+    /// Stashed, and not put back cleanly: what git said. The stash is kept.
+    Conflicts(String),
+}
+
+/// Switches the repository at `root` to `to`, bringing the changes not
+/// committed along. If git won't switch with them, as when the branch
+/// changed the same files, they're stashed first, and put back after.
+pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
+    let run = || {
+        let mut command = writing(root);
+        command.arg("switch");
+        match to {
+            SwitchTo::Branch(name) => command.args(["--", name]),
+            SwitchTo::New(name) => command.args(["-c", name]),
+            SwitchTo::Track(remote) => command.args(["--track", remote]),
+        };
+        run_with_input(command, b"").map(drop)
+    };
+    let err = match run() {
+        Ok(()) => return Ok(Carried::Along),
+        Err(err) => err,
+    };
+    let in_the_way = ["would be overwritten", "commit your changes or stash them"];
+    if !in_the_way.iter().any(|said| err.contains(said)) {
+        return Err(err);
+    }
+    let message = format!("Switching to {}", to.name());
+    stash(root, &message, false)?;
+    if let Err(err) = run() {
+        // Back as they were.
+        let mut pop = writing(root);
+        pop.args(["stash", "pop"]);
+        let _ = run_with_input(pop, b"");
+        return Err(err);
+    }
+    let mut pop = writing(root);
+    pop.args(["stash", "pop"]);
+    match run_with_input(pop, b"") {
+        Ok(_) => Ok(Carried::Stashed),
+        Err(err) => Ok(Carried::Conflicts(err)),
+    }
 }
 
 /// `git` for something that changes the repository at `dir`: as [`git`],
@@ -1386,6 +1528,87 @@ pub(crate) mod tests {
         git.restart();
         git.wait();
         assert_eq!(git.repos()[0].stashes, 1, "git status says how many");
+    }
+
+    #[test]
+    fn lists_branches_and_switches_bringing_changes() {
+        let dir = repo("switch");
+        commit_as_cue(&dir);
+        fs::write(dir.join("a.txt"), "1\n2\n3\n4\n5\n").unwrap();
+        commit_all(&dir, "lines");
+        run(&dir, &["switch", "-q", "-c", "other"]);
+        fs::write(dir.join("a.txt"), "one\n2\n3\n4\n5\n").unwrap();
+        commit_all(&dir, "other");
+        run(&dir, &["switch", "-q", "main"]);
+        run(&dir, &["remote", "add", "origin", "."]);
+        run(&dir, &["update-ref", "refs/remotes/origin/main", "main"]);
+        run(&dir, &["update-ref", "refs/remotes/origin/feature", "main"]);
+        let head = [
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ];
+        run(&dir, &head);
+
+        let mut listed: Vec<(String, bool, bool)> = branches(&dir)
+            .into_iter()
+            .map(|branch| (branch.name, branch.remote, branch.current))
+            .collect();
+        listed.sort();
+        let branch = |name: &str, remote, current| (name.to_string(), remote, current);
+        assert_eq!(
+            listed,
+            [
+                branch("main", false, true),
+                branch("origin/feature", true, false),
+                branch("other", false, false),
+            ],
+            "a remote's branch only if there's none here by its name"
+        );
+
+        let head = |dir: &Path| {
+            let output = git(dir)
+                .args(["branch", "--show-current"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let a = |dir: &Path| fs::read_to_string(dir.join("a.txt")).unwrap();
+        // A change git switches with.
+        fs::write(dir.join("b.txt"), "changed\n").unwrap();
+        let to = |name: &str| SwitchTo::Branch(name.to_string());
+        assert_eq!(switch(&dir, &to("other")), Ok(Carried::Along));
+        assert_eq!(head(&dir), "other");
+        assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "changed\n");
+        assert_eq!(switch(&dir, &to("main")), Ok(Carried::Along));
+
+        // One git won't switch with, but that goes back cleanly.
+        fs::write(dir.join("a.txt"), "1\n2\n3\n4\nfive\n").unwrap();
+        assert_eq!(switch(&dir, &to("other")), Ok(Carried::Stashed));
+        assert_eq!(a(&dir), "one\n2\n3\n4\nfive\n");
+        assert!(stashes(&dir).is_empty());
+        run(&dir, &["reset", "-q", "--hard"]);
+        run(&dir, &["switch", "-q", "main"]);
+
+        // And one that doesn't: it's kept in a stash.
+        fs::write(dir.join("a.txt"), "uno\n2\n3\n4\n5\n").unwrap();
+        let Ok(Carried::Conflicts(err)) = switch(&dir, &to("other")) else {
+            panic!("conflicts");
+        };
+        assert!(err.contains("CONFLICT"), "{err}");
+        assert_eq!(head(&dir), "other");
+        assert_eq!(stashes(&dir)[0].commit.subject, "Switching to other");
+        run(&dir, &["reset", "-q", "--hard"]);
+
+        let new = SwitchTo::New("fresh".to_string());
+        assert_eq!(switch(&dir, &new), Ok(Carried::Along));
+        assert_eq!(head(&dir), "fresh");
+        let track = SwitchTo::Track("origin/feature".to_string());
+        assert_eq!(track.name(), "feature");
+        assert_eq!(switch(&dir, &track), Ok(Carried::Along));
+        assert_eq!(head(&dir), "feature");
+        let err = switch(&dir, &to("nowhere")).unwrap_err();
+        assert!(err.contains("nowhere"), "{err}");
     }
 
     #[test]

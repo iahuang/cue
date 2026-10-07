@@ -2,8 +2,9 @@
 //! shown in the sidebar in place of the file tree.
 //!
 //! Each repository the workspace's folders are in is listed, under a row
-//! for what it does as a whole: the branch it's on, and buttons to its
-//! commit view, where changes are staged and committed, and to its log.
+//! for what it does as a whole: the branch it's on, which shows its
+//! branches to switch to, and buttons to its commit view, where changes are
+//! staged and committed, and to its log.
 //! Under its name are its changed files in their folders, each marked with
 //! how it changed. A folder holding only another folder shows as one row,
 //! `src/git`, as VS Code's compact folders do. Keys and the mouse work as
@@ -349,9 +350,11 @@ impl ChangesView {
         }
         if let What::Header(_) = self.rows[self.selected].what {
             let root = self.rows[self.selected].path.clone();
+            let branch = &self.rows[self.selected].name;
             return match header_button(x, width) {
                 Some(LOG_BUTTON) => TreeAction::Log(root),
                 Some(_) => TreeAction::Commit(root),
+                None if branch_area(branch, width).contains(&x) => TreeAction::Branches(root),
                 None => TreeAction::None,
             };
         }
@@ -379,12 +382,14 @@ impl ChangesView {
     /// `y`, that a click does something to, in a list `width` wide: a row,
     /// or a button on a repository's first row.
     pub fn hover(&self, x: u32, y: u32, width: u32) -> Option<Range<u32>> {
-        match self.rows.get(self.scroll + y as usize)?.what {
+        let row = self.rows.get(self.scroll + y as usize)?;
+        match &row.what {
             What::Gap => None,
-            What::Header(_) => header_button(x, width).map(|button| match button {
-                LOG_BUTTON => button_area(log_button(width)),
-                _ => button_area(commit_button(width)),
-            }),
+            What::Header(branch) => match header_button(x, width) {
+                Some(LOG_BUTTON) => Some(button_area(log_button(width))),
+                Some(_) => Some(button_area(commit_button(width))),
+                None => Some(branch_area(branch, width)).filter(|area| area.contains(&x)),
+            },
             _ => Some(0..width),
         }
     }
@@ -648,6 +653,16 @@ fn header_button(x: u32, width: u32) -> Option<&'static str> {
     }
 }
 
+/// The branch on a repository's first row, which shows its branches: its
+/// icon and name, as far as there's room before the buttons, in a list
+/// `width` wide.
+fn branch_area(branch: &str, width: u32) -> Range<u32> {
+    let name_x = 1 + icons::width();
+    let room = width.saturating_sub(name_x + BUTTONS.len() as u32 + 2);
+    let shown = (branch.chars().count() as u32).min(room);
+    button_area(1..name_x + shown)
+}
+
 /// Where a click on a button that's at `columns` counts: there, and a
 /// column either side.
 pub(crate) fn button_area(columns: Range<u32>) -> Range<u32> {
@@ -793,12 +808,14 @@ mod tests {
             "below the rows"
         );
         // On the first row, the buttons at its right end show the log and
-        // the commit view.
-        assert_eq!(view.click(3, 0, 20, false), TreeAction::None);
+        // the commit view, and the branch shows the branches.
         let log = TreeAction::Log(PathBuf::from("/w/cue"));
         assert_eq!(view.click(17, 0, 20, false), log);
         let commit = TreeAction::Commit(PathBuf::from("/w/cue"));
         assert_eq!(view.click(10, 0, 20, false), commit);
+        let branches = TreeAction::Branches(PathBuf::from("/w/cue"));
+        assert_eq!(view.click(3, 0, 20, false), branches, "the branch");
+        assert_eq!(view.click(6, 0, 20, false), TreeAction::None, "past it");
         assert_eq!(view.run(Command::TreeOpen), log, "as Enter on it does");
         assert_eq!(
             view.click(3, 1, 20, false),
