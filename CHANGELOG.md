@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.9 — 2026-10-06
 
 - Use VS Code word separators for double-click selection in the editor (`fd6db5a`)
 - Swap keybindings for set mark and clear mark (`4d0112b`)
