@@ -439,6 +439,9 @@ impl CommitView {
 
     /// What `button` does to the selected stash.
     fn stash_button(&self, button: StashButton) -> CommitAction {
+        if self.committing() && matches!(button, StashButton::Apply | StashButton::Pop) {
+            return CommitAction::None;
+        }
         let Some(stash) = self.selected_stash() else {
             return CommitAction::None;
         };
@@ -1574,6 +1577,54 @@ mod tests {
         view.set_repo(after);
         assert_eq!(view.stashes.len(), 1);
         assert_eq!(view.stashes[0].commit.subject, "new stash");
+    }
+
+    #[test]
+    fn blocks_stash_application_until_commit_finishes() {
+        let root = git::tests::repo("stash-during-commit");
+        git::tests::commit_as_cue(&root);
+        std::fs::write(root.join("new.txt"), "stashed addition\n").unwrap();
+        git::stage(&root, &[root.join("new.txt")]).unwrap();
+        git::stash(&root, "new file", true).unwrap();
+        let mut git = git::Git::new(std::slice::from_ref(&root));
+        git.wait();
+        let mut view = CommitView::open(&git.repos()[0], "cue".into());
+        view.set_size(40, 24);
+        let stash = view
+            .rows
+            .iter()
+            .position(|row| matches!(row.what, What::Stash(_)))
+            .unwrap();
+        view.select(stash);
+        view.run(Command::TreeExpand);
+        let actions = view
+            .rows
+            .iter()
+            .position(|row| matches!(row.what, What::StashActions(_)))
+            .unwrap();
+        let y = (view.list_top() + actions - view.scroll) as u32;
+        let buttons = view.stash_buttons(view.rows[actions].depth);
+        let (sender, receiver) = mpsc::channel();
+        view.committing = Some(receiver);
+        for command in [Command::TreeApplyStash, Command::TreePopStash] {
+            assert_eq!(view.run(command), CommitAction::None);
+        }
+        for (area, button) in &buttons {
+            if matches!(button, StashButton::Apply | StashButton::Pop) {
+                assert_eq!(view.click(area.start, y, false), CommitAction::None);
+            }
+        }
+        sender.send(Ok("1234567".into())).unwrap();
+        assert!(view.poll().unwrap().is_ok());
+        for (command, pop) in [(Command::TreeApplyStash, false), (Command::TreePopStash, true)] {
+            assert_eq!(
+                view.run(command),
+                CommitAction::ApplyStash {
+                    hash: view.stashes[0].commit.hash.clone(),
+                    pop,
+                }
+            );
+        }
     }
 
     #[test]
