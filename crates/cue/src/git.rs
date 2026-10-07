@@ -670,8 +670,11 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
         Ok(()) => return Ok(Carried::Along),
         Err(err) => err,
     };
-    let in_the_way = ["would be overwritten", "commit your changes or stash them"];
-    if !in_the_way.iter().any(|said| err.contains(said)) {
+    // Only changes to files git knows of are stashed: a new file the
+    // branch has too would only stay in the stash, the branch's in its
+    // place.
+    let changed = err.contains("commit your changes or stash them");
+    if !changed || err.contains("untracked working tree files") {
         return Err(err);
     }
     let message = format!("Switching to {}", to.name());
@@ -679,8 +682,7 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
     stash(root, &message, false)?;
     let created = stashes(root).into_iter().next();
     let Some(created) = created.filter(|stash| Some(&stash.commit.hash) != before.as_ref()) else {
-        // Ignored files aren't stashed. If they're all that's in the way,
-        // no stash was made, and an older one must not be popped.
+        // If no stash was made, an older one must not be popped.
         return Err(err);
     };
     // Whether what was staged is again: if it doesn't apply to what's
@@ -1725,6 +1727,23 @@ pub(crate) mod tests {
         assert!(a(&dir).contains("<<<<<<<"), "{err}");
         assert_eq!(head(&dir), "other");
         assert_eq!(stashes(&dir)[0].commit.subject, "Switching to other");
+        run(&dir, &["reset", "-q", "--hard"]);
+
+        // A new file the branch has too: it's left as it is, and git's
+        // said why not.
+        run(&dir, &["switch", "-q", "main"]);
+        fs::write(dir.join("c.txt"), "theirs\n").unwrap();
+        commit_all(&dir, "c");
+        run(&dir, &["switch", "-q", "other"]);
+        fs::write(dir.join("a.txt"), "uno\n2\n3\n4\n5\n").unwrap();
+        fs::write(dir.join("c.txt"), "mine\n").unwrap();
+        let err = switch(&dir, &to("main")).unwrap_err();
+        assert!(err.contains("c.txt"), "{err}");
+        assert_eq!(head(&dir), "other");
+        assert_eq!(a(&dir), "uno\n2\n3\n4\n5\n");
+        assert_eq!(fs::read_to_string(dir.join("c.txt")).unwrap(), "mine\n");
+        assert_eq!(stashes(&dir).len(), 1, "only the one from before");
+        fs::remove_file(dir.join("c.txt")).unwrap();
         run(&dir, &["reset", "-q", "--hard"]);
 
         let new = SwitchTo::New("fresh".to_string());
