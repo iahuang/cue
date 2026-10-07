@@ -19,6 +19,18 @@ pub enum SelectionBehavior {
     Line,
 }
 
+/// Which cells a selection made from viewport cells covers
+/// (`SelectionOccupancy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionOccupancy {
+    /// Both end cells, for a block cursor.
+    #[default]
+    Cell,
+    /// From the boundary before one end cell to the boundary before the
+    /// other, for a bar cursor.
+    Boundary,
+}
+
 /// Selection highlight colors. `fg` of `None` keeps the text's own color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionColors {
@@ -634,6 +646,19 @@ impl EditorView<'_> {
                 opt_ptr(&colors.fg),
             )
         }
+    }
+
+    /// Which cells selections from viewport cells cover, and where the
+    /// cursor can stop at a soft wrap: with [`Boundary`], at the end of the
+    /// wrapped row too.
+    ///
+    /// [`Boundary`]: SelectionOccupancy::Boundary
+    pub fn set_selection_occupancy(&self, occupancy: SelectionOccupancy) {
+        let occupancy = match occupancy {
+            SelectionOccupancy::Cell => 0,
+            SelectionOccupancy::Boundary => 1,
+        };
+        unsafe { sys::editorViewSetSelectionOccupancy(self.handle, occupancy) }
     }
 
     /// Starts a selection from viewport cells, as for a mouse press. With

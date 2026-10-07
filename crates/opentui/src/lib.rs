@@ -45,8 +45,8 @@ mod tty;
 pub use buffer::{Buffer, FrameBuffer, OwnedBuffer};
 pub use color::{Attributes, Rgba};
 pub use edit::{
-    EditBuffer, EditorView, Highlight, LogicalCursor, SelectionBehavior, SelectionColors, Viewport,
-    VisibleLine, VisualCursor,
+    EditBuffer, EditorView, Highlight, LogicalCursor, SelectionBehavior, SelectionColors,
+    SelectionOccupancy, Viewport, VisibleLine, VisualCursor,
 };
 pub use error::{Error, Result};
 pub use image::Image;

@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use opentui::{
     Attributes, Buffer, EditBuffer, EditorView, Highlight, SelectionBehavior, SelectionColors,
-    Viewport, WrapMode,
+    SelectionOccupancy, Viewport, WrapMode,
 };
 
 use crate::config::{self, Config};
@@ -736,7 +736,7 @@ impl Editor {
         // A drag that started in the text stays with it.
         let pressed = matches!(mouse.kind, MouseKind::Press(_));
         if (self.drag.is_none() || pressed) && self.handle_find_mouse(mouse, now) {
-            self.drag = None;
+            self.cancel_drag();
             return;
         }
         let wheel_lines = config::get().scroll_lines as i64;
@@ -762,6 +762,11 @@ impl Editor {
                 self.jump_from(self.cursor());
                 self.anchor = None;
                 self.view.clear_selection();
+                // The cursor is a bar, so a drag selects from the gap before
+                // the cell it starts on to the gap before the one it's on,
+                // rather than taking in both cells.
+                self.view
+                    .set_selection_occupancy(SelectionOccupancy::Boundary);
                 self.view.set_local_selection(
                     cell(at),
                     cell(at),
@@ -1541,6 +1546,7 @@ impl Editor {
     fn finish_drag(&mut self, drag: Drag) {
         let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) else {
             self.view.clear_selection();
+            self.view.set_selection_occupancy(SelectionOccupancy::Cell);
             self.anchor = None;
             return;
         };
@@ -1552,7 +1558,17 @@ impl Editor {
         };
         self.view.set_cursor_by_offset(cursor);
         self.view.set_selection(start, end, selection_colors());
+        // Only drags select from cells, and cell occupancy keeps the cursor
+        // off the gap at the end of a wrapped row, which the view can't show.
+        self.view.set_selection_occupancy(SelectionOccupancy::Cell);
         self.anchor = Some(anchor);
+    }
+
+    /// Stops a drag without making an offset selection of it.
+    fn cancel_drag(&mut self) {
+        if self.drag.take().is_some() {
+            self.view.set_selection_occupancy(SelectionOccupancy::Cell);
+        }
     }
 
     fn click_count(&mut self, at: (u32, u32), now: Instant) -> u32 {
@@ -2135,7 +2151,7 @@ impl Editor {
         if self.find.is_some() {
             self.close_find();
         }
-        self.drag = None;
+        self.cancel_drag();
         self.read_from(top);
     }
 
@@ -2221,7 +2237,7 @@ impl Editor {
         if self.find.is_some() {
             self.close_find();
         }
-        self.drag = None;
+        self.cancel_drag();
         self.reader = None;
         let mut diff = DiffView::new(self.doc.clone(), top);
         diff.set_size(self.width, self.height);
@@ -3192,18 +3208,25 @@ mod tests {
         assert_eq!((eb.cursor().row, eb.cursor().col), (1, 4));
         assert_eq!(editor.view.selection(), None);
 
-        // Drag backwards from (8,1) to (2,0). Both end cells are included, as
-        // in terminal selection; the cursor ends at the start.
+        // The cursor is a bar, so a drag selects from the gap before the cell
+        // it starts on to the gap before the one it ends on, either way.
         let t1 = t0 + Duration::from_secs(1);
+        mouse(&mut editor, MouseKind::Press(left), 2, 0, t1);
+        mouse(&mut editor, MouseKind::Drag(left), 5, 0, t1);
+        mouse(&mut editor, MouseKind::Release(left), 5, 0, t1);
+        assert_eq!(editor.view.selected_text(), "llo");
+        assert_eq!((eb.cursor().row, eb.cursor().col), (0, 5));
+
+        // Drag backwards from (8,1) to (2,0); the cursor ends at the start.
         mouse(&mut editor, MouseKind::Press(left), 8, 1, t1);
         mouse(&mut editor, MouseKind::Drag(left), 5, 0, t1);
         mouse(&mut editor, MouseKind::Drag(left), 2, 0, t1);
         mouse(&mut editor, MouseKind::Release(left), 2, 0, t1);
-        assert_eq!(editor.view.selected_text(), "llo world\nsecond li");
+        assert_eq!(editor.view.selected_text(), "llo world\nsecond l");
         assert_eq!((eb.cursor().row, eb.cursor().col), (0, 2));
         // Shift+Right moves the start; the drag origin stays the anchor.
         shift(&mut editor, KeyCode::Right);
-        assert_eq!(editor.view.selected_text(), "lo world\nsecond li");
+        assert_eq!(editor.view.selected_text(), "lo world\nsecond l");
 
         // Double click selects a word; a third click the line.
         let t2 = t1 + Duration::from_secs(1);
