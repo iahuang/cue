@@ -6685,8 +6685,8 @@ mod tests {
         let root = fixture("mark", &[("a.txt", &text), ("b.txt", "b")]);
         let mut app = app(&root, Some("a.txt"));
         let row = |app: &App| app.ed().place().0;
-        let jump = |app: &mut App| ctrl(app, '\'');
-        let set = |app: &mut App| {
+        let set = |app: &mut App| ctrl(app, '\'');
+        let jump = |app: &mut App| {
             let shift = Mods {
                 shift: true,
                 ..Mods::CTRL
@@ -6754,7 +6754,7 @@ mod tests {
         // From a terminal too.
         app.run(Command::NewTerminal, false);
         app.after_input();
-        ctrl(&mut app, '\'');
+        jump(&mut app);
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
     }
 
@@ -6768,7 +6768,13 @@ mod tests {
         );
         let mut app = app(&root, Some("a.txt"));
         let row = |app: &App| app.ed().place().0;
-        let jump = |app: &mut App| ctrl(app, '\'');
+        let jump = |app: &mut App| {
+            let shift = Mods {
+                shift: true,
+                ..Mods::CTRL
+            };
+            app.handle_key(Key::new(KeyCode::Char('\''), shift));
+        };
         let open = |app: &mut App, name: &str| {
             app.open(&root.join(name), false);
             app.after_input();
@@ -6835,7 +6841,13 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("mark-terminal", &[("a.txt", "a"), ("b.txt", "b")]);
         let mut app = app(&root, Some("a.txt"));
-        let jump = |app: &mut App| ctrl(app, '\'');
+        let jump = |app: &mut App| {
+            let shift = Mods {
+                shift: true,
+                ..Mods::CTRL
+            };
+            app.handle_key(Key::new(KeyCode::Char('\''), shift));
+        };
         let shown_terminal = |app: &App| {
             app.active_panel()
                 .terminal()
@@ -6846,11 +6858,7 @@ mod tests {
         let id = shown_terminal(&app).unwrap();
         let marked = app.tab().active;
         // cue's shortcuts work from the terminal.
-        let shift = Mods {
-            shift: true,
-            ..Mods::CTRL
-        };
-        app.handle_key(Key::new(KeyCode::Char('\''), shift));
+        ctrl(&mut app, '\'');
         assert!(screen(&app).contains("Mark set."));
 
         // Where the panel moved on since, it goes back through its history

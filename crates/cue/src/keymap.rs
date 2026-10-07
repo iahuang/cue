@@ -443,12 +443,12 @@ impl Default for Keymap {
         bindings.push((key(Char('-'), Mods::CTRL), GoBack));
         bindings.push((key(Char('_'), Mods::CTRL), GoBack));
         bindings.push((key(Char('='), Mods::CTRL), GoForward));
-        // Ctrl+' as Vim's ', which jumps to a mark. Some terminals report
-        // the shifted key, `"`. Legacy terminals can't send these; the
-        // kitty protocol can.
-        bindings.push((key(Char('\''), Mods::CTRL), JumpToMark));
-        bindings.push((key(Char('\''), CTRL_SHIFT), SetMark));
-        bindings.push((key(Char('"'), CTRL_SHIFT), SetMark));
+        // Ctrl+' sets the mark and Ctrl+Shift+' jumps to it. Some terminals
+        // report the shifted key, `"`. Legacy terminals can't send these;
+        // the kitty protocol can.
+        bindings.push((key(Char('\''), Mods::CTRL), SetMark));
+        bindings.push((key(Char('\''), CTRL_SHIFT), JumpToMark));
+        bindings.push((key(Char('"'), CTRL_SHIFT), JumpToMark));
         // As in VS Code and browsers. In a terminal, the shell has them.
         bindings.push((key(PageDown, Mods::CTRL), NextTab));
         bindings.push((key(PageUp, Mods::CTRL), PreviousTab));
