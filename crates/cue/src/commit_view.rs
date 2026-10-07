@@ -426,9 +426,11 @@ impl CommitView {
     /// Stashes the changes, with the message written: what's staged, if
     /// anything is, or else all of them.
     fn stash(&self) -> CommitAction {
-        if self.changes.is_empty() || self.committing() {
+        if self.committing() {
             return CommitAction::None;
         }
+        // The app checks unsaved documents too; they may be all that's
+        // changed, and must be saved before git has anything to stash.
         CommitAction::Stash {
             message: self.message.text.clone(),
             staged: self.staged_count() > 0,
@@ -943,7 +945,7 @@ impl CommitView {
         }
         let stash = self.stash_area();
         if !stash.is_empty() {
-            let fg = match self.changes.is_empty() || self.committing() {
+            let fg = match self.committing() {
                 true => colors.faint,
                 false => colors.text,
             };

@@ -5183,6 +5183,15 @@ impl App {
                 return self.save_then_go(Saving { docs, redo });
             }
         }
+        if !self
+            .git
+            .repos()
+            .iter()
+            .any(|repo| repo.root == root && !repo.changes.is_empty())
+        {
+            self.show_message("No changes to stash.", false);
+            return AppAction::Continue;
+        }
         self.stash_now(&root, &message, staged);
         AppAction::Continue
     }
@@ -10032,6 +10041,50 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert!(tall_screen(&app).contains("Dropped the stash."));
         assert!(git::stashes(&root).is_empty());
+    }
+
+    #[test]
+    fn stashing_saves_edits_when_the_working_tree_is_clean() {
+        let _serial = crate::test_serial();
+        for click in [false, true] {
+            let root = crate::git::tests::repo(&format!("app-unsaved-stash-{click}"));
+            crate::git::tests::commit_as_cue(&root);
+            let mut app = tall_app(&root, Some("a.txt"));
+            wait_for_git(&mut app);
+            app.focus = Focus::Editor;
+            type_text(&mut app, "unsaved ");
+            assert!(app.documents[0].is_modified());
+            assert!(app.git.repos()[0].changes.is_empty());
+            app.run(Command::TreeCommit, false);
+            type_text(&mut app, "My stash");
+            key(&mut app, KeyCode::Esc);
+            if click {
+                let width = app.visible_tree_width();
+                left_click(&mut app, width - 15, 4);
+            } else {
+                app.run(Command::TreeStash, false);
+            }
+
+            let stashes = git::stashes(&root);
+            assert_eq!(stashes.len(), 1);
+            assert_eq!(stashes[0].commit.subject, "My stash");
+            assert_eq!(
+                git::file_at(&root, &stashes[0].commit.hash, Path::new("a.txt")),
+                git::Base::Text("unsaved a\n".into())
+            );
+            assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+            assert!(!app.documents[0].is_modified());
+            assert_eq!(app.commit_views[0].message(), "");
+
+            // On a clean repository, the enabled button leaves the draft
+            // and existing stashes alone and explains there's nothing to do.
+            wait_for_git(&mut app);
+            app.commit_views[0].edit(Edit::Insert("Keep this draft"), false);
+            app.run(Command::TreeStash, false);
+            assert_eq!(git::stashes(&root), stashes);
+            assert_eq!(app.commit_views[0].message(), "Keep this draft");
+            assert!(tall_screen(&app).contains("No changes to stash."));
+        }
     }
 
     #[test]
