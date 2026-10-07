@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Refresh stashes in the commit view when one is replaced by another (`943d7bd`)
+- Switch to the right branch when a tag shares its name (`6b22062`)
+- Keep ignored files, and older stashes, when switching branches (`d7dc9c9`)
+- Prevent applying or popping a stash while a commit is in progress (`b94691b`)
+- Allow committing a merge with no staged changes (`58632d8`)
+- Turn off amending as soon as a branch switch finishes (`0078654`)
+- Save and stash unsaved edits when there are no other changes (`1b00f03`)
+- Bring changes along unstaged when switching branches if what was staged no longer applies (`6379408`)
+- Refuse to switch branches over new files the branch also has, rather than stashing them (`d984544`)
+- Bring changes along when switching branches with a translated git (`ca8b759`)
+- Offer only a remote's branch, not a new branch of the same name, when its name is typed in the branch picker (`2469d3f`)
+- List remotes' branches correctly when a remote's name has a `/` in it (`f7310af`)
+
 ## v0.3.10 — 2026-10-07
 
 - Indent new lines and closing brackets as you type (`334f3de`)
@@ -7,6 +22,8 @@
 - Limit hover highlights in the Git sidebar views to rows and buttons that can be clicked (`ac5f5af`)
 - Add stashing, and applying, popping, and dropping stashes, to the commit view (`f22b3c2`)
 - Switch and create branches from the branch name in the Git sidebar views, bringing uncommitted changes along (`fe137dd`)
+- Keep what's staged when switching branches, and wait for a commit in progress to finish first (`926b0fd`)
+- Turn off amending when switching branches (`4f8a21d`)
 
 ## v0.3.9 — 2026-10-06
 
