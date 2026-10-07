@@ -548,7 +548,7 @@ fn stash_name(root: &Path, hash: &str) -> Result<String, String> {
 /// A branch to switch to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Branch {
-    /// As git shortens it: `main`, or a remote's, `origin/main`.
+    /// Its name: `main`, or a remote's, `origin/main`.
     pub name: String,
     /// It's a remote's, with no branch of its own here yet.
     pub remote: bool,
@@ -566,7 +566,7 @@ pub fn branches(root: &Path) -> Vec<Branch> {
         .args([
             "for-each-ref",
             "--sort=-committerdate",
-            "--format=%(refname)%1f%(refname:short)%1f%(HEAD)%1f%(committerdate:unix)%1f%(symref)",
+            "--format=%(refname)%1f%(refname:strip=2)%1f%(HEAD)%1f%(committerdate:unix)%1f%(symref)",
             "refs/heads",
             "refs/remotes",
         ])
@@ -657,7 +657,7 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
         match to {
             SwitchTo::Branch(name) => command.args(["--", name]),
             SwitchTo::New(name) => command.args(["-c", name]),
-            SwitchTo::Track(remote) => command.args(["--track", remote]),
+            SwitchTo::Track(remote) => command.args(["--track", &format!("refs/remotes/{remote}")]),
         };
         run_with_input(command, b"").map(drop)
     };
@@ -1517,6 +1517,34 @@ pub(crate) mod tests {
         git.restart();
         git.wait();
         assert_eq!(git.repos()[0].stashes, stashes(&dir));
+    }
+
+    #[test]
+    fn switches_to_branches_that_share_names_with_tags() {
+        let dir = repo("switch-tags");
+        run(&dir, &["tag", "main"]);
+        run(&dir, &["remote", "add", "origin", "."]);
+        run(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        run(&dir, &["update-ref", "refs/remotes/origin/topic", "HEAD"]);
+        run(&dir, &["tag", "origin/topic"]);
+        run(&dir, &["switch", "-q", "-c", "other"]);
+        let listed = branches(&dir);
+        assert!(!listed.iter().any(|branch| branch.name == "origin/main"));
+        for (name, remote) in [("main", false), ("origin/topic", true)] {
+            let branch = listed.iter().find(|branch| branch.name == name).unwrap();
+            assert_eq!(branch.remote, remote);
+            let to = if remote {
+                SwitchTo::Track(branch.name.clone())
+            } else {
+                SwitchTo::Branch(branch.name.clone())
+            };
+            assert_eq!(switch(&dir, &to), Ok(Carried::Along));
+        }
+        let upstream = git(&dir)
+            .args(["rev-parse", "--symbolic-full-name", "@{upstream}"])
+            .output()
+            .unwrap();
+        assert_eq!(upstream.stdout, b"refs/remotes/origin/topic\n");
     }
 
     #[test]
