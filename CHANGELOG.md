@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.11 — 2026-10-07
 
 - Refresh stashes in the commit view when one is replaced by another (`943d7bd`)
 - Switch to the right branch when a tag shares its name (`6b22062`)
