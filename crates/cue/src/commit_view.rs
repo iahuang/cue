@@ -263,6 +263,9 @@ impl CommitView {
     /// Catches up with what git says of the repository now, keeping the
     /// selection on the same entry while it's still listed.
     pub fn set_repo(&mut self, repo: &Repo) {
+        if self.branch != repo.head.name() && self.amend {
+            self.toggle_amend();
+        }
         self.branch = repo.head.name().to_string();
         self.initial = repo.commit.is_none();
         if self.initial {
@@ -1551,6 +1554,36 @@ mod tests {
                 format!("{}{wraps}", &text[line.range])
             })
             .collect()
+    }
+
+    #[test]
+    fn switching_branches_clears_amend_but_keeps_edited_messages() {
+        let mut repo = repo(&[]);
+        repo.root = git::tests::repo("amend-switch");
+        for edited in [false, true] {
+            repo.head = Head::Branch("main".into());
+            let mut view = CommitView::open(&repo, "cue".into());
+            view.toggle_amend();
+            assert_eq!(view.message(), "first");
+            if edited {
+                view.edit(Edit::Insert("My draft"), false);
+            }
+            let message = view.message().to_string();
+            view.set_repo(&repo);
+            assert!(view.amend, "ordinary refreshes keep amend enabled");
+            repo.head = Head::Branch("other".into());
+            view.set_repo(&repo);
+            assert!(!view.amend);
+            assert_eq!(view.message(), if edited { &message } else { "" });
+            assert_eq!(
+                view.commit(),
+                Err(if edited {
+                    CantCommit::NothingStaged
+                } else {
+                    CantCommit::NoMessage
+                })
+            );
+        }
     }
 
     #[test]
