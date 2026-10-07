@@ -5269,6 +5269,10 @@ impl App {
     }
 
     fn switch_now(&mut self, root: &Path, to: &SwitchTo) {
+        if self.commit_view_of(root).is_some_and(|view| view.committing()) {
+            self.show_message("Wait for the commit to finish before switching branches.", true);
+            return;
+        }
         let name = to.name().to_string();
         match git::switch(root, to) {
             Ok(Carried::Along) => self.show_message(format!("Switched to {name}."), false),
@@ -10072,6 +10076,22 @@ mod tests {
             fs::read_to_string(root.join("a.txt")).unwrap(),
             "xchanged\n"
         );
+
+        // A pending commit must finish on the branch it started on.
+        git::stage(&root, &[root.join("a.txt")]).unwrap();
+        app.git.restart();
+        wait_for_git(&mut app);
+        app.commit_views[0].edit(Edit::Insert("Stay on main"), false);
+        app.commit();
+        assert!(app.commit_views[0].committing());
+        let to = SwitchTo::Branch("topic".to_string());
+        app.switch_branch(root.clone(), to.clone());
+        assert_eq!(branch(), "main");
+        assert!(tall_screen(&app).contains("Wait for the commit"));
+        app.commit_views[0].wait().unwrap().unwrap();
+        assert_eq!(git::log(&root, 0, 1)[0].subject, "Stay on main");
+        app.switch_branch(root.clone(), to);
+        assert_eq!(branch(), "topic");
     }
 
     #[test]

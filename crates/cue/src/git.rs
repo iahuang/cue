@@ -674,12 +674,12 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
     if let Err(err) = run() {
         // Back as they were.
         let mut pop = writing(root);
-        pop.args(["stash", "pop"]);
+        pop.args(["stash", "pop", "--index"]);
         let _ = run_with_input(pop, b"");
         return Err(err);
     }
     let mut pop = writing(root);
-    pop.args(["stash", "pop"]);
+    pop.args(["stash", "pop", "--index"]);
     match run_with_input(pop, b"") {
         Ok(_) => Ok(Carried::Stashed),
         Err(err) => Ok(Carried::Conflicts(err)),
@@ -1583,9 +1583,23 @@ pub(crate) mod tests {
         assert_eq!(switch(&dir, &to("main")), Ok(Carried::Along));
 
         // One git won't switch with, but that goes back cleanly.
+        stage(&dir, &[dir.join("b.txt")]).unwrap();
+        fs::write(dir.join("b.txt"), "changed again\n").unwrap();
         fs::write(dir.join("a.txt"), "1\n2\n3\n4\nfive\n").unwrap();
         assert_eq!(switch(&dir, &to("other")), Ok(Carried::Stashed));
         assert_eq!(a(&dir), "one\n2\n3\n4\nfive\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "changed again\n"
+        );
+        assert_eq!(
+            staged(&dir),
+            [
+                ("a.txt".to_string(), Staged::No),
+                ("b.txt".to_string(), Staged::Partly),
+            ],
+            "the staged and unstaged changes stay separate"
+        );
         assert!(stashes(&dir).is_empty());
         run(&dir, &["reset", "-q", "--hard"]);
         run(&dir, &["switch", "-q", "main"]);
@@ -1595,7 +1609,8 @@ pub(crate) mod tests {
         let Ok(Carried::Conflicts(err)) = switch(&dir, &to("other")) else {
             panic!("conflicts");
         };
-        assert!(err.contains("CONFLICT"), "{err}");
+        assert!(!err.is_empty());
+        assert!(a(&dir).contains("<<<<<<<"), "{err}");
         assert_eq!(head(&dir), "other");
         assert_eq!(stashes(&dir)[0].commit.subject, "Switching to other");
         run(&dir, &["reset", "-q", "--hard"]);
