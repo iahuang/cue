@@ -238,6 +238,13 @@ enum Sidebar {
     Commit,
 }
 
+/// What the name prompt names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Naming {
+    Tab,
+    Session,
+}
+
 /// What a context menu's commands act on.
 enum MenuFor {
     /// A file or folder, from the tree.
@@ -333,8 +340,8 @@ pub struct App {
     next_tab: TabId,
     /// The id for the next new panel, in any tab.
     next_panel: PanelId,
-    /// The prompt for the tab's new name, while it's open.
-    tab_prompt: Option<Prompt>,
+    /// The prompt for the tab's or the session's new name, while it's open.
+    name_prompt: Option<(Prompt, Naming)>,
     /// Text from the last copy or cut, shared by all editors.
     clipboard: Option<String>,
     /// Text a terminal's program copied, for the system clipboard.
@@ -603,7 +610,7 @@ impl App {
             tab: 0,
             next_tab: 1,
             next_panel: 1,
-            tab_prompt: None,
+            name_prompt: None,
             clipboard: None,
             copied: None,
             focus,
@@ -694,14 +701,19 @@ impl App {
             let action = alert.handle_key(key);
             return self.alert_action(action);
         }
-        if let Some(prompt) = &mut self.tab_prompt {
+        if let Some((prompt, naming)) = &mut self.name_prompt {
+            let naming = *naming;
             match prompt.handle_key(key) {
                 PromptKey::Continue => {}
-                PromptKey::Cancel => self.tab_prompt = None,
+                PromptKey::Cancel => self.name_prompt = None,
                 // An empty name goes back to naming it for what it shows.
                 PromptKey::Submit(name) => {
-                    self.tab_prompt = None;
-                    self.tab_mut().name = (!name.is_empty()).then_some(name);
+                    self.name_prompt = None;
+                    let name = (!name.is_empty()).then_some(name);
+                    match naming {
+                        Naming::Tab => self.tab_mut().name = name,
+                        Naming::Session => self.rename_session(name.as_deref()),
+                    }
                 }
             }
             return AppAction::Continue;
@@ -914,6 +926,16 @@ impl App {
                 };
             }
             Command::EndSession => return self.end_session(),
+            Command::RenameSession => match &self.session {
+                Some(session) => {
+                    let name = session.name().unwrap_or_default();
+                    let prompt = Prompt::new("Rename session", name);
+                    self.name_prompt = Some((prompt, Naming::Session));
+                }
+                None => {
+                    self.show_message("No active session. Use Keep Session to create one.", false)
+                }
+            },
             Command::ToggleTree => {
                 self.tree_visible = !self.tree_visible;
                 if self.tree_visible {
@@ -1013,7 +1035,7 @@ impl App {
             }
             Command::RenameTab => {
                 let name = self.tab().name.clone().unwrap_or_default();
-                self.tab_prompt = Some(Prompt::new("Rename tab", &name));
+                self.name_prompt = Some((Prompt::new("Rename tab", &name), Naming::Tab));
             }
             Command::NewTerminal => self.new_terminal(),
             Command::ClearTerminal => {
@@ -1261,7 +1283,7 @@ impl App {
         };
         if let MouseKind::Press(_) = mouse.kind {
             // Like a key press, a click dismisses messages and prompts.
-            self.tab_prompt = None;
+            self.name_prompt = None;
             self.active_panel_mut().clear_message();
             if let Some(terminal) = self.active_terminal() {
                 terminal.borrow_mut().cancel_prompt();
@@ -1500,13 +1522,13 @@ impl App {
             if self.height > 1
                 && y == self.height - 1
                 && x < self.width
-                && self.tab_prompt.is_none()
+                && self.name_prompt.is_none()
             {
                 let status = self.active_panel().status();
-                if let Some(badge) = status::session_badge(&status, self.width) {
-                    if self.session.is_some() && badge.contains(&x) {
-                        return Some(MouseTarget::Session);
-                    }
+                let session =
+                    status::session_badge(&status, self.session_label().as_deref(), self.width);
+                if session.is_some_and(|badge| badge.contains(&x)) {
+                    return Some(MouseTarget::Session);
                 }
                 let git = status::git_badge(&status, self.git_badge().as_ref(), self.width);
                 if git.as_ref().is_some_and(|git| git.contains(&x)) {
@@ -1694,7 +1716,7 @@ impl App {
         if self.alert.is_some() {
             return;
         }
-        if let Some(prompt) = &mut self.tab_prompt {
+        if let Some((prompt, _)) = &mut self.name_prompt {
             prompt.paste(text);
             return;
         }
@@ -1793,12 +1815,12 @@ impl App {
             cursor = message_cursor;
         }
         if self.height > 1 {
-            let status = match &self.tab_prompt {
-                Some(prompt) => prompt.status(),
+            let status = match &self.name_prompt {
+                Some((prompt, _)) => prompt.status(),
                 None => self.active_panel().status(),
             };
             let y = self.height - 1;
-            let session = self.session.is_some();
+            let session = self.session_label();
             let git = self.git_badge();
             let width = self.width;
             if let Some(prompt) = status::draw(
@@ -1807,7 +1829,7 @@ impl App {
                 y,
                 width,
                 &self.keymap,
-                session,
+                session.as_deref(),
                 git.as_ref(),
                 self.terminal_cue_keys,
             ) {
@@ -1919,9 +1941,12 @@ impl App {
                 self.width,
             )
             .map(span),
-            MouseTarget::Session => {
-                status::session_badge(&self.active_panel().status(), self.width).map(span)
-            }
+            MouseTarget::Session => status::session_badge(
+                &self.active_panel().status(),
+                self.session_label().as_deref(),
+                self.width,
+            )
+            .map(span),
             MouseTarget::Language => {
                 let status = self.active_panel().status();
                 let offset = status::git_badge(&status, self.git_badge().as_ref(), self.width)
@@ -2613,7 +2638,7 @@ impl App {
             return;
         }
         self.active_panel_mut().clear_message();
-        self.tab_prompt = None;
+        self.name_prompt = None;
         self.tab = index;
         self.focus = Focus::Editor;
         // The screen may have changed size while it was away.
@@ -2677,7 +2702,7 @@ impl App {
         if !self.ask_first(title, unsaved, &running, "&Close Tab", redo) {
             return;
         }
-        self.tab_prompt = None;
+        self.name_prompt = None;
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.tabs.push(Tab::new(self.next_tab, self.next_panel));
@@ -2724,7 +2749,7 @@ impl App {
                 let session = self.session.is_some();
                 let available = |command: Command| match command {
                     Command::KeepSession => !session && self.sessions.is_some(),
-                    Command::EndSession => session,
+                    Command::EndSession | Command::RenameSession => session,
                     Command::Detach => self.sessions.is_some(),
                     command => command.context() != Context::Terminal || terminal,
                 };
@@ -4003,6 +4028,16 @@ impl App {
         self.session.as_ref()
     }
 
+    /// What the status bar's badge calls the session, if in one: its name,
+    /// or "session" and its ID if it has none.
+    fn session_label(&self) -> Option<String> {
+        let session = self.session.as_ref()?;
+        Some(match session.name() {
+            Some(name) => name.to_string(),
+            None => format!("session {}", session.id()),
+        })
+    }
+
     /// Stops being a session, removing what it kept, as when it was one
     /// only to restart (see [`App::hand_over`]). Unsaved changes have
     /// recovery copies again.
@@ -4076,6 +4111,14 @@ impl App {
         match running_programs(&self.terminals).is_empty() {
             true => AppAction::Quit,
             false => AppAction::Detach,
+        }
+    }
+
+    /// Names the session `name`, or with `None`, unnames it.
+    fn rename_session(&mut self, name: Option<&str>) {
+        if let Some(session) = &mut self.session {
+            session.rename(name);
+            self.save_session(false);
         }
     }
 
@@ -4265,6 +4308,9 @@ impl App {
                 })
             }),
             attached: self.attached,
+            // The session's own, which it saves with this.
+            name: None,
+            unknown: Default::default(),
         })
     }
 
@@ -4516,6 +4562,7 @@ impl App {
             true => Focus::Tree,
             false => Focus::Editor,
         };
+        session.carry(&state);
         self.session = Some(session);
         self.recovery.discard();
         self.layout();
@@ -5278,8 +5325,14 @@ impl App {
     }
 
     fn switch_now(&mut self, root: &Path, to: &SwitchTo) {
-        if self.commit_view_of(root).is_some_and(|view| view.committing()) {
-            self.show_message("Wait for the commit to finish before switching branches.", true);
+        if self
+            .commit_view_of(root)
+            .is_some_and(|view| view.committing())
+        {
+            self.show_message(
+                "Wait for the commit to finish before switching branches.",
+                true,
+            );
             return;
         }
         let name = to.name().to_string();
@@ -5559,11 +5612,14 @@ impl App {
     /// The session badge's menu, above it: to detach or end the session.
     fn show_session_menu(&mut self) {
         let status = self.active_panel().status();
-        let Some(badge) = status::session_badge(&status, self.width) else {
+        let Some(badge) =
+            status::session_badge(&status, self.session_label().as_deref(), self.width)
+        else {
             return;
         };
         let items = vec![
             MenuItem::Command(Command::Detach, "Detach Session".into()),
+            MenuItem::Command(Command::RenameSession, "Rename Session…".into()),
             MenuItem::Command(Command::EndSession, "End Session".into()),
         ];
         let y = self.height.saturating_sub(1);
@@ -6071,7 +6127,7 @@ impl App {
             || self.search.is_some()
             || self.dialog.is_some()
             || self.menu.is_some()
-            || self.tab_prompt.is_some();
+            || self.name_prompt.is_some();
         if self.focus != Focus::Editor || popup {
             return None;
         }
@@ -6331,7 +6387,7 @@ impl App {
             || self.search.is_some()
             || self.picker.is_some()
             || self.dialog.is_some()
-            || self.tab_prompt.is_some();
+            || self.name_prompt.is_some();
         let selected = match self.focus {
             Focus::Tree if !popup && self.visible_tree_width() > 0 => self.sidebar_selected(),
             _ => None,
@@ -11127,9 +11183,11 @@ mod tests {
         assert!(app.palette_has(Command::EndSession));
         let dir = app.session().unwrap().dir().to_path_buf();
         assert!(dir.join("session.toml").is_file());
+        app.rename_session(Some("work"));
         app.save_session(true);
 
         let mut app = reopen(app, Vec::new());
+        assert_eq!(app.session().unwrap().name(), Some("work"));
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(app.tab, 1);
         assert_eq!(app.tab().name.as_deref(), Some("notes"));
@@ -11167,24 +11225,24 @@ mod tests {
     }
 
     #[test]
-    fn the_status_bar_shows_a_session_and_its_badge_detaches_or_ends_it() {
+    fn the_status_bar_shows_a_session_and_its_badge_detaches_renames_or_ends_it() {
         let _serial = crate::test_serial();
         let root = fixture("session-badge", &[("a.txt", "alpha")]);
         let mut app = app(&root, Some("a.txt"));
         app.sessions = Some(sessions_dir("badge"));
         let status_line = |app: &App| screen(app).lines().last().unwrap().trim_end().to_string();
-        assert!(
-            !status_line(&app).ends_with(" session"),
-            "{}",
-            status_line(&app)
-        );
+        // Out of a session, the hints end the line.
+        let line = status_line(&app);
+        assert!(line.ends_with(" quit"), "{line}");
         left_click(&mut app, 78, 9);
         assert!(app.menu.is_none());
 
         app.run(Command::KeepSession, false);
         key(&mut app, KeyCode::Right);
+        // Unnamed, the badge shows its ID.
+        let id = app.session().unwrap().id().to_string();
         let line = status_line(&app);
-        assert!(line.ends_with(" session"), "{line}");
+        assert!(line.ends_with(&format!("  session {id}")), "{line}");
         // Where a menu item is on screen, by its label.
         let find = |app: &App, label: &str| {
             screen(app).lines().enumerate().find_map(|(y, line)| {
@@ -11218,6 +11276,31 @@ mod tests {
         assert!(find(&app, "End Session").is_some(), "{}", screen(&app));
         assert!(matches!(click(&mut app, detach), AppAction::Detach));
         assert!(app.menu.is_none());
+
+        // Named, and unnamed with no name.
+        click(&mut app, (78, 9));
+        let rename = find(&app, "Rename Session…").expect("the menu");
+        click(&mut app, rename);
+        type_text(&mut app, "api");
+        assert!(
+            screen(&app).contains(" Rename session: api"),
+            "{}",
+            screen(&app)
+        );
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.session().unwrap().name(), Some("api"));
+        let line = status_line(&app);
+        assert!(line.ends_with("  api"), "{line}");
+        let listed = session::list(app.sessions.as_ref().unwrap());
+        assert_eq!(listed[0].state.name.as_deref(), Some("api"));
+        app.run(Command::RenameSession, false);
+        for _ in 0.."api".len() {
+            key(&mut app, KeyCode::Backspace);
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.session().unwrap().name(), None);
+        let line = status_line(&app);
+        assert!(line.ends_with(&format!("  session {id}")), "{line}");
 
         click(&mut app, (78, 9));
         let end = find(&app, "End Session").expect("the menu");

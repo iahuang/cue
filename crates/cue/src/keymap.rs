@@ -49,6 +49,7 @@ commands! {
     KeepSession => "session:keep", "Keep Session";
     Detach => "session:detach", "Detach Session";
     EndSession => "session:end", "End Session";
+    RenameSession => "session:rename", "Rename Session";
     Palette => "app:command-palette", "Show Command Palette";
     OpenSettings => "app:open-settings", "Open Settings";
     ReloadSettings => "app:reload-settings", "Reload Settings";
@@ -256,7 +257,7 @@ impl Command {
             | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal
             | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft | MoveTabRight
             | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6
-            | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder => Context::Global,
+            | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
@@ -901,6 +902,7 @@ mod tests {
             Command::KeepSession,
             Command::Detach,
             Command::EndSession,
+            Command::RenameSession,
             // The branch badge gets there too.
             Command::ToggleChanges,
             // So does the button in a changed file's header.

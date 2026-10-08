@@ -1,7 +1,7 @@
 //! `cue --resume`: the sessions to go back to, full screen, before cue
 //! starts. It lists those of the folder it's run in, or with Tab (or
 //! `--all`), every one, most recent first, and narrows them as you type:
-//! by folder, tab, file, program, or id.
+//! by name, folder, tab, file, program, or id.
 //!
 //! It runs in the `cue` the shell ran (see [`crate::client`]), which then
 //! attaches to the session chosen, or starts a cue for it.
@@ -341,7 +341,8 @@ impl Chooser {
         let (shown, cursor) = self.caret.view(&self.query, room);
         match self.query.is_empty() {
             true => {
-                let placeholder = truncate("Search folders, tabs, files, and programs", room);
+                let placeholder =
+                    truncate("Search names, folders, tabs, files, and programs", room);
                 frame.draw_text(&placeholder, x, 2, colors.faint, None, Attributes::NONE);
             }
             false => frame.draw_text(&shown, x, 2, colors.text, None, Attributes::NONE),
@@ -391,7 +392,7 @@ impl Chooser {
                 frame.draw_text("▌", 0, y + 1, colors.accent, None, Attributes::NONE);
             }
 
-            // The folders, and when it was saved and how it is now.
+            // Its name and folders, and when it was saved and how it is now.
             let status = listing.status();
             let age = format!("{} · ", listing.age(self.now));
             let right_len = (age.chars().count() + status.len()) as u32;
@@ -408,8 +409,19 @@ impl Chooser {
                 true => Attributes::BOLD,
                 false => Attributes::NONE,
             };
+            let mut x = 2;
+            if let Some(name) = &listing.state.name {
+                let name = truncate(name, room);
+                draw_found(frame, &name, x, y, colors.text, title_attributes, &words);
+                x += name.chars().count() as u32 + 2;
+            }
+            let room = right_x.saturating_sub(x + 2) as usize;
             let folders = truncate(&listing.folders(), room);
-            draw_found(frame, &folders, 2, y, colors.text, title_attributes, &words);
+            let (fg, attributes) = match listing.state.name {
+                Some(_) => (colors.muted, Attributes::NONE),
+                None => (colors.text, title_attributes),
+            };
+            draw_found(frame, &folders, x, y, fg, attributes, &words);
 
             // What's open in it, and its id.
             let id = &listing.id;
@@ -461,11 +473,12 @@ impl Chooser {
 const SCOPE_HERE: &str = " This Folder ";
 const SCOPE_ALL: &str = " All ";
 
-/// What a session is found by: its folders, tabs, files, terminals, and id,
-/// lowercase.
+/// What a session is found by: its name, folders, tabs, files, terminals,
+/// and id, lowercase.
 fn haystack(listing: &Listing) -> String {
     let state = &listing.state;
-    let mut parts = vec![listing.folders(), listing.id.clone()];
+    let mut parts: Vec<String> = listing.state.name.iter().cloned().collect();
+    parts.extend([listing.folders(), listing.id.clone()]);
     parts.extend(state.roots.iter().map(|root| root.display().to_string()));
     parts.extend(state.tabs.iter().filter_map(|tab| tab.name.clone()));
     parts.extend(
@@ -818,6 +831,17 @@ mod tests {
         assert_eq!(key(&mut chooser, KeyCode::Enter), Action::Continue);
         key(&mut chooser, KeyCode::Esc);
         assert_eq!(key(&mut chooser, KeyCode::Esc), Action::Cancel);
+    }
+
+    #[test]
+    fn a_name_comes_before_the_folders_and_finds_its_session() {
+        let _serial = crate::test_serial();
+        let mut chooser = chooser(true);
+        chooser.listings[1].state.name = Some("Docs pass".into());
+        chooser.haystacks[1] = haystack(&chooser.listings[1]);
+        assert!(screen(&chooser).contains("  Docs pass  /work/cue "));
+        type_text(&mut chooser, "pass");
+        assert_eq!(ids(&chooser), ["b2"]);
     }
 
     #[test]

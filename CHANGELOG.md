@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Name sessions with Rename Session; names show in `cue --list` and `cue --resume`, and `cue --end` takes one. Older versions don't list sessions saved by this one
+
 ## v0.3.11 — 2026-10-07
 
 - Refresh stashes in the commit view when one is replaced by another (`943d7bd`)

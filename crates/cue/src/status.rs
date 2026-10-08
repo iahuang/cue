@@ -1,13 +1,15 @@
 //! The status bar along the bottom of the screen. It's the active panel's:
 //! where its cursor is and what its file is written in, a message after a
 //! key press, or a prompt, such as a terminal's new name. Shortcut hints
-//! fill the right, and in a session, a badge saying so: a click on it
-//! offers to detach or end the session. In a git repository, a badge at
-//! the left end names the branch (see [`GitBadge`]).
+//! fill the right, and in a session, a badge with its name, or if it has
+//! none, its ID: a click on it offers to detach or end the session. In a
+//! git repository, a badge at the left end names the branch (see
+//! [`GitBadge`]).
 
 use std::ops::Range;
 
 use opentui::{Attributes, Buffer, Rgba};
+use unicode_width::UnicodeWidthStr;
 
 use crate::icons;
 use crate::input::{Key, KeyCode};
@@ -47,8 +49,8 @@ impl Status {
     }
 }
 
-/// The badge at the right end of the status bar in a session.
-const SESSION_BADGE: &str = " session ";
+/// Session names past this many characters are cut short in its badge.
+const MAX_SESSION: usize = 24;
 /// Branch names past this many characters are cut short in the git badge.
 const MAX_BRANCH: usize = 32;
 /// The git badge shows only if it leaves this many columns for the rest.
@@ -147,10 +149,17 @@ pub fn git_badge(status: &Status, badge: Option<&GitBadge>, width: u32) -> Optio
     }
 }
 
-/// The columns the session badge takes in a status bar `width` wide
-/// showing `status`, if it shows one: not over a message or a prompt.
-pub fn session_badge(status: &Status, width: u32) -> Option<Range<u32>> {
-    let len = SESSION_BADGE.len() as u32;
+/// What the badge at the right end of the status bar says for a session
+/// labeled `session`.
+fn session_text(session: &str) -> String {
+    format!(" {} ", truncate(session, MAX_SESSION))
+}
+
+/// The columns the badge for a session labeled `session` takes in a
+/// status bar `width` wide showing `status`, if it shows one: not over
+/// a message or a prompt.
+pub fn session_badge(status: &Status, session: Option<&str>, width: u32) -> Option<Range<u32>> {
+    let len = session_text(session?).width() as u32;
     match status {
         Status::Info(_) | Status::Terminal(_) | Status::EditorInfo { .. } if width >= len * 2 => {
             Some(width - len..width)
@@ -214,9 +223,9 @@ impl Prompt {
 }
 
 /// Draws `status` across row `y` of `frame`, `width` wide, with the
-/// session badge if `session`, and `git`'s badge if there's room. A
-/// terminal's hint says whether cue's shortcuts (`terminal_cue_keys`) or
-/// the shell gets keys. Returns where the terminal cursor goes while the
+/// badge labeled `session` if in a session, and `git`'s badge if
+/// there's room. A terminal's hint says whether cue's shortcuts
+/// (`terminal_cue_keys`) or the shell gets keys. Returns where the terminal cursor goes while the
 /// prompt is open.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
@@ -225,7 +234,7 @@ pub fn draw(
     y: u32,
     width: u32,
     keymap: &Keymap,
-    session: bool,
+    session: Option<&str>,
     git: Option<&GitBadge>,
     terminal_cue_keys: bool,
 ) -> Option<(u32, u32)> {
@@ -277,7 +286,7 @@ pub fn draw(
                 })
                 .collect();
             let hints = hints.strip_suffix(' ').unwrap_or(&hints);
-            let badge = session_badge(status, width).filter(|_| session);
+            let badge = session_badge(status, session, width);
             // The hints end in a space; another sets them off the badge.
             let right = badge.as_ref().map_or(width, |badge| badge.start - 1);
             let hints_x = right.saturating_sub(hints.len() as u32);
@@ -302,9 +311,10 @@ pub fn draw(
                 };
                 frame.draw_text(hints, hints_x, y, fg, None, Attributes::NONE);
             }
-            if let Some(badge) = badge {
+            if let (Some(badge), Some(session)) = (badge, session) {
                 let (fg, bg) = (colors.on_accent, Some(colors.accent));
-                frame.draw_text(SESSION_BADGE, badge.start, y, fg, bg, Attributes::BOLD);
+                let text = session_text(session);
+                frame.draw_text(&text, badge.start, y, fg, bg, Attributes::BOLD);
             }
             None
         }

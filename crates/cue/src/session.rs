@@ -17,6 +17,11 @@
 //! `~/.local/state/cue/sessions`: `session.toml`, unsaved text in `docs/`,
 //! terminals' screens in `terminals/`, and while a cue runs it, a lock it
 //! holds and the socket it takes attaching on.
+//!
+//! A cue writes back the keys at the top of `session.toml` it doesn't know,
+//! so that what a later cue added is still there when it comes back to the
+//! session; what's added later goes there to be kept. A change older cues
+//! can't read the file with takes a new [`VERSION`].
 
 use std::fs;
 use std::io::{self, Write};
@@ -30,9 +35,25 @@ use toml::{Table, Value};
 use crate::document::Document;
 use crate::layout::{Axis, Layout, PanelId};
 
-/// What `session.toml` starts with; files of other versions are passed over.
-const VERSION: i64 = 1;
+/// What `session.toml` starts with; files of later versions are passed
+/// over. 2 added the name, and keeping unknown keys.
+const VERSION: i64 = 2;
 const STATE: &str = "session.toml";
+/// The keys at the top of `session.toml` this cue knows; it keeps others.
+const KNOWN: &[&str] = &[
+    "version",
+    "name",
+    "saved",
+    "attached",
+    "roots",
+    "tree",
+    "tab",
+    "recent",
+    "mark",
+    "documents",
+    "terminals",
+    "tabs",
+];
 const LOCK: &str = "lock";
 const SOCKET: &str = "sock";
 /// The longest socket path there's room for (`sun_path` is 104 bytes on
@@ -126,6 +147,8 @@ pub struct TerminalState {
 /// Everything a session keeps.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct State {
+    /// The name it was given, if any.
+    pub name: Option<String>,
     pub roots: Vec<PathBuf>,
     /// When it was saved, in seconds since the epoch.
     pub saved: u64,
@@ -145,6 +168,8 @@ pub struct State {
     pub mark: Option<Mark>,
     /// A terminal shows its screen there.
     pub attached: bool,
+    /// The keys at the top of the file this cue doesn't know, to write back.
+    pub unknown: Table,
 }
 
 impl State {
@@ -171,6 +196,10 @@ pub struct Session {
     id: String,
     dir: PathBuf,
     _lock: fs::File,
+    /// The name it was given, if any.
+    name: Option<String>,
+    /// The keys of its file this cue doesn't know, to write back.
+    unknown: Table,
     /// The state last written, to write only what changed.
     written: Option<String>,
     /// The documents whose unsaved text is in `docs/`.
@@ -236,6 +265,8 @@ impl Session {
             .unwrap_or_default();
         Ok(Session {
             id,
+            name: None,
+            unknown: Table::new(),
             dir: dir.to_path_buf(),
             _lock: lock,
             written: None,
@@ -252,15 +283,35 @@ impl Session {
         &self.dir
     }
 
+    /// The name it was given, if any.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Names it `name`, on one line, or with `None` (or nothing but
+    /// spaces), unnames it. It's written with the rest.
+    pub fn rename(&mut self, name: Option<&str>) {
+        self.name = name.map(clean_name).filter(|name| !name.is_empty());
+    }
+
+    /// Takes what's its own from `state`, as restored: its name, and what
+    /// this cue doesn't know, to write back.
+    pub fn carry(&mut self, state: &State) {
+        self.name = state.name.clone();
+        self.unknown = state.unknown.clone();
+    }
+
     /// Where it takes attaching while it runs.
     pub fn socket(&self) -> PathBuf {
         socket_path(&self.dir)
     }
 
-    /// Writes `state`, unless that's what was written last. Returns
-    /// whether it wrote it.
+    /// Writes `state`, with its name and what this cue doesn't know,
+    /// unless that's what was written last. Returns whether it wrote it.
     pub fn save(&mut self, state: &State) -> io::Result<bool> {
         let mut state = state.clone();
+        state.name = self.name.clone();
+        state.unknown = self.unknown.clone();
         let saved = std::mem::take(&mut state.saved);
         let text = encode(&state);
         if self.written.as_deref() == Some(text.as_str()) {
@@ -439,9 +490,11 @@ impl Listing {
         }
     }
 
-    /// A line about it, as `~/cue + ~/notes · 3 tabs · nvim · 2h ago · running`.
+    /// A line about it, as `~/cue + ~/notes · 3 tabs · nvim · 2h ago · running`,
+    /// after its name if it has one.
     pub fn describe(&self, now: SystemTime) -> String {
-        let mut parts = vec![self.folders()];
+        let mut parts: Vec<String> = self.state.name.iter().cloned().collect();
+        parts.push(self.folders());
         match self.state.tabs.len() {
             0 | 1 => {}
             tabs => parts.push(format!("{tabs} tabs")),
@@ -503,15 +556,22 @@ pub fn matching(sessions: &Path, folder: &Path) -> Vec<Listing> {
         .collect()
 }
 
-/// The session `id` names, or the only one an id starting with it names.
+/// The session `id` names: by its id, or the only one with that name, or
+/// the only one whose id starts with it.
 pub fn find(sessions: &Path, id: &str) -> Option<Listing> {
     let all = list(sessions);
     if let Some(exact) = all.iter().find(|listing| listing.id == id) {
         return Some(exact.clone());
     }
-    let mut prefixed = all.into_iter().filter(|listing| listing.id.starts_with(id));
-    let first = prefixed.next()?;
-    prefixed.next().is_none().then_some(first)
+    let only = |found: Vec<&Listing>| match found[..] {
+        [one] => Some(one.clone()),
+        _ => None,
+    };
+    let named = all
+        .iter()
+        .filter(|listing| listing.state.name.as_deref() == Some(id));
+    let prefixed = all.iter().filter(|listing| listing.id.starts_with(id));
+    only(named.collect()).or_else(|| only(prefixed.collect()))
 }
 
 /// Whether a cue runs the session in `dir`: whether it holds the lock.
@@ -521,6 +581,15 @@ pub fn is_live(dir: &Path) -> bool {
         return false;
     };
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
+}
+
+/// `name` on one line, trimmed.
+fn clean_name(name: &str) -> String {
+    let name: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    name.trim().to_string()
 }
 
 /// Reads the state kept in `dir`.
@@ -636,6 +705,9 @@ pub fn encode(state: &State) -> String {
     let int = |n: u64| Value::Integer(n.min(i64::MAX as u64) as i64);
     let mut root = Table::new();
     root.insert("version".into(), Value::Integer(VERSION));
+    if let Some(name) = &state.name {
+        root.insert("name".into(), Value::String(name.clone()));
+    }
     root.insert("saved".into(), int(state.saved));
     root.insert("attached".into(), Value::Boolean(state.attached));
     root.insert(
@@ -724,6 +796,11 @@ pub fn encode(state: &State) -> String {
         Value::Table(table)
     });
     root.insert("tabs".into(), Value::Array(tabs.collect()));
+    for (key, value) in &state.unknown {
+        if !KNOWN.contains(&key.as_str()) {
+            root.insert(key.clone(), value.clone());
+        }
+    }
     root.to_string()
 }
 
@@ -790,11 +867,11 @@ fn layout_panels(layout: &Layout, ids: &mut Vec<PanelId>) {
     }
 }
 
-/// The state `text` has, if it's a `session.toml` of this version. What
-/// doesn't make sense in it is left out.
+/// The state `text` has, if it's a `session.toml` of this version or an
+/// earlier one. What doesn't make sense in it is left out.
 pub fn decode(text: &str) -> Option<State> {
     let root: Table = text.parse().ok()?;
-    if root.get("version")?.as_integer()? != VERSION {
+    if !(1..=VERSION).contains(&root.get("version")?.as_integer()?) {
         return None;
     }
     let shown_list = |table: &Table, key: &str| -> Vec<Shown> {
@@ -812,6 +889,9 @@ pub fn decode(text: &str) -> Option<State> {
     let tree = root.get("tree").and_then(Value::as_table);
     let tree_flag = |key: &str| tree.and_then(|tree| tree.get(key)).and_then(Value::as_bool);
     let mut state = State {
+        name: get_string(&root, "name")
+            .map(|name| clean_name(&name))
+            .filter(|name| !name.is_empty()),
         roots: root
             .get("roots")?
             .as_array()?
@@ -840,6 +920,11 @@ pub fn decode(text: &str) -> Option<State> {
                 visited: visited_from(mark)?,
             })
         }),
+        unknown: root
+            .iter()
+            .filter(|(key, _)| !KNOWN.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
         ..State::default()
     };
     state.documents = get_array(&root, "documents")
@@ -1039,6 +1124,7 @@ mod tests {
                 },
             }),
             attached: true,
+            ..State::default()
         }
     }
 
@@ -1051,7 +1137,9 @@ mod tests {
     #[test]
     fn broken_parts_are_left_out() {
         let mut text = encode(&sample());
-        assert!(decode(&text.replace("version = 1", "version = 2")).is_none());
+        assert!(decode(&text.replace("version = 2", "version = 3")).is_none());
+        let earlier = decode(&text.replace("version = 2", "version = 1"));
+        assert_eq!(earlier, Some(sample()), "read as before");
         // A tab whose layout names a panel it doesn't have gets an empty
         // one; one with no layout is dropped.
         text = text.replace("panel = 5", "panel = 9");
@@ -1059,6 +1147,29 @@ mod tests {
         let panels: Vec<PanelId> = state.tabs[1].panels.iter().map(|p| p.id).collect();
         assert_eq!(panels, [3, 9]);
         assert_eq!(state.tabs[1].active, 3, "the active panel is gone");
+    }
+
+    #[test]
+    fn a_name_and_what_a_later_cue_added_read_back() {
+        let mut state = sample();
+        state.name = Some("api".into());
+        let text = encode(&state);
+        let text = format!("pinned = [\"/w/cue/b.rs\"]\n{text}\n[later]\nwidth = 3\n");
+        let read = decode(&text).unwrap();
+        assert_eq!(read.name.as_deref(), Some("api"));
+        let keys: Vec<&str> = read.unknown.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["pinned", "later"]);
+        assert_eq!(read.unknown["later"]["width"].as_integer(), Some(3));
+        assert_eq!(decode(&encode(&read)), Some(read.clone()), "written back");
+
+        // Not over what this cue knows.
+        let mut clash = read.clone();
+        clash.unknown.insert("tab".into(), Value::Integer(9));
+        assert_eq!(decode(&encode(&clash)).unwrap().tab, 1);
+        // A name on one line, or none.
+        let named = |name: &str| decode(&text.replace("name = \"api\"", name)).unwrap().name;
+        assert_eq!(named("name = \" a\\tb \""), Some("a b".into()));
+        assert_eq!(named("name = \" \""), None);
     }
 
     #[test]
@@ -1089,6 +1200,30 @@ mod tests {
             line,
             "/w/cue + /w/notes · 2 tabs · cargo · 1 unsaved file · 2h ago · running"
         );
+
+        // A name, saved with the rest, and found by.
+        assert_eq!(session.name(), None);
+        session.rename(Some("  api\nwork "));
+        assert_eq!(session.name(), Some("api work"));
+        assert!(session.save(&state).unwrap());
+        let listed = list(&sessions);
+        assert_eq!(listed[0].state.name.as_deref(), Some("api work"));
+        assert!(listed[0]
+            .describe(SystemTime::now())
+            .starts_with("api work · /w/cue"));
+        assert_eq!(find(&sessions, "api work").map(|l| l.id), Some(id.clone()));
+        assert!(find(&sessions, "api").is_none());
+        session.rename(Some(" "));
+        assert_eq!(session.name(), None);
+        assert!(session.save(&state).unwrap());
+        assert_eq!(list(&sessions)[0].state.name, None);
+
+        // What a later cue added is written back once carried.
+        let mut later = read(session.dir()).unwrap();
+        later.unknown.insert("later".into(), Value::Boolean(true));
+        session.carry(&later);
+        assert!(session.save(&state).unwrap());
+        assert!(read(session.dir()).unwrap().unknown.contains_key("later"));
 
         let screen = session.save_screen(2, b"\x1b[1mhi").unwrap();
         assert_eq!(session.screen(&screen).as_deref(), Some(&b"\x1b[1mhi"[..]));
