@@ -179,6 +179,12 @@ commands! {
     TreeApplyStash => "tree:apply-stash", "Changes: Apply Stash";
     TreePopStash => "tree:pop-stash", "Changes: Pop Stash";
     TreeDropStash => "tree:drop-stash", "Changes: Drop Stash…";
+    TreeOpenFile => "tree:open-file", "Log: Open File";
+    TreeCopyHash => "tree:copy-hash", "Log: Copy Commit Hash";
+    TreeCopyMessage => "tree:copy-message", "Log: Copy Commit Message";
+    TreeCheckOut => "tree:check-out", "Log: Check Out Commit";
+    TreeNewBranch => "tree:new-branch", "Log: Create Branch from Commit…";
+    TreeRevert => "tree:revert", "Log: Revert Commit…";
     GitCommit => "git:commit", "Commit Staged Changes";
     GitFetch => "git:fetch", "Fetch from Remote";
     GitPull => "git:pull", "Pull from Remote";
@@ -268,7 +274,8 @@ impl Command {
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
             | TreeDuplicate | TreeTrash | TreeCopyPath | TreeCopyRelativePath | TreeReveal
             | TreeOpenInTerminal | TreeRemoveFolder | TreeToggleStaged | TreeCommit | TreeStash
-            | TreeApplyStash | TreePopStash | TreeDropStash => Context::Tree,
+            | TreeApplyStash | TreePopStash | TreeDropStash | TreeOpenFile | TreeCopyHash
+            | TreeCopyMessage | TreeCheckOut | TreeNewBranch | TreeRevert => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
@@ -920,6 +927,13 @@ mod tests {
             Command::TreeApplyStash,
             Command::TreePopStash,
             Command::TreeDropStash,
+            // The log's menu.
+            Command::TreeOpenFile,
+            Command::TreeCopyHash,
+            Command::TreeCopyMessage,
+            Command::TreeCheckOut,
+            Command::TreeNewBranch,
+            Command::TreeRevert,
             // As do the sync button and a repository's menu.
             Command::GitFetch,
             Command::GitPull,

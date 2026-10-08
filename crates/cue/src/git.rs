@@ -433,7 +433,16 @@ fn change_index(root: &Path, args: &[&str], paths: &[PathBuf]) -> Result<(), Str
 /// The full message of the last commit in the repository at `root`, if
 /// there is one.
 pub fn last_message(root: &Path) -> Option<String> {
-    let output = git(root).args(["log", "-1", "--format=%B"]).output().ok()?;
+    message(root, "HEAD")
+}
+
+/// The full message of `commit`, by hash or name, in the repository at
+/// `root`.
+pub fn message(root: &Path, commit: &str) -> Option<String> {
+    let output = git(root)
+        .args(["log", "-1", "--format=%B", commit, "--"])
+        .output()
+        .ok()?;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
             .trim_end()
@@ -457,6 +466,14 @@ pub fn commit(root: &Path, message: &str, amend: bool) -> Result<String, String>
         .output()
         .map_err(|err| err.to_string())?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Makes a commit, in the repository at `root`, that undoes `commit`, by
+/// hash, with the message git gives it. Returns what git said went wrong.
+pub fn revert(root: &Path, commit: &str) -> Result<(), String> {
+    let mut command = writing(root);
+    command.args(["revert", "--no-edit", commit]);
+    run_with_input(command, b"").map(drop)
 }
 
 /// Changes put away, as `git stash` keeps them: a commit of the files as
@@ -725,6 +742,16 @@ pub enum SwitchTo {
     Branch(String),
     /// A new branch, by this name, at the commit checked out.
     New(String),
+    /// A new branch, by this name, at a commit, by hash.
+    NewAt {
+        name: String,
+        commit: String,
+    },
+    /// A commit, by hash, on no branch, named by its abbreviated hash.
+    Detached {
+        commit: String,
+        short: String,
+    },
     /// A branch of its own for a remote's branch, which tracks it: the
     /// remote, and the branch's name there.
     Track {
@@ -737,7 +764,11 @@ impl SwitchTo {
     /// The name of the branch it switches to.
     pub fn name(&self) -> &str {
         match self {
-            SwitchTo::Branch(name) | SwitchTo::New(name) | SwitchTo::Track { name, .. } => name,
+            SwitchTo::Branch(name)
+            | SwitchTo::New(name)
+            | SwitchTo::NewAt { name, .. }
+            | SwitchTo::Track { name, .. } => name,
+            SwitchTo::Detached { short, .. } => short,
         }
     }
 }
@@ -769,6 +800,8 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
         match to {
             SwitchTo::Branch(name) => command.args(["--", name]),
             SwitchTo::New(name) => command.args(["-c", name]),
+            SwitchTo::NewAt { name, commit } => command.args(["-c", name, commit]),
+            SwitchTo::Detached { commit, .. } => command.args(["--detach", commit]),
             SwitchTo::Track { remote, name } => {
                 command.args(["--track", &format!("refs/remotes/{remote}/{name}")])
             }

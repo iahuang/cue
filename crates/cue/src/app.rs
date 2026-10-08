@@ -162,6 +162,9 @@ enum Redo {
     DropStash(PathBuf, String),
     /// Switching the repository at this root to a branch.
     Switch(PathBuf, SwitchTo),
+    /// Making a commit that undoes this one, in the repository at this
+    /// root.
+    Revert(PathBuf, Commit),
 }
 
 /// An answer to an alert.
@@ -249,10 +252,12 @@ enum Sidebar {
 }
 
 /// What the name prompt names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Naming {
     Tab,
     Session,
+    /// A new branch at a commit, by hash, in the repository at this root.
+    Branch(PathBuf, String),
 }
 
 /// What a context menu's commands act on.
@@ -720,7 +725,7 @@ impl App {
             return self.alert_action(action);
         }
         if let Some((prompt, naming)) = &mut self.name_prompt {
-            let naming = *naming;
+            let naming = naming.clone();
             match prompt.handle_key(key) {
                 PromptKey::Continue => {}
                 PromptKey::Cancel => self.name_prompt = None,
@@ -731,6 +736,11 @@ impl App {
                     match naming {
                         Naming::Tab => self.tab_mut().name = name,
                         Naming::Session => self.rename_session(name.as_deref()),
+                        Naming::Branch(root, commit) => {
+                            if let Some(name) = name {
+                                return self.switch_branch(root, SwitchTo::NewAt { name, commit });
+                            }
+                        }
                     }
                 }
             }
@@ -1361,7 +1371,13 @@ impl App {
                                 view.and_then(CommitView::selected)
                             }
                         }
-                        Sidebar::Log => None,
+                        Sidebar::Log => {
+                            let hit = self.log.as_mut().is_some_and(|log| log.select_at(mouse.y));
+                            if hit {
+                                self.open_log_menu(Some((mouse.x, mouse.y)));
+                            }
+                            None
+                        }
                     };
                     if let Some(target) = target {
                         self.open_menu(target, Some((mouse.x, mouse.y)));
@@ -3629,6 +3645,10 @@ impl App {
                 self.switch_now(&root, &to);
                 AppAction::Continue
             }
+            Redo::Revert(root, commit) => {
+                self.revert(&root, &commit);
+                AppAction::Continue
+            }
         };
         self.confirmed = false;
         action
@@ -4990,8 +5010,64 @@ impl App {
                 };
                 self.open_commit(&root, commit, change, focus);
             }
+            LogAction::OpenFile(path) => {
+                let target = Entry {
+                    path,
+                    is_dir: false,
+                    is_root: false,
+                };
+                return self.file_command(Command::TreeOpen, target, true);
+            }
+            LogAction::Copy { text, said } => {
+                self.show_message(said, false);
+                self.clipboard = Some(text.clone());
+                return AppAction::Copy(text);
+            }
+            LogAction::CheckOut(commit) => {
+                if let Some(root) = self.log.as_ref().map(|log| log.root().to_path_buf()) {
+                    let to = SwitchTo::Detached {
+                        commit: commit.hash,
+                        short: commit.short,
+                    };
+                    return self.switch_branch(root, to);
+                }
+            }
+            LogAction::NewBranch(commit) => {
+                if let Some(root) = self.log.as_ref().map(|log| log.root().to_path_buf()) {
+                    let prompt = Prompt::new("New branch", "");
+                    self.name_prompt = Some((prompt, Naming::Branch(root, commit.hash)));
+                }
+            }
+            LogAction::Revert(commit) => {
+                if let Some(root) = self.log.as_ref().map(|log| log.root().to_path_buf()) {
+                    let message = "A new commit will undo its changes.";
+                    let title = format!("Revert “{}”?", commit.subject);
+                    let redo = Redo::Revert(root, commit);
+                    let buttons = vec![Button::new("&Revert", Answer::Go(redo))];
+                    self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
+                }
+            }
         }
         AppAction::Continue
+    }
+
+    /// Makes a commit that undoes `commit`, in the repository at `root`.
+    fn revert(&mut self, root: &Path, commit: &Commit) {
+        if self
+            .commit_view_of(root)
+            .is_some_and(|view| view.committing())
+        {
+            self.show_message("Wait for the commit to finish.", false);
+            return;
+        }
+        match git::revert(root, &commit.hash) {
+            Ok(()) => self.show_message(format!("Reverted {}.", commit.short), false),
+            Err(err) if err.contains("CONFLICT") => {
+                self.show_git_error("Reverted with Conflicts", &err)
+            }
+            Err(err) => self.show_git_error("Can't Revert", &err),
+        }
+        self.git.restart();
     }
 
     /// Shows the commit view of the repository at `root` in the sidebar,
@@ -5687,6 +5763,8 @@ impl App {
             .is_some_and(CommitView::stash_selected);
         if self.sidebar == Sidebar::Commit && stash {
             self.open_stash_menu(None);
+        } else if self.sidebar == Sidebar::Log {
+            self.open_log_menu(None);
         } else if let Some(target) = self.sidebar_selected() {
             self.open_menu(target, None);
         }
@@ -5708,6 +5786,59 @@ impl App {
             .first()
             .and_then(CommitView::selected_position);
         let (x, y) = at.or(position).unwrap_or((0, 0));
+        let menu = ContextMenu::new(
+            items,
+            &self.keymap,
+            x,
+            y,
+            at.is_some(),
+            self.width,
+            self.height,
+        );
+        self.close_popups();
+        self.menu = Some((menu, MenuFor::Sidebar));
+    }
+
+    /// Opens the context menu of what's selected in the log: a commit, or a
+    /// file or folder one changed, at the cell right-clicked, or from the
+    /// keyboard, next to it.
+    fn open_log_menu(&mut self, at: Option<(u32, u32)>) {
+        use Command::*;
+        let Some(log) = &self.log else {
+            return;
+        };
+        let item = |command, label: &str| MenuItem::Command(command, label.to_string());
+        let mut items = Vec::new();
+        match log.selected() {
+            Some(entry) => {
+                if !entry.is_dir {
+                    items.extend([
+                        item(TreeOpen, "Open Changes"),
+                        item(TreeOpenFile, "Open File"),
+                        MenuItem::Separator,
+                    ]);
+                }
+                let reveal = match cfg!(target_os = "macos") {
+                    true => "Reveal in Finder",
+                    false => "Open Containing Folder",
+                };
+                items.extend([
+                    item(TreeCopyPath, "Copy Path"),
+                    item(TreeCopyRelativePath, "Copy Relative Path"),
+                    item(TreeReveal, reveal),
+                ]);
+            }
+            None => items.extend([
+                item(TreeCopyHash, "Copy Hash"),
+                item(TreeCopyMessage, "Copy Message"),
+                MenuItem::Separator,
+                item(TreeCheckOut, "Check Out"),
+                item(TreeNewBranch, "Create Branch…"),
+                MenuItem::Separator,
+                item(TreeRevert, "Revert…"),
+            ]),
+        }
+        let (x, y) = at.or_else(|| log.selected_position()).unwrap_or((0, 0));
         let menu = ContextMenu::new(
             items,
             &self.keymap,
@@ -5783,7 +5914,7 @@ impl App {
                     .commit_views
                     .first()
                     .and_then(CommitView::selected_position),
-                Sidebar::Log => None,
+                Sidebar::Log => self.log.as_ref().and_then(LogView::selected_position),
             })
             .unwrap_or((0, 0));
         let menu = ContextMenu::new(
@@ -6499,7 +6630,7 @@ impl App {
         match self.sidebar {
             Sidebar::Files => self.tree.selected(),
             Sidebar::Changes => self.changes.selected(),
-            Sidebar::Log => None,
+            Sidebar::Log => self.log.as_ref().and_then(LogView::selected),
             Sidebar::Commit => self.commit_views.first().and_then(CommitView::selected),
         }
     }
@@ -8458,6 +8589,73 @@ mod tests {
         ctrl(&mut app, 's');
         wait_for_git(&mut app);
         assert_eq!(marks(&app), " ▎ ", "and saved ones");
+    }
+
+    #[test]
+    fn the_log_has_menus_for_commits_and_the_files_they_changed() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::history_repo("app-log-menu");
+        let mut app = tall_app(&root, None);
+        wait_for_git(&mut app);
+        app.run(Command::ToggleChanges, false);
+        let width = app.visible_tree_width();
+        left_click(&mut app, width - 3, 0);
+        assert_eq!(app.sidebar, Sidebar::Log);
+        let log = git::log(&root, 0, 2);
+
+        // A commit's: its hash and message, and what to do with it.
+        right_click(&mut app, 3, 2);
+        let text = tall_screen(&app);
+        assert!(
+            text.contains("Copy Hash") && text.contains("Revert…"),
+            "{text}"
+        );
+        assert!(!text.contains("Open File"), "that's for files");
+        click_item(&mut app, "Copy Hash");
+        assert_eq!(app.clipboard.as_deref(), Some(log[1].hash.as_str()));
+
+        // A file's: how the commit changed it, or the file as it is now.
+        left_click(&mut app, 3, 2);
+        right_click(&mut app, 6, 4);
+        let text = tall_screen(&app);
+        assert!(
+            text.contains("Open Changes") && text.contains("Copy Path"),
+            "{text}"
+        );
+        assert!(!text.contains("Copy Hash"), "that's for commits");
+        click_item(&mut app, "Open File");
+        assert_eq!(app.active_panel().path(), Some(root.join("a.txt")));
+
+        right_click(&mut app, 3, 1);
+        click_item(&mut app, "Create Branch…");
+        type_text(&mut app, "topic");
+        key(&mut app, KeyCode::Enter);
+        wait_for_git(&mut app);
+        assert_eq!(app.git.repos()[0].head, git::Head::Branch("topic".into()));
+
+        right_click(&mut app, 3, 1);
+        click_item(&mut app, "Revert…");
+        assert!(tall_screen(&app).contains("Revert “third”?"));
+        key(&mut app, KeyCode::Char('r'));
+        assert!(
+            fs::read_to_string(root.join("d.txt")).is_ok(),
+            "third undone"
+        );
+        assert!(git::log(&root, 0, 1)[0]
+            .subject
+            .starts_with("Revert \"third\""));
+        wait_for_git(&mut app);
+
+        // From the keyboard, next to the selection.
+        app.focus = Focus::Tree;
+        key(&mut app, KeyCode::End);
+        let selected = app.log.as_ref().and_then(LogView::selected_commit).cloned();
+        let selected = selected.expect("a commit");
+        assert!(app.log.as_ref().and_then(LogView::selected).is_none());
+        app.run(Command::TreeContextMenu, false);
+        click_item(&mut app, "Check Out");
+        wait_for_git(&mut app);
+        assert_eq!(app.git.repos()[0].head, git::Head::Detached(selected.short));
     }
 
     #[test]

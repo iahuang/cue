@@ -20,7 +20,7 @@ use crate::git::{self, Change, Commit, Kind, Repo};
 use crate::icons;
 use crate::keymap::Command;
 use crate::theme;
-use crate::tree::truncate;
+use crate::tree::{truncate, Entry};
 
 /// Commits read at a time.
 #[cfg(not(test))]
@@ -63,6 +63,19 @@ pub enum LogAction {
         change: Change,
         focus: bool,
     },
+    /// Show the file at this path as it is now.
+    OpenFile(PathBuf),
+    /// Put `text` on the clipboard, and say so as `said`.
+    Copy {
+        text: String,
+        said: String,
+    },
+    /// Check this commit out, on no branch.
+    CheckOut(Commit),
+    /// Ask for a name for a new branch at this commit.
+    NewBranch(Commit),
+    /// Ask whether to make a commit that undoes this one.
+    Revert(Commit),
 }
 
 pub struct LogView {
@@ -171,6 +184,25 @@ impl LogView {
             Command::TreeCollapse => self.collapse_or_leave(),
             Command::TreeOpen => action = self.activate(true),
             Command::TreePreview => action = self.activate(false),
+            Command::TreeOpenFile => {
+                if let Some(Entry {
+                    path,
+                    is_dir: false,
+                    ..
+                }) = self.selected()
+                {
+                    action = LogAction::OpenFile(path);
+                }
+            }
+            Command::TreeCopyHash
+            | Command::TreeCopyMessage
+            | Command::TreeCheckOut
+            | Command::TreeNewBranch
+            | Command::TreeRevert => {
+                if let Some(commit) = self.selected_commit().cloned() {
+                    action = self.commit_command(command, commit);
+                }
+            }
             _ => {}
         }
         self.read_more_near_end();
@@ -197,6 +229,54 @@ impl LogView {
         let action = self.activate(double);
         self.read_more_near_end();
         action
+    }
+
+    /// The file or folder selected, if it's one a commit changed, rather
+    /// than a commit.
+    pub fn selected(&self) -> Option<Entry> {
+        let row = self.rows.get(self.selected)?;
+        let is_dir = match row.what {
+            What::Folder(_) => true,
+            What::File(..) => false,
+            What::Commit(_) | What::Info(_) => return None,
+        };
+        Some(Entry {
+            path: row.path.clone(),
+            is_dir,
+            is_root: false,
+        })
+    }
+
+    /// The commit selected, or the one the file or folder selected is in.
+    pub fn selected_commit(&self) -> Option<&Commit> {
+        let (What::Commit(i) | What::Info(i) | What::Folder(i) | What::File(i, _)) =
+            self.rows.get(self.selected)?.what;
+        self.commits.get(i)
+    }
+
+    /// Where the selection's name starts on screen, if it's in view, for a
+    /// menu to open next to.
+    pub fn selected_position(&self) -> Option<(u32, u32)> {
+        let row = self.rows.get(self.selected)?;
+        let y = self.selected.checked_sub(self.scroll)?;
+        let icon = match row.what {
+            What::Folder(_) | What::File(..) => icons::width(),
+            What::Commit(_) | What::Info(_) => 0,
+        };
+        (y < self.height).then_some((3 + 2 * row.depth as u32 + icon, y as u32 + 1))
+    }
+
+    /// Selects the row on screen row `y`, as a right click does, without
+    /// opening it. Returns false if there's none there.
+    pub fn select_at(&mut self, y: u32) -> bool {
+        let Some(index) = (y as usize).checked_sub(1).map(|row| self.scroll + row) else {
+            return false;
+        };
+        if index >= self.rows.len() {
+            return false;
+        }
+        self.select(index);
+        true
     }
 
     /// Scrolls by `rows` without moving the selection.
@@ -482,6 +562,27 @@ impl LogView {
                 LogAction::None
             }
             What::Info(_) => LogAction::None,
+        }
+    }
+
+    /// What `command`, from the log's menu, does to `commit`.
+    fn commit_command(&self, command: Command, commit: Commit) -> LogAction {
+        match command {
+            Command::TreeCopyHash => LogAction::Copy {
+                said: format!("Copied {}.", commit.hash),
+                text: commit.hash,
+            },
+            Command::TreeCopyMessage => {
+                let text = git::message(&self.root, &commit.hash).unwrap_or(commit.subject);
+                LogAction::Copy {
+                    said: format!("Copied the message of {}.", commit.short),
+                    text,
+                }
+            }
+            Command::TreeCheckOut => LogAction::CheckOut(commit),
+            Command::TreeNewBranch => LogAction::NewBranch(commit),
+            Command::TreeRevert => LogAction::Revert(commit),
+            _ => LogAction::None,
         }
     }
 
