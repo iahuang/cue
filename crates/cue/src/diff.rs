@@ -27,9 +27,10 @@ use unicode_width::UnicodeWidthChar;
 use crate::config;
 use crate::document::Document;
 use crate::git::{Base, Kind, Tracked};
-use crate::input::{Mouse, MouseButton, MouseKind, MULTI_CLICK};
+use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::language::Language;
 use crate::reader::columns;
+use crate::scroller::{Scrolled, Scroller, Spot};
 use crate::status::Status;
 use crate::syntax::{ExcerptHighlighter, LineColors};
 use crate::theme::{self, Colors, Hue, SyntaxColor};
@@ -139,15 +140,6 @@ struct Key {
     unfolded: usize,
 }
 
-struct Click {
-    row: usize,
-    time: Instant,
-    count: u32,
-}
-
-/// A row, and a column of the text on it.
-type Spot = (usize, usize);
-
 pub enum DiffEvent {
     /// Go to editing, with the cursor on file line `line`, which was at
     /// `row` of the view.
@@ -171,8 +163,8 @@ pub struct DiffView {
     source: Source,
     highlighter: RefCell<ExcerptHighlighter>,
     laid: RefCell<Option<(Key, Layout)>>,
-    /// The row at the top of the view.
-    top: Cell<usize>,
+    /// Laid out again, the rows are others, and the selection is gone.
+    scroller: Scroller,
     /// A file line to scroll to once the text is laid out, and how many
     /// rows down the view to put it.
     pending: Cell<Option<(u32, u32)>>,
@@ -180,13 +172,6 @@ pub struct DiffView {
     unfolded: HashSet<usize>,
     width: u32,
     height: u32,
-    last_click: Option<Click>,
-    /// Where a selection started, and where it goes to. Laid out again,
-    /// the rows are others, and it's gone.
-    selection: Cell<Option<(Spot, Spot)>>,
-    /// Where the left button went down, until it's released.
-    press: Option<Spot>,
-    dragged: bool,
 }
 
 impl DiffView {
@@ -218,15 +203,11 @@ impl DiffView {
             source,
             highlighter: RefCell::new(ExcerptHighlighter::new()),
             laid: RefCell::new(None),
-            top: Cell::new(0),
+            scroller: Scroller::default(),
             pending: Cell::new(Some((top, 0))),
             unfolded: HashSet::new(),
             width: 0,
             height: 0,
-            last_click: None,
-            selection: Cell::new(None),
-            press: None,
-            dragged: false,
         }
     }
 
@@ -254,32 +235,6 @@ impl DiffView {
             width: self.width,
             unfolded: self.unfolded.len(),
         }
-    }
-
-    /// Lays the text out again if it, the width, or the last commit
-    /// changed, keeping the same file line at the top.
-    fn sync(&self) {
-        let tracked = self.tracked();
-        let key = self.key(tracked.as_ref());
-        let current = matches!(&*self.laid.borrow(), Some((laid, _)) if *laid == key);
-        if !current {
-            let old = self.laid.borrow_mut().take();
-            let keep = old.as_ref().and_then(|(_, layout)| {
-                let row = layout.rows.get(self.top.get())?;
-                Some((row.line, self.top.get() - layout.row_of(row.line)))
-            });
-            let layout = self.lay_out(tracked.as_deref());
-            self.selection.set(None);
-            if let Some((line, within)) = keep {
-                self.top.set(layout.row_of(line) + within);
-            }
-            *self.laid.borrow_mut() = Some((key, layout));
-        }
-        if let Some((line, down)) = self.pending.take() {
-            let row = self.with_layout(|layout| layout.row_of(line));
-            self.top.set(row.saturating_sub(down as usize));
-        }
-        self.top.set(self.top.get().min(self.max_top()));
     }
 
     fn lay_out(&self, tracked: Option<&Tracked>) -> Layout {
@@ -330,14 +285,6 @@ impl DiffView {
         }
     }
 
-    fn rows(&self) -> usize {
-        self.with_layout(|layout| layout.rows.len())
-    }
-
-    fn max_top(&self) -> usize {
-        self.rows().saturating_sub(self.height as usize)
-    }
-
     /// Lays the text out again, as when the theme changed.
     pub fn invalidate(&mut self) {
         *self.laid.get_mut() = None;
@@ -346,145 +293,41 @@ impl DiffView {
     /// The file line at the top of the view.
     pub fn top_line(&self) -> u32 {
         self.sync();
-        self.with_layout(|layout| layout.rows.get(self.top.get()).map_or(0, |row| row.line))
-    }
-
-    pub fn scroll(&mut self, rows: i64) {
-        self.sync();
-        let top = self.top.get() as i64 + rows;
-        self.top.set(top.clamp(0, self.max_top() as i64) as usize);
-    }
-
-    pub fn page(&self) -> i64 {
-        self.height.saturating_sub(1).max(1) as i64
-    }
-
-    pub fn scroll_to_end(&mut self, end: bool) {
-        self.sync();
-        self.top.set(if end { self.max_top() } else { 0 });
-    }
-
-    fn has_selection(&self) -> bool {
-        self.selection.get().is_some_and(|(a, b)| a != b)
-    }
-
-    pub fn clear_selection(&mut self) {
-        self.selection.set(None);
-    }
-
-    pub fn select_all(&mut self) {
-        self.sync();
-        self.selection.set(Some(((0, 0), (self.rows(), 0))));
-    }
-
-    /// The selection, start first.
-    fn ordered_selection(&self) -> Option<(Spot, Spot)> {
-        let (a, b) = self.selection.get()?;
-        Some(if a <= b { (a, b) } else { (b, a) })
-    }
-
-    /// The selected text, as written: tabs as tabs, a line that wrapped
-    /// as one, and folds left out.
-    pub fn selected_text(&self) -> Option<String> {
-        if !self.has_selection() {
-            return None;
-        }
-        self.sync();
-        let (start, end) = self.ordered_selection()?;
-        let text = self.with_layout(|layout| {
-            let mut out = String::new();
-            let mut any = false;
-            let last = end.0.min(layout.rows.len().saturating_sub(1));
-            for (index, row) in layout.rows.iter().enumerate().take(last + 1).skip(start.0) {
-                let What::Line { first, text, .. } = &row.what else {
-                    continue;
-                };
-                // The rest of a line that wrapped goes on with it.
-                if any && *first {
-                    out.push('\n');
-                }
-                any = true;
-                let range = selected_columns(index, (start, end));
-                let chars = text.iter().filter(|(col, _)| range.contains(col));
-                out.extend(chars.map(|&(_, c)| c));
-            }
-            out
-        });
-        Some(text)
-    }
-
-    /// The row and text column at cell (`x`, `y`) of the view: the line
-    /// numbers count as the text's start.
-    fn spot(&self, x: u32, y: u32) -> Spot {
-        let gutter = self.with_layout(Layout::gutter);
-        (
-            self.top.get() + y as usize,
-            (x as usize).saturating_sub(gutter),
-        )
+        self.with_layout(|layout| {
+            layout
+                .rows
+                .get(self.scroller.top.get())
+                .map_or(0, |row| row.line)
+        })
     }
 
     /// A mouse event at cell (`mouse.x`, `mouse.y`) of the view.
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> Option<DiffEvent> {
         self.sync();
-        match mouse.kind {
-            MouseKind::Press(MouseButton::Left) => {
-                let at = self.spot(mouse.x, mouse.y);
-                let row = at.0;
-                let count = match &self.last_click {
-                    Some(click)
-                        if click.row == row && now.duration_since(click.time) < MULTI_CLICK =>
-                    {
-                        click.count + 1
-                    }
-                    _ => 1,
-                };
-                self.last_click = Some(Click {
-                    row,
-                    time: now,
-                    count,
-                });
-                let what = self.with_layout(|layout| {
-                    layout.rows.get(row).map(|row| (row.what.clone(), row.line))
-                });
-                match what {
-                    Some((What::Fold { start, .. }, _)) => {
-                        self.unfolded.insert(start);
-                        return None;
-                    }
-                    Some((What::Line { .. }, line))
-                        if count == 2 && matches!(self.source, Source::Live(_)) =>
-                    {
-                        self.press = None;
-                        return Some(DiffEvent::Edit { line, row: mouse.y });
-                    }
-                    _ => {}
-                }
-                match (mouse.mods.shift, self.selection.get()) {
-                    (true, Some((anchor, _))) => self.selection.set(Some((anchor, at))),
-                    _ => self.selection.set(None),
-                }
-                self.press = Some(at);
-                self.dragged = false;
+        // The line numbers count as the text's start.
+        let col = (mouse.x as usize).saturating_sub(self.with_layout(Layout::gutter));
+        if mouse.kind != MouseKind::Press(MouseButton::Left) {
+            self.drag_or_scroll(mouse, col);
+            return None;
+        }
+        let at = self.scroller.spot(mouse.y, col);
+        let row = at.0;
+        let count = self.scroller.count_click((row, 0), now);
+        let what =
+            self.with_layout(|layout| layout.rows.get(row).map(|row| (row.what.clone(), row.line)));
+        match what {
+            Some((What::Fold { start, .. }, _)) => {
+                self.unfolded.insert(start);
+                return None;
             }
-            MouseKind::Drag(MouseButton::Left) => {
-                let origin = self.press?;
-                // Dragged past the top or bottom, it scrolls.
-                if mouse.y >= self.height {
-                    self.scroll(1);
-                } else if mouse.y == 0 {
-                    self.scroll(-1);
-                }
-                let at = self.spot(mouse.x, mouse.y.min(self.height.saturating_sub(1)));
-                self.dragged = self.dragged || at != origin;
-                if self.dragged {
-                    self.selection.set(Some((origin, at)));
-                }
+            Some((What::Line { .. }, line))
+                if count == 2 && matches!(self.source, Source::Live(_)) =>
+            {
+                return Some(DiffEvent::Edit { line, row: mouse.y });
             }
-            MouseKind::Release(MouseButton::Left) => self.press = None,
-            MouseKind::ScrollUp => self.scroll(-(crate::config::get().scroll_lines as i64)),
-            MouseKind::ScrollDown => self.scroll(crate::config::get().scroll_lines as i64),
             _ => {}
         }
+        self.scroller.press(at, mouse.mods.shift);
         None
     }
 
@@ -507,8 +350,8 @@ impl DiffView {
             frame.draw_text(note, x + 1, y, colors.muted, None, Attributes::NONE);
             return;
         }
-        let selection = self.ordered_selection();
-        let rows = layout.rows.iter().enumerate().skip(self.top.get());
+        let selection = self.scroller.ordered_selection();
+        let rows = layout.rows.iter().enumerate().skip(self.scroller.top.get());
         for ((index, row), screen_y) in rows.zip(y..y + self.height) {
             let selected = selection
                 .map(|selection| selected_columns(index, selection))
@@ -526,17 +369,86 @@ impl DiffView {
 
     pub fn status(&self) -> Status {
         self.sync();
-        let top = self.top.get();
-        let max_top = self.max_top();
-        let position = match (top, max_top) {
-            (_, 0) => "All".to_string(),
-            (0, _) => "Top".to_string(),
-            (top, max) if top >= max => "Bot".to_string(),
-            (top, max) => format!("{}%", top * 100 / max),
-        };
+        let position = self.position();
         let (added, removed) = self.with_layout(|layout| (layout.added, layout.removed));
         let line = self.top_line() + 1;
         Status::Info(format!("Diff  +{added} −{removed}  Ln {line}  {position}"))
+    }
+}
+
+impl Scrolled for DiffView {
+    fn scroller(&self) -> &Scroller {
+        &self.scroller
+    }
+
+    fn scroller_mut(&mut self) -> &mut Scroller {
+        &mut self.scroller
+    }
+
+    /// Lays the text out again if it, the width, or the last commit
+    /// changed, keeping the same file line at the top.
+    fn sync(&self) {
+        let tracked = self.tracked();
+        let key = self.key(tracked.as_ref());
+        let current = matches!(&*self.laid.borrow(), Some((laid, _)) if *laid == key);
+        if !current {
+            let old = self.laid.borrow_mut().take();
+            let keep = old.as_ref().and_then(|(_, layout)| {
+                let row = layout.rows.get(self.scroller.top.get())?;
+                Some((row.line, self.scroller.top.get() - layout.row_of(row.line)))
+            });
+            let layout = self.lay_out(tracked.as_deref());
+            self.scroller.selection.set(None);
+            if let Some((line, within)) = keep {
+                self.scroller.top.set(layout.row_of(line) + within);
+            }
+            *self.laid.borrow_mut() = Some((key, layout));
+        }
+        if let Some((line, down)) = self.pending.take() {
+            let row = self.with_layout(|layout| layout.row_of(line));
+            self.scroller.top.set(row.saturating_sub(down as usize));
+        }
+        self.scroller
+            .top
+            .set(self.scroller.top.get().min(self.max_top()));
+    }
+
+    fn rows(&self) -> usize {
+        self.with_layout(|layout| layout.rows.len())
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The selected text, as written: tabs as tabs, a line that wrapped
+    /// as one, and folds left out.
+    fn selected_text(&self) -> Option<String> {
+        if !self.has_selection() {
+            return None;
+        }
+        self.sync();
+        let (start, end) = self.scroller.ordered_selection()?;
+        let text = self.with_layout(|layout| {
+            let mut out = String::new();
+            let mut any = false;
+            let last = end.0.min(layout.rows.len().saturating_sub(1));
+            for (index, row) in layout.rows.iter().enumerate().take(last + 1).skip(start.0) {
+                let What::Line { first, text, .. } = &row.what else {
+                    continue;
+                };
+                // The rest of a line that wrapped goes on with it.
+                if any && *first {
+                    out.push('\n');
+                }
+                any = true;
+                let range = selected_columns(index, (start, end));
+                let chars = text.iter().filter(|(col, _)| range.contains(col));
+                out.extend(chars.map(|&(_, c)| c));
+            }
+            out
+        });
+        Some(text)
     }
 }
 

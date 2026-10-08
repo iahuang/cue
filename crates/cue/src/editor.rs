@@ -39,6 +39,7 @@ use crate::keymap::{Command, Keymap};
 use crate::line_edit::Edit;
 use crate::location::Position;
 use crate::reader::{Reader, ReaderEvent};
+use crate::scroller::{Ran, Scrolled};
 use crate::search::Toggle;
 use crate::status::Status;
 use crate::syntax::Region;
@@ -482,26 +483,10 @@ impl Editor {
     /// Types a key bound to no command. Keys with Ctrl/Alt/Cmd held never
     /// type. In reader and diff mode, Space pages down, and Shift+Space up.
     pub fn type_key(&mut self, key: Key) -> Action {
-        if let Some(diff) = &mut self.diff {
-            return match key.code {
-                KeyCode::Char(' ') if key.mods.is_plain() => {
-                    let page = diff.page();
-                    diff.scroll(if key.mods.shift { -page } else { page });
-                    Action::Continue
-                }
-                KeyCode::Char(_) if key.mods.is_plain() => Action::ReadOnly,
-                _ => Action::Continue,
-            };
-        }
-        if let Some(reader) = self.reader_mut() {
-            return match key.code {
-                KeyCode::Char(' ') if key.mods.is_plain() => {
-                    let page = reader.page();
-                    reader.scroll(if key.mods.shift { -page } else { page });
-                    Action::Continue
-                }
-                KeyCode::Char(_) if key.mods.is_plain() => Action::ReadOnly,
-                _ => Action::Continue,
+        if let Some(view) = self.read_only_view() {
+            return match view.type_key(key) {
+                true => Action::ReadOnly,
+                false => Action::Continue,
             };
         }
         if let KeyCode::Char(c) = key.code {
@@ -530,101 +515,28 @@ impl Editor {
         select: bool,
         clipboard: &mut Option<String>,
     ) -> Action {
-        if self.diffing() {
-            return self.run_diffing(command, clipboard);
-        }
-        if self.reading() {
-            return self.run_reading(command, clipboard);
+        if self.diffing() || self.reading() {
+            return self.run_read_only(command, clipboard);
         }
         let action = self.run_command(command, select, clipboard);
         self.sync_find();
         action
     }
 
-    /// Runs a command in reader mode: keys that move the cursor scroll,
-    /// and those that edit don't.
-    fn run_reading(&mut self, command: Command, clipboard: &mut Option<String>) -> Action {
-        let Some(reader) = self.reader.as_mut() else {
-            return Action::Continue;
-        };
+    /// Runs a command in reader or diff mode: keys that move the cursor
+    /// scroll, and those that edit don't.
+    fn run_read_only(&mut self, command: Command, clipboard: &mut Option<String>) -> Action {
+        let diffing = self.diffing();
         match command {
-            Command::ToggleReader => self.set_reading(false),
-            Command::ToggleDiff => self.set_diffing(true),
+            Command::ToggleReader => self.set_reading(diffing),
+            Command::ToggleDiff => self.set_diffing(!diffing),
             Command::Save => return self.save(),
-            Command::Copy => match reader.selected_text() {
-                Some(text) => return self.copy_text(text, clipboard),
-                None => self.show_message("Nothing selected.", false),
+            _ => match self.read_only_view().map(|view| view.run(command)) {
+                Some(Ran::Copy(Some(text))) => return self.copy_text(text, clipboard),
+                Some(Ran::Copy(None)) => self.show_message("Nothing selected.", false),
+                Some(Ran::ReadOnly) => return Action::ReadOnly,
+                Some(Ran::Done) | None => {}
             },
-            Command::SelectAll => reader.select_all(),
-            Command::ClearSelection => reader.clear_selection(),
-            Command::CursorUp => reader.scroll(-1),
-            Command::CursorDown => reader.scroll(1),
-            Command::CursorPageUp => reader.scroll(-reader.page()),
-            Command::CursorPageDown => reader.scroll(reader.page()),
-            Command::DocumentStart => reader.scroll_to_end(false),
-            Command::DocumentEnd => reader.scroll_to_end(true),
-            Command::Undo
-            | Command::Redo
-            | Command::Cut
-            | Command::Paste
-            | Command::NewLine
-            | Command::InsertTab
-            | Command::Indent
-            | Command::Outdent
-            | Command::ToggleComment
-            | Command::DeleteBackward
-            | Command::DeleteForward
-            | Command::DeleteWordBackward
-            | Command::DeleteWordForward
-            | Command::MoveLinesUp
-            | Command::MoveLinesDown
-            | Command::Replace
-            | Command::ReplaceAll => return Action::ReadOnly,
-            _ => {}
-        }
-        Action::Continue
-    }
-
-    /// Runs a command in diff mode: keys that move the cursor scroll, and
-    /// those that edit don't.
-    fn run_diffing(&mut self, command: Command, clipboard: &mut Option<String>) -> Action {
-        let Some(diff) = self.diff.as_mut() else {
-            return Action::Continue;
-        };
-        match command {
-            Command::ToggleDiff => self.set_diffing(false),
-            Command::ToggleReader => self.set_reading(true),
-            Command::Save => return self.save(),
-            Command::Copy => match diff.selected_text() {
-                Some(text) => return self.copy_text(text, clipboard),
-                None => self.show_message("Nothing selected.", false),
-            },
-            Command::SelectAll => diff.select_all(),
-            Command::ClearSelection => diff.clear_selection(),
-            Command::CursorUp => diff.scroll(-1),
-            Command::CursorDown => diff.scroll(1),
-            Command::CursorPageUp => diff.scroll(-diff.page()),
-            Command::CursorPageDown => diff.scroll(diff.page()),
-            Command::DocumentStart => diff.scroll_to_end(false),
-            Command::DocumentEnd => diff.scroll_to_end(true),
-            Command::Undo
-            | Command::Redo
-            | Command::Cut
-            | Command::Paste
-            | Command::NewLine
-            | Command::InsertTab
-            | Command::Indent
-            | Command::Outdent
-            | Command::ToggleComment
-            | Command::DeleteBackward
-            | Command::DeleteForward
-            | Command::DeleteWordBackward
-            | Command::DeleteWordForward
-            | Command::MoveLinesUp
-            | Command::MoveLinesDown
-            | Command::Replace
-            | Command::ReplaceAll => return Action::ReadOnly,
-            _ => {}
         }
         Action::Continue
     }
@@ -2195,6 +2107,14 @@ impl Editor {
     fn reader_mut(&mut self) -> Option<&mut Reader> {
         let markdown = self.is_markdown();
         self.reader.as_mut().filter(|_| markdown)
+    }
+
+    /// The diff in diff mode, or the reader in reader mode.
+    fn read_only_view(&mut self) -> Option<&mut dyn Scrolled> {
+        if self.diff.is_some() {
+            return self.diff.as_mut().map(|diff| diff as &mut dyn Scrolled);
+        }
+        self.reader_mut().map(|reader| reader as &mut dyn Scrolled)
     }
 
     pub fn reading(&self) -> bool {

@@ -36,6 +36,7 @@ mod quick_look;
 mod reader;
 mod recovery;
 mod resume;
+mod scroller;
 mod search;
 mod search_modal;
 mod session;

@@ -58,6 +58,123 @@ struct Row {
     ignored: bool,
 }
 
+/// Rows, some of which open to show the rows under them, gone through the
+/// same way: the tree, the changes, the log, and the commit view.
+pub trait Outline {
+    fn row_count(&self) -> usize;
+    fn row_depth(&self, row: usize) -> usize;
+    /// Whether `row` is open, if it opens.
+    fn row_open(&self, row: usize) -> Option<bool>;
+    /// Opens `row`, or closes it if it's open.
+    fn toggle_row(&mut self, row: usize);
+    /// Whether `row` can't be selected, and is stepped over.
+    fn row_skipped(&self, _row: usize) -> bool {
+        false
+    }
+    /// How many rows fit on screen.
+    fn rows_shown(&self) -> usize;
+    /// The selected row, and the row at the top of the screen.
+    fn place(&mut self) -> (&mut usize, &mut usize);
+
+    /// Moves the selection, or opens or closes what's selected, if
+    /// `command` is one that does.
+    fn navigate(&mut self, command: Command) {
+        let page = self.rows_shown().saturating_sub(1).max(1);
+        let selected = *self.place().0;
+        match command {
+            Command::TreeUp => self.step(-1),
+            Command::TreeDown => self.step(1),
+            Command::TreePageUp => self.select(selected.saturating_sub(page)),
+            Command::TreePageDown => self.select(selected + page),
+            Command::TreeFirst => self.select(0),
+            Command::TreeLast => self.select(usize::MAX),
+            Command::TreeExpand => self.expand_or_enter(),
+            Command::TreeCollapse => self.collapse_or_leave(),
+            _ => {}
+        }
+    }
+
+    /// Selects row `index` (clamped), or the one next to it if it's
+    /// skipped, and scrolls it into view.
+    fn select(&mut self, index: usize) {
+        let count = self.row_count();
+        let mut index = index.min(count.saturating_sub(1));
+        if self.row_skipped(index) {
+            index = match index + 1 < count {
+                true => index + 1,
+                false => index.saturating_sub(1),
+            };
+        }
+        *self.place().0 = index;
+        self.scroll_into_view();
+    }
+
+    /// Moves the selection `by` rows, over those skipped.
+    fn step(&mut self, by: isize) {
+        let mut index = self.place().0.saturating_add_signed(by);
+        if self.row_skipped(index) {
+            index = index.saturating_add_signed(by.signum());
+        }
+        if index < self.row_count() {
+            self.select(index);
+        }
+    }
+
+    fn scroll_into_view(&mut self) {
+        let (shown, count) = (self.rows_shown(), self.row_count());
+        let (selected, scroll) = self.place();
+        *scroll = scroll_to_show(*selected, *scroll, shown, count);
+    }
+
+    /// Right: opens what's selected, if it's closed, or steps into it.
+    fn expand_or_enter(&mut self) {
+        let selected = *self.place().0;
+        if selected >= self.row_count() {
+            return;
+        }
+        match self.row_open(selected) {
+            Some(false) => self.toggle_row(selected),
+            Some(true)
+                if selected + 1 < self.row_count()
+                    && self.row_depth(selected + 1) > self.row_depth(selected) =>
+            {
+                self.select(selected + 1)
+            }
+            _ => {}
+        }
+    }
+
+    /// Left: closes what's selected, if it's open, or steps out to what
+    /// it's in.
+    fn collapse_or_leave(&mut self) {
+        let selected = *self.place().0;
+        if selected >= self.row_count() {
+            return;
+        }
+        if self.row_open(selected) == Some(true) {
+            self.toggle_row(selected);
+            return;
+        }
+        let depth = self.row_depth(selected);
+        if let Some(parent) = (0..selected).rev().find(|&row| self.row_depth(row) < depth) {
+            self.select(parent);
+        }
+    }
+}
+
+/// The row at the top of the screen, from `scroll`, to show row
+/// `selected` of `count`, with `shown` rows on screen.
+fn scroll_to_show(selected: usize, scroll: usize, shown: usize, count: usize) -> usize {
+    let scroll = if selected < scroll {
+        selected
+    } else if selected >= scroll + shown {
+        selected + 1 - shown
+    } else {
+        scroll
+    };
+    scroll.min(count.saturating_sub(shown))
+}
+
 /// What the app should do after the tree handled input.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TreeAction {
@@ -173,7 +290,10 @@ impl FileTree {
         self.rows = rows;
         self.listing += 1;
         let selected = selected.and_then(|(root, path)| {
-            let root = self.roots.iter().position(|other| Some(other) == root.as_ref())?;
+            let root = self
+                .roots
+                .iter()
+                .position(|other| Some(other) == root.as_ref())?;
             self.index_of(root, &path)
         });
         if let Some(index) = selected {
@@ -384,20 +504,11 @@ impl FileTree {
     }
 
     pub fn run(&mut self, command: Command) -> TreeAction {
-        let page = self.height.saturating_sub(1).max(1);
         match command {
-            Command::TreeUp => self.select(self.selected.saturating_sub(1)),
-            Command::TreeDown => self.select(self.selected + 1),
-            Command::TreePageUp => self.select(self.selected.saturating_sub(page)),
-            Command::TreePageDown => self.select(self.selected + page),
-            Command::TreeFirst => self.select(0),
-            Command::TreeLast => self.select(usize::MAX),
-            Command::TreeExpand => self.expand_or_enter(),
-            Command::TreeCollapse => self.collapse_or_leave(),
             Command::TreeOpen => return self.activate(true, false),
             Command::TreePreview => return self.activate(false, true),
             Command::TreeRefresh => self.refresh(),
-            _ => {}
+            _ => self.navigate(command),
         }
         TreeAction::None
     }
@@ -531,25 +642,6 @@ impl FileTree {
 
     // --- navigation -----------------------------------------------------------
 
-    /// Selects row `index` (clamped) and scrolls it into view.
-    fn select(&mut self, index: usize) {
-        self.selected = index.min(self.rows.len().saturating_sub(1));
-        self.scroll_into_view();
-    }
-
-    fn scroll_into_view(&mut self) {
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + self.height {
-            self.scroll = self.selected + 1 - self.height;
-        }
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.height));
-        // Nor under the folders stuck to the top.
-        while self.scroll > 0 && self.selected < self.scroll + self.sticky().len() {
-            self.scroll -= 1;
-        }
-    }
-
     /// Enter/Shift+Space/click: opens the selected file, or expands/collapses a
     /// folder.
     fn activate(&mut self, focus: bool, preview: bool) -> TreeAction {
@@ -563,49 +655,8 @@ impl FileTree {
                 preview,
             };
         }
-        if self.is_open(row) {
-            self.collapse(self.selected);
-        } else {
-            self.expand(self.selected);
-        }
+        self.toggle_row(self.selected);
         TreeAction::None
-    }
-
-    /// Right: expands a collapsed folder, or steps into an expanded one.
-    fn expand_or_enter(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
-            return;
-        };
-        if !row.is_dir {
-            return;
-        }
-        if !self.is_open(row) {
-            self.expand(self.selected);
-        } else if self
-            .rows
-            .get(self.selected + 1)
-            .is_some_and(|next| next.depth > row.depth)
-        {
-            self.select(self.selected + 1);
-        }
-    }
-
-    /// Left: collapses an expanded folder, or steps out to the parent.
-    fn collapse_or_leave(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
-            return;
-        };
-        if row.is_dir && self.is_open(row) {
-            self.collapse(self.selected);
-            return;
-        }
-        let depth = row.depth;
-        if let Some(parent) = self.rows[..self.selected]
-            .iter()
-            .rposition(|row| row.depth < depth)
-        {
-            self.select(parent);
-        }
     }
 
     fn expand(&mut self, index: usize) {
@@ -638,13 +689,17 @@ impl FileTree {
 
     /// Where `path` is listed under the root at position `root`.
     fn index_of(&self, root: usize, path: &Path) -> Option<usize> {
-        self.rows.iter().position(|row| row.root == root && row.path == path)
+        self.rows
+            .iter()
+            .position(|row| row.root == root && row.path == path)
     }
 
     /// Whether `row`'s folder is expanded where it's listed.
     fn is_open(&self, row: &Row) -> bool {
         let root = &self.roots[row.root];
-        self.expanded.get(root).is_some_and(|open| open.contains(&row.path))
+        self.expanded
+            .get(root)
+            .is_some_and(|open| open.contains(&row.path))
     }
 
     /// The folders expanded under the root at position `root`.
@@ -671,6 +726,44 @@ impl FileTree {
             if expand {
                 self.push_children(rows, root, &path, depth + 1, ignored);
             }
+        }
+    }
+}
+
+impl Outline for FileTree {
+    fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row_depth(&self, row: usize) -> usize {
+        self.rows[row].depth
+    }
+
+    fn row_open(&self, row: usize) -> Option<bool> {
+        let row = &self.rows[row];
+        row.is_dir.then(|| self.is_open(row))
+    }
+
+    fn toggle_row(&mut self, row: usize) {
+        match self.is_open(&self.rows[row]) {
+            true => self.collapse(row),
+            false => self.expand(row),
+        }
+    }
+
+    fn rows_shown(&self) -> usize {
+        self.height
+    }
+
+    fn place(&mut self) -> (&mut usize, &mut usize) {
+        (&mut self.selected, &mut self.scroll)
+    }
+
+    fn scroll_into_view(&mut self) {
+        self.scroll = scroll_to_show(self.selected, self.scroll, self.height, self.rows.len());
+        // Nor under the folders stuck to the top.
+        while self.scroll > 0 && self.selected < self.scroll + self.sticky().len() {
+            self.scroll -= 1;
         }
     }
 }
@@ -996,7 +1089,14 @@ mod tests {
         let mut tree = tree(&[outer.clone(), inner.clone()]);
         assert_eq!(
             listing(&tree),
-            ["outer/", "  pkg/", "  .gitignore", "  top.rs", "pkg/", "  src/"]
+            [
+                "outer/",
+                "  pkg/",
+                "  .gitignore",
+                "  top.rs",
+                "pkg/",
+                "  src/"
+            ]
         );
         let ignored = |tree: &FileTree| -> Vec<(usize, String)> {
             let rows = tree.rows.iter().filter(|row| row.ignored);

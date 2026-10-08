@@ -10,9 +10,10 @@ use opentui::Buffer;
 
 use crate::diff::DiffView;
 use crate::git::{self, Base, Change, Commit, Kind};
-use crate::input::{Key, KeyCode, Mouse};
+use crate::input::{Key, Mouse};
 use crate::keymap::Command;
 use crate::layout::Rect;
+use crate::scroller::{Ran, Scrolled};
 use crate::status::Status;
 
 /// What a key or command did, for the app to finish.
@@ -98,54 +99,20 @@ impl CommitDiff {
     /// Runs an editor command: keys that move the cursor scroll, and
     /// those that edit don't.
     pub fn run(&mut self, command: Command) -> Outcome {
-        let view = &mut self.view;
-        match command {
-            Command::Copy => {
-                return match view.selected_text() {
-                    Some(text) => Outcome::Copy(text),
-                    None => Outcome::Message("Nothing selected."),
-                }
-            }
-            Command::SelectAll => view.select_all(),
-            Command::ClearSelection => view.clear_selection(),
-            Command::CursorUp => view.scroll(-1),
-            Command::CursorDown => view.scroll(1),
-            Command::CursorPageUp => view.scroll(-view.page()),
-            Command::CursorPageDown => view.scroll(view.page()),
-            Command::DocumentStart => view.scroll_to_end(false),
-            Command::DocumentEnd => view.scroll_to_end(true),
-            Command::Undo
-            | Command::Redo
-            | Command::Cut
-            | Command::Paste
-            | Command::NewLine
-            | Command::InsertTab
-            | Command::Indent
-            | Command::Outdent
-            | Command::DeleteBackward
-            | Command::DeleteForward
-            | Command::DeleteWordBackward
-            | Command::DeleteWordForward
-            | Command::MoveLinesUp
-            | Command::MoveLinesDown
-            | Command::Replace
-            | Command::ReplaceAll => return Outcome::Message(READ_ONLY),
-            _ => {}
+        match self.view.run(command) {
+            Ran::Done => Outcome::Continue,
+            Ran::Copy(Some(text)) => Outcome::Copy(text),
+            Ran::Copy(None) => Outcome::Message("Nothing selected."),
+            Ran::ReadOnly => Outcome::Message(READ_ONLY),
         }
-        Outcome::Continue
     }
 
     /// Types a key bound to no command: Space pages down, and Shift+Space
     /// up.
     pub fn type_key(&mut self, key: Key) -> Outcome {
-        match key.code {
-            KeyCode::Char(' ') if key.mods.is_plain() => {
-                let page = self.view.page();
-                self.view.scroll(if key.mods.shift { -page } else { page });
-                Outcome::Continue
-            }
-            KeyCode::Char(_) if key.mods.is_plain() => Outcome::Message(READ_ONLY),
-            _ => Outcome::Continue,
+        match self.view.type_key(key) {
+            true => Outcome::Message(READ_ONLY),
+            false => Outcome::Continue,
         }
     }
 }

@@ -28,9 +28,10 @@ use pulldown_cmark::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::input::{Mouse, MouseButton, MouseKind, MULTI_CLICK};
+use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::language;
 use crate::math::{self, Formula, Typesetter};
+use crate::scroller::{Scrolled, Scroller, Spot};
 use crate::status::Status;
 use crate::syntax::ExcerptHighlighter;
 use crate::theme::{self, Colors, Hue, SyntaxColor};
@@ -1587,9 +1588,6 @@ fn expand_tabs(text: &str) -> String {
 
 // --- the view ---------------------------------------------------------------
 
-/// A place in the laid out text: a row, and a column in it.
-type Spot = (usize, usize);
-
 /// What a mouse event in the reader asks of the editor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReaderEvent {
@@ -1608,12 +1606,6 @@ struct Laid {
     cell: Option<(u32, u32)>,
 }
 
-struct Click {
-    at: Spot,
-    time: Instant,
-    count: u32,
-}
-
 pub struct Reader {
     buffer: Rc<EditBuffer>,
     /// Names the file, for the highlighter's cache.
@@ -1621,19 +1613,12 @@ pub struct Reader {
     highlighter: RefCell<ExcerptHighlighter>,
     typesetter: RefCell<Option<Typesetter>>,
     laid: RefCell<Option<Laid>>,
-    /// The row at the top of the view.
-    top: Cell<usize>,
+    scroller: Scroller,
     /// A file line to scroll to once the text is laid out, and how many
     /// rows down the view to put it.
     pending: Cell<Option<(u32, u32)>>,
     width: u32,
     height: u32,
-    /// Where a selection started, and where it goes to.
-    selection: Option<(Spot, Spot)>,
-    /// Where the left button went down, until it's released.
-    press: Option<Spot>,
-    dragged: bool,
-    last_click: Option<Click>,
 }
 
 impl Reader {
@@ -1646,14 +1631,10 @@ impl Reader {
             highlighter: RefCell::new(ExcerptHighlighter::new()),
             typesetter: RefCell::new(None),
             laid: RefCell::new(None),
-            top: Cell::new(0),
+            scroller: Scroller::default(),
             pending: Cell::new(Some((top, 0))),
             width: 0,
             height: 0,
-            selection: None,
-            press: None,
-            dragged: false,
-            last_click: None,
         }
     }
 
@@ -1674,66 +1655,11 @@ impl Reader {
         self.width.saturating_sub(self.margin() + 1).max(1)
     }
 
-    /// Lays the text out again if it or the width changed, keeping the
-    /// same file line at the top.
-    fn sync(&self) {
-        let epoch = self.buffer.content_epoch();
-        let width = self.text_width();
-        let cell = math::cell();
-        let current = matches!(&*self.laid.borrow(), Some(laid) if laid.epoch == epoch && laid.width == width && laid.cell == cell);
-        if !current {
-            let old = self.laid.borrow_mut().take();
-            let keep = old.as_ref().map(|old| {
-                let top = self.top.get();
-                let source = old.layout.source_of(top);
-                (source, top.saturating_sub(old.layout.row_of(source)))
-            });
-            let mut typesetter = self.typesetter.borrow_mut();
-            if typesetter.as_ref().map(Typesetter::cell) != cell {
-                *typesetter = cell.map(Typesetter::new);
-            }
-            let layout = lay_out(
-                &self.buffer.text(),
-                width as usize,
-                &mut self.highlighter.borrow_mut(),
-                &self.name,
-                typesetter.as_mut(),
-            );
-            if let Some((source, within)) = keep {
-                let row = layout.row_of(source);
-                let rows = layout.lines[row.min(layout.lines.len())..]
-                    .iter()
-                    .take_while(|line| line.source == source)
-                    .count();
-                self.top.set(row + within.min(rows.saturating_sub(1)));
-            }
-            *self.laid.borrow_mut() = Some(Laid {
-                layout,
-                epoch,
-                width,
-                cell,
-            });
-        }
-        if let Some((source, down)) = self.pending.take() {
-            let row = self.with_layout(|layout| layout.row_of(source));
-            self.top.set(row.saturating_sub(down as usize));
-        }
-        self.top.set(self.top.get().min(self.max_top()));
-    }
-
     fn with_layout<R>(&self, f: impl FnOnce(&Layout) -> R) -> R {
         match &*self.laid.borrow() {
             Some(laid) => f(&laid.layout),
             None => f(&Layout::default()),
         }
-    }
-
-    fn rows(&self) -> usize {
-        self.with_layout(|layout| layout.lines.len())
-    }
-
-    fn max_top(&self) -> usize {
-        self.rows().saturating_sub(self.height as usize)
     }
 
     /// Lays the text out again, as when the theme changed.
@@ -1746,89 +1672,19 @@ impl Reader {
     /// The row at the top of the view.
     pub fn top_row(&self) -> u32 {
         self.sync();
-        self.top.get() as u32
+        self.scroller.top.get() as u32
     }
 
     /// The file line at the top of the view.
     pub fn top_line(&self) -> u32 {
         self.sync();
-        self.with_layout(|layout| layout.source_of(self.top.get()))
+        self.with_layout(|layout| layout.source_of(self.scroller.top.get()))
     }
 
     /// Scrolls file line `line` to `row` rows down the view, as near as
     /// the text allows.
     pub fn scroll_line_to(&mut self, line: u32, row: u32) {
         self.pending.set(Some((line, row)));
-    }
-
-    pub fn scroll(&mut self, rows: i64) {
-        self.sync();
-        let top = self.top.get() as i64 + rows;
-        self.top.set(top.clamp(0, self.max_top() as i64) as usize);
-    }
-
-    pub fn page(&self) -> i64 {
-        self.height.saturating_sub(1).max(1) as i64
-    }
-
-    pub fn scroll_to_end(&mut self, end: bool) {
-        self.sync();
-        self.top.set(if end { self.max_top() } else { 0 });
-    }
-
-    pub fn has_selection(&self) -> bool {
-        self.selection.is_some_and(|(a, b)| a != b)
-    }
-
-    pub fn clear_selection(&mut self) {
-        self.selection = None;
-    }
-
-    pub fn select_all(&mut self) {
-        self.sync();
-        let rows = self.rows();
-        self.selection = Some(((0, 0), (rows, 0)));
-    }
-
-    /// The selection, start first.
-    fn ordered_selection(&self) -> Option<(Spot, Spot)> {
-        let (a, b) = self.selection?;
-        Some(if a <= b { (a, b) } else { (b, a) })
-    }
-
-    /// The selected text, as shown, without spaces at the ends of lines.
-    pub fn selected_text(&self) -> Option<String> {
-        if !self.has_selection() {
-            return None;
-        }
-        self.sync();
-        let (start, end) = self.ordered_selection()?;
-        let text = self.with_layout(|layout| {
-            let mut out = Vec::new();
-            for row in start.0..=end.0.min(layout.lines.len().saturating_sub(1)) {
-                let line = &layout.lines[row];
-                // Display math's rows after its first copy as nothing.
-                if line
-                    .spans
-                    .iter()
-                    .any(|span| span.math.as_ref().is_some_and(|mark| mark.row > 0))
-                {
-                    continue;
-                }
-                let from = if row == start.0 { start.1 } else { 0 };
-                let to = if row == end.0 { end.1 } else { usize::MAX };
-                out.push(line.copy(from..to).trim_end().to_string());
-            }
-            out.join("\n")
-        });
-        Some(text)
-    }
-
-    /// The row and column at cell (`x`, `y`) of the view.
-    fn spot(&self, x: u32, y: u32) -> Spot {
-        let row = self.top.get() + y as usize;
-        let col = x.saturating_sub(self.margin()) as usize;
-        (row, col)
     }
 
     /// The link at `spot`, if any.
@@ -1859,7 +1715,7 @@ impl Reader {
                 .map(|(_, row)| *row)
         });
         if let Some(row) = row {
-            self.top.set(row.min(self.max_top()));
+            self.scroller.top.set(row.min(self.max_top()));
         }
         row.is_some()
     }
@@ -1867,65 +1723,23 @@ impl Reader {
     /// A mouse event at cell (`mouse.x`, `mouse.y`) of the view.
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> Option<ReaderEvent> {
         self.sync();
-        match mouse.kind {
-            MouseKind::Press(MouseButton::Left) => {
-                let at = self.spot(mouse.x, mouse.y);
-                let count = match &self.last_click {
-                    Some(click)
-                        if click.at == at && now.duration_since(click.time) < MULTI_CLICK =>
-                    {
-                        click.count + 1
-                    }
-                    _ => 1,
-                };
-                self.last_click = Some(Click {
-                    at,
-                    time: now,
-                    count,
-                });
-                if count == 2 {
-                    self.press = None;
-                    let line = self.with_layout(|layout| layout.source_of(at.0));
-                    return Some(ReaderEvent::Edit { line, row: mouse.y });
-                }
-                match (mouse.mods.shift, self.selection) {
-                    (true, Some((anchor, _))) => self.selection = Some((anchor, at)),
-                    _ => self.selection = None,
-                }
-                self.press = Some(at);
-                self.dragged = false;
+        let col = mouse.x.saturating_sub(self.margin()) as usize;
+        if mouse.kind != MouseKind::Press(MouseButton::Left) {
+            // A click that's not a drag follows a link.
+            let clicked = self.drag_or_scroll(mouse, col)?;
+            let link = self.link_at(clicked)?;
+            if let Some(anchor) = link.strip_prefix('#') {
+                self.go_to_anchor(anchor);
+                return None;
             }
-            MouseKind::Drag(MouseButton::Left) => {
-                let origin = self.press?;
-                // Dragged past the top or bottom, it scrolls.
-                if mouse.y >= self.height {
-                    self.scroll(1);
-                } else if mouse.y == 0 {
-                    self.scroll(-1);
-                }
-                let y = mouse.y.min(self.height.saturating_sub(1));
-                let at = self.spot(mouse.x, y);
-                self.dragged = self.dragged || at != origin;
-                if self.dragged {
-                    self.selection = Some((origin, at));
-                }
-            }
-            MouseKind::Release(MouseButton::Left) => {
-                let origin = self.press.take()?;
-                if self.dragged {
-                    return None;
-                }
-                let link = self.link_at(origin)?;
-                if let Some(anchor) = link.strip_prefix('#') {
-                    self.go_to_anchor(anchor);
-                    return None;
-                }
-                return Some(ReaderEvent::Link(link.to_string()));
-            }
-            MouseKind::ScrollUp => self.scroll(-(crate::config::get().scroll_lines as i64)),
-            MouseKind::ScrollDown => self.scroll(crate::config::get().scroll_lines as i64),
-            _ => {}
+            return Some(ReaderEvent::Link(link.to_string()));
         }
+        let at = self.scroller.spot(mouse.y, col);
+        if self.scroller.count_click(at, now) == 2 {
+            let line = self.with_layout(|layout| layout.source_of(at.0));
+            return Some(ReaderEvent::Edit { line, row: mouse.y });
+        }
+        self.scroller.press(at, mouse.mods.shift);
         None
     }
 
@@ -1935,7 +1749,7 @@ impl Reader {
         let colors = theme::colors();
         frame.fill_rect(x, y, self.width, self.height, colors.bg);
         let margin = self.margin();
-        let selection = self.ordered_selection();
+        let selection = self.scroller.ordered_selection();
         let laid = self.laid.borrow();
         let Some(laid) = &*laid else {
             return;
@@ -1952,7 +1766,7 @@ impl Reader {
             );
             return;
         }
-        let top = self.top.get();
+        let top = self.scroller.top.get();
         let mut formulas = Vec::new();
         for (i, line) in lines
             .iter()
@@ -2032,16 +1846,106 @@ impl Reader {
 
     pub fn status(&self) -> Status {
         self.sync();
-        let top = self.top.get();
+        let top = self.scroller.top.get();
         let line = self.with_layout(|layout| layout.source_of(top)) + 1;
-        let max_top = self.max_top();
-        let position = match (top, max_top) {
-            (_, 0) => "All".to_string(),
-            (0, _) => "Top".to_string(),
-            (top, max) if top >= max => "Bot".to_string(),
-            (top, max) => format!("{}%", top * 100 / max),
-        };
-        Status::Info(format!("Reader  Ln {line}  {position}"))
+        Status::Info(format!("Reader  Ln {line}  {}", self.position()))
+    }
+}
+
+impl Scrolled for Reader {
+    fn scroller(&self) -> &Scroller {
+        &self.scroller
+    }
+
+    fn scroller_mut(&mut self) -> &mut Scroller {
+        &mut self.scroller
+    }
+
+    /// Lays the text out again if it or the width changed, keeping the
+    /// same file line at the top.
+    fn sync(&self) {
+        let epoch = self.buffer.content_epoch();
+        let width = self.text_width();
+        let cell = math::cell();
+        let current = matches!(&*self.laid.borrow(), Some(laid) if laid.epoch == epoch && laid.width == width && laid.cell == cell);
+        if !current {
+            let old = self.laid.borrow_mut().take();
+            let keep = old.as_ref().map(|old| {
+                let top = self.scroller.top.get();
+                let source = old.layout.source_of(top);
+                (source, top.saturating_sub(old.layout.row_of(source)))
+            });
+            let mut typesetter = self.typesetter.borrow_mut();
+            if typesetter.as_ref().map(Typesetter::cell) != cell {
+                *typesetter = cell.map(Typesetter::new);
+            }
+            let layout = lay_out(
+                &self.buffer.text(),
+                width as usize,
+                &mut self.highlighter.borrow_mut(),
+                &self.name,
+                typesetter.as_mut(),
+            );
+            if let Some((source, within)) = keep {
+                let row = layout.row_of(source);
+                let rows = layout.lines[row.min(layout.lines.len())..]
+                    .iter()
+                    .take_while(|line| line.source == source)
+                    .count();
+                self.scroller
+                    .top
+                    .set(row + within.min(rows.saturating_sub(1)));
+            }
+            *self.laid.borrow_mut() = Some(Laid {
+                layout,
+                epoch,
+                width,
+                cell,
+            });
+        }
+        if let Some((source, down)) = self.pending.take() {
+            let row = self.with_layout(|layout| layout.row_of(source));
+            self.scroller.top.set(row.saturating_sub(down as usize));
+        }
+        self.scroller
+            .top
+            .set(self.scroller.top.get().min(self.max_top()));
+    }
+
+    fn rows(&self) -> usize {
+        self.with_layout(|layout| layout.lines.len())
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The selected text, as shown, without spaces at the ends of lines.
+    fn selected_text(&self) -> Option<String> {
+        if !self.has_selection() {
+            return None;
+        }
+        self.sync();
+        let (start, end) = self.scroller.ordered_selection()?;
+        let text = self.with_layout(|layout| {
+            let mut out = Vec::new();
+            for row in start.0..=end.0.min(layout.lines.len().saturating_sub(1)) {
+                let line = &layout.lines[row];
+                // Display math's rows after its first copy as nothing.
+                if line
+                    .spans
+                    .iter()
+                    .any(|span| span.math.as_ref().is_some_and(|mark| mark.row > 0))
+                {
+                    continue;
+                }
+                let from = if row == start.0 { start.1 } else { 0 };
+                let to = if row == end.0 { end.1 } else { usize::MAX };
+                out.push(line.copy(from..to).trim_end().to_string());
+            }
+            out.join("\n")
+        });
+        Some(text)
     }
 }
 

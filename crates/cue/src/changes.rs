@@ -22,7 +22,7 @@ use crate::git::{Change, Kind, Repo, Sync};
 use crate::icons::{self, Icon};
 use crate::keymap::Command;
 use crate::theme;
-use crate::tree::{truncate, Entry, TreeAction};
+use crate::tree::{truncate, Entry, Outline, TreeAction};
 use crate::workspace::root_names;
 
 /// The button on a repository's first row that shows its log.
@@ -344,19 +344,10 @@ impl ChangesView {
     }
 
     pub fn run(&mut self, command: Command) -> TreeAction {
-        let page = self.height.saturating_sub(1).max(1);
         match command {
-            Command::TreeUp => self.step(-1),
-            Command::TreeDown => self.step(1),
-            Command::TreePageUp => self.select(self.selected.saturating_sub(page)),
-            Command::TreePageDown => self.select(self.selected + page),
-            Command::TreeFirst => self.select(0),
-            Command::TreeLast => self.select(usize::MAX),
-            Command::TreeExpand => self.expand_or_enter(),
-            Command::TreeCollapse => self.collapse_or_leave(),
             Command::TreeOpen => return self.activate(true, false),
             Command::TreePreview => return self.activate(false, true),
-            _ => {}
+            _ => self.navigate(command),
         }
         TreeAction::None
     }
@@ -560,43 +551,6 @@ impl ChangesView {
 
     // --- navigation -------------------------------------------------------------
 
-    /// Selects row `index` (clamped), or the row after it if it's
-    /// between repositories, and scrolls it into view.
-    fn select(&mut self, index: usize) {
-        let mut index = index.min(self.rows.len().saturating_sub(1));
-        if self
-            .rows
-            .get(index)
-            .is_some_and(|row| row.what == What::Gap)
-        {
-            index += 1;
-        }
-        self.selected = index;
-        self.scroll_into_view();
-    }
-
-    /// Moves the selection `by` rows, over those between repositories.
-    fn step(&mut self, by: isize) {
-        let mut index = self.selected.saturating_add_signed(by);
-        if self
-            .rows
-            .get(index)
-            .is_some_and(|row| row.what == What::Gap)
-        {
-            index = index.saturating_add_signed(by.signum());
-        }
-        self.select(index);
-    }
-
-    fn scroll_into_view(&mut self) {
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + self.height {
-            self.scroll = self.selected + 1 - self.height;
-        }
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.height));
-    }
-
     /// Enter/Shift+Space/click: opens the selected file, or collapses or expands
     /// a folder.
     fn activate(&mut self, focus: bool, preview: bool) -> TreeAction {
@@ -615,51 +569,44 @@ impl ChangesView {
             What::Gap => return TreeAction::None,
             What::Repo | What::Folder => {}
         }
-        let path = row.path.clone();
+        self.toggle_row(self.selected);
+        TreeAction::None
+    }
+}
+
+impl Outline for ChangesView {
+    fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row_depth(&self, row: usize) -> usize {
+        self.rows[row].depth
+    }
+
+    fn row_open(&self, row: usize) -> Option<bool> {
+        let row = &self.rows[row];
+        matches!(row.what, What::Repo | What::Folder).then(|| !self.collapsed.contains(&row.path))
+    }
+
+    fn toggle_row(&mut self, row: usize) {
+        let path = self.rows[row].path.clone();
         if !self.collapsed.remove(&path) {
             self.collapsed.insert(path);
         }
         self.rebuild();
-        TreeAction::None
     }
 
-    /// Right: expands a collapsed folder, or steps into an expanded one.
-    fn expand_or_enter(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
-            return;
-        };
-        if !matches!(row.what, What::Repo | What::Folder) {
-            return;
-        }
-        if self.collapsed.remove(&row.path) {
-            self.rebuild();
-        } else if self
-            .rows
-            .get(self.selected + 1)
-            .is_some_and(|next| next.depth > row.depth)
-        {
-            self.select(self.selected + 1);
-        }
+    /// Those between repositories.
+    fn row_skipped(&self, row: usize) -> bool {
+        self.rows.get(row).is_some_and(|row| row.what == What::Gap)
     }
 
-    /// Left: collapses an expanded folder, or steps out to the parent.
-    fn collapse_or_leave(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
-            return;
-        };
-        let collapses = matches!(row.what, What::Repo | What::Folder);
-        if collapses && !self.collapsed.contains(&row.path) {
-            self.collapsed.insert(row.path.clone());
-            self.rebuild();
-            return;
-        }
-        let depth = row.depth;
-        if let Some(parent) = self.rows[..self.selected]
-            .iter()
-            .rposition(|row| row.depth < depth)
-        {
-            self.select(parent);
-        }
+    fn rows_shown(&self) -> usize {
+        self.height
+    }
+
+    fn place(&mut self) -> (&mut usize, &mut usize) {
+        (&mut self.selected, &mut self.scroll)
     }
 }
 

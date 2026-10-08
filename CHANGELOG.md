@@ -8,7 +8,7 @@
 - Add a context menu to panel headers (`721ee30`)
 - Open the file picker by clicking the file's name in a panel's header (`721ee30`)
 - Dynamic git fetch/pull/push button (`0e7659f`)
-- Add a context menu to the git log: copy a commit's hash or message, check it out, branch from it, or revert it
+- Add a context menu to the git log: copy a commit's hash or message, check it out, branch from it, or revert it (`2a7a91f`)
 
 ## v0.3.11 — 2026-10-07
 

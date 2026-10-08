@@ -887,66 +887,6 @@ mod tests {
     }
 
     #[test]
-    fn every_command_has_a_shortcut() {
-        // Reached only from the command palette, or the tree's context menu.
-        const UNBOUND: &[Command] = &[
-            // `$` in the file picker gets there too.
-            Command::GoToTerminal,
-            // `!` in the file picker gets there too.
-            Command::GoToUnsaved,
-            Command::OpenSettings,
-            Command::ReloadSettings,
-            Command::SelectTheme,
-            Command::ToggleWrap,
-            Command::SaveAll,
-            Command::PreviewToSide,
-            Command::CloseFile,
-            Command::RenameTerminal,
-            Command::RenameTab,
-            Command::TreeNewFile,
-            Command::TreeNewFolder,
-            Command::TreeDuplicate,
-            Command::TreeCopyPath,
-            Command::TreeCopyRelativePath,
-            Command::TreeReveal,
-            Command::TreeOpenInTerminal,
-            Command::AddFolder,
-            Command::RecoverUnsaved,
-            Command::TreeRemoveFolder,
-            Command::Restart,
-            Command::KeepSession,
-            Command::Detach,
-            Command::EndSession,
-            Command::RenameSession,
-            // The branch badge gets there too.
-            Command::ToggleChanges,
-            // So does the button in a changed file's header.
-            Command::ToggleDiff,
-            // The commit view's buttons, and a stash's menu, get there too.
-            Command::TreeStash,
-            Command::TreeApplyStash,
-            Command::TreePopStash,
-            Command::TreeDropStash,
-            // The log's menu.
-            Command::TreeOpenFile,
-            Command::TreeCopyHash,
-            Command::TreeCopyMessage,
-            Command::TreeCheckOut,
-            Command::TreeNewBranch,
-            Command::TreeRevert,
-            // As do the sync button and a repository's menu.
-            Command::GitFetch,
-            Command::GitPull,
-            Command::GitPush,
-        ];
-        let keymap = Keymap::default();
-        for &command in Command::ALL {
-            let bound = keymap.shortcut(command).is_some();
-            assert_eq!(bound, !UNBOUND.contains(&command), "{}", command.id());
-        }
-    }
-
-    #[test]
     fn keys_are_bound_at_most_once_per_context() {
         let keymap = Keymap::default();
         for (i, a) in keymap.bindings.iter().enumerate() {

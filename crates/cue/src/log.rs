@@ -20,7 +20,7 @@ use crate::git::{self, Change, Commit, Kind, Repo};
 use crate::icons;
 use crate::keymap::Command;
 use crate::theme;
-use crate::tree::{truncate, Entry};
+use crate::tree::{truncate, Entry, Outline};
 
 /// Commits read at a time.
 #[cfg(not(test))]
@@ -171,17 +171,8 @@ impl LogView {
     }
 
     pub fn run(&mut self, command: Command) -> LogAction {
-        let page = self.height.saturating_sub(1).max(1);
         let mut action = LogAction::None;
         match command {
-            Command::TreeUp => self.select(self.selected.saturating_sub(1)),
-            Command::TreeDown => self.select(self.selected + 1),
-            Command::TreePageUp => self.select(self.selected.saturating_sub(page)),
-            Command::TreePageDown => self.select(self.selected + page),
-            Command::TreeFirst => self.select(0),
-            Command::TreeLast => self.select(usize::MAX),
-            Command::TreeExpand => self.expand_or_enter(),
-            Command::TreeCollapse => self.collapse_or_leave(),
             Command::TreeOpen => action = self.activate(true),
             Command::TreePreview => action = self.activate(false),
             Command::TreeOpenFile => {
@@ -203,7 +194,7 @@ impl LogView {
                     action = self.commit_command(command, commit);
                 }
             }
-            _ => {}
+            _ => self.navigate(command),
         }
         self.read_more_near_end();
         action
@@ -518,21 +509,6 @@ impl LogView {
 
     // --- navigation -------------------------------------------------------------
 
-    /// Selects row `index` (clamped) and scrolls it into view.
-    fn select(&mut self, index: usize) {
-        self.selected = index.min(self.rows.len().saturating_sub(1));
-        self.scroll_into_view();
-    }
-
-    fn scroll_into_view(&mut self) {
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + self.height {
-            self.scroll = self.selected + 1 - self.height;
-        }
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.height));
-    }
-
     /// Enter/Space/click: shows the selected file, or opens or closes a
     /// commit or folder.
     fn activate(&mut self, focus: bool) -> LogAction {
@@ -545,20 +521,8 @@ impl LogView {
                 change,
                 focus,
             },
-            What::Commit(i) => {
-                let hash = self.commits[i].hash.clone();
-                if !self.open.remove(&hash) {
-                    self.open_commit(i);
-                }
-                self.rebuild();
-                LogAction::None
-            }
-            What::Folder(i) => {
-                let key = (self.commits[i].hash.clone(), row.path);
-                if !self.collapsed.remove(&key) {
-                    self.collapsed.insert(key);
-                }
-                self.rebuild();
+            What::Commit(_) | What::Folder(_) => {
+                self.toggle_row(self.selected);
                 LogAction::None
             }
             What::Info(_) => LogAction::None,
@@ -595,54 +559,54 @@ impl LogView {
         }
         self.open.insert(commit.hash.clone());
     }
+}
 
-    /// Right: opens a closed commit or folder, or steps into an open one.
-    fn expand_or_enter(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
-            return;
-        };
-        let closed = match &row.what {
-            What::Commit(i) => !self.open.contains(&self.commits[*i].hash),
-            What::Folder(i) => self
-                .collapsed
-                .contains(&(self.commits[*i].hash.clone(), row.path.clone())),
-            _ => return,
-        };
-        if closed {
-            self.activate(false);
-        } else if self
-            .rows
-            .get(self.selected + 1)
-            .is_some_and(|next| next.depth > row.depth)
-        {
-            self.select(self.selected + 1);
+impl Outline for LogView {
+    fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row_depth(&self, row: usize) -> usize {
+        self.rows[row].depth
+    }
+
+    fn row_open(&self, row: usize) -> Option<bool> {
+        let row = &self.rows[row];
+        match &row.what {
+            What::Commit(i) => Some(self.open.contains(&self.commits[*i].hash)),
+            What::Folder(i) => Some(
+                !self
+                    .collapsed
+                    .contains(&(self.commits[*i].hash.clone(), row.path.clone())),
+            ),
+            _ => None,
         }
     }
 
-    /// Left: closes an open commit or folder, or steps out to the commit
-    /// or folder it's in.
-    fn collapse_or_leave(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
-            return;
-        };
-        let open = match &row.what {
-            What::Commit(i) => self.open.contains(&self.commits[*i].hash),
-            What::Folder(i) => !self
-                .collapsed
-                .contains(&(self.commits[*i].hash.clone(), row.path.clone())),
-            _ => false,
-        };
-        if open {
-            self.activate(false);
-            return;
+    fn toggle_row(&mut self, row: usize) {
+        match self.rows[row].what {
+            What::Commit(i) => {
+                if !self.open.remove(&self.commits[i].hash) {
+                    self.open_commit(i);
+                }
+            }
+            What::Folder(i) => {
+                let key = (self.commits[i].hash.clone(), self.rows[row].path.clone());
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+            }
+            _ => return,
         }
-        let depth = row.depth;
-        if let Some(parent) = self.rows[..self.selected]
-            .iter()
-            .rposition(|row| row.depth < depth)
-        {
-            self.select(parent);
-        }
+        self.rebuild();
+    }
+
+    fn rows_shown(&self) -> usize {
+        self.height
+    }
+
+    fn place(&mut self) -> (&mut usize, &mut usize) {
+        (&mut self.selected, &mut self.scroll)
     }
 }
 

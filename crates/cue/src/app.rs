@@ -9499,19 +9499,10 @@ mod tests {
 
     /// Waits for the search in progress to finish.
     fn wait_for_search(app: &mut App) {
-        let started = Instant::now();
-        while app.screen_contains_searching() {
-            assert!(started.elapsed() < Duration::from_secs(10));
-            app.poll();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    impl App {
-        fn screen_contains_searching(&self) -> bool {
-            let text = screen(self);
-            text.contains("Searching") || text.contains("searching")
-        }
+        wait_until(app, "the search", |app| {
+            let text = screen(app);
+            !text.contains("Searching") && !text.contains("searching")
+        });
     }
 
     #[test]

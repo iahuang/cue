@@ -1348,374 +1348,224 @@ mod tests {
     #[test]
     fn highlights_every_language() {
         assert_highlights(&[
-            ("a.rs", "const MAX: u8 = 1;", "MAX", Some("constant")),
-            ("a.rs", "fn f(v: Vec<u8>) {}", "Vec", Some("type")),
-            (
-                "a.toml",
-                "[package]\nname = \"q\" # c",
-                "\"q\"",
-                Some("string"),
-            ),
-            (
-                "a.toml",
-                "[package]\nname = \"q\" # c",
-                "# c",
-                Some("comment"),
-            ),
-            ("a.md", "# Title\n\ntext\n", "Title", Some("text.title")),
-            ("a.json", "{\"a\": 1, \"b\": true}", "1", Some("number")),
-            (
-                "a.json",
-                "{\"a\": 1, \"b\": true}",
-                "true",
-                Some("constant"),
-            ),
-            ("a.py", "def f():\n    return \"x\"", "def", Some("keyword")),
-            ("a.py", "def f():\n    return \"x\"", "f(", Some("function")),
-            (
-                "a.py",
-                "def f():\n    return \"x\"",
-                "\"x\"",
-                Some("string"),
-            ),
-            (
-                "a.js",
-                "function f() { return 1; }",
-                "function",
-                Some("keyword"),
-            ),
-            ("a.js", "function f() { return 1; }", "f(", Some("function")),
-            ("a.js", "const s = `a${b}`;", "`a", Some("string")),
-            ("a.jsx", "const a = <div id=\"x\" />;", "div", Some("tag")),
-            (
-                "a.ts",
-                "interface A { x: number }",
-                "interface",
-                Some("keyword"),
-            ),
-            ("a.ts", "interface A { x: number }", "number", Some("type")),
-            ("a.tsx", "const a = <div id={1} />;", "div", Some("tag")),
-            ("a.tsx", "let n: string = f<T>();", "string", Some("type")),
+            ("a.rs", "const MAX: u8 = 1;", "MAX", "constant"),
+            ("a.rs", "fn f(v: Vec<u8>) {}", "Vec", "type"),
+            ("a.toml", "[package]\nname = \"q\" # c", "\"q\"", "string"),
+            ("a.toml", "[package]\nname = \"q\" # c", "# c", "comment"),
+            ("a.md", "# Title\n\ntext\n", "Title", "text.title"),
+            ("a.json", "{\"a\": 1, \"b\": true}", "1", "number"),
+            ("a.json", "{\"a\": 1, \"b\": true}", "true", "constant"),
+            ("a.py", "def f():\n    return \"x\"", "def", "keyword"),
+            ("a.py", "def f():\n    return \"x\"", "f(", "function"),
+            ("a.py", "def f():\n    return \"x\"", "\"x\"", "string"),
+            ("a.js", "function f() { return 1; }", "function", "keyword"),
+            ("a.js", "function f() { return 1; }", "f(", "function"),
+            ("a.js", "const s = `a${b}`;", "`a", "string"),
+            ("a.jsx", "const a = <div id=\"x\" />;", "div", "tag"),
+            ("a.ts", "interface A { x: number }", "interface", "keyword"),
+            ("a.ts", "interface A { x: number }", "number", "type"),
+            ("a.tsx", "const a = <div id={1} />;", "div", "tag"),
+            ("a.tsx", "let n: string = f<T>();", "string", "type"),
             (
                 "a.go",
                 "package main\nfunc f() int { return 0 }",
                 "func",
-                Some("keyword"),
+                "keyword",
             ),
             (
                 "a.go",
                 "package main\nfunc f() int { return 0 }",
                 "int",
-                Some("type"),
+                "type",
             ),
             (
                 "a.c",
                 "int main(void) { return 0; } // c",
                 "return",
-                Some("keyword"),
+                "keyword",
             ),
             (
                 "a.c",
                 "int main(void) { return 0; } // c",
                 "main",
-                Some("function"),
+                "function",
             ),
             (
                 "a.c",
                 "int main(void) { return 0; } // c",
                 "// c",
-                Some("comment"),
+                "comment",
             ),
-            (
-                "a.cpp",
-                "class A { public: int x; };",
-                "class",
-                Some("keyword"),
-            ),
-            ("a.cpp", "class A { public: int x; };", "int", Some("type")),
-            ("a.sh", "echo \"hi\" # c", "\"hi\"", Some("string")),
-            ("a.sh", "echo \"hi\" # c", "# c", Some("comment")),
-            ("a.sh", "if true; then echo; fi", "then", Some("keyword")),
-            ("a.yaml", "a: \"b\" # c", "\"b\"", Some("string")),
-            ("a.yaml", "a: \"b\" # c", "# c", Some("comment")),
-            ("a.html", "<p class=\"x\">hi</p>", "p ", Some("tag")),
-            (
-                "a.html",
-                "<p class=\"x\">hi</p>",
-                "class",
-                Some("attribute"),
-            ),
-            ("a.html", "<p class=\"x\">hi</p>", "hi", None),
-            (
-                "a.css",
-                "a { color: red; } /* c */",
-                "/* c",
-                Some("comment"),
-            ),
-            ("a.css", "a { color: red; } /* c */", "a ", Some("tag")),
-            (
-                "a.zig",
-                "const std = @import(\"std\");",
-                "const",
-                Some("keyword"),
-            ),
+            ("a.cpp", "class A { public: int x; };", "class", "keyword"),
+            ("a.cpp", "class A { public: int x; };", "int", "type"),
+            ("a.sh", "echo \"hi\" # c", "\"hi\"", "string"),
+            ("a.sh", "echo \"hi\" # c", "# c", "comment"),
+            ("a.sh", "if true; then echo; fi", "then", "keyword"),
+            ("a.yaml", "a: \"b\" # c", "\"b\"", "string"),
+            ("a.yaml", "a: \"b\" # c", "# c", "comment"),
+            ("a.html", "<p class=\"x\">hi</p>", "p ", "tag"),
+            ("a.html", "<p class=\"x\">hi</p>", "class", "attribute"),
+            ("a.html", "<p class=\"x\">hi</p>", "hi", UNCOLORED),
+            ("a.css", "a { color: red; } /* c */", "/* c", "comment"),
+            ("a.css", "a { color: red; } /* c */", "a ", "tag"),
+            ("a.zig", "const std = @import(\"std\");", "const", "keyword"),
             (
                 "a.zig",
                 "const std = @import(\"std\");",
                 "\"std\"",
-                Some("string"),
+                "string",
             ),
-            ("a.zig", "pub fn main() void {}", "main", Some("function")),
+            ("a.zig", "pub fn main() void {}", "main", "function"),
             (
                 "a.java",
                 "class A { void m() { m(); } }",
                 "class",
-                Some("keyword"),
+                "keyword",
             ),
             (
                 "a.java",
                 "class A { void m() { m(); } }",
                 "m();",
-                Some("function"),
+                "function",
             ),
-            (
-                "a.kt",
-                "fun main() { val s = \"hi\" }",
-                "main",
-                Some("function"),
-            ),
-            (
-                "a.kt",
-                "fun main() { val s = \"hi\" }",
-                "\"hi\"",
-                Some("string"),
-            ),
-            (
-                "a.swift",
-                "func f() -> Int { return 1 }",
-                "Int",
-                Some("type"),
-            ),
-            (
-                "a.dart",
-                "void main() { print('hi'); }",
-                "'hi'",
-                Some("string"),
-            ),
-            ("a.rb", "def f\n  puts \"x\"\nend", "def", Some("keyword")),
-            (
-                "a.php",
-                "<p>hi</p><?php echo \"x\"; ?>",
-                "echo",
-                Some("keyword"),
-            ),
-            ("a.pl", "my $x = \"a\"; # c", "my", Some("keyword")),
-            ("a.pl", "my $x = \"a\"; # c", "# c", Some("comment")),
-            ("a.ex", "defmodule A do\nend", "defmodule", Some("keyword")),
+            ("a.kt", "fun main() { val s = \"hi\" }", "main", "function"),
+            ("a.kt", "fun main() { val s = \"hi\" }", "\"hi\"", "string"),
+            ("a.swift", "func f() -> Int { return 1 }", "Int", "type"),
+            ("a.dart", "void main() { print('hi'); }", "'hi'", "string"),
+            ("a.rb", "def f\n  puts \"x\"\nend", "def", "keyword"),
+            ("a.php", "<p>hi</p><?php echo \"x\"; ?>", "echo", "keyword"),
+            ("a.pl", "my $x = \"a\"; # c", "my", "keyword"),
+            ("a.pl", "my $x = \"a\"; # c", "# c", "comment"),
+            ("a.ex", "defmodule A do\nend", "defmodule", "keyword"),
             (
                 "a.hs",
                 "main = putStrLn \"hi\"\nf x = x\n",
                 "putStrLn",
-                Some("function"),
+                "function",
             ),
-            ("a.r", "f <- function(x) x", "function", Some("keyword")),
+            ("a.r", "f <- function(x) x", "function", "keyword"),
             (
                 "a.sql",
                 "SELECT a FROM t WHERE b = 'x';",
                 "SELECT",
-                Some("keyword"),
+                "keyword",
             ),
-            ("a.graphql", "type T { f: Int }", "T ", Some("type")),
+            ("a.graphql", "type T { f: Int }", "T ", "type"),
             (
                 "a.ps1",
                 "function F { Write-Host \"x\" }",
                 "Write-Host",
-                Some("function"),
+                "function",
             ),
-            ("a.clj", "(defn f [x] \"s\")", "defn", Some("keyword")),
-            ("a.clj", "(defn f [x] \"s\")", "f ", Some("function")),
-            ("a.scm", "(define (f x) \"s\")", "define", Some("keyword")),
-            ("a.lisp", "(defun f (x) \"s\")", "defun", Some("keyword")),
+            ("a.clj", "(defn f [x] \"s\")", "defn", "keyword"),
+            ("a.clj", "(defn f [x] \"s\")", "f ", "function"),
+            ("a.scm", "(define (f x) \"s\")", "define", "keyword"),
+            ("a.lisp", "(defun f (x) \"s\")", "defun", "keyword"),
             (
                 "a.gd",
                 "func _ready():\n\tvar x = 1\n",
                 "_ready",
-                Some("function"),
+                "function",
             ),
-            ("a.vim", "let g:x = 1\n", "let", Some("keyword")),
-            ("a.s", "mov eax, 1 ; c", "; c", Some("comment")),
-            ("Dockerfile", "FROM alpine:3\n", "FROM", Some("keyword")),
-            (
-                "Makefile",
-                "all: b\n\techo hi\n# c\n",
-                "# c",
-                Some("comment"),
-            ),
-            (
-                "Makefile",
-                "all: b\nb:\n\techo hi\n",
-                "b:",
-                Some("function"),
-            ),
-            (
-                "Makefile",
-                "all: b\nb:\n\techo hi\n",
-                "all",
-                Some("constant"),
-            ),
-            ("Makefile", "CC = gcc\n", "CC", Some("constant")),
+            ("a.vim", "let g:x = 1\n", "let", "keyword"),
+            ("a.s", "mov eax, 1 ; c", "; c", "comment"),
+            ("Dockerfile", "FROM alpine:3\n", "FROM", "keyword"),
+            ("Makefile", "all: b\n\techo hi\n# c\n", "# c", "comment"),
+            ("Makefile", "all: b\nb:\n\techo hi\n", "b:", "function"),
+            ("Makefile", "all: b\nb:\n\techo hi\n", "all", "constant"),
+            ("Makefile", "CC = gcc\n", "CC", "constant"),
             (
                 "CMakeLists.txt",
                 "add_executable(a b.c)",
                 "add_executable",
-                Some("function"),
+                "function",
             ),
             (
                 "nginx.conf",
                 "server {\n  listen 80;\n}\n",
                 "listen",
-                Some("keyword"),
+                "keyword",
             ),
-            ("a.diff", "--- a\n+++ b\n-x\n+y\n", "-x", Some("diff.minus")),
-            ("a.diff", "--- a\n+++ b\n-x\n+y\n", "+y", Some("diff.plus")),
-            (
-                "requirements.txt",
-                "requests==2.0 # c\n",
-                "# c",
-                Some("comment"),
-            ),
-            (
-                "a.typ",
-                "= Heading\n*bold*\n",
-                "Heading",
-                Some("text.title"),
-            ),
-            ("a.tex", "\\section{Intro} % c", "Intro", Some("text.title")),
-            ("a.tex", "\\section{Intro} % c", "% c", Some("comment")),
-            (
-                "a.bib",
-                "@article{k, title = {T}}",
-                "@article",
-                Some("keyword"),
-            ),
-            (
-                "a.mmd",
-                "flowchart TD\n  A --> B\n",
-                "flowchart",
-                Some("keyword"),
-            ),
-            (
-                "a.cu",
-                "int main() { return 0; }",
-                "return",
-                Some("keyword"),
-            ),
-            ("a.svelte", "<p>hi</p>", "p>", Some("tag")),
-            (
-                "a.frag",
-                "void main() { return; }",
-                "return",
-                Some("keyword"),
-            ),
+            ("a.diff", "--- a\n+++ b\n-x\n+y\n", "-x", "diff.minus"),
+            ("a.diff", "--- a\n+++ b\n-x\n+y\n", "+y", "diff.plus"),
+            ("requirements.txt", "requests==2.0 # c\n", "# c", "comment"),
+            ("a.typ", "= Heading\n*bold*\n", "Heading", "text.title"),
+            ("a.tex", "\\section{Intro} % c", "Intro", "text.title"),
+            ("a.tex", "\\section{Intro} % c", "% c", "comment"),
+            ("a.bib", "@article{k, title = {T}}", "@article", "keyword"),
+            ("a.mmd", "flowchart TD\n  A --> B\n", "flowchart", "keyword"),
+            ("a.cu", "int main() { return 0; }", "return", "keyword"),
+            ("a.svelte", "<p>hi</p>", "p>", "tag"),
+            ("a.frag", "void main() { return; }", "return", "keyword"),
         ]);
     }
 
     #[test]
     fn markdown_injections_preserve_markup_and_fallback_colors() {
         assert_highlights(&[
-            (
-                "a.md",
-                "text\n\n```\ncode\n```\n",
-                "code",
-                Some("text.literal"),
-            ),
+            ("a.md", "text\n\n```\ncode\n```\n", "code", "text.literal"),
             // Inline markup, injected into paragraphs, headings, and cells.
-            ("a.md", "a `code` b\n", "code", Some("text.literal")),
-            ("a.md", "a `code` b\n", "`code", Some("text.delimiter")),
-            ("a.md", "a *em* b\n", "em", Some("text.emphasis")),
-            ("a.md", "a **st** b\n", "st", Some("text.strong")),
-            ("a.md", "a ~~del~~ b\n", "del", Some("text.strike")),
-            ("a.md", "[t](http://x)\n", "t]", Some("text.reference")),
-            ("a.md", "[t](http://x)\n", "http", Some("text.uri")),
-            ("a.md", "a <b>hi</b>\n", "b>", Some("tag")),
-            ("a.md", "a\\*b\n", "\\*", Some("string.escape")),
+            ("a.md", "a `code` b\n", "code", "text.literal"),
+            ("a.md", "a `code` b\n", "`code", "text.delimiter"),
+            ("a.md", "a *em* b\n", "em", "text.emphasis"),
+            ("a.md", "a **st** b\n", "st", "text.strong"),
+            ("a.md", "a ~~del~~ b\n", "del", "text.strike"),
+            ("a.md", "[t](http://x)\n", "t]", "text.reference"),
+            ("a.md", "[t](http://x)\n", "http", "text.uri"),
+            ("a.md", "a <b>hi</b>\n", "b>", "tag"),
+            ("a.md", "a\\*b\n", "\\*", "string.escape"),
             // A heading keeps its color around inline markup.
-            ("a.md", "## A `b` c\n", "##", Some("text.title")),
-            ("a.md", "## A `b` c\n", "c\n", Some("text.title")),
-            ("a.md", "## A `b` c\n", "b`", Some("text.literal")),
-            ("a.md", "- [x] a\n", "- ", Some("text.list")),
-            ("a.md", "- [x] a\n", "[x]", Some("text.list")),
+            ("a.md", "## A `b` c\n", "##", "text.title"),
+            ("a.md", "## A `b` c\n", "c\n", "text.title"),
+            ("a.md", "## A `b` c\n", "b`", "text.literal"),
+            ("a.md", "- [x] a\n", "- ", "text.list"),
+            ("a.md", "- [x] a\n", "[x]", "text.list"),
             // Quotes' markers aren't inline markup, though inside it.
-            ("a.md", "> a\n> `b`\n", "> `", Some("text.delimiter")),
-            ("a.md", "> a\n> `b`\n", "b`", Some("text.literal")),
-            ("a.md", "| a |\n|---|\n| `b` |\n", "a ", Some("text.strong")),
-            (
-                "a.md",
-                "| a |\n|---|\n| `b` |\n",
-                "b`",
-                Some("text.literal"),
-            ),
+            ("a.md", "> a\n> `b`\n", "> `", "text.delimiter"),
+            ("a.md", "> a\n> `b`\n", "b`", "text.literal"),
+            ("a.md", "| a |\n|---|\n| `b` |\n", "a ", "text.strong"),
+            ("a.md", "| a |\n|---|\n| `b` |\n", "b`", "text.literal"),
             // Code blocks in a language cue knows are highlighted as it,
             // and those in others as code.
-            ("a.md", "```rust\nlet x;\n```\n", "let", Some("keyword")),
-            ("a.md", "```rust\nlet x;\n```\n", "x;", None),
-            (
-                "a.md",
-                "```rust\nlet x;\n```\n",
-                "rust",
-                Some("text.delimiter"),
-            ),
-            ("a.md", "```wat\nlet x;\n```\n", "x;", Some("text.literal")),
-            ("a.md", "---\na: \"b\"\n---\n", "\"b\"", Some("string")),
+            ("a.md", "```rust\nlet x;\n```\n", "let", "keyword"),
+            ("a.md", "```rust\nlet x;\n```\n", "x;", UNCOLORED),
+            ("a.md", "```rust\nlet x;\n```\n", "rust", "text.delimiter"),
+            ("a.md", "```wat\nlet x;\n```\n", "x;", "text.literal"),
+            ("a.md", "---\na: \"b\"\n---\n", "\"b\"", "string"),
             // Injections in injections.
             (
                 "a.md",
                 "```html\n<script>let x;</script>\n```\n",
                 "let",
-                Some("keyword"),
+                "keyword",
             ),
             // Markdown's code blocks, in any of those.
-            (
-                "a.md",
-                "```kotlin\nval x = 1\n```\n",
-                "val",
-                Some("keyword"),
-            ),
+            ("a.md", "```kotlin\nval x = 1\n```\n", "val", "keyword"),
         ]);
     }
 
     #[test]
     fn embedded_languages_use_their_own_highlighting() {
         assert_highlights(&[
-            ("a.html", "<style>/* c */</style>", "/* c", Some("comment")),
+            ("a.html", "<style>/* c */</style>", "/* c", "comment"),
             // Outside `<?php ?>`, HTML.
-            ("a.php", "<p>hi</p><?php echo \"x\"; ?>", "p>", Some("tag")),
+            ("a.php", "<p>hi</p><?php echo \"x\"; ?>", "p>", "tag"),
             // Raw blocks, in the language they name.
-            ("a.typ", "```rust\nfn f() {}\n```\n", "fn", Some("keyword")),
+            ("a.typ", "```rust\nfn f() {}\n```\n", "fn", "keyword"),
         ]);
     }
 
     #[test]
     fn svelte_script_language_overrides_the_default_injection() {
         assert_highlights(&[
-            (
-                "a.svelte",
-                "<script>let x = 1;</script>",
-                "let",
-                Some("keyword"),
-            ),
+            ("a.svelte", "<script>let x = 1;</script>", "let", "keyword"),
             (
                 "a.svelte",
                 "<script lang=\"ts\">let x: number;</script>",
                 "number",
-                Some("type"),
+                "type",
             ),
-            (
-                "a.svelte",
-                "<style>p { color: red; }</style>",
-                "p ",
-                Some("tag"),
-            ),
+            ("a.svelte", "<style>p { color: red; }</style>", "p ", "tag"),
         ]);
     }
 
@@ -1724,20 +1574,20 @@ mod tests {
         assert_highlights(&[
             // As in tree-sitter's own highlighter: the call pattern comes
             // after the one for uppercase names.
-            ("a.rs", "let x = Some(1);", "Some", Some("function")),
+            ("a.rs", "let x = Some(1);", "Some", "function"),
             // Keys are `type` inside a `property`: tree-sitter's own
             // highlighter drops the inner capture, as they start together.
-            (
-                "a.toml",
-                "[package]\nname = \"q\" # c",
-                "name",
-                Some("type"),
-            ),
+            ("a.toml", "[package]\nname = \"q\" # c", "name", "type"),
             // Keys are strings: `@string` comes after `@string.special.key`.
-            ("a.json", "{\"a\": 1, \"b\": true}", "\"a\"", Some("string")),
-            ("a.hs", "main = putStrLn \"hi\"\nf x = x\n", "x\n", None),
+            ("a.json", "{\"a\": 1, \"b\": true}", "\"a\"", "string"),
+            (
+                "a.hs",
+                "main = putStrLn \"hi\"\nf x = x\n",
+                "x\n",
+                UNCOLORED,
+            ),
             // GLSL's queries add to C's.
-            ("a.frag", "void main() {}", "main", Some("function")),
+            ("a.frag", "void main() {}", "main", "function"),
         ]);
     }
 
@@ -1745,20 +1595,23 @@ mod tests {
     fn regex_predicates_distinguish_zig_identifiers() {
         assert_highlights(&[
             // Lowercase names do not match the type-name regex.
-            ("a.zig", "const std = @import(\"std\");", "std ", None),
-            ("a.zig", "const T = struct {};", "T ", Some("type")),
+            ("a.zig", "const std = @import(\"std\");", "std ", UNCOLORED),
+            ("a.zig", "const T = struct {};", "T ", "type"),
         ]);
     }
 
+    /// What [`assert_highlights`] expects of text left uncolored.
+    const UNCOLORED: &str = "";
+
     /// (file, source text, first text to inspect, expected capture style).
-    fn assert_highlights(cases: &[(&str, &str, &str, Option<&str>)]) {
+    fn assert_highlights(cases: &[(&str, &str, &str, &str)]) {
         let _serial = crate::test_serial();
         let theme = Theme::new().unwrap();
         let mut wrong = Vec::new();
         for &(name, text, needle, capture) in cases {
-            let expected = capture.and_then(|c| theme.capture_style(c));
+            let expected = theme.capture_style(capture);
             assert!(
-                capture.is_none() || expected.is_some(),
+                capture == UNCOLORED || expected.is_some(),
                 "{capture:?} has no style"
             );
             let got = style_of(&theme, name, text, needle);

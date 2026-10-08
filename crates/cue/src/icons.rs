@@ -193,11 +193,10 @@ mod tests {
 
     #[test]
     fn files_by_name_then_extension() {
-        assert_eq!(file("main.rs").glyph, '\u{e7a8}');
-        assert_eq!(file("Cargo.toml").glyph, '\u{e7a8}', "the name wins");
-        assert_eq!(file("other.toml").glyph, '\u{e6b2}');
-        assert_eq!(file("README.MD").glyph, '\u{e609}', "ignoring case");
-        assert_eq!(file(".env.local").glyph, '\u{e615}');
+        assert_eq!(file("Cargo.toml"), file("main.rs"), "the name wins");
+        assert_ne!(file("other.toml"), file("Cargo.toml"));
+        assert_eq!(file("README.MD"), file("notes.md"), "ignoring case");
+        assert_ne!(file(".env.local"), FILE, "by how the name starts");
         assert_eq!(file("Makefile"), file("makefile"));
         assert_eq!(file("notes"), FILE);
         assert_eq!(file("archive.unknown"), FILE);

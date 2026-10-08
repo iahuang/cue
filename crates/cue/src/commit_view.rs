@@ -33,7 +33,7 @@ use crate::keymap::Command;
 use crate::line_edit::{Caret, Edit};
 use crate::log::ago;
 use crate::theme;
-use crate::tree::{truncate, Entry};
+use crate::tree::{truncate, Entry, Outline};
 
 /// The most rows the message box grows to; past them, it scrolls.
 const MAX_MESSAGE_ROWS: usize = 6;
@@ -401,16 +401,7 @@ impl CommitView {
     }
 
     pub fn run(&mut self, command: Command) -> CommitAction {
-        let page = self.list_height().saturating_sub(1).max(1);
         match command {
-            Command::TreeUp => self.step(-1),
-            Command::TreeDown => self.step(1),
-            Command::TreePageUp => self.select(self.selected.saturating_sub(page)),
-            Command::TreePageDown => self.select(self.selected + page),
-            Command::TreeFirst => self.select(0),
-            Command::TreeLast => self.select(usize::MAX),
-            Command::TreeExpand => self.expand_or_enter(),
-            Command::TreeCollapse => self.collapse_or_leave(),
             Command::TreeOpen => return self.activate(true, false),
             Command::TreePreview => return self.activate(false, true),
             Command::TreeToggleStaged => return self.toggle_staged(self.selected),
@@ -418,7 +409,7 @@ impl CommitView {
             Command::TreeApplyStash => return self.stash_button(StashButton::Apply),
             Command::TreePopStash => return self.stash_button(StashButton::Pop),
             Command::TreeDropStash => return self.stash_button(StashButton::Drop),
-            _ => {}
+            _ => self.navigate(command),
         }
         CommitAction::None
     }
@@ -1098,37 +1089,6 @@ impl CommitView {
         }
     }
 
-    /// Opens `row`, or closes it if it's open, reading a stash's files the
-    /// first time it opens.
-    fn toggle(&mut self, row: &Row) {
-        let hash = row.stash.clone().unwrap_or_default();
-        match &row.what {
-            What::All | What::Folder => {
-                if !self.collapsed.remove(&row.path) {
-                    self.collapsed.insert(row.path.clone());
-                }
-            }
-            What::Stashes => self.stashes_collapsed = !self.stashes_collapsed,
-            What::Stash(i) => {
-                if !self.open_stashes.remove(&hash) {
-                    if !self.stash_files.contains_key(&hash) {
-                        let files = git::stash_changes(&self.root, &self.stashes[*i]);
-                        self.stash_files.insert(hash.clone(), files);
-                    }
-                    self.open_stashes.insert(hash);
-                }
-            }
-            What::StashFolder(_) => {
-                let key = (hash, row.path.clone());
-                if !self.stash_collapsed.remove(&key) {
-                    self.stash_collapsed.insert(key);
-                }
-            }
-            _ => return,
-        }
-        self.rebuild();
-    }
-
     // --- layout ---------------------------------------------------------------
 
     /// The columns a row of the message has, inside the box's borders and
@@ -1306,49 +1266,6 @@ impl CommitView {
 
     // --- navigation -----------------------------------------------------------
 
-    /// Selects row `index` (clamped), or if that's the note that nothing
-    /// changed, the row next to it, and scrolls it into view.
-    fn select(&mut self, index: usize) {
-        let mut index = index.min(self.rows.len().saturating_sub(1));
-        if self
-            .rows
-            .get(index)
-            .is_some_and(|row| row.what == What::Note)
-        {
-            index = match index + 1 < self.rows.len() {
-                true => index + 1,
-                false => index - 1,
-            };
-        }
-        self.selected = index;
-        self.scroll_into_view();
-    }
-
-    /// Moves the selection `by` rows, over the note that nothing changed.
-    fn step(&mut self, by: isize) {
-        let mut index = self.selected.saturating_add_signed(by);
-        if self
-            .rows
-            .get(index)
-            .is_some_and(|row| row.what == What::Note)
-        {
-            index = index.saturating_add_signed(by.signum());
-        }
-        if index < self.rows.len() {
-            self.select(index);
-        }
-    }
-
-    fn scroll_into_view(&mut self) {
-        let height = self.list_height();
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + height {
-            self.scroll = self.selected + 1 - height;
-        }
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(height));
-    }
-
     /// Enter/Shift+Space/click: opens the selected file, or a stash's, or
     /// opens or closes what opens.
     fn activate(&mut self, focus: bool, preview: bool) -> CommitAction {
@@ -1367,47 +1284,68 @@ impl CommitView {
                 focus,
             },
             _ => {
-                self.toggle(&row);
+                self.toggle_row(self.selected);
                 CommitAction::None
             }
         }
     }
+}
 
-    /// Right: opens what's selected, if it's closed, or steps into it.
-    fn expand_or_enter(&mut self) {
-        let Some(row) = self.rows.get(self.selected).cloned() else {
-            return;
-        };
-        match self.is_open(&row) {
-            Some(false) => self.toggle(&row),
-            Some(true)
-                if self
-                    .rows
-                    .get(self.selected + 1)
-                    .is_some_and(|next| next.depth > row.depth) =>
-            {
-                self.select(self.selected + 1)
-            }
-            _ => {}
-        }
+impl Outline for CommitView {
+    fn row_count(&self) -> usize {
+        self.rows.len()
     }
 
-    /// Left: closes what's selected, if it's open, or steps out to what
-    /// it's in.
-    fn collapse_or_leave(&mut self) {
-        let Some(row) = self.rows.get(self.selected).cloned() else {
-            return;
-        };
-        if self.is_open(&row) == Some(true) {
-            self.toggle(&row);
-            return;
+    fn row_depth(&self, row: usize) -> usize {
+        self.rows[row].depth
+    }
+
+    fn row_open(&self, row: usize) -> Option<bool> {
+        self.is_open(&self.rows[row])
+    }
+
+    /// Reads a stash's files the first time it opens.
+    fn toggle_row(&mut self, row: usize) {
+        let row = self.rows[row].clone();
+        let hash = row.stash.clone().unwrap_or_default();
+        match &row.what {
+            What::All | What::Folder => {
+                if !self.collapsed.remove(&row.path) {
+                    self.collapsed.insert(row.path.clone());
+                }
+            }
+            What::Stashes => self.stashes_collapsed = !self.stashes_collapsed,
+            What::Stash(i) => {
+                if !self.open_stashes.remove(&hash) {
+                    if !self.stash_files.contains_key(&hash) {
+                        let files = git::stash_changes(&self.root, &self.stashes[*i]);
+                        self.stash_files.insert(hash.clone(), files);
+                    }
+                    self.open_stashes.insert(hash);
+                }
+            }
+            What::StashFolder(_) => {
+                let key = (hash, row.path.clone());
+                if !self.stash_collapsed.remove(&key) {
+                    self.stash_collapsed.insert(key);
+                }
+            }
+            _ => return,
         }
-        if let Some(parent) = self.rows[..self.selected]
-            .iter()
-            .rposition(|other| other.depth < row.depth)
-        {
-            self.select(parent);
-        }
+        self.rebuild();
+    }
+
+    /// The note that nothing changed.
+    fn row_skipped(&self, row: usize) -> bool {
+        self.rows.get(row).is_some_and(|row| row.what == What::Note)
+    }
+
+    fn rows_shown(&self) -> usize {
+        self.list_height()
+    }
+
+    fn place(&mut self) -> (&mut usize, &mut usize) {
+        (&mut self.selected, &mut self.scroll)
     }
 }
 
@@ -1633,7 +1571,10 @@ mod tests {
         }
         sender.send(Ok("1234567".into())).unwrap();
         assert!(view.poll().unwrap().is_ok());
-        for (command, pop) in [(Command::TreeApplyStash, false), (Command::TreePopStash, true)] {
+        for (command, pop) in [
+            (Command::TreeApplyStash, false),
+            (Command::TreePopStash, true),
+        ] {
             assert_eq!(
                 view.run(command),
                 CommitAction::ApplyStash {
@@ -1859,7 +1800,9 @@ mod tests {
             .unwrap();
         assert!(parents.status.success());
         assert_eq!(
-            String::from_utf8_lossy(&parents.stdout).split_whitespace().count(),
+            String::from_utf8_lossy(&parents.stdout)
+                .split_whitespace()
+                .count(),
             3,
             "the commit has two parents"
         );
