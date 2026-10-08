@@ -76,6 +76,8 @@ pub enum TreeAction {
     Commit(PathBuf),
     /// Show the branches of the repository at this root, to switch to one.
     Branches(PathBuf),
+    /// Sync the repository at this root with the branch it tracks.
+    Sync(PathBuf),
 }
 
 /// An entry in the tree, as the file commands see it.

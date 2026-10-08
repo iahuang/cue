@@ -180,6 +180,9 @@ commands! {
     TreePopStash => "tree:pop-stash", "Changes: Pop Stash";
     TreeDropStash => "tree:drop-stash", "Changes: Drop Stash…";
     GitCommit => "git:commit", "Commit Staged Changes";
+    GitFetch => "git:fetch", "Fetch from Remote";
+    GitPull => "git:pull", "Pull from Remote";
+    GitPush => "git:push", "Push to Remote";
     PickerUp => "picker:up", "Picker: Select Previous";
     PickerDown => "picker:down", "Picker: Select Next";
     PickerPageUp => "picker:page-up", "Picker: Page Up";
@@ -258,7 +261,8 @@ impl Command {
             | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal
             | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft | MoveTabRight
             | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6
-            | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession => Context::Global,
+            | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch | GitPull
+            | GitPush => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
@@ -916,6 +920,10 @@ mod tests {
             Command::TreeApplyStash,
             Command::TreePopStash,
             Command::TreeDropStash,
+            // As do the sync button and a repository's menu.
+            Command::GitFetch,
+            Command::GitPull,
+            Command::GitPush,
         ];
         let keymap = Keymap::default();
         for &command in Command::ALL {

@@ -69,6 +69,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use opentui::{Attributes, Buffer};
@@ -84,7 +85,7 @@ use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
 use crate::find;
-use crate::git::{self, Carried, Change, Commit, Git, SwitchTo};
+use crate::git::{self, Carried, Change, Commit, Git, Repo, SwitchTo};
 use crate::image::{self, ImageView};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
@@ -190,6 +191,15 @@ enum Answer {
 struct Saving {
     docs: Vec<Rc<Document>>,
     redo: Redo,
+}
+
+/// A repository syncing with its remote, in the background.
+struct Syncing {
+    /// Its top folder.
+    root: PathBuf,
+    sync: git::Sync,
+    /// How it went, once it's done.
+    done: Receiver<Result<(), String>>,
 }
 
 /// What the main loop should do after the app handled input.
@@ -364,6 +374,8 @@ pub struct App {
     /// The commit views shown, each with the message written in it: the
     /// one the sidebar shows, or showed last, first.
     commit_views: Vec<CommitView>,
+    /// The repositories syncing with their remotes, in the background.
+    syncing: Vec<Syncing>,
     /// The repository whose branches the picker lists, while it does.
     branch_root: Option<PathBuf>,
     /// What git says about the workspace's repositories.
@@ -593,6 +605,7 @@ impl App {
             changes: ChangesView::new(),
             log: None,
             commit_views: Vec::new(),
+            syncing: Vec::new(),
             branch_root: None,
             sidebar: Sidebar::Files,
             index_symbols_after_listing: false,
@@ -1180,6 +1193,9 @@ impl App {
                 self.commit()
             }
             Command::TreeCommit | Command::GitCommit => self.write_commit_message(),
+            Command::GitFetch | Command::GitPull | Command::GitPush => {
+                self.sync_command(command, None)
+            }
             command if command.context() == Context::Tree => match self.sidebar {
                 Sidebar::Files => {
                     let action = self.tree.run(command);
@@ -2112,6 +2128,20 @@ impl App {
             .collect();
         for result in committed {
             self.committed(result);
+            changed = true;
+        }
+        let mut index = 0;
+        while let Some(syncing) = self.syncing.get(index) {
+            let result = match syncing.done.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => Err("git stopped unexpectedly.".to_string()),
+            };
+            let Syncing { root, sync, .. } = self.syncing.remove(index);
+            self.synced(&root, &sync, result);
             changed = true;
         }
         if self.git.poll() {
@@ -4883,8 +4913,11 @@ impl App {
                     self.focus = Focus::Editor;
                 }
             }
-            // The tree has no logs, commits, or branches.
-            TreeAction::Log(_) | TreeAction::Commit(_) | TreeAction::Branches(_) => {}
+            // The tree has no logs, commits, branches, or remotes.
+            TreeAction::Log(_)
+            | TreeAction::Commit(_)
+            | TreeAction::Branches(_)
+            | TreeAction::Sync(_) => {}
         }
     }
 
@@ -4897,6 +4930,13 @@ impl App {
             TreeAction::Log(root) => return self.show_log(&root),
             TreeAction::Commit(root) => return self.show_commit_view(&root),
             TreeAction::Branches(root) => return self.show_branches(root),
+            TreeAction::Sync(root) => {
+                let repo = self.git.repos().iter().find(|repo| repo.root == root);
+                if let Some(sync) = repo.and_then(Repo::sync) {
+                    self.sync(root, sync);
+                }
+                return;
+            }
             TreeAction::Open {
                 path,
                 focus,
@@ -4980,11 +5020,10 @@ impl App {
         self.show_active_in_tree();
     }
 
-    /// Shows a commit view with the keyboard in its message box: of the
-    /// repository the changes view has selected, if it has the keyboard,
-    /// or of the commit view shown, or else of the file on screen, or the
-    /// first.
-    fn write_commit_message(&mut self) {
+    /// The repository a git command is for: the one the changes view has
+    /// selected, if it has the keyboard, or the one the commit view or log
+    /// shown is of, or else the one the file on screen is in, or the first.
+    fn command_repo(&self) -> Option<PathBuf> {
         let shown = self.visible_tree_width() > 0;
         let root = match self.sidebar {
             Sidebar::Changes if shown && self.focus == Focus::Tree => self.changes.selected_repo(),
@@ -4992,16 +5031,109 @@ impl App {
                 .commit_views
                 .first()
                 .map(|view| view.root().to_path_buf()),
+            Sidebar::Log if shown => self.log.as_ref().map(|log| log.root().to_path_buf()),
             _ => None,
         };
-        let root = root.or_else(|| {
+        root.or_else(|| {
             let path = self.active_panel().path();
             let repo = path
                 .and_then(|path| self.git.repo_of(&path))
                 .or_else(|| self.git.repos().first())?;
             Some(repo.root.clone())
+        })
+    }
+
+    /// Fetches, pulls, or pushes, as `command` says, the repository at
+    /// `root`, or if `None`, the one [`App::command_repo`] finds. A branch
+    /// that tracks none is pushed to the remote it'd be published to.
+    fn sync_command(&mut self, command: Command, root: Option<PathBuf>) {
+        let Some(root) = root.or_else(|| self.command_repo()) else {
+            self.show_message("Not in a git repository.", false);
+            return;
+        };
+        let Some(repo) = self.git.repos().iter().find(|repo| repo.root == root) else {
+            return;
+        };
+        let branch = match &repo.head {
+            git::Head::Branch(name) => Some(name.clone()),
+            git::Head::Detached(_) => None,
+        };
+        let sync = match (command, &branch, &repo.upstream, &repo.publish_to) {
+            (Command::GitFetch, ..) => Ok(git::Sync::Fetch),
+            (_, None, ..) => Err("Not on a branch.".to_string()),
+            (Command::GitPull, Some(_), Some(_), _) => Ok(git::Sync::Pull),
+            (Command::GitPull, Some(name), None, _) => {
+                Err(format!("{name} doesn't track a branch to pull from."))
+            }
+            (_, Some(_), Some(_), _) => Ok(git::Sync::Push),
+            (_, Some(_), None, Some(remote)) => Ok(git::Sync::Publish(remote.clone())),
+            (_, Some(name), None, None) => Err(format!("There's no remote to push {name} to.")),
+        };
+        match sync {
+            Ok(sync) => self.sync(root, sync),
+            Err(message) => self.show_message(message, false),
+        }
+    }
+
+    /// Starts `sync`, of the repository at `root` with its remote, in the
+    /// background, unless it's busy.
+    fn sync(&mut self, root: PathBuf, sync: git::Sync) {
+        if self.syncing.iter().any(|syncing| syncing.root == root) {
+            self.show_message("Wait for the last one to finish.", false);
+            return;
+        }
+        if self
+            .commit_view_of(&root)
+            .is_some_and(|view| view.committing())
+        {
+            self.show_message("Wait for the commit to finish.", false);
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let (dir, what) = (root.clone(), sync.clone());
+        std::thread::spawn(move || {
+            let _ = sender.send(git::sync(&dir, &what));
         });
-        let Some(root) = root else {
+        self.changes.set_syncing(&root, Some(sync.clone()));
+        self.syncing.push(Syncing {
+            root,
+            sync,
+            done: receiver,
+        });
+    }
+
+    /// Says how `sync`, of the repository at `root`, went.
+    fn synced(&mut self, root: &Path, sync: &git::Sync, result: Result<(), String>) {
+        self.changes.set_syncing(root, None);
+        self.git.restart();
+        let err = match result {
+            Ok(()) => {
+                let message = match sync {
+                    git::Sync::Fetch => "Fetched.".to_string(),
+                    git::Sync::Pull => "Pulled.".to_string(),
+                    git::Sync::Push => "Pushed.".to_string(),
+                    git::Sync::Both => "Pulled and pushed.".to_string(),
+                    git::Sync::Publish(remote) => format!("Published to {remote}."),
+                };
+                return self.show_message(message, false);
+            }
+            Err(err) => err,
+        };
+        let title = match sync {
+            _ if err.contains("CONFLICT") => "Pulled with Conflicts",
+            git::Sync::Fetch => "Can't Fetch",
+            git::Sync::Pull => "Can't Pull",
+            git::Sync::Push => "Can't Push",
+            git::Sync::Both => "Can't Sync",
+            git::Sync::Publish(_) => "Can't Publish",
+        };
+        self.show_git_error(title, &err);
+    }
+
+    /// Shows a commit view with the keyboard in its message box: of the
+    /// repository [`App::command_repo`] finds.
+    fn write_commit_message(&mut self) {
+        let Some(root) = self.command_repo() else {
             self.show_message("Not in a git repository.", false);
             return;
         };
@@ -5595,6 +5727,14 @@ impl App {
         use Command::*;
         let item = |command, label: &str| MenuItem::Command(command, label.to_string());
         let mut items = Vec::new();
+        if self.sidebar == Sidebar::Changes && target.is_root {
+            items.extend([
+                item(GitFetch, "Fetch"),
+                item(GitPull, "Pull"),
+                item(GitPush, "Push"),
+                MenuItem::Separator,
+            ]);
+        }
         if !target.is_dir {
             items.extend([
                 item(TreeOpen, "Open"),
@@ -5814,6 +5954,9 @@ impl App {
                 if self.tab().panels.len() > panels && self.open(&target.path, false) {
                     self.focus = Focus::Editor;
                 }
+            }
+            Command::GitFetch | Command::GitPull | Command::GitPush => {
+                self.sync_command(command, Some(target.path))
             }
             Command::TreeNewFile => self.open_dialog(Purpose::Create, &folder, "", None),
             Command::TreeNewFolder => self.open_dialog(Purpose::CreateFolder, &folder, "", None),
@@ -10387,6 +10530,50 @@ mod tests {
         assert_eq!(git::log(&root, 0, 1)[0].subject, "Stay on main");
         app.switch_branch(root.clone(), to);
         assert_eq!(branch(), "topic");
+    }
+
+    #[test]
+    fn syncs_with_the_remote_in_the_background() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-sync");
+        crate::git::tests::commit_as_cue(&root);
+        let remote = root.with_file_name("app-sync-remote");
+        let _ = fs::remove_dir_all(&remote);
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init", "-q", "--bare", remote.to_str().unwrap()]);
+        run(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        let mut app = app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+
+        app.run(Command::GitPull, false);
+        let message = status_message(&app).unwrap();
+        assert!(message.ends_with("doesn't track a branch to pull from."));
+        // A branch that tracks none is published.
+        app.run(Command::GitPush, false);
+        assert_eq!(app.syncing.len(), 1);
+        app.run(Command::GitFetch, false);
+        assert_eq!(
+            status_message(&app).as_deref(),
+            Some("Wait for the last one to finish.")
+        );
+        while !app.syncing.is_empty() {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            status_message(&app).as_deref(),
+            Some("Published to origin.")
+        );
+        wait_for_git(&mut app);
+        assert_eq!(app.git.repos()[0].sync(), Some(git::Sync::Fetch));
     }
 
     #[test]

@@ -143,6 +143,56 @@ pub struct Repo {
     pub removed: usize,
     /// The changes stashed, newest first.
     pub stashes: Vec<Stash>,
+    /// The branch the one checked out tracks, if it tracks one.
+    pub upstream: Option<Upstream>,
+    /// The remote a branch that tracks none would be published to, if
+    /// there's one to choose.
+    pub publish_to: Option<String>,
+}
+
+/// The branch, on a remote, that the one checked out tracks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    /// Its name: `origin/main`.
+    pub name: String,
+    /// Commits here it doesn't have yet.
+    pub ahead: usize,
+    /// Commits it has that aren't here yet, as of the last fetch.
+    pub behind: usize,
+}
+
+/// What a repository's branch needs to catch up with the branch it tracks,
+/// as its sync button does it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sync {
+    /// Nothing, as far as is known: asks the remote what's new.
+    Fetch,
+    Pull,
+    Push,
+    /// Pull, then push.
+    Both,
+    /// Push a branch that tracks none to this remote, and track it there.
+    Publish(String),
+}
+
+impl Repo {
+    /// What its sync button does, if it has one: not on a detached head,
+    /// or a branch with nowhere to go.
+    pub fn sync(&self) -> Option<Sync> {
+        let Head::Branch(_) = self.head else {
+            return None;
+        };
+        let Some(upstream) = &self.upstream else {
+            self.commit.as_ref()?;
+            return self.publish_to.clone().map(Sync::Publish);
+        };
+        Some(match (upstream.ahead > 0, upstream.behind > 0) {
+            (false, false) => Sync::Fetch,
+            (false, true) => Sync::Pull,
+            (true, false) => Sync::Push,
+            (true, true) => Sync::Both,
+        })
+    }
 }
 
 /// What git says of a file: the repository it's in, how it changed since
@@ -779,6 +829,25 @@ pub fn switch(root: &Path, to: &SwitchTo) -> Result<Carried, String> {
     }
 }
 
+/// Does what `sync` says in the repository at `root`, with its remote.
+/// Returns what git said went wrong. A merge a pull makes takes git's
+/// message, as there's no editor to write one in; and whether a pull
+/// merges or rebases is as git's set up to do.
+pub fn sync(root: &Path, sync: &Sync) -> Result<(), String> {
+    let run = |args: &[&str]| {
+        let mut command = writing(root);
+        command.env("GIT_MERGE_AUTOEDIT", "no").args(args);
+        run_with_input(command, b"").map(drop)
+    };
+    match sync {
+        Sync::Fetch => run(&["fetch"]),
+        Sync::Pull => run(&["pull"]),
+        Sync::Push => run(&["push"]),
+        Sync::Both => run(&["pull"]).and_then(|()| run(&["push"])),
+        Sync::Publish(remote) => run(&["push", "--set-upstream", remote, "HEAD"]),
+    }
+}
+
 /// `git` for something that changes the repository at `dir`: as [`git`],
 /// but in a session of its own, without the terminal, so a hook or a
 /// signing program that asks for something can't read from it or draw
@@ -1032,8 +1101,12 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
     if !output.status.success() {
         return None;
     }
-    let (head, commit, changes) = parse_status(&output.stdout);
+    let (head, commit, changes, upstream) = parse_status(&output.stdout);
     let stashes = stashes(top);
+    let publish_to = match (&head, &upstream) {
+        (Head::Branch(_), None) => publish_remote(top),
+        _ => None,
+    };
     let (mut added, removed) = diff_lines(top, commit.is_none());
     let untracked = changes
         .iter()
@@ -1061,7 +1134,31 @@ fn status(top: &Path, git_dir: PathBuf) -> Option<Repo> {
         added,
         removed,
         stashes,
+        upstream,
+        publish_to,
     })
+}
+
+/// The remote a branch that tracks none would be published to: the one
+/// git's set to push to, or `origin`, or the only one. `None` if there's
+/// no remote, or several and none of those.
+fn publish_remote(top: &Path) -> Option<String> {
+    let read = |args: &[&str]| {
+        let output = git(top).args(args).output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    if let Some(remote) = read(&["config", "--get", "remote.pushDefault"]) {
+        return Some(remote.trim().to_string());
+    }
+    let remotes = read(&["remote"])?;
+    let remotes: Vec<&str> = remotes.lines().collect();
+    match remotes[..] {
+        [only] => Some(only.to_string()),
+        _ => remotes.contains(&"origin").then(|| "origin".to_string()),
+    }
 }
 
 /// The lines added and removed in the working tree `top`, staged or not,
@@ -1130,10 +1227,14 @@ fn count_lines(paths: impl Iterator<Item = PathBuf>) -> usize {
 type Entry = (PathBuf, Kind, Option<PathBuf>, Staged);
 
 /// What `git status --porcelain=v2 --branch -z` says: the head, the commit
-/// checked out, unless there's none yet, and the files changed.
-fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>) {
+/// checked out, unless there's none yet, the files changed, and the branch
+/// the head tracks, if it tracks one.
+fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>, Option<Upstream>) {
     let mut oid = None;
     let mut branch = None;
+    let mut upstream = None;
+    // Missing when the branch it tracks is gone.
+    let mut ahead_behind = (0, 0);
     let mut changes = Vec::new();
     let mut fields = output
         .split(|&byte| byte == 0)
@@ -1144,6 +1245,14 @@ fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>) {
                 oid = Some(value.to_string());
             } else if let Some(value) = header.strip_prefix("branch.head ") {
                 branch = Some(value.to_string());
+            } else if let Some(value) = header.strip_prefix("branch.upstream ") {
+                upstream = Some(value.to_string());
+            } else if let Some(value) = header.strip_prefix("branch.ab ") {
+                // `+1 -2`
+                let mut counts = value
+                    .split(' ')
+                    .map(|count| count.trim_start_matches(['+', '-']).parse().unwrap_or(0));
+                ahead_behind = (counts.next().unwrap_or(0), counts.next().unwrap_or(0));
             }
             continue;
         }
@@ -1191,7 +1300,12 @@ fn parse_status(output: &[u8]) -> (Head, Option<String>, Vec<Entry>) {
             Head::Detached(oid.chars().take(7).collect())
         }
     };
-    (head, commit, changes)
+    let upstream = upstream.map(|name| Upstream {
+        name,
+        ahead: ahead_behind.0,
+        behind: ahead_behind.1,
+    });
+    (head, commit, changes, upstream)
 }
 
 /// How much of a changed entry is staged, from the `XY` its line starts
@@ -1296,7 +1410,8 @@ pub(crate) mod tests {
             2 C. N... 100644 100644 100644 aaa aaa C75 copy.rs\0orig.rs\0\
             u UU N... 100644 100644 100644 100644 a b c both.rs\0\
             ? notes.txt\0";
-        let (head, commit, changes) = parse_status(output);
+        let (head, commit, changes, upstream) = parse_status(output);
+        assert_eq!(upstream, None);
         assert_eq!(head, Head::Branch("main".into()));
         assert_eq!(commit.as_deref(), Some("0123456789abcdef"));
         let expected = [
@@ -1839,5 +1954,62 @@ pub(crate) mod tests {
         let dir = fixture("no-commits");
         run(&dir, &["init", "-q"]);
         assert!(log(&dir, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn syncs_with_the_branch_it_tracks() {
+        let status = |dir: &Path| {
+            let mut git = Git::new(&[dir.to_path_buf()]);
+            git.wait();
+            git.repos()[0].clone()
+        };
+        let remote = fixture("sync-remote");
+        run(&remote, &["init", "-q", "--bare"]);
+        let dir = repo("sync-here");
+        commit_as_cue(&dir);
+        run(&dir, &["config", "pull.rebase", "false"]);
+        assert_eq!(status(&dir).sync(), None, "nowhere to push to");
+        run(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        let publish = Sync::Publish("origin".into());
+        assert_eq!(status(&dir).sync(), Some(publish.clone()));
+        sync(&dir, &publish).unwrap();
+        let repo = status(&dir);
+        let upstream = repo.upstream.as_ref().unwrap();
+        assert!(upstream.name.starts_with("origin/"), "{}", upstream.name);
+        assert_eq!(repo.sync(), Some(Sync::Fetch));
+
+        fs::write(dir.join("a.txt"), "ahead\n").unwrap();
+        commit_all(&dir, "ahead");
+        assert_eq!(status(&dir).sync(), Some(Sync::Push));
+        sync(&dir, &Sync::Push).unwrap();
+        assert_eq!(status(&dir).sync(), Some(Sync::Fetch));
+
+        // Another clone pushes, so this one's behind once it fetches.
+        let other = fixture("sync-other");
+        run(&other, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        commit_as_cue(&other);
+        fs::write(other.join("b.txt"), "theirs\n").unwrap();
+        commit_all(&other, "theirs");
+        sync(&other, &Sync::Push).unwrap();
+        sync(&dir, &Sync::Fetch).unwrap();
+        assert_eq!(status(&dir).sync(), Some(Sync::Pull));
+        fs::write(dir.join("c.txt"), "mine\n").unwrap();
+        commit_all(&dir, "mine");
+        let repo = status(&dir);
+        let upstream = repo.upstream.as_ref().unwrap();
+        assert_eq!((upstream.ahead, upstream.behind), (1, 1));
+        assert_eq!(repo.sync(), Some(Sync::Both));
+        sync(&dir, &Sync::Both).unwrap();
+        assert_eq!(status(&dir).sync(), Some(Sync::Fetch));
+        assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "theirs\n");
+    }
+
+    #[test]
+    fn reads_how_far_apart_the_branches_are() {
+        let output = b"# branch.oid 0123456789abcdef\0# branch.head main\0\
+            # branch.upstream origin/main\0# branch.ab +2 -13\0";
+        let upstream = parse_status(output).3.unwrap();
+        assert_eq!(upstream.name, "origin/main");
+        assert_eq!((upstream.ahead, upstream.behind), (2, 13));
     }
 }

@@ -3,21 +3,22 @@
 //!
 //! Each repository the workspace's folders are in is listed, under a row
 //! for what it does as a whole: the branch it's on, which shows its
-//! branches to switch to, and buttons to its commit view, where changes are
-//! staged and committed, and to its log.
+//! branches to switch to, a button that syncs it with the branch it tracks,
+//! saying what it'd do (fetch, pull, push, or both), and buttons to its
+//! commit view, where changes are staged and committed, and to its log.
 //! Under its name are its changed files in their folders, each marked with
 //! how it changed. A folder holding only another folder shows as one row,
 //! `src/git`, as VS Code's compact folders do. Keys and the mouse work as
 //! in the tree: a click previews a file, and a double click or Enter opens
 //! it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use opentui::{Attributes, Buffer, Rgba};
 
-use crate::git::{Change, Kind, Repo};
+use crate::git::{Change, Kind, Repo, Sync};
 use crate::icons::{self, Icon};
 use crate::keymap::Command;
 use crate::theme;
@@ -28,8 +29,15 @@ use crate::workspace::root_names;
 const LOG_BUTTON: &str = "Log";
 /// The button before it, which shows the commit view.
 const COMMIT_BUTTON: &str = "Commit";
-/// Both, as they're drawn.
-const BUTTONS: &str = "Commit  Log";
+
+/// A button on a repository's first row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderButton {
+    /// Syncs it with the branch it tracks.
+    Sync,
+    Commit,
+    Log,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
@@ -42,9 +50,10 @@ struct Row {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum What {
-    /// A repository's first row: the branch it's on, and the button to its
-    /// log.
-    Header(String),
+    /// A repository's first row: the branch it's on, as its name, and the
+    /// buttons: the sync button, saying this, if it has one, then the
+    /// buttons to its commit view and its log.
+    Header(Option<String>),
     /// A repository's name, which collapses it.
     Repo,
     Folder,
@@ -241,6 +250,8 @@ pub struct ChangesView {
     active: Option<PathBuf>,
     /// The active file is a preview, shown in italics.
     active_preview: bool,
+    /// What the repositories syncing are doing, by their top folders.
+    syncing: HashMap<PathBuf, Sync>,
 }
 
 impl ChangesView {
@@ -255,7 +266,18 @@ impl ChangesView {
             height: 1,
             active: None,
             active_preview: false,
+            syncing: HashMap::new(),
         }
+    }
+
+    /// Says on its sync button that the repository at `root` is doing
+    /// `sync`, or with `None`, that it's done.
+    pub fn set_syncing(&mut self, root: &Path, sync: Option<Sync>) {
+        match sync {
+            Some(sync) => self.syncing.insert(root.to_path_buf(), sync),
+            None => self.syncing.remove(root),
+        };
+        self.rebuild();
     }
 
     /// Lists the changes in `repos`, keeping the selection on the same
@@ -348,13 +370,16 @@ impl ChangesView {
         if !self.select_at(y) {
             return TreeAction::None;
         }
-        if let What::Header(_) = self.rows[self.selected].what {
-            let root = self.rows[self.selected].path.clone();
-            let branch = &self.rows[self.selected].name;
-            return match header_button(x, width) {
-                Some(LOG_BUTTON) => TreeAction::Log(root),
-                Some(_) => TreeAction::Commit(root),
-                None if branch_area(branch, width).contains(&x) => TreeAction::Branches(root),
+        let row = &self.rows[self.selected];
+        if let What::Header(sync) = &row.what {
+            let root = row.path.clone();
+            return match header_button(x, width, sync.as_deref()) {
+                Some((HeaderButton::Sync, _)) => TreeAction::Sync(root),
+                Some((HeaderButton::Commit, _)) => TreeAction::Commit(root),
+                Some((HeaderButton::Log, _)) => TreeAction::Log(root),
+                None if branch_area(&row.name, width, sync.as_deref()).contains(&x) => {
+                    TreeAction::Branches(root)
+                }
                 None => TreeAction::None,
             };
         }
@@ -385,10 +410,10 @@ impl ChangesView {
         let row = self.rows.get(self.scroll + y as usize)?;
         match &row.what {
             What::Gap => None,
-            What::Header(branch) => match header_button(x, width) {
-                Some(LOG_BUTTON) => Some(button_area(log_button(width))),
-                Some(_) => Some(button_area(commit_button(width))),
-                None => Some(branch_area(branch, width)).filter(|area| area.contains(&x)),
+            What::Header(sync) => match header_button(x, width, sync.as_deref()) {
+                Some((_, columns)) => Some(button_area(columns)),
+                None => Some(branch_area(&row.name, width, sync.as_deref()))
+                    .filter(|area| area.contains(&x)),
             },
             _ => Some(0..width),
         }
@@ -450,9 +475,14 @@ impl ChangesView {
         }
         let open = !self.collapsed.contains(&row.path);
         let letter;
+        let buttons;
         let (open, icon, right) = match &row.what {
             What::Gap => return,
-            What::Header(_) => (None, Some(icons::branch()), Some((BUTTONS, colors.muted))),
+            What::Header(sync) => {
+                buttons = header_text(sync.as_deref());
+                let right = Some((buttons.as_str(), colors.muted));
+                (None, Some(icons::branch()), right)
+            }
             What::Repo => (Some(open), Some(icons::folder(open)), None),
             What::Folder => (Some(open), Some(icons::folder(open)), None),
             What::File(kind) => {
@@ -492,12 +522,11 @@ impl ChangesView {
                     what: What::Gap,
                 });
             }
-            let branch = repo.head.name().to_string();
             rows.push(Row {
                 path: repo.root.clone(),
-                name: branch.clone(),
+                name: repo.head.name().to_string(),
                 depth: 0,
-                what: What::Header(branch),
+                what: What::Header(sync_label(repo, self.syncing.get(&repo.root))),
             });
             rows.push(Row {
                 path: repo.root.clone(),
@@ -634,31 +663,78 @@ impl ChangesView {
     }
 }
 
-/// The columns of a repository's log button, from the list's left edge,
-/// in a list `width` wide.
-fn log_button(width: u32) -> Range<u32> {
-    let start = width.saturating_sub(LOG_BUTTON.len() as u32 + 1);
-    start..start + LOG_BUTTON.len() as u32
+/// What a repository's sync button says: what it does, with how many
+/// commits it'd bring in or send, or what it's doing, if it's `syncing`.
+/// `None` if it has no sync button.
+fn sync_label(repo: &Repo, syncing: Option<&Sync>) -> Option<String> {
+    if let Some(sync) = syncing {
+        let doing = match sync {
+            Sync::Fetch => "Fetching…",
+            Sync::Pull => "Pulling…",
+            Sync::Push => "Pushing…",
+            Sync::Both => "Syncing…",
+            Sync::Publish(_) => "Publishing…",
+        };
+        return Some(doing.to_string());
+    }
+    let (ahead, behind) = repo
+        .upstream
+        .as_ref()
+        .map_or((0, 0), |upstream| (upstream.ahead, upstream.behind));
+    Some(match repo.sync()? {
+        Sync::Fetch => "Fetch".to_string(),
+        Sync::Pull => format!("Pull ↓{behind}"),
+        Sync::Push => format!("Push ↑{ahead}"),
+        Sync::Both => format!("Sync ↓{behind} ↑{ahead}"),
+        Sync::Publish(_) => "Publish".to_string(),
+    })
+}
+
+/// A repository's first row's buttons, as they're drawn: the sync button,
+/// saying `sync`, if it has one, then the others.
+fn header_text(sync: Option<&str>) -> String {
+    let others = format!("{COMMIT_BUTTON}  {LOG_BUTTON}");
+    match sync {
+        Some(sync) => format!("{sync}  {others}"),
+        None => others,
+    }
+}
+
+/// The buttons on a repository's first row, with their columns from the
+/// list's left edge, in a list `width` wide, from the right: Log, Commit,
+/// and the sync button, saying `sync`, if it has one.
+fn header_buttons(width: u32, sync: Option<&str>) -> Vec<(HeaderButton, Range<u32>)> {
+    let labels = [
+        (HeaderButton::Log, LOG_BUTTON),
+        (HeaderButton::Commit, COMMIT_BUTTON),
+    ];
+    let sync = sync.map(|label| (HeaderButton::Sync, label));
+    let mut end = width.saturating_sub(1);
+    let mut buttons = Vec::new();
+    for (button, label) in labels.into_iter().chain(sync) {
+        let start = end.saturating_sub(label.chars().count() as u32);
+        buttons.push((button, start..end));
+        end = start.saturating_sub(2);
+    }
+    buttons
 }
 
 /// The button on a repository's first row at column `x`, from the list's
-/// left edge, in a list `width` wide, if there's one there.
-fn header_button(x: u32, width: u32) -> Option<&'static str> {
-    if button_area(log_button(width)).contains(&x) {
-        Some(LOG_BUTTON)
-    } else if button_area(commit_button(width)).contains(&x) {
-        Some(COMMIT_BUTTON)
-    } else {
-        None
-    }
+/// left edge, in a list `width` wide, and its columns, if there's one
+/// there. `sync` is what its sync button says, if it has one.
+fn header_button(x: u32, width: u32, sync: Option<&str>) -> Option<(HeaderButton, Range<u32>)> {
+    header_buttons(width, sync)
+        .into_iter()
+        .find(|(_, columns)| button_area(columns.clone()).contains(&x))
 }
 
 /// The branch on a repository's first row, which shows its branches: its
 /// icon and name, as far as there's room before the buttons, in a list
 /// `width` wide.
-fn branch_area(branch: &str, width: u32) -> Range<u32> {
+fn branch_area(branch: &str, width: u32, sync: Option<&str>) -> Range<u32> {
     let name_x = 1 + icons::width();
-    let room = width.saturating_sub(name_x + BUTTONS.len() as u32 + 2);
+    let buttons = header_text(sync).chars().count() as u32;
+    let room = width.saturating_sub(name_x + buttons + 2);
     let shown = (branch.chars().count() as u32).min(room);
     button_area(1..name_x + shown)
 }
@@ -667,12 +743,6 @@ fn branch_area(branch: &str, width: u32) -> Range<u32> {
 /// column either side.
 pub(crate) fn button_area(columns: Range<u32>) -> Range<u32> {
     columns.start.saturating_sub(1)..columns.end + 1
-}
-
-/// The columns of a repository's commit button, as [`log_button`]'s.
-fn commit_button(width: u32) -> Range<u32> {
-    let start = width.saturating_sub(BUTTONS.len() as u32 + 1);
-    start..start + COMMIT_BUTTON.len() as u32
 }
 
 #[cfg(test)]
@@ -700,6 +770,8 @@ mod tests {
             added: 0,
             removed: 0,
             stashes: Vec::new(),
+            upstream: None,
+            publish_to: None,
             root,
         }
     }
@@ -720,7 +792,7 @@ mod tests {
                 let name = &row.name;
                 let indent = "  ".repeat(row.depth);
                 match &row.what {
-                    What::Header(branch) => format!("@{branch}"),
+                    What::Header(_) => format!("@{name}"),
                     What::Repo => name.clone(),
                     What::Folder => format!("{indent}{name}/"),
                     What::File(kind) => format!("{indent}{name} {}", kind.letter()),
@@ -849,6 +921,65 @@ mod tests {
                 "     a.rs         M"
             ]
         );
+    }
+
+    #[test]
+    fn the_sync_button_says_what_it_does() {
+        let _serial = crate::test_serial();
+        let drawn = |view: &ChangesView| {
+            let screen =
+                opentui::OwnedBuffer::new(34, 1, false, opentui::WidthMethod::Unicode, "test")
+                    .unwrap();
+            screen.clear(Rgba::BLACK);
+            view.draw(&screen, 0, 34, true);
+            screen
+                .to_text(true)
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end()
+                .to_string()
+        };
+        let mut cue = repo("/w/cue", &[]);
+        cue.commit = Some("0123abc".into());
+        let root = cue.root.clone();
+        assert_eq!(
+            drawn(&view(&[cue.clone()])),
+            " main                 Commit  Log"
+        );
+        cue.publish_to = Some("origin".into());
+        assert_eq!(
+            drawn(&view(&[cue.clone()])),
+            " main        Publish  Commit  Log"
+        );
+        cue.upstream = Some(crate::git::Upstream {
+            name: "origin/main".into(),
+            ahead: 0,
+            behind: 0,
+        });
+        assert_eq!(
+            drawn(&view(&[cue.clone()])),
+            " main          Fetch  Commit  Log"
+        );
+        cue.upstream.as_mut().unwrap().ahead = 3;
+        assert_eq!(
+            drawn(&view(&[cue.clone()])),
+            " main        Push ↑3  Commit  Log"
+        );
+        cue.upstream.as_mut().unwrap().behind = 12;
+        let mut view = view(&[cue]);
+        assert_eq!(drawn(&view), " main    Sync ↓12 ↑3  Commit  Log");
+        // Commit and Log stay where they were.
+        let at = |view: &mut ChangesView, x| view.click(x, 0, 34, false);
+        assert_eq!(at(&mut view, 18), TreeAction::Sync(root.clone()));
+        assert_eq!(at(&mut view, 9), TreeAction::Sync(root.clone()));
+        assert_eq!(at(&mut view, 24), TreeAction::Commit(root.clone()));
+        assert_eq!(at(&mut view, 31), TreeAction::Log(root.clone()));
+        assert_eq!(at(&mut view, 3), TreeAction::Branches(root.clone()));
+        view.set_syncing(&root, Some(Sync::Both));
+        assert_eq!(drawn(&view), " main       Syncing…  Commit  Log");
+        view.set_syncing(&root, None);
+        assert_eq!(drawn(&view), " main    Sync ↓12 ↑3  Commit  Log");
     }
 
     #[test]
