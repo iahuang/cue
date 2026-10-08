@@ -685,6 +685,8 @@ fn attached(
     };
     // Dropped before the renderer, putting the terminal's background back.
     let mut host_colors = HostColors { background: None };
+    // Likewise, putting the terminal's title back.
+    let mut host_title = HostTitle { title: None };
 
     // When stdin last had input, to tell a lone ESC from the start of a
     // sequence split across reads.
@@ -698,6 +700,7 @@ fn attached(
         let _ = listen(app, listener);
         app.update_theme();
         host_colors.apply(&mut renderer, app);
+        host_title.apply(app);
         if dirty && pacing.ready() {
             {
                 let frame = renderer.next_buffer()?;
@@ -974,6 +977,40 @@ impl Drop for HostColors {
     fn drop(&mut self) {
         if self.background.is_some() {
             write_to_terminal(&theme::set_background(None));
+        }
+    }
+}
+
+/// The terminal's title (OSC 0), as [`App::window_title`] has it. The
+/// terminal's own is saved on its title stack first, and put back when cue
+/// exits.
+struct HostTitle {
+    /// The title cue gave the terminal, if it did.
+    title: Option<String>,
+}
+
+impl HostTitle {
+    fn apply(&mut self, app: &App) {
+        let title = app.window_title();
+        if self.title.as_ref() == Some(&title) {
+            return;
+        }
+        // Push the terminal's own (XTWINOPS 22) the first time.
+        let push = match self.title {
+            None => "\x1b[22;0t",
+            Some(_) => "",
+        };
+        write_to_terminal(&format!("{push}\x1b]0;{title}\x1b\\"));
+        self.title = Some(title);
+    }
+}
+
+impl Drop for HostTitle {
+    fn drop(&mut self) {
+        if self.title.is_some() {
+            // Cleared first for terminals without a title stack, where
+            // popping (XTWINOPS 23) does nothing.
+            write_to_terminal("\x1b]0;\x1b\\\x1b[23;0t");
         }
     }
 }

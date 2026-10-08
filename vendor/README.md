@@ -105,6 +105,9 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   that switch screens, and each screen's cursor, style, and kitty keyboard
   flags. The palette is left out, since setting it would mark every slot as
   the program's own.
+- `src/terminal.zig`: `resetState` clears the title only if `setTerminalTitle`
+  set one, so it doesn't clear the title cue put back from the terminal's
+  title stack on exit.
 
 ## `tree-sitter-latex/`
 

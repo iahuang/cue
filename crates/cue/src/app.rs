@@ -4038,6 +4038,22 @@ impl App {
         })
     }
 
+    /// What to title the terminal cue is in: "cue" and the session's name
+    /// or ID, or else its first folder and how many more, as
+    /// `cue: ~/cue +1`.
+    pub fn window_title(&self) -> String {
+        let about = match (self.session_label(), self.workspace.roots()) {
+            (Some(label), _) => label,
+            (None, []) => return "cue".to_string(),
+            (None, [root]) => crate::client::tilde(root),
+            (None, [root, more @ ..]) => {
+                format!("{} +{}", crate::client::tilde(root), more.len())
+            }
+        };
+        let about: String = about.chars().filter(|c| !c.is_control()).collect();
+        format!("cue: {about}")
+    }
+
     /// Stops being a session, removing what it kept, as when it was one
     /// only to restart (see [`App::hand_over`]). Unsaved changes have
     /// recovery copies again.

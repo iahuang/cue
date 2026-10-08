@@ -232,6 +232,7 @@ state: struct {
     pixel_mouse: bool = false,
     color_scheme_updates: bool = false,
     theme_queries_sent: bool = false,
+    title_set: bool = false,
     focus_tracking: bool = false,
     modify_other_keys: bool = false,
     mouse_pointer: MousePointerStyle = .default,
@@ -328,7 +329,10 @@ pub fn resetState(self: *Terminal, tty: anytype) !void {
         try self.setColorSchemeUpdates(tty, false);
     }
 
-    self.setTerminalTitle(tty, "");
+    // Only a title this set: the app may have set its own, to put back.
+    if (self.state.title_set) {
+        self.setTerminalTitle(tty, "");
+    }
 
     // OSC 111 is intentionally disabled for now. In Ghostty, sending the
     // reset alone is enough to poison later OSC 11 background reporting for
@@ -1537,7 +1541,8 @@ pub fn setKittyKeyboardFlags(self: *Terminal, flags: u8) void {
     self.opts.kitty_keyboard_flags = flags;
 }
 
-pub fn setTerminalTitle(_: *Terminal, tty: anytype, title: []const u8) void {
+pub fn setTerminalTitle(self: *Terminal, tty: anytype, title: []const u8) void {
+    self.state.title_set = title.len > 0;
     // For Windows, we might need to use different approach, but ANSI sequences work in Windows Terminal, ConPTY, etc.
     // For other platforms, ANSI OSC sequences work reliably
     ansi.ANSI.setTerminalTitleOutput(tty, title) catch {};
