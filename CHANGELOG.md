@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-- Name sessions with Rename Session; names show in `cue --list` and `cue --resume`, and `cue --end` takes one. Older versions don't list sessions saved by this one
+- Name sessions with Rename Session (`a07c1e9`)
+- Give the enclosing terminal window a relevant title (`ad31b9e`)
+- Add shortcut for clear terminal (`c335616`)
+- Add a context menu to panel headers
+- Open the file picker by clicking the file's name in a panel's header
 
 ## v0.3.11 — 2026-10-07
 

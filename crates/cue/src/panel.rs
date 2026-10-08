@@ -19,7 +19,7 @@
 //! too, as in Vim's jump list: going to a line, symbol, or search result,
 //! to the start or end, a click, or the find bar, when they go far.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::Instant;
@@ -173,6 +173,10 @@ pub struct Panel {
     message: Option<(String, bool)>,
     area: Rect,
     history: History,
+    /// The columns the header's name took when last drawn, its icon
+    /// included, from the first to past the last: a click there opens the
+    /// file picker.
+    name_columns: Cell<(u32, u32)>,
 }
 
 impl Panel {
@@ -187,6 +191,7 @@ impl Panel {
             message: None,
             area: Rect::default(),
             history: History::default(),
+            name_columns: Cell::new((0, 0)),
         }
     }
 
@@ -840,8 +845,23 @@ impl Panel {
         self.area.width.saturating_sub(buttons)
     }
 
+    /// Whether screen column `x` of the header is on its name.
+    pub fn on_name(&self, x: u32) -> bool {
+        let (start, end) = self.name_columns.get();
+        (start..end).contains(&x) && x < self.area.x + self.title_width()
+    }
+
     /// The interactive area under the pointer, without changing selection.
     pub fn hover_header(&self, x: u32) -> Option<Rect> {
+        if self.on_name(x) {
+            let (start, end) = self.name_columns.get();
+            return Some(Rect {
+                x: start,
+                y: self.area.y,
+                width: end - start,
+                height: 1,
+            });
+        }
         if let Some((button, label, start)) = self
             .buttons()
             .into_iter()
@@ -913,6 +933,7 @@ impl Panel {
         let room = width.saturating_sub(2 + icon) as usize;
         let name = truncate_left(&name, room);
         frame.draw_text(&name, area.x + 1 + icon, area.y, fg, None, Attributes::BOLD);
+        self.set_name_columns(icon + label_width(&name));
         if let Some(status) = terminal.exit() {
             let used = (1 + icon) as usize + name.chars().count() + 2;
             let note = format!("[{}]", terminal::describe_exit(status).to_lowercase());
@@ -961,6 +982,7 @@ impl Panel {
                     None,
                     Attributes::NONE,
                 );
+                self.set_name_columns(label_width("No file"));
                 return;
             }
         };
@@ -988,6 +1010,7 @@ impl Panel {
             attributes |= Attributes::ITALIC;
         }
         frame.draw_text(&name, area.x + 1 + icon, area.y, fg, None, attributes);
+        self.set_name_columns(icon + label_width(&name));
         let used = (1 + icon) as usize + name.chars().count() + 2;
         let room = (width as usize).saturating_sub(used + 1);
         if !folder.is_empty() && room > 1 {
@@ -995,6 +1018,12 @@ impl Panel {
             let x = area.x + used as u32;
             frame.draw_text(&folder, x, area.y, colors.muted, None, Attributes::NONE);
         }
+    }
+
+    /// Notes that the header's name, icon included, is `width` columns.
+    fn set_name_columns(&self, width: u32) {
+        let start = self.area.x + 1;
+        self.name_columns.set((start, start + width));
     }
 
     /// Lists shortcuts to open something, centered below the header.

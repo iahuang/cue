@@ -251,6 +251,8 @@ enum MenuFor {
     File(Entry),
     /// The session, from the status bar's badge.
     Session,
+    /// A panel, from its header.
+    Panel(PanelId),
     /// What's selected in the sidebar, which its commands act on.
     Sidebar,
 }
@@ -301,6 +303,9 @@ struct HeaderDrag {
     moving: bool,
     /// Where the panel goes if released now.
     drop: Option<layout::Drop>,
+    /// It was grabbed by the name, which opens the file picker if it's
+    /// released there without going anywhere.
+    on_name: bool,
 }
 
 pub struct App {
@@ -1149,6 +1154,10 @@ impl App {
                 return self.picker_action(action);
             }
             Command::TreeContextMenu => self.show_tree_menu(),
+            Command::PanelContextMenu => {
+                let id = self.tab().active;
+                self.open_panel_menu(id, None);
+            }
             Command::TreeOpenToSide
             | Command::TreeNewFile
             | Command::TreeNewFolder
@@ -1586,6 +1595,14 @@ impl App {
         let area = self.main_area();
         let tab = self.tab;
         match mouse.kind {
+            // Ctrl+click, as on macOS.
+            MouseKind::Press(button)
+                if button == MouseButton::Right
+                    || (button == MouseButton::Left && mouse.mods.ctrl) =>
+            {
+                self.activate(id);
+                self.open_panel_menu(id, Some((mouse.x, mouse.y)));
+            }
             MouseKind::Press(MouseButton::Left) => {
                 self.activate(id);
                 let button = self
@@ -1613,6 +1630,11 @@ impl App {
                     .into_iter()
                     .find(|handle| handle.rect.contains(mouse.x, mouse.y))
                     .map(|handle| handle.path);
+                let on_name = self
+                    .tab()
+                    .panels
+                    .iter()
+                    .any(|panel| panel.id == id && panel.on_name(mouse.x));
                 self.header_drag = Some(HeaderDrag {
                     handle,
                     x: mouse.x,
@@ -1621,6 +1643,7 @@ impl App {
                     resizing: false,
                     moving: false,
                     drop: None,
+                    on_name,
                 });
             }
             MouseKind::Drag(MouseButton::Left) => {
@@ -1659,6 +1682,17 @@ impl App {
                 if let Some(drop) = drag.drop.filter(|_| drag.moving) {
                     self.tab_mut().layout.drop_panel(id, drop);
                     self.layout();
+                }
+                // A click on the name, as on the title in VS Code: a
+                // terminal's goes to terminals.
+                let clicked = drag.on_name && !drag.moving && !drag.resizing && mouse.y == drag.y;
+                let panels = &self.tab().panels;
+                if clicked && panels.iter().any(|p| p.id == id && p.on_name(mouse.x)) {
+                    let command = match self.active_terminal() {
+                        Some(_) => Command::GoToTerminal,
+                        None => Command::GoToFile,
+                    };
+                    self.run(command, false);
                 }
             }
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
@@ -5652,6 +5686,87 @@ impl App {
         self.menu = Some((menu, MenuFor::Session));
     }
 
+    /// Panel `id`'s menu, of what it shows, at the cell right-clicked on its
+    /// header, or from the keyboard, below the header's start.
+    fn open_panel_menu(&mut self, id: PanelId, at: Option<(u32, u32)>) {
+        use Command::*;
+        let Some(panel) = self.tab().panels.iter().find(|panel| panel.id == id) else {
+            return;
+        };
+        let item = |command, label: &str| MenuItem::Command(command, label.to_string());
+        let mut items = Vec::new();
+        if panel.terminal().is_some() {
+            items.extend([
+                item(RenameTerminal, "Rename Terminal…"),
+                item(ClearTerminal, "Clear Terminal"),
+            ]);
+        } else if panel.is_empty() {
+            items.extend([
+                item(GoToFile, "Go to File"),
+                item(NewFile, "New File"),
+                item(NewTerminal, "New Terminal"),
+            ]);
+        } else if let Some(editor) = panel.editor() {
+            if editor.is_markdown() {
+                items.push(match editor.reading() {
+                    true => item(ToggleReader, "Exit Reader Mode"),
+                    false => item(ToggleReader, "Enter Reader Mode"),
+                });
+                if !editor.reading() {
+                    items.push(item(PreviewToSide, "Open Preview to the Side"));
+                }
+            }
+            if editor.has_diff() {
+                items.push(match editor.diffing() {
+                    true => item(ToggleDiff, "Hide Diff"),
+                    false => item(ToggleDiff, "Show Diff"),
+                });
+            }
+            if !editor.reading() {
+                items.push(item(ToggleWrap, "Toggle Word Wrap"));
+            }
+        }
+        if panel.path().is_some() {
+            let reveal = match cfg!(target_os = "macos") {
+                true => "Reveal in Finder",
+                false => "Open Containing Folder",
+            };
+            if !items.is_empty() {
+                items.push(MenuItem::Separator);
+            }
+            items.extend([
+                item(TreeCopyPath, "Copy Path"),
+                item(TreeCopyRelativePath, "Copy Relative Path"),
+                item(TreeReveal, reveal),
+            ]);
+        }
+        if !items.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        items.extend([
+            item(SplitRight, "Split Right"),
+            item(SplitDown, "Split Down"),
+            MenuItem::Separator,
+        ]);
+        if panel.editor().is_some() || panel.image().is_some() || panel.commit().is_some() {
+            items.push(item(CloseFile, "Close File"));
+        }
+        items.push(item(ClosePanel, "Close Panel"));
+        let area = panel.area();
+        let (x, y) = at.unwrap_or((area.x, area.y));
+        let menu = ContextMenu::new(
+            items,
+            &self.keymap,
+            x,
+            y,
+            at.is_some(),
+            self.width,
+            self.height,
+        );
+        self.close_popups();
+        self.menu = Some((menu, MenuFor::Panel(id)));
+    }
+
     fn menu_action(&mut self, action: MenuAction) -> AppAction {
         match action {
             MenuAction::Continue => AppAction::Continue,
@@ -5662,6 +5777,10 @@ impl App {
             MenuAction::Accept(command) => match self.menu.take() {
                 Some((_, MenuFor::File(target))) => self.file_command(command, target, true),
                 Some((_, MenuFor::Session | MenuFor::Sidebar)) => self.run(command, false),
+                Some((_, MenuFor::Panel(id))) => {
+                    self.activate(id);
+                    self.run(command, false)
+                }
                 None => AppAction::Continue,
             },
         }
@@ -9559,6 +9678,45 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_headers_name_opens_the_picker() {
+        let _serial = crate::test_serial();
+        let root = fixture("header-name", &[("a.txt", "a")]);
+        let mut app = app(&root, Some("a.txt"));
+        let header = screen(&app).lines().next().unwrap().to_string();
+        let area = app.active_panel().area();
+        let name = header[..header.find("a.txt").unwrap()].chars().count() as u32;
+        left_click(&mut app, name + 6, area.y);
+        assert!(app.picker.is_none(), "past the name, it doesn't");
+        left_click(&mut app, name, area.y);
+        assert_eq!(app.picker.as_ref().map(Picker::mode), Some(Mode::Files));
+        app.picker = None;
+
+        // Dragged away, it moves the panel instead.
+        app.run(Command::SplitRight, false);
+        app.open(&root.join("a.txt"), false);
+        screen(&app);
+        let area = app.active_panel().area();
+        let now = Instant::now();
+        let at = |kind, x| Mouse {
+            kind,
+            x,
+            y: area.y,
+            mods: Mods::NONE,
+        };
+        app.handle_mouse(at(MouseKind::Press(MouseButton::Left), area.x + 2), now);
+        app.handle_mouse(at(MouseKind::Drag(MouseButton::Left), 2), now);
+        app.handle_mouse(at(MouseKind::Release(MouseButton::Left), area.x + 2), now);
+        assert!(app.picker.is_none());
+
+        // A terminal's goes to terminals.
+        app.run(Command::NewTerminal, false);
+        screen(&app);
+        let area = app.active_panel().area();
+        left_click(&mut app, area.x + 2, area.y);
+        assert_eq!(app.picker.as_ref().map(Picker::mode), Some(Mode::Terminals));
+    }
+
+    #[test]
     fn panels_move_by_their_headers() {
         let _serial = crate::test_serial();
         let root = fixture("panel-move", &[("a.txt", "alpha"), ("b.txt", "beta")]);
@@ -10322,19 +10480,13 @@ mod tests {
     /// Clicks the menu item labeled `label`.
     fn click_item(app: &mut App, label: &str) {
         let text = tall_screen(app);
-        let (y, line) = text
+        let border = format!("│ {label}");
+        let (y, at) = text
             .lines()
             .enumerate()
-            .find(|(_, line)| line.contains(&format!("│ {label}")))
+            .find_map(|(y, line)| Some((y, line[..line.find(&border)?].chars().count())))
             .unwrap_or_else(|| panic!("no {label} in\n{text}"));
-        let x = line.chars().position(|c| c == '│').unwrap() as u32;
-        // Past the tree's divider, if the menu is right of it.
-        let x = line
-            .chars()
-            .skip(x as usize + 1)
-            .position(|c| c == '│')
-            .map_or(x, |_| x);
-        left_click(app, x + 2, y as u32);
+        left_click(app, at as u32 + 2, y as u32);
     }
 
     #[test]
@@ -10565,6 +10717,87 @@ mod tests {
             _ => panic!("nothing copied"),
         }
         assert_eq!(app.clipboard.as_deref(), Some("dir/a.txt"));
+    }
+
+    #[test]
+    fn right_clicking_a_panel_header_opens_its_menu() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-header", &[("a.txt", "alpha")]);
+        let mut app = tall_app(&root, Some("a.txt"));
+        let area = app.active_panel().area();
+        right_click(&mut app, area.x + 4, area.y);
+        assert!(app.menu.is_some(), "the release left it open");
+        let text = tall_screen(&app);
+        for label in ["Copy Path", "Split Right", "Close File", "Close Panel"] {
+            assert!(text.contains(label), "{label} in\n{text}");
+        }
+        assert!(!text.contains("Reader Mode"), "that's for Markdown");
+        assert!(!text.contains("Clear Terminal"), "that's for terminals");
+        click_item(&mut app, "Split Right");
+        assert!(app.menu.is_none());
+        assert_eq!(app.tab().panels.len(), 2);
+    }
+
+    #[test]
+    fn the_header_menu_acts_on_its_panel() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-header-panel", &[("a.txt", ""), ("b.txt", "")]);
+        let mut app = tall_app(&root, Some("a.txt"));
+        app.run(Command::SplitRight, false);
+        app.open(&root.join("b.txt"), false);
+        let left = app.tab().layout.panels(app.main_area())[0];
+        let area = left.1;
+        // Ctrl+click, as on macOS.
+        let press = Mouse {
+            kind: MouseKind::Press(MouseButton::Left),
+            x: area.x + 4,
+            y: area.y,
+            mods: Mods::CTRL,
+        };
+        app.handle_mouse(press, Instant::now());
+        assert_eq!(app.tab().active, left.0, "it gets the keyboard");
+        click_item(&mut app, "Copy Relative Path");
+        assert_eq!(app.clipboard.as_deref(), Some("a.txt"));
+    }
+
+    #[test]
+    fn a_terminal_header_menu_has_terminal_commands() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-header-terminal", &[]);
+        let mut app = tall_app(&root, None);
+        app.run(Command::NewTerminal, false);
+        let area = app.active_panel().area();
+        right_click(&mut app, area.x + 4, area.y);
+        let text = tall_screen(&app);
+        assert!(text.contains("Rename Terminal…"), "{text}");
+        assert!(!text.contains("Copy Path"), "{text}");
+        assert!(!text.contains("Close File"), "{text}");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn shift_f10_in_a_panel_opens_its_menu() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-header-keys", &[("a.md", "# A")]);
+        let mut app = tall_app(&root, None);
+        // A new split starts empty.
+        app.run(Command::SplitRight, false);
+        let shift = Mods {
+            shift: true,
+            ..Mods::NONE
+        };
+        app.handle_key(Key::new(KeyCode::F(10), shift));
+        assert!(app.menu.is_some());
+        let text = tall_screen(&app);
+        assert!(text.contains("│ New Terminal"), "an empty panel's\n{text}");
+        key(&mut app, KeyCode::Esc);
+
+        app.open(&root.join("a.md"), false);
+        app.handle_key(Key::new(KeyCode::F(10), shift));
+        // Enter Reader Mode is first.
+        key(&mut app, KeyCode::Enter);
+        assert!(app.editor().is_some_and(Editor::reading));
     }
 
     #[test]

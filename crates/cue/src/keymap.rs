@@ -118,6 +118,7 @@ commands! {
     SplitRight => "panel:split-right", "Split Panel Right";
     SplitDown => "panel:split-down", "Split Panel Down";
     ClosePanel => "panel:close", "Close Panel";
+    PanelContextMenu => "panel:context-menu", "Show Panel Menu";
     Pop => "panel:pop", "Pop";
     GoBack => "panel:go-back", "Go Back";
     GoForward => "panel:go-forward", "Go Forward";
@@ -544,6 +545,7 @@ impl Default for Keymap {
             (key(Enter, SUPER), TreeOpenToSide),
             // As in Windows and GTK; F2 renames there, and in VS Code.
             (key(F(10), SHIFT), TreeContextMenu),
+            (key(F(10), SHIFT), PanelContextMenu),
             (key(F(2), Mods::NONE), TreeRename),
             // Cmd+Backspace as in the Finder.
             (key(Delete, Mods::NONE), TreeTrash),
