@@ -1,5 +1,7 @@
 a post-agentic terminal code editor
 
+![cue](assets/screenshot.png)
+
 ```bash
 curl -fsSL https://s3.ianhuang.dev/cue/install.sh | bash
 ```
