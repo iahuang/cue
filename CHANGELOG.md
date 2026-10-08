@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.12 — 2026-10-08
 
 - Name sessions with Rename Session (`a07c1e9`)
 - Give the enclosing terminal window a relevant title (`ad31b9e`)

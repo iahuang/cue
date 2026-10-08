@@ -1,6 +1,6 @@
 [package]
 name = "cue"
-version = "0.3.11"
+version = "0.3.12"
 description = "A terminal text editor built on OpenTUI's native core"
 edition.workspace = true
 license.workspace = true
