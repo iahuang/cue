@@ -5,8 +5,9 @@
 - Name sessions with Rename Session (`a07c1e9`)
 - Give the enclosing terminal window a relevant title (`ad31b9e`)
 - Add shortcut for clear terminal (`c335616`)
-- Add a context menu to panel headers
-- Open the file picker by clicking the file's name in a panel's header
+- Add a context menu to panel headers (`721ee30`)
+- Open the file picker by clicking the file's name in a panel's header (`721ee30`)
+- Dynamic git fetch/pull/push button (`0e7659f`)
 
 ## v0.3.11 — 2026-10-07
 
