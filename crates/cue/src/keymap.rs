@@ -599,13 +599,16 @@ impl Default for Keymap {
         // terminals, Ctrl+Shift copies and pastes. Ctrl+` toggles whether
         // cue's shortcuts or the shell gets Ctrl keys (VS Code's terminal
         // toggle; shells don't use it). Ctrl+1 to 9 go to tabs, and Ctrl+0
-        // pops, from terminals too: shells don't use them either.
+        // pops, from terminals too: shells don't use them either. Ctrl+Shift+K
+        // clears, as Cmd+K does in macOS terminals; legacy terminals send it
+        // as Ctrl+K, the command palette.
         let go_to_tab = ('1'..='9')
             .zip(Command::GO_TO_TAB)
             .map(|(n, command)| (key(Char(n), Mods::CTRL), command));
         for (key, command) in go_to_tab.chain([
             (key(Char('0'), Mods::CTRL), Pop),
             (key(Char('`'), Mods::CTRL), ToggleTerminalKeys),
+            (key(Char('k'), CTRL_SHIFT), ClearTerminal),
             (key(Char('c'), CTRL_SHIFT), Copy),
             (key(Char('c'), SUPER), Copy),
             (key(Char('v'), CTRL_SHIFT), Paste),
@@ -885,7 +888,6 @@ mod tests {
             Command::SaveAll,
             Command::PreviewToSide,
             Command::CloseFile,
-            Command::ClearTerminal,
             Command::RenameTerminal,
             Command::RenameTab,
             Command::TreeNewFile,
@@ -1142,6 +1144,8 @@ mod tests {
             (key('c', true, false, true, false), Command::Copy),
             (key('c', false, false, false, true), Command::Copy),
             (key('v', true, false, true, false), Command::Paste),
+            (key('k', true, false, true, false), Command::ClearTerminal),
+            (key('K', false, false, true, false), Command::ClearTerminal),
             (
                 key('`', false, false, true, false),
                 Command::ToggleTerminalKeys,
