@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-10-09
 
 - Add custom theme "Tidepool" (`58045b1`)
 - Change a file's indentation from the status bar, offering to convert its lines between tabs and spaces, and remember the choice for the file in the session (`a08ab49`)
