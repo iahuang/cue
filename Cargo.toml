@@ -11,4 +11,5 @@ license = "MIT"
 inherits = "release"
 lto = true
 codegen-units = 1
-strip = true
+# Symbol names stay, for crash reports' backtraces.
+strip = "debuginfo"

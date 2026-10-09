@@ -320,8 +320,9 @@ pub fn take_stdio(stdio: [OwnedFd; 3]) {
     }
 }
 
-/// Lets go of the terminal: stdin, stdout, and stderr become `/dev/null`.
-pub fn let_go_of_stdio() {
+/// Lets go of the terminal: stdin and stdout become `/dev/null`, and
+/// stderr `stderr`, or `/dev/null` without one.
+pub fn let_go_of_stdio(stderr: Option<fs::File>) {
     let Ok(null) = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -329,9 +330,11 @@ pub fn let_go_of_stdio() {
     else {
         return;
     };
-    for target in 0..3 {
+    for target in 0..2 {
         unsafe { libc::dup2(null.as_raw_fd(), target) };
     }
+    let stderr = stderr.as_ref().unwrap_or(&null);
+    unsafe { libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) };
 }
 
 // --- taking over ----------------------------------------------------------------

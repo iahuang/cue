@@ -10,6 +10,7 @@ mod commit_diff;
 mod commit_view;
 mod config;
 mod context_menu;
+mod crash;
 mod diff;
 mod document;
 mod editor;
@@ -59,7 +60,6 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use opentui::{Output, Renderer, Rgba};
@@ -94,13 +94,7 @@ const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
-    // The renderer restores the terminal when dropped during unwinding; hold
-    // the panic message until then so it isn't drawn into the alternate screen.
-    static PANIC: Mutex<Option<String>> = Mutex::new(None);
-    std::panic::set_hook(Box::new(|info| {
-        let backtrace = std::backtrace::Backtrace::capture();
-        *PANIC.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{info}\n{backtrace}"));
-    }));
+    crash::install();
     // Before the binary can be replaced, as when cue is updated.
     attach::build();
 
@@ -112,10 +106,18 @@ fn main() -> ExitCode {
         Err(code) => return code,
     };
     let result = std::panic::catch_unwind(|| serve(start));
-    if let Some(message) = PANIC.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        eprintln!("cue crashed: {message}");
+    if let Some(panic) = crash::take_panic() {
+        eprintln!("cue crashed: {}", panic.text);
+        // Said, unless stderr is the background's log.
+        if unsafe { libc::isatty(libc::STDERR_FILENO) } == 1 {
+            if let Some(report) = &panic.report {
+                crash::mark_seen(report);
+            }
+        }
+        crash::close_log();
         return ExitCode::FAILURE;
     }
+    crash::close_log();
     match result {
         Ok(Ok(())) => ExitCode::SUCCESS,
         Ok(Err(err)) => {
@@ -277,6 +279,9 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(note) = background_sessions(&app) {
         app.show_message_now(note, false);
     }
+    if let Some(note) = crashes() {
+        app.show_message_now(note, true);
+    }
     for signal in [libc::SIGHUP, libc::SIGTERM] {
         unsafe {
             libc::signal(
@@ -361,7 +366,7 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Detached: in the background, until a client attaches.
-        attach::let_go_of_stdio();
+        attach::let_go_of_stdio(crash::open_log());
         app.set_attached(false);
         environment = None;
         match headless(&mut app, listener.as_ref().map(|l| &l.listener)) {
@@ -470,6 +475,23 @@ fn background_sessions(app: &App) -> Option<String> {
     }
 }
 
+/// Where the crash reports not said yet are, if there are any.
+fn crashes() -> Option<String> {
+    let dir = crash::default_dir()?;
+    match crash::collect(&dir).as_slice() {
+        [] => None,
+        [report] => Some(format!(
+            "cue crashed. The report is in {}.",
+            client::tilde(report)
+        )),
+        reports => Some(format!(
+            "cue crashed {} times. The reports are in {}.",
+            reports.len(),
+            client::tilde(&dir)
+        )),
+    }
+}
+
 /// What the client that detached says about how to come back.
 fn detached(app: &App) -> String {
     let running = app.running_programs();
@@ -541,6 +563,7 @@ fn take(
         );
     }
     attach::take_stdio(request.stdio);
+    crash::close_log();
     *control = Some(client);
     *environment = Some(request.environment);
     let mut app = app;
@@ -561,6 +584,7 @@ fn restart(
 ) -> Result<App, Box<dyn std::error::Error>> {
     if let Some(stdio) = stdio {
         attach::take_stdio(stdio);
+        crash::close_log();
     }
     let Some((dir, ephemeral, adopted)) = app.hand_over() else {
         return Ok(app);
@@ -1053,7 +1077,7 @@ fn file_and_position(arg: PathBuf) -> (PathBuf, Option<location::Position>) {
 /// across every module in this test binary.
 #[cfg(test)]
 fn test_serial() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
