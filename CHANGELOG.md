@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.13 — 2026-10-08
 
 - Fix a crash diffing a file with a lone carriage return in it (`4aecc87`)
 - Show messages as toasts over the bottom right, not in the status bar (`6f30bf3`)
