@@ -2,8 +2,11 @@
 
 ## Unreleased
 
-- Change a file's indentation from the status bar, offering to convert its lines between tabs and spaces, and remember the choice for the file in the session (`HASH`)
-- Toggle word wrap, or go to a line, by clicking it in the status bar (`HASH`)
+- Add custom theme "Tidepool" (`58045b1`)
+- Change a file's indentation from the status bar, offering to convert its lines between tabs and spaces, and remember the choice for the file in the session (`a08ab49`)
+- Toggle word wrap, or go to a line, by clicking it in the status bar (`a08ab49`)
+- Tree-sitter Go to Definition (`b22c2b3`)
+- In-editor context menu (`fb84db0`)
 
 ## v0.3.13 — 2026-10-08
 
