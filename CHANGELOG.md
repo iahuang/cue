@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix a crash diffing a file with a lone carriage return in it
+
 ## v0.3.12 — 2026-10-08
 
 - Name sessions with Rename Session (`a07c1e9`)

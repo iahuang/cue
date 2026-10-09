@@ -597,10 +597,7 @@ fn hunks(old: &str, new: &str) -> Vec<Hunk> {
     // differ are diffed, which keeps a long file quick to type in.
     let (head, tail) = same_ends(&old, &new);
     let skipped = old[..head].matches('\n').count() as u32;
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Patience)
-        .timeout(TIMEOUT)
-        .diff_lines(&old[head..old.len() - tail], &new[head..new.len() - tail]);
+    let diff = diff_lines(&old[head..old.len() - tail], &new[head..new.len() - tail]);
     diff.ops()
         .iter()
         .filter_map(|op| {
@@ -815,10 +812,7 @@ fn lay_out(
 ) -> Layout {
     // Whether the last line ends with a newline isn't shown.
     let (old, new) = (with_newline(old), with_newline(new));
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Patience)
-        .timeout(TIMEOUT)
-        .diff_lines(old.as_str(), new.as_str());
+    let diff = diff_lines(&old, &new);
     let ops = diff.ops();
     let old_lines = line_ranges(&old);
     let new_lines = line_ranges(&new);
@@ -943,6 +937,18 @@ fn lay_out(
         }
     }
     layout
+}
+
+/// The diff of `old` and `new` by line, a line ending only at a newline,
+/// as the editor and `line_ranges` see it: `similar`'s own `diff_lines`
+/// also ends one at a lone carriage return.
+fn diff_lines<'a>(old: &'a str, new: &'a str) -> TextDiff<'a, 'a, str> {
+    let old: Vec<&str> = old.split_inclusive('\n').collect();
+    let new: Vec<&str> = new.split_inclusive('\n').collect();
+    TextDiff::configure()
+        .algorithm(Algorithm::Patience)
+        .timeout(TIMEOUT)
+        .diff_slices(&old, &new)
 }
 
 /// `text`, ending with a newline unless it's empty.
@@ -1137,6 +1143,19 @@ mod tests {
         assert_eq!((layout.added, layout.removed), (2, 1));
         // A line taken out goes to editing where it was.
         assert_eq!(layout.rows[1].line, 1);
+    }
+
+    #[test]
+    fn a_lone_carriage_return_doesnt_end_a_line() {
+        let old = "a\rb\nc\n";
+        let new = "a\rb\nc\nd\re\n";
+        let layout = layout(old, new, 80, &HashSet::new());
+        assert_eq!(listing(&layout), ["  1 1 ab", "  2 2 c", "+ _ 3 de"]);
+        let added = Hunk {
+            mark: Mark::Added,
+            lines: 2..3,
+        };
+        assert_eq!(hunks(old, new), [added]);
     }
 
     #[test]
