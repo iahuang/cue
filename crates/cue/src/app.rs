@@ -88,6 +88,7 @@ use crate::find;
 use crate::git::{self, Carried, Change, Commit, Git, Repo, SwitchTo};
 use crate::image::{self, ImageView};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
+use crate::input_box::{InputAction, InputBox};
 use crate::keymap::{Command, Context, Keymap};
 use crate::layout::{self, Axis, Direction, Layout, PanelId, Rect};
 use crate::line_edit::Edit;
@@ -100,11 +101,12 @@ use crate::recovery::{self, Orphan, Recovery};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::session::{self, Session, Shown};
-use crate::status::{self, GitBadge, Prompt, PromptKey};
+use crate::status::{self, GitBadge};
 use crate::symbols::{self, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
 use crate::theme::{self, TerminalColors, Theme, ThemeId, ThemeSetting};
+use crate::toast::Toasts;
 use crate::tree::{Entry, FileTree, TreeAction};
 use crate::watch::{Changes, Watcher};
 use crate::workspace::Workspace;
@@ -251,10 +253,12 @@ enum Sidebar {
     Commit,
 }
 
-/// What the name prompt names.
+/// What the input box names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Naming {
     Tab,
+    /// A terminal, by id.
+    Terminal(u32),
     Session,
     /// A new branch at a commit, by hash, in the repository at this root.
     Branch(PathBuf, String),
@@ -360,8 +364,10 @@ pub struct App {
     next_tab: TabId,
     /// The id for the next new panel, in any tab.
     next_panel: PanelId,
-    /// The prompt for the tab's or the session's new name, while it's open.
-    name_prompt: Option<(Prompt, Naming)>,
+    /// The box asking for a new name, while it's open.
+    input: Option<(InputBox, Naming)>,
+    /// Messages, over the bottom right of the screen.
+    toasts: Toasts,
     /// Text from the last copy or cut, shared by all editors.
     clipboard: Option<String>,
     /// Text a terminal's program copied, for the system clipboard.
@@ -470,6 +476,24 @@ trait QueryInput {
     fn select_all(&mut self);
 
     fn selected_text(&self) -> Option<&str>;
+}
+
+impl QueryInput for InputBox {
+    fn edit(&mut self, edit: Edit) {
+        InputBox::edit(self, edit);
+    }
+
+    fn edit_selecting(&mut self, edit: Edit) {
+        InputBox::edit_selecting(self, edit);
+    }
+
+    fn select_all(&mut self) {
+        InputBox::select_all(self);
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        InputBox::selected_text(self)
+    }
 }
 
 impl QueryInput for Picker {
@@ -633,7 +657,8 @@ impl App {
             tab: 0,
             next_tab: 1,
             next_panel: 1,
-            name_prompt: None,
+            input: None,
+            toasts: Toasts::default(),
             clipboard: None,
             copied: None,
             focus,
@@ -719,42 +744,18 @@ impl App {
     }
 
     fn dispatch_key(&mut self, key: Key) -> AppAction {
-        self.active_panel_mut().clear_message();
         if let Some(alert) = &mut self.alert {
             let action = alert.handle_key(key);
             return self.alert_action(action);
         }
-        if let Some((prompt, naming)) = &mut self.name_prompt {
-            let naming = naming.clone();
-            match prompt.handle_key(key) {
-                PromptKey::Continue => {}
-                PromptKey::Cancel => self.name_prompt = None,
-                // An empty name goes back to naming it for what it shows.
-                PromptKey::Submit(name) => {
-                    self.name_prompt = None;
-                    let name = (!name.is_empty()).then_some(name);
-                    match naming {
-                        Naming::Tab => self.tab_mut().name = name,
-                        Naming::Session => self.rename_session(name.as_deref()),
-                        Naming::Branch(root, commit) => {
-                            if let Some(name) = name {
-                                return self.switch_branch(root, SwitchTo::NewAt { name, commit });
-                            }
-                        }
-                    }
-                }
-            }
-            return AppAction::Continue;
+        if self.input.is_some() {
+            return self.input_key(key);
         }
         // While its find bar has the keyboard, keys are the bar's.
         if let Some(terminal) = self
             .keyboard_terminal()
             .filter(|terminal| !terminal.borrow().find_focused())
         {
-            if terminal.borrow().prompt_open() {
-                terminal.borrow_mut().handle_prompt_key(key);
-                return AppAction::Continue;
-            }
             if terminal.borrow().exit().is_none() {
                 return match self.keymap.lookup_terminal(key, self.terminal_cue_keys) {
                     Some(command) => self.run(command, false),
@@ -839,8 +840,64 @@ impl App {
         }
     }
 
+    /// A key for the input box: Enter names what it's for, Esc cancels,
+    /// and other keys edit the name.
+    fn input_key(&mut self, key: Key) -> AppAction {
+        let plain = key.mods.is_plain();
+        match key.code {
+            KeyCode::Esc if plain => self.input = None,
+            KeyCode::Enter if plain => {
+                if let Some((input, naming)) = self.input.take() {
+                    return self.name(naming, input.text());
+                }
+            }
+            _ => return self.edit_query(key),
+        }
+        AppAction::Continue
+    }
+
+    /// Asks for a new name for what `naming` names, starting from `name`,
+    /// in the input box.
+    fn ask_name(
+        &mut self,
+        title: &'static str,
+        placeholder: &'static str,
+        name: &str,
+        naming: Naming,
+    ) {
+        let input = InputBox::new(title, placeholder, name, self.width, self.height);
+        self.input = Some((input, naming));
+    }
+
+    /// Names what `naming` names `name`. An empty name goes back to naming
+    /// it for what it shows.
+    fn name(&mut self, naming: Naming, name: &str) -> AppAction {
+        let name = (!name.is_empty()).then(|| name.to_string());
+        match naming {
+            Naming::Tab => self.tab_mut().name = name,
+            Naming::Terminal(id) => {
+                if let Some(terminal) = self.terminals.iter().find(|t| t.borrow().id() == id) {
+                    terminal.borrow_mut().set_name(name);
+                }
+            }
+            Naming::Session => self.rename_session(name.as_deref()),
+            Naming::Branch(root, commit) => {
+                if let Some(name) = name {
+                    return self.switch_branch(root, SwitchTo::NewAt { name, commit });
+                }
+            }
+        }
+        AppAction::Continue
+    }
+
     /// The query line of the open popup, or the focused find bar field.
     fn query_input(&mut self) -> Option<&mut dyn QueryInput> {
+        if self.input.is_some() {
+            return self
+                .input
+                .as_mut()
+                .map(|(input, _)| input as &mut dyn QueryInput);
+        }
         if self.search.is_some() {
             return self
                 .search
@@ -956,9 +1013,9 @@ impl App {
             Command::EndSession => return self.end_session(),
             Command::RenameSession => match &self.session {
                 Some(session) => {
-                    let name = session.name().unwrap_or_default();
-                    let prompt = Prompt::new("Rename session", name);
-                    self.name_prompt = Some((prompt, Naming::Session));
+                    let name = session.name().unwrap_or_default().to_string();
+                    let placeholder = "Leave empty to go by its ID";
+                    self.ask_name("Rename Session", placeholder, &name, Naming::Session);
                 }
                 None => {
                     self.show_message("No active session. Use Keep Session to create one.", false)
@@ -1063,7 +1120,8 @@ impl App {
             }
             Command::RenameTab => {
                 let name = self.tab().name.clone().unwrap_or_default();
-                self.name_prompt = Some((Prompt::new("Rename tab", &name), Naming::Tab));
+                let placeholder = "Leave empty to name it for what it shows";
+                self.ask_name("Rename Tab", placeholder, &name, Naming::Tab);
             }
             Command::NewTerminal => self.new_terminal(),
             Command::ClearTerminal => {
@@ -1087,9 +1145,12 @@ impl App {
             }
             Command::RenameTerminal => {
                 if let Some(terminal) = self.active_terminal() {
-                    terminal.borrow_mut().show_rename();
-                    // The prompt is in the status bar, and takes the keys.
-                    self.focus = Focus::Editor;
+                    let terminal = terminal.borrow();
+                    let name = terminal.given_name().unwrap_or_default().to_string();
+                    let placeholder = "Leave empty to name it for what's running";
+                    let naming = Naming::Terminal(terminal.id());
+                    drop(terminal);
+                    self.ask_name("Rename Terminal", placeholder, &name, naming);
                 }
             }
             Command::ToggleTerminalKeys => {
@@ -1274,6 +1335,13 @@ impl App {
             let action = alert.handle_mouse(mouse);
             return self.alert_action(action);
         }
+        if let Some((input, _)) = &mut self.input {
+            self.mouse_target = None;
+            if input.handle_mouse(mouse, now) == InputAction::Cancel {
+                self.input = None;
+            }
+            return AppAction::Continue;
+        }
         if let Some((menu, _)) = &mut self.menu {
             let action = menu.handle_mouse(mouse);
             if action != MenuAction::CloseAndPass {
@@ -1299,6 +1367,13 @@ impl App {
             let action = dialog.handle_mouse(mouse, now);
             return self.dialog_action(action);
         }
+        if let MouseKind::Press(_) = mouse.kind {
+            if let Some(index) = self.toasts.at(mouse.x, mouse.y, self.width, self.height) {
+                self.mouse_target = None;
+                self.toasts.dismiss(index);
+                return AppAction::Continue;
+            }
+        }
         let target = match mouse.kind {
             MouseKind::Press(_) => {
                 // In case the last drag's release never came.
@@ -1316,14 +1391,6 @@ impl App {
         let Some(target) = target else {
             return AppAction::Continue;
         };
-        if let MouseKind::Press(_) = mouse.kind {
-            // Like a key press, a click dismisses messages and prompts.
-            self.name_prompt = None;
-            self.active_panel_mut().clear_message();
-            if let Some(terminal) = self.active_terminal() {
-                terminal.borrow_mut().cancel_prompt();
-            }
-        }
 
         match target {
             MouseTarget::QuickLook => {
@@ -1560,11 +1627,7 @@ impl App {
         }
         let area = self.main_area();
         if y >= area.bottom() {
-            if self.height > 1
-                && y == self.height - 1
-                && x < self.width
-                && self.name_prompt.is_none()
-            {
+            if self.height > 1 && y == self.height - 1 && x < self.width {
                 let status = self.active_panel().status();
                 let session =
                     status::session_badge(&status, self.session_label().as_deref(), self.width);
@@ -1782,14 +1845,13 @@ impl App {
         if self.alert.is_some() {
             return;
         }
-        if let Some((prompt, _)) = &mut self.name_prompt {
-            prompt.paste(text);
+        if let Some((input, _)) = &mut self.input {
+            input.paste(text);
             return;
         }
-        let terminal = self.keyboard_terminal().filter(|terminal| {
-            let terminal = terminal.borrow();
-            terminal.prompt_open() || terminal.exit().is_none()
-        });
+        let terminal = self
+            .keyboard_terminal()
+            .filter(|terminal| terminal.borrow().exit().is_none());
         if let Some(terminal) = self.finding_terminal() {
             let line = text.split(['\r', '\n']).next().unwrap_or("");
             terminal.borrow_mut().find_edit(Edit::Insert(line));
@@ -1819,6 +1881,7 @@ impl App {
     /// shares with other panels, which input to another may have taken,
     /// and watches the folders shown or with files open.
     fn after_input(&mut self) {
+        self.take_messages();
         self.keep_if_edited();
         self.note_find_memory();
         for doc in &self.documents {
@@ -1881,15 +1944,12 @@ impl App {
             cursor = message_cursor;
         }
         if self.height > 1 {
-            let status = match &self.name_prompt {
-                Some((prompt, _)) => prompt.status(),
-                None => self.active_panel().status(),
-            };
+            let status = self.active_panel().status();
             let y = self.height - 1;
             let session = self.session_label();
             let git = self.git_badge();
             let width = self.width;
-            if let Some(prompt) = status::draw(
+            status::draw(
                 frame,
                 &status,
                 y,
@@ -1898,9 +1958,7 @@ impl App {
                 session.as_deref(),
                 git.as_ref(),
                 self.terminal_cue_keys,
-            ) {
-                cursor = Some(prompt);
-            }
+            );
         }
         for handle in tab.layout.handles(main) {
             if handle.axis == Axis::Horizontal {
@@ -1917,6 +1975,8 @@ impl App {
         if let Some(look) = &self.quick_look {
             look.draw(frame, &self.keymap);
         }
+        // Under the popups, which they don't take clicks from.
+        self.toasts.draw(frame, self.width, self.height);
         let cursor = self.draw_popups(frame, cursor);
         match &self.alert {
             // Over any popup it asks for.
@@ -1948,6 +2008,9 @@ impl App {
         if let Some(alert) = &self.alert {
             return alert.hover_area(x, y).map(rect);
         }
+        if self.input.is_some() {
+            return None;
+        }
         if let Some((menu, _)) = &self.menu {
             return menu.hover_area(x, y).map(rect);
         }
@@ -1959,6 +2022,9 @@ impl App {
         }
         if let Some(dialog) = &self.dialog {
             return dialog.hover_area(x, y).map(rect);
+        }
+        if let Some(index) = self.toasts.at(x, y, self.width, self.height) {
+            return self.toasts.area(index, self.width, self.height).map(rect);
         }
         let span = |columns: std::ops::Range<u32>| Rect {
             x: columns.start,
@@ -2039,6 +2105,11 @@ impl App {
         if let Some(area) = self.hover_area() {
             let colors = theme::colors();
             let divider = self.alert.is_none()
+                && self.input.is_none()
+                && self
+                    .toasts
+                    .at(area.x, area.y, self.width, self.height)
+                    .is_none()
                 && self.menu.is_none()
                 && self.search.is_none()
                 && self.picker.is_none()
@@ -2065,6 +2136,9 @@ impl App {
     /// Draws the popup that's open, if any, and returns where the cursor
     /// goes: in it, or else at `cursor` if the editor has the keyboard.
     fn draw_popups(&self, frame: &Buffer, cursor: Option<(u32, u32)>) -> Option<(u32, u32)> {
+        if let Some((input, _)) = &self.input {
+            return input.draw(frame);
+        }
         if let Some((menu, _)) = &self.menu {
             menu.draw(frame);
             return None;
@@ -2090,9 +2164,10 @@ impl App {
 
     /// Catches up on work in the background: output from terminals,
     /// listing the workspace's files and searching them, and files other
-    /// programs changed. Returns whether the screen needs redrawing.
+    /// programs changed, and puts away toasts whose time is up. Returns
+    /// whether the screen needs redrawing.
     pub fn poll(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.toasts.expire(Instant::now());
         for terminal in &self.terminals {
             let mut terminal = terminal.borrow_mut();
             changed |= terminal.poll();
@@ -2432,7 +2507,6 @@ impl App {
     /// the panel's history.
     fn pop(&mut self) {
         if self.active_panel().is_empty() {
-            self.show_message("Nothing to close.", false);
             return;
         }
         let visit = self.active_panel().visit();
@@ -2450,16 +2524,10 @@ impl App {
     }
 
     /// Shows what the active panel showed before what it shows now, or
-    /// with `back` false, what it went back from, or says there's nothing
-    /// to (see [`App::step_history`]).
+    /// with `back` false, what it went back from, if there's anything to
+    /// (see [`App::step_history`]).
     fn go_history(&mut self, back: bool) {
-        if !self.step_history(back) {
-            let message = match back {
-                true => "Nothing to go back to.",
-                false => "Nothing to go forward to.",
-            };
-            self.show_message(message, false);
-        }
+        self.step_history(back);
     }
 
     /// Shows what the active panel showed before what it shows now, or
@@ -2553,7 +2621,6 @@ impl App {
                     panel: panel.id,
                     visit,
                 });
-                self.show_message("Mark set.", false);
             }
             _ => self.show_message("Marks can only be set in files and terminals.", false),
         }
@@ -2681,17 +2748,12 @@ impl App {
         }
     }
 
-    /// Gives the keyboard to panel `id`. The status bar is its now, so the
-    /// last panel's message goes.
+    /// Gives the keyboard to panel `id`.
     fn activate(&mut self, id: PanelId) {
         self.focus = Focus::Editor;
         let tab = self.tab_mut();
         if tab.active != id {
-            // It may have just closed.
             let active = tab.active;
-            if let Some(panel) = tab.panel_mut(active) {
-                panel.clear_message();
-            }
             tab.previous = Some(active);
             tab.active = id;
             self.show_active_in_tree();
@@ -2711,14 +2773,12 @@ impl App {
     }
 
     /// Puts the tab at `index` on screen, and gives the keyboard to its
-    /// active panel. The status bar is that panel's now, so the last one's
-    /// message goes.
+    /// active panel.
     fn switch_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
-        self.active_panel_mut().clear_message();
-        self.name_prompt = None;
+        self.input = None;
         self.tab = index;
         self.focus = Focus::Editor;
         // The screen may have changed size while it was away.
@@ -2782,7 +2842,7 @@ impl App {
         if !self.ask_first(title, unsaved, &running, "&Close Tab", redo) {
             return;
         }
-        self.name_prompt = None;
+        self.input = None;
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.tabs.push(Tab::new(self.next_tab, self.next_panel));
@@ -3078,7 +3138,6 @@ impl App {
     /// that already. Without, it shows the text.
     fn open_as(&mut self, path: &Path, preview: bool, diff: bool) -> bool {
         let path = document::resolve(path);
-        self.active_panel_mut().clear_message();
         // Coming back to a file, the keyboard is for its text.
         if let Some(editor) = self.editor_mut() {
             editor.blur_find();
@@ -3193,7 +3252,7 @@ impl App {
     }
 
     fn cant_open(&mut self, reason: &str, path: &Path) {
-        // Reason first: the status bar clips long paths on the right.
+        // Reason first: long paths are the least of it.
         let message = format!(
             "Can't open: {reason} ({})",
             self.workspace.display_path(path)
@@ -3570,7 +3629,6 @@ impl App {
                     self.show_message(format!("Can't revert {name}: {err}"), true);
                     return AppAction::Continue;
                 }
-                self.show_message(format!("Reloaded {name} from disk."), false);
                 match saving {
                     Some(saving) => saving,
                     None => return AppAction::Continue,
@@ -3614,7 +3672,6 @@ impl App {
         let action = match redo {
             Redo::SavedAll => {
                 self.editor_action(Action::Saved);
-                self.show_message("Saved all files.", false);
                 AppAction::Continue
             }
             Redo::Run(command) => self.run(command, false),
@@ -3909,7 +3966,6 @@ impl App {
     /// With a theme for a dark terminal and one for a light, it's the one
     /// for the terminal now.
     fn choose_theme(&mut self, id: ThemeId) {
-        let name = id.name();
         let light = self.terminal_colors.light() == Some(true);
         let mut setting = config::get().theme;
         match (setting.dark == setting.light, light) {
@@ -3959,9 +4015,7 @@ impl App {
         self.settings_hash = Some(document::content_hash(text.as_bytes()));
         let (config, warnings) = config::parse(&text);
         self.apply_settings(config);
-        if warnings.is_empty() {
-            self.show_message(format!("Using {name}."), false);
-        } else {
+        if !warnings.is_empty() {
             self.warn_about_config(&warnings);
         }
     }
@@ -4163,7 +4217,7 @@ impl App {
         running_programs(&self.terminals)
     }
 
-    /// Shows `text` in the status bar, as from outside, after input.
+    /// Shows `text` as a toast, as from outside, after input.
     pub fn show_message_now(&mut self, text: String, error: bool) {
         self.show_message(text, error);
     }
@@ -5034,8 +5088,8 @@ impl App {
             }
             LogAction::NewBranch(commit) => {
                 if let Some(root) = self.log.as_ref().map(|log| log.root().to_path_buf()) {
-                    let prompt = Prompt::new("New branch", "");
-                    self.name_prompt = Some((prompt, Naming::Branch(root, commit.hash)));
+                    let naming = Naming::Branch(root, commit.hash);
+                    self.ask_name("New Branch", "Name the branch", "", naming);
                 }
             }
             LogAction::Revert(commit) => {
@@ -5560,7 +5614,6 @@ impl App {
         let current = self.git.repos().iter().find(|repo| repo.root == root);
         if let (Some(repo), SwitchTo::Branch(name)) = (current, &to) {
             if repo.head == git::Head::Branch(name.clone()) {
-                self.show_message(format!("Already on {name}."), false);
                 return AppAction::Continue;
             }
         }
@@ -5667,8 +5720,6 @@ impl App {
         match outcome {
             Outcome::Continue => AppAction::Continue,
             Outcome::Copy(text) => {
-                let copied = format!("Copied {} characters.", text.chars().count());
-                self.show_message(copied, false);
                 self.clipboard = Some(text.clone());
                 AppAction::Copy(text)
             }
@@ -6137,7 +6188,6 @@ impl App {
 
     /// Puts the path `text` on the clipboard.
     fn copy_path(&mut self, text: String) -> AppAction {
-        self.show_message(format!("Copied {text}"), false);
         self.clipboard = Some(text.clone());
         AppAction::Copy(text)
     }
@@ -6170,7 +6220,6 @@ impl App {
         } else {
             self.workspace.remove_root(&target.path);
             self.roots_changed();
-            self.show_message(format!("Removed {name} from the workspace."), false);
         }
     }
 
@@ -6246,15 +6295,6 @@ impl App {
         self.tree.moved(from, to);
         self.files.refresh();
         self.show_active_in_tree();
-        let message = match from.parent() == to.parent() {
-            true => format!("Renamed {} to {}.", file_name(from), file_name(to)),
-            false => format!(
-                "Moved {} to {}.",
-                file_name(from),
-                self.workspace.display_path(to)
-            ),
-        };
-        self.show_message(message, false);
         Ok(AppAction::Continue)
     }
 
@@ -6311,7 +6351,6 @@ impl App {
             .retain(|recent| !matches!(recent, Recent::File(open) if open.starts_with(&resolved)));
         self.tree.refresh();
         self.files.refresh();
-        self.show_message(format!("Moved {name} to the Trash."), false);
     }
 
     /// Shows `path` in the Finder, or elsewhere, opens its folder.
@@ -6536,7 +6575,7 @@ impl App {
             || self.search.is_some()
             || self.dialog.is_some()
             || self.menu.is_some()
-            || self.name_prompt.is_some();
+            || self.input.is_some();
         if self.focus != Focus::Editor || popup {
             return None;
         }
@@ -6732,6 +6771,9 @@ impl App {
         if let Some(alert) = &mut self.alert {
             alert.set_size(self.width, self.height);
         }
+        if let Some((input, _)) = &mut self.input {
+            input.set_size(self.width, self.height);
+        }
         let bounds = self.quick_look_bounds();
         if let Some(look) = &mut self.quick_look {
             look.set_bounds(bounds);
@@ -6796,7 +6838,7 @@ impl App {
             || self.search.is_some()
             || self.picker.is_some()
             || self.dialog.is_some()
-            || self.name_prompt.is_some();
+            || self.input.is_some();
         let selected = match self.focus {
             Focus::Tree if !popup && self.visible_tree_width() > 0 => self.sidebar_selected(),
             _ => None,
@@ -6836,9 +6878,19 @@ impl App {
         self.active_panel_mut().editor_mut()
     }
 
-    /// Shows `text` in the active panel's status bar until the next key.
+    /// Shows `text` as a toast.
     fn show_message(&mut self, text: impl Into<String>, error: bool) {
-        self.active_panel_mut().show_message(text.into(), error);
+        self.toasts.push(text.into(), error, Instant::now());
+    }
+
+    /// Shows what the editors said to as toasts.
+    fn take_messages(&mut self) {
+        let now = Instant::now();
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            for (text, error) in panel.take_messages() {
+                self.toasts.push(text, error, now);
+            }
+        }
     }
 
     /// The label of `command`'s shortcut, or its id if it has none.
@@ -7629,14 +7681,13 @@ mod tests {
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         // What was popped isn't gone back to.
         ctrl(&mut app, '-');
-        assert!(screen(&app).contains("Nothing to go back to."));
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         // The last leaves the panel empty.
         ctrl(&mut app, '0');
         assert!(app.active_panel().is_empty());
         assert!(app.documents.is_empty());
         ctrl(&mut app, '0');
-        assert!(screen(&app).contains("Nothing to close."));
+        assert!(app.active_panel().is_empty());
 
         // A file another panel shows stays open there.
         app.open(&root.join("b.txt"), false);
@@ -7666,13 +7717,12 @@ mod tests {
         ctrl(&mut app, '_');
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         ctrl(&mut app, '-');
-        assert!(screen(&app).contains("Nothing to go back to."));
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         forward(&mut app);
         forward(&mut app);
         assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
         forward(&mut app);
-        assert!(screen(&app).contains("Nothing to go forward to."));
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
 
         // Going somewhere new, there's no going forward.
         ctrl(&mut app, '-');
@@ -7712,18 +7762,19 @@ mod tests {
         ctrl(&mut app, '\\');
         assert!(!app.ed_is_shown());
         ctrl(&mut app, '-');
-        assert!(screen(&app).contains("Nothing to go back to."));
+        assert!(!app.ed_is_shown(), "nothing to go back to");
         app.open(&root.join("c.txt"), false);
         let id = app.terminals[0].borrow().id();
         app.picker_action(PickerAction::Accept(Choice::Terminal(id)));
         assert!(app.active_terminal().is_some());
         app.run(Command::FocusPanelLeft, false);
+        let shown = shown_name(&app);
         forward(&mut app);
         assert!(
             app.active_terminal().is_none(),
             "the terminal is the other panel's"
         );
-        assert!(screen(&app).contains("Nothing to go forward to."));
+        assert_eq!(shown_name(&app), shown, "nothing else to go forward to");
     }
 
     #[test]
@@ -7833,7 +7884,7 @@ mod tests {
         // Jumping goes to the mark, and going back comes back.
         go_to_line(&mut app, 30);
         set(&mut app);
-        assert!(screen(&app).contains("Mark set."));
+        assert!(app.mark.is_some());
         go_to_line(&mut app, 150);
         jump(&mut app);
         assert_eq!(row(&app), 29);
@@ -7986,7 +8037,7 @@ mod tests {
         let marked = app.tab().active;
         // cue's shortcuts work from the terminal.
         ctrl(&mut app, '\'');
-        assert!(screen(&app).contains("Mark set."));
+        assert!(app.mark.is_some());
 
         // Where the panel moved on since, it goes back through its history
         // to the terminal.
@@ -8155,7 +8206,9 @@ mod tests {
         // Opening a file replaces the terminal, which keeps running.
         app.open(&root.join("a.txt"), false);
         assert!(app.active_terminal().is_none());
-        assert!(screen(&app).contains("alpha"));
+        // On a screen this short, the toasts about the keys cover it.
+        app.toasts = Toasts::default();
+        assert!(screen(&app).contains("alpha"), "{}", screen(&app));
         assert_eq!(app.terminals.len(), 1);
         assert!(app.terminals[0].borrow().exit().is_none());
 
@@ -8253,12 +8306,16 @@ mod tests {
         let shown = palette(&mut app, "rename terminal");
         assert!(shown.contains("Rename Terminal"), "{shown}");
 
-        // Renaming it asks for a name in the status bar, which takes the
-        // keys, even from the tree, and the name is shown there.
+        // Renaming it asks for a name in the input box, which takes the
+        // keys, even from the tree, and the name is shown in the status bar.
         let status_bar = |app: &App| screen(app).lines().last().unwrap().to_string();
         app.run(Command::FocusTree, false);
         app.run(Command::RenameTerminal, false);
-        assert_eq!(status_bar(&app).trim_end(), " Rename terminal:");
+        assert!(
+            screen(&app).contains("╭─ Rename Terminal ─"),
+            "{}",
+            screen(&app)
+        );
         type_text(&mut app, "bu");
         app.paste("ild\nrest");
         key(&mut app, KeyCode::Enter);
@@ -8277,7 +8334,7 @@ mod tests {
         // Renaming starts from the name; Esc keeps it, and an empty name
         // takes it away.
         app.run(Command::RenameTerminal, false);
-        assert_eq!(status_bar(&app).trim_end(), " Rename terminal: build");
+        assert!(screen(&app).contains("│ build"), "{}", screen(&app));
         key(&mut app, KeyCode::Esc);
         assert!(
             status_bar(&app).starts_with(" build"),
@@ -8285,15 +8342,17 @@ mod tests {
             status_bar(&app)
         );
         app.run(Command::RenameTerminal, false);
-        for _ in 0..5 {
-            key(&mut app, KeyCode::Backspace);
-        }
+        key(&mut app, KeyCode::Backspace);
         key(&mut app, KeyCode::Enter);
         assert!(
             !status_bar(&app).starts_with(" build"),
             "{}",
             status_bar(&app)
         );
+
+        // Renaming left the keyboard with the tree.
+        assert_eq!(app.focus, Focus::Tree);
+        app.run(Command::FocusEditor, false);
 
         // Popping it, with Ctrl+0 even from the terminal, asks first, then
         // hangs up on what it's running, and goes back to the file.
@@ -8476,7 +8535,7 @@ mod tests {
         // A file that's gone isn't opened as a new one.
         left_click(&mut app, 6, 3);
         assert!(app.active_panel().path().is_none());
-        assert!(status(&app).contains("b.txt was deleted."));
+        assert_eq!(status_message(&app).as_deref(), Some("b.txt was deleted."));
         key(&mut app, KeyCode::Up);
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.active_panel().path(), Some(root.join("a.txt")));
@@ -8721,7 +8780,6 @@ mod tests {
             app.handle_mouse(Mouse { kind, x, y, mods }, Instant::now());
         };
         assert!(matches!(ctrl(&mut app, 'c'), AppAction::Continue));
-        assert!(screen(&app).contains("Nothing selected."));
 
         // From the line numbers, which count as the start, to past the end.
         mouse(
@@ -9124,16 +9182,29 @@ mod tests {
     }
 
     #[test]
-    fn switching_files_clears_stale_messages() {
+    fn messages_are_toasts_that_leave_the_status_bar_be() {
         let _serial = crate::test_serial();
         let root = fixture("stale", &[("a.txt", "a"), ("b.txt", "b")]);
         let mut app = app(&root, Some("a.txt"));
         type_text(&mut app, "!");
-        ctrl(&mut app, 's');
-        assert!(screen(&app).contains("Wrote a.txt"));
+        app.run(Command::NextTab, false);
+        app.after_input();
+        assert!(
+            screen(&app).contains("│ No other tabs."),
+            "{}",
+            screen(&app)
+        );
+        let text = screen(&app);
+        let status = text.lines().last().unwrap();
+        assert!(status.contains("Ln 1, Col 2"), "{text}");
         assert!(app.open(&root.join("b.txt"), false));
-        assert!(app.open(&root.join("a.txt"), false));
-        assert!(!screen(&app).contains("Wrote"));
+        assert!(screen(&app).contains("No other tabs."));
+
+        // A click on one puts it away.
+        let (x, y) = find_on_screen(&app, "No other tabs.").unwrap();
+        left_click(&mut app, x, y);
+        assert!(!screen(&app).contains("No other tabs."));
+        assert_eq!(app.active_panel().path(), Some(root.join("b.txt")));
     }
 
     /// The name of the file previewed.
@@ -10422,7 +10493,9 @@ mod tests {
         assert_eq!(tab_bar(&app), " 1 a.txt  2 b.txt  +");
         assert_eq!(app.tab, 1, "b.txt, after the closed tab");
 
-        // Dragged along the bar, a tab moves.
+        // Dragged along the bar, a tab moves. (Not so soon after the click
+        // on it as to be a double click.)
+        app.last_tab_click = None;
         mouse_at(&mut app, MouseKind::Press(MouseButton::Left), 2, 0);
         mouse_at(&mut app, MouseKind::Drag(MouseButton::Left), 12, 0);
         mouse_at(&mut app, MouseKind::Drag(MouseButton::Left), 14, 0);
@@ -10431,17 +10504,17 @@ mod tests {
         assert_eq!(app.tab, 1, "a.txt stays on screen");
 
         // A double click renames it; no name names it for its file again.
+        app.last_tab_click = None;
         left_click(&mut app, 12, 0);
         left_click(&mut app, 12, 0);
         type_text(&mut app, "notes");
-        assert!(cells(&app, 9, 0..80).starts_with(" Rename tab: notes"));
+        assert!(screen(&app).contains("│ notes"), "{}", screen(&app));
         key(&mut app, KeyCode::Enter);
         assert_eq!(tab_bar(&app), " 1 b.txt  2 notes  +");
-        assert!(!app.ed().is_modified(), "the prompt took the keys");
+        assert!(!app.ed().is_modified(), "the input box took the keys");
+        // The name it has is selected, so one Backspace takes it away.
         app.run(Command::RenameTab, false);
-        for _ in 0.."notes".len() {
-            key(&mut app, KeyCode::Backspace);
-        }
+        key(&mut app, KeyCode::Backspace);
         key(&mut app, KeyCode::Enter);
         assert_eq!(tab_bar(&app), " 1 b.txt  2 a.txt  +");
     }
@@ -11650,7 +11723,7 @@ mod tests {
             "[editor]\nwrap = false\n\n[ui]\ntheme = \"Cue Dark\"\n"
         );
         assert!(!config::get().wrap);
-        assert!(screen(&app).contains("Using Cue Dark."));
+        assert_eq!(status_message(&app), None, "a theme picked shows itself");
     }
 
     #[test]
@@ -11665,9 +11738,9 @@ mod tests {
             "x".to_string(),
         ];
         app.warn_about_config(&warnings);
-        let text = screen(&app);
+        let text = status_message(&app).unwrap_or_default();
         assert!(
-            text.contains("Settings: Unknown setting: editor.tabwidth (and 1 more"),
+            text.starts_with("Settings: Unknown setting: editor.tabwidth (and 1 more"),
             "{text}"
         );
     }
@@ -11694,7 +11767,6 @@ mod tests {
         assert_eq!(config::get().tab_width, 2);
         let text = screen(&app);
         assert!(text.contains("Settings applied."), "{text}");
-        app.active_panel_mut().clear_message();
         let text = screen(&app);
         assert!(text.contains("nowrap"), "{text}");
         assert_eq!(app.visible_tree_width(), 20);
@@ -11711,6 +11783,7 @@ mod tests {
         );
 
         // Saved again unchanged, nothing's read.
+        app.toasts = Toasts::default();
         ctrl(&mut app, 's');
         assert!(!screen(&app).contains("Settings applied."));
 
@@ -11720,7 +11793,7 @@ mod tests {
         ctrl(&mut app, 's');
         assert_eq!(config::get().tab_width, 3);
         assert_eq!(config::get().tree_width, 30);
-        let text = screen(&app);
+        let text = status_message(&app).unwrap_or_default();
         assert!(text.contains("Unknown setting: editor.wrapping"), "{text}");
     }
 
@@ -11907,11 +11980,7 @@ mod tests {
         let rename = find(&app, "Rename Session…").expect("the menu");
         click(&mut app, rename);
         type_text(&mut app, "api");
-        assert!(
-            screen(&app).contains(" Rename session: api"),
-            "{}",
-            screen(&app)
-        );
+        assert!(screen(&app).contains("│ api"), "{}", screen(&app));
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.session().unwrap().name(), Some("api"));
         let line = status_line(&app);
@@ -11919,9 +11988,7 @@ mod tests {
         let listed = session::list(app.sessions.as_ref().unwrap());
         assert_eq!(listed[0].state.name.as_deref(), Some("api"));
         app.run(Command::RenameSession, false);
-        for _ in 0.."api".len() {
-            key(&mut app, KeyCode::Backspace);
-        }
+        key(&mut app, KeyCode::Backspace);
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.session().unwrap().name(), None);
         let line = status_line(&app);
@@ -12156,11 +12223,9 @@ mod tests {
         })
     }
 
+    /// The newest toast.
     fn status_message(app: &App) -> Option<String> {
-        match app.active_panel().status() {
-            status::Status::Message { text, .. } => Some(text),
-            _ => None,
-        }
+        app.toasts.texts().last().map(|text| text.to_string())
     }
 
     #[test]

@@ -347,7 +347,7 @@ impl<T: Clone> Alert<T> {
 
 /// `text`'s lines, wrapped at spaces to `width` characters, and words too
 /// long for a line broken where they reach its end.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for paragraph in text.lines() {
         let mut line = String::new();

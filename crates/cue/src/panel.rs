@@ -169,8 +169,6 @@ pub struct Panel {
     /// How a commit changed a file, if that's on screen. The panel owns
     /// it, as it does an image.
     commit: Option<CommitDiff>,
-    /// While empty, a message for the status bar until the next key press.
-    message: Option<(String, bool)>,
     area: Rect,
     history: History,
     /// The columns the header's name took when last drawn, its icon
@@ -188,7 +186,6 @@ impl Panel {
             terminal: None,
             image: None,
             commit: None,
-            message: None,
             area: Rect::default(),
             history: History::default(),
             name_columns: Cell::new((0, 0)),
@@ -344,7 +341,6 @@ impl Panel {
     /// Takes the editor off screen, for a terminal or an image, dropping it
     /// if it's of an unnamed document that was never typed in.
     fn leave_editor(&mut self) {
-        self.message = None;
         if let Some(left) = self.current.take() {
             if self.editors[left].is_blank() {
                 self.editors.remove(left);
@@ -450,15 +446,11 @@ impl Panel {
         self.terminal = None;
         self.image = None;
         self.commit = None;
-        self.message = None;
         if let Some(left) = left.filter(|&left| left != index && self.editors[left].is_blank()) {
             self.editors.remove(left);
             if index > left {
                 self.current = Some(index - 1);
             }
-        }
-        if let Some(editor) = self.editor_mut() {
-            editor.clear_message();
         }
         Ok(())
     }
@@ -492,7 +484,6 @@ impl Panel {
         self.terminal = None;
         self.image = None;
         self.commit = None;
-        self.message = None;
     }
 
     // --- history ------------------------------------------------------------------
@@ -677,39 +668,26 @@ impl Panel {
         self.history = history;
     }
 
-    /// Shows `text` in the status bar until the next key press.
-    pub fn show_message(&mut self, text: String, error: bool) {
-        match self.editor_mut() {
-            Some(editor) => editor.show_message(text, error),
-            None => self.message = Some((text, error)),
-        }
-    }
-
-    pub fn clear_message(&mut self) {
-        self.message = None;
-        if let Some(editor) = self.current.and_then(|i| self.editors.get_mut(i)) {
-            editor.clear_message();
-        }
+    /// What its editors said to show since the last call, as (text,
+    /// error).
+    pub fn take_messages(&mut self) -> impl Iterator<Item = (String, bool)> + '_ {
+        self.editors.iter_mut().filter_map(Editor::take_message)
     }
 
     /// What the status bar shows while this panel is active.
     pub fn status(&self) -> Status {
-        if let (Some(terminal), None) = (&self.terminal, &self.message) {
+        if let Some(terminal) = &self.terminal {
             return terminal.borrow().status();
         }
-        if let (Some(image), None) = (&self.image, &self.message) {
+        if let Some(image) = &self.image {
             return image.status(self.body());
         }
-        if let (Some(commit), None) = (&self.commit, &self.message) {
+        if let Some(commit) = &self.commit {
             return commit.status();
         }
-        match (self.editor(), &self.message) {
-            (Some(editor), _) => editor.status(),
-            (None, Some((text, error))) => Status::Message {
-                text: text.clone(),
-                error: *error,
-            },
-            (None, None) => Status::Info(String::new()),
+        match self.editor() {
+            Some(editor) => editor.status(),
+            None => Status::Info(String::new()),
         }
     }
 

@@ -47,7 +47,7 @@ use crate::line_edit::Edit;
 use crate::location::{self, Target};
 use crate::pty::Pty;
 use crate::search::Toggle;
-use crate::status::{Prompt, PromptKey, Status};
+use crate::status::Status;
 use crate::theme;
 
 /// At most this much output is read per poll, so a flood of it can't keep
@@ -62,8 +62,6 @@ pub struct Terminal {
     id: u32,
     /// The name it was given, if it was renamed.
     name: Option<String>,
-    /// The prompt for a new name, while it's open.
-    prompt: Option<Prompt>,
     vt: EmbeddedTerminal,
     pty: Pty,
     cwd: PathBuf,
@@ -205,7 +203,6 @@ impl Terminal {
         Terminal {
             id,
             name: None,
-            prompt: None,
             vt,
             pty,
             cwd: cwd.to_path_buf(),
@@ -380,38 +377,6 @@ impl Terminal {
         self.name.is_some()
     }
 
-    /// Asks for a new name in the status bar, starting from the one it
-    /// was given, if any.
-    pub fn show_rename(&mut self) {
-        let name = self.name.as_deref().unwrap_or_default();
-        self.prompt = Some(Prompt::new("Rename terminal", name));
-    }
-
-    /// The rename prompt has the keyboard.
-    pub fn prompt_open(&self) -> bool {
-        self.prompt.is_some()
-    }
-
-    pub fn cancel_prompt(&mut self) {
-        self.prompt = None;
-    }
-
-    /// A key for the rename prompt, while it's open. An empty name takes
-    /// away the one it was given.
-    pub fn handle_prompt_key(&mut self, key: Key) {
-        let Some(prompt) = &mut self.prompt else {
-            return;
-        };
-        match prompt.handle_key(key) {
-            PromptKey::Continue => {}
-            PromptKey::Cancel => self.prompt = None,
-            PromptKey::Submit(name) => {
-                self.prompt = None;
-                self.name = (!name.is_empty()).then_some(name);
-            }
-        }
-    }
-
     /// How the shell ended, once it has.
     pub fn exit(&self) -> Option<ExitStatus> {
         self.exit
@@ -517,13 +482,8 @@ impl Terminal {
         self.send(&bytes);
     }
 
-    /// Pastes `text` into the program, or into the rename prompt while
-    /// it's open.
+    /// Pastes `text` into the program.
     pub fn paste(&mut self, text: &str) {
-        if let Some(prompt) = &mut self.prompt {
-            prompt.paste(text);
-            return;
-        }
         let bytes = self.vt.encode_paste(text);
         self.send(&bytes);
     }
@@ -1018,9 +978,6 @@ impl Terminal {
 
     /// What the status bar shows while this terminal is in the active panel.
     pub fn status(&self) -> Status {
-        if let Some(prompt) = &self.prompt {
-            return prompt.status();
-        }
         // While typing a query that isn't a valid regex, why.
         if let Some(error) = self
             .find

@@ -468,7 +468,7 @@ impl Editor {
         }
     }
 
-    /// Shows `text` in the status bar until the next key press.
+    /// Shows `text` as a toast, once the app takes it.
     pub fn show_message(&mut self, text: impl Into<String>, error: bool) {
         self.message = Some(Message {
             text: text.into(),
@@ -476,8 +476,10 @@ impl Editor {
         });
     }
 
-    pub fn clear_message(&mut self) {
-        self.message = None;
+    /// The message to show since the last call, as (text, error).
+    pub fn take_message(&mut self) -> Option<(String, bool)> {
+        let Message { text, error } = self.message.take()?;
+        Some((text, error))
     }
 
     /// Types a key bound to no command. Keys with Ctrl/Alt/Cmd held never
@@ -533,9 +535,8 @@ impl Editor {
             Command::Save => return self.save(),
             _ => match self.read_only_view().map(|view| view.run(command)) {
                 Some(Ran::Copy(Some(text))) => return self.copy_text(text, clipboard),
-                Some(Ran::Copy(None)) => self.show_message("Nothing selected.", false),
                 Some(Ran::ReadOnly) => return Action::ReadOnly,
-                Some(Ran::Done) | None => {}
+                Some(Ran::Copy(None) | Ran::Done) | None => {}
             },
         }
         Action::Continue
@@ -667,7 +668,6 @@ impl Editor {
         );
         match mouse.kind {
             MouseKind::Press(MouseButton::Left) if mouse.y < text_h => {
-                self.message = None;
                 self.history().break_group();
                 let count = self.click_count(at, now);
                 if mouse.mods.shift && count == 1 {
@@ -1377,24 +1377,18 @@ impl Editor {
     }
 
     fn undo(&mut self) {
-        let undo = self.history().undo();
-        match undo {
-            Some(steps) => (0..steps).for_each(|_| {
-                self.buffer.undo();
-            }),
-            None => self.show_message("Nothing to undo.", false),
+        let steps = self.history().undo().unwrap_or(0);
+        for _ in 0..steps {
+            self.buffer.undo();
         }
         self.anchor = None;
         self.view.clear_selection();
     }
 
     fn redo(&mut self) {
-        let redo = self.history().redo();
-        match redo {
-            Some(steps) => (0..steps).for_each(|_| {
-                self.buffer.redo();
-            }),
-            None => self.show_message("Nothing to redo.", false),
+        let steps = self.history().redo().unwrap_or(0);
+        for _ in 0..steps {
+            self.buffer.redo();
         }
         self.anchor = None;
         self.view.clear_selection();
@@ -1405,17 +1399,12 @@ impl Editor {
     fn copy(&mut self, clipboard: &mut Option<String>) -> Action {
         let text = self.view.selected_text();
         if text.is_empty() {
-            self.show_message("Nothing selected.", false);
             return Action::Continue;
         }
         self.copy_text(text, clipboard)
     }
 
     fn copy_text(&mut self, text: String, clipboard: &mut Option<String>) -> Action {
-        self.show_message(
-            format!("Copied {} characters.", text.chars().count()),
-            false,
-        );
         *clipboard = Some(text.clone());
         Action::Copy(text)
     }
@@ -1924,7 +1913,7 @@ impl Editor {
             return;
         };
         if bar.matches.is_empty() {
-            return self.show_message("Nothing to replace.", false);
+            return;
         }
         let text = self.buffer.text();
         let replacer = find::Replacer::new(&bar.memory.query, &bar.memory.replacement);
@@ -1960,12 +1949,6 @@ impl Editor {
 
     /// What the status bar shows while this editor is active.
     pub fn status(&self) -> Status {
-        if let Some(message) = &self.message {
-            return Status::Message {
-                text: message.text.clone(),
-                error: message.error,
-            };
-        }
         if let Some(diff) = &self.diff {
             return diff.status();
         }
@@ -2027,16 +2010,8 @@ impl Editor {
     /// Writes the file to `path`, whatever is there.
     pub fn write(&mut self, path: PathBuf) -> Action {
         match self.doc.save(&path) {
-            Ok(()) => {
-                let lines = self.buffer.line_count();
-                let name = path
-                    .file_name()
-                    .unwrap_or(path.as_os_str())
-                    .to_string_lossy();
-                self.show_message(format!("Wrote {name} ({lines} lines)"), false);
-                Action::Saved
-            }
-            // Reason first: the status bar clips long paths on the right.
+            Ok(()) => Action::Saved,
+            // Reason first: long paths are the least of it.
             Err(err) => {
                 self.show_message(format!("Can't save: {err} ({})", path.display()), true);
                 Action::Continue
@@ -2403,7 +2378,6 @@ mod tests {
 
     impl HandleKey for Editor {
         fn handle_key(&mut self, key: Key) -> Action {
-            self.clear_message();
             match Keymap::default().lookup(key, Context::Editor) {
                 Some((command, select)) => CLIPBOARD
                     .with(|clipboard| self.run(command, select, &mut clipboard.borrow_mut())),
@@ -2471,6 +2445,14 @@ mod tests {
         editor.status().text()
     }
 
+    /// The message it said to show last, if any.
+    fn message(editor: &mut Editor) -> String {
+        editor
+            .take_message()
+            .map(|(text, _)| text)
+            .unwrap_or_default()
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cue-editor-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -2498,11 +2480,6 @@ mod tests {
 
         ctrl(&mut editor, 's');
         assert_eq!(fs::read_to_string(&path).unwrap(), "one\r\ntwo");
-        assert!(
-            status(&editor).starts_with(" Wrote "),
-            "{}",
-            status(&editor)
-        );
         key(&mut editor, KeyCode::Left);
         assert!(!editor.is_modified());
     }
@@ -2555,7 +2532,6 @@ mod tests {
 
         assert!(matches!(editor.save_as(path.clone()), Action::Saved));
         assert_eq!(fs::read_to_string(&path).unwrap(), "hi");
-        assert!(status(&editor).starts_with(" Wrote "));
         assert_eq!(editor.path(), Some(path));
     }
 
@@ -2585,7 +2561,6 @@ mod tests {
             status(&editor)
         );
         editor.save_as(path);
-        editor.clear_message();
         assert!(
             status(&editor).contains("  Shell  LF"),
             "{}",
@@ -2618,7 +2593,7 @@ mod tests {
         }
         assert!(!editor.is_modified(), "back at the (empty) saved state");
         ctrl(&mut editor, 'z');
-        assert_eq!(status(&editor), " Nothing to undo.");
+        assert_eq!(eb.text(), "", "nothing more to undo");
 
         for text in expect.iter().rev().skip(1) {
             ctrl(&mut editor, 'y');
@@ -4009,7 +3984,7 @@ mod tests {
 
         editor.run(Command::ReplaceAll, false, &mut clipboard);
         assert_eq!(eb.text(), "<1> <22>\nb3 <4>");
-        assert_eq!(status(&editor), " Replaced 2 matches.");
+        assert_eq!(message(&mut editor), "Replaced 2 matches.");
         ctrl(&mut editor, 'z');
         assert_eq!(eb.text(), "<1> a22\nb3 a4", "one undo step");
         ctrl(&mut editor, 'z');

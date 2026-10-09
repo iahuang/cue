@@ -1,6 +1,6 @@
 //! The status bar along the bottom of the screen. It's the active panel's:
-//! where its cursor is and what its file is written in, a message after a
-//! key press, or a prompt, such as a terminal's new name. Shortcut hints
+//! where its cursor is and what its file is written in, or what's wrong,
+//! such as a query that isn't a valid regex. Shortcut hints
 //! fill the right, and in a session, a badge with its name, or if it has
 //! none, its ID: a click on it offers to detach or end the session. In a
 //! git repository, a badge at the left end names the branch (see
@@ -12,7 +12,6 @@ use opentui::{Attributes, Buffer, Rgba};
 use unicode_width::UnicodeWidthStr;
 
 use crate::icons;
-use crate::input::{Key, KeyCode};
 use crate::keymap::{Command, Keymap};
 use crate::theme::{self, Hue};
 use crate::tree::truncate;
@@ -29,10 +28,8 @@ pub enum Status {
     },
     /// A terminal's name and what it's running.
     Terminal(String),
-    /// Shown until the next key press.
+    /// What's wrong, or what to do next, while it's so.
     Message { text: String, error: bool },
-    /// A prompt, with what's been typed.
-    Prompt { label: &'static str, input: String },
 }
 
 impl Status {
@@ -44,7 +41,6 @@ impl Status {
                 format!(" {info}")
             }
             Status::Message { text, .. } => format!(" {text}"),
-            Status::Prompt { label, input } => format!(" {label}: {input}"),
         }
     }
 }
@@ -134,7 +130,7 @@ fn short_count(n: usize) -> String {
 }
 
 /// The columns the git badge takes in a status bar `width` wide showing
-/// `status`, if it shows `badge`: not over a message or a prompt, nor
+/// `status`, if it shows `badge`: not over a message, nor
 /// where it would crowd out the rest. What the status bar says starts
 /// where it ends.
 pub fn git_badge(status: &Status, badge: Option<&GitBadge>, width: u32) -> Option<Range<u32>> {
@@ -157,7 +153,7 @@ fn session_text(session: &str) -> String {
 
 /// The columns the badge for a session labeled `session` takes in a
 /// status bar `width` wide showing `status`, if it shows one: not over
-/// a message or a prompt.
+/// a message.
 pub fn session_badge(status: &Status, session: Option<&str>, width: u32) -> Option<Range<u32>> {
     let len = session_text(session?).width() as u32;
     match status {
@@ -168,65 +164,10 @@ pub fn session_badge(status: &Status, session: Option<&str>, width: u32) -> Opti
     }
 }
 
-/// A line of text asked for in the status bar, such as a terminal's name.
-pub struct Prompt {
-    label: &'static str,
-    input: String,
-}
-
-/// What a key did to a [`Prompt`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum PromptKey {
-    Continue,
-    Cancel,
-    /// Enter, with what was typed, trimmed.
-    Submit(String),
-}
-
-impl Prompt {
-    /// A prompt labeled `label` ("Rename terminal"), starting with `input`
-    /// typed.
-    pub fn new(label: &'static str, input: &str) -> Prompt {
-        Prompt {
-            label,
-            input: input.to_string(),
-        }
-    }
-
-    pub fn handle_key(&mut self, Key { code, mods }: Key) -> PromptKey {
-        match code {
-            KeyCode::Esc => return PromptKey::Cancel,
-            KeyCode::Char('c' | 'q') if mods.ctrl || mods.sup => return PromptKey::Cancel,
-            KeyCode::Enter => return PromptKey::Submit(self.input.trim().to_string()),
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) if mods.is_plain() => self.input.push(c),
-            _ => {}
-        }
-        PromptKey::Continue
-    }
-
-    /// Takes the first line of `text`.
-    pub fn paste(&mut self, text: &str) {
-        // Terminals send newlines in pastes as CR.
-        self.input
-            .push_str(text.split(['\r', '\n']).next().unwrap_or(""));
-    }
-
-    pub fn status(&self) -> Status {
-        Status::Prompt {
-            label: self.label,
-            input: self.input.clone(),
-        }
-    }
-}
-
 /// Draws `status` across row `y` of `frame`, `width` wide, with the
 /// badge labeled `session` if in a session, and `git`'s badge if
 /// there's room. A terminal's hint says whether cue's shortcuts
-/// (`terminal_cue_keys`) or the shell gets keys. Returns where the terminal cursor goes while the
-/// prompt is open.
+/// (`terminal_cue_keys`) or the shell gets keys.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &Buffer,
@@ -237,21 +178,9 @@ pub fn draw(
     session: Option<&str>,
     git: Option<&GitBadge>,
     terminal_cue_keys: bool,
-) -> Option<(u32, u32)> {
+) {
     let colors = theme::colors();
     match status {
-        Status::Prompt { label, input } => {
-            frame.fill_rect(0, y, width, 1, colors.surface);
-            let label = format!(" {label}: ");
-            frame.draw_text(&label, 0, y, colors.muted, None, Attributes::NONE);
-            let x = label.chars().count() as u32;
-            // Keep the end of a long path visible.
-            let room = width.saturating_sub(x + 1) as usize;
-            let chars: Vec<char> = input.chars().collect();
-            let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
-            frame.draw_text(&shown, x, y, colors.text, None, Attributes::NONE);
-            Some((x + shown.chars().count() as u32, y))
-        }
         Status::Message { text, error } => {
             let bg = if *error {
                 colors.error_bg
@@ -267,7 +196,6 @@ pub fn draw(
                 None,
                 Attributes::BOLD,
             );
-            None
         }
         Status::Info(info) | Status::Terminal(info) | Status::EditorInfo { text: info, .. } => {
             frame.fill_rect(0, y, width, 1, colors.surface);
@@ -316,7 +244,6 @@ pub fn draw(
                 let text = session_text(session);
                 frame.draw_text(&text, badge.start, y, fg, bg, Attributes::BOLD);
             }
-            None
         }
     }
 }
