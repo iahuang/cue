@@ -205,7 +205,7 @@ impl Toasts {
                 true => colors.error,
                 false => colors.border,
             };
-            frame.fill_rect(x, y, width, height, colors.surface);
+            frame.fill_rect(x, y, width, height, colors.bg);
             let rule = "─".repeat(width as usize - 2);
             let draw = |text: &str, x, y, fg| {
                 frame.draw_text(text, x, y, fg, None, Attributes::NONE);
