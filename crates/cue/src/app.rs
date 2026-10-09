@@ -1368,7 +1368,7 @@ impl App {
             return self.dialog_action(action);
         }
         if let MouseKind::Press(_) = mouse.kind {
-            if let Some(index) = self.toasts.at(mouse.x, mouse.y, self.width, self.height) {
+            if let Some(index) = self.toasts.at(mouse.x, mouse.y, self.toast_area()) {
                 self.mouse_target = None;
                 self.toasts.dismiss(index);
                 return AppAction::Continue;
@@ -1976,7 +1976,7 @@ impl App {
             look.draw(frame, &self.keymap);
         }
         // Under the popups, which they don't take clicks from.
-        self.toasts.draw(frame, self.width, self.height);
+        self.toasts.draw(frame, self.toast_area());
         let cursor = self.draw_popups(frame, cursor);
         match &self.alert {
             // Over any popup it asks for.
@@ -2023,8 +2023,8 @@ impl App {
         if let Some(dialog) = &self.dialog {
             return dialog.hover_area(x, y).map(rect);
         }
-        if let Some(index) = self.toasts.at(x, y, self.width, self.height) {
-            return self.toasts.area(index, self.width, self.height).map(rect);
+        if let Some(index) = self.toasts.at(x, y, self.toast_area()) {
+            return self.toasts.area(index, self.toast_area()).map(rect);
         }
         let span = |columns: std::ops::Range<u32>| Rect {
             x: columns.start,
@@ -2106,10 +2106,7 @@ impl App {
             let colors = theme::colors();
             let divider = self.alert.is_none()
                 && self.input.is_none()
-                && self
-                    .toasts
-                    .at(area.x, area.y, self.width, self.height)
-                    .is_none()
+                && self.toasts.at(area.x, area.y, self.toast_area()).is_none()
                 && self.menu.is_none()
                 && self.search.is_none()
                 && self.picker.is_none()
@@ -2621,6 +2618,7 @@ impl App {
                     panel: panel.id,
                     visit,
                 });
+                self.show_message("Mark set.", false);
             }
             _ => self.show_message("Marks can only be set in files and terminals.", false),
         }
@@ -6750,6 +6748,18 @@ impl App {
         u32::from(self.tabs.len() > 1 && self.height >= layout::MIN_HEIGHT + 2)
     }
 
+    /// Where toasts go: below the tab bar and above the status bar, across
+    /// the screen.
+    fn toast_area(&self) -> crate::picker::Area {
+        let bar = self.bar_height();
+        crate::picker::Area {
+            x: 0,
+            y: bar,
+            width: self.width,
+            height: self.height.saturating_sub(1 + bar),
+        }
+    }
+
     /// The tab bar, across the top of the panels.
     fn bar_area(&self) -> Rect {
         Rect {
@@ -7900,7 +7910,7 @@ mod tests {
         // Jumping goes to the mark, and going back comes back.
         go_to_line(&mut app, 30);
         set(&mut app);
-        assert!(app.mark.is_some());
+        assert!(screen(&app).contains("Mark set."));
         go_to_line(&mut app, 150);
         jump(&mut app);
         assert_eq!(row(&app), 29);
@@ -8053,7 +8063,7 @@ mod tests {
         let marked = app.tab().active;
         // cue's shortcuts work from the terminal.
         ctrl(&mut app, '\'');
-        assert!(app.mark.is_some());
+        assert!(screen(&app).contains("Mark set."));
 
         // Where the panel moved on since, it goes back through its history
         // to the terminal.

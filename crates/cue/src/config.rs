@@ -21,6 +21,7 @@ use crate::indent::Indent;
 use crate::input::{Key, KeyCode};
 use crate::keymap::{Command, Context};
 use crate::theme::{ThemeId, ThemeSetting};
+use crate::toast::ToastPosition;
 
 /// The settings, each named as in the file.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +58,8 @@ pub struct Config {
     pub tree: bool,
     /// `ui.tree_width`: the file tree's width, at first.
     pub tree_width: u32,
+    /// `ui.toast_position`: the corner messages show in.
+    pub toast_position: ToastPosition,
     /// `terminal.shell`: the program terminals run, or `$SHELL`.
     pub shell: Option<PathBuf>,
     /// `terminal.scrollback`: bytes of history a terminal keeps.
@@ -85,6 +88,7 @@ impl Default for Config {
             nerd_font: false,
             tree: true,
             tree_width: 30,
+            toast_position: ToastPosition::default(),
             shell: None,
             scrollback: 10 * 1024 * 1024,
             exclude: Vec::new(),
@@ -117,6 +121,7 @@ pub const TEMPLATE: &str = r#"# Uncomment settings to customize. Save in cue or 
 # nerd_font = false          # File icons; requires a Nerd Font.
 # tree = true
 # tree_width = 30
+# toast_position = "bottom-right" # Or "bottom-left", "top-right", "top-left".
 
 [terminal]
 # Changes apply to new terminals.
@@ -298,6 +303,12 @@ impl Config {
             "ui.tree_width" => {
                 const EXPECTED: &str = "a number from 12 to 1000";
                 self.tree_width = int(value, MIN_TREE_WIDTH..=1000).ok_or(EXPECTED)?;
+            }
+            "ui.toast_position" => {
+                const EXPECTED: &str =
+                    "\"bottom-right\", \"bottom-left\", \"top-right\", or \"top-left\"";
+                let name = value.as_str().ok_or(EXPECTED)?;
+                self.toast_position = ToastPosition::named(name).ok_or(EXPECTED)?;
             }
             "terminal.shell" => {
                 const EXPECTED: &str = "the path of a program";
@@ -615,6 +626,7 @@ mod tests {
             nerd_font = true
             tree = false
             tree_width = 40
+            toast_position = "top-left"
             [terminal]
             shell = "/bin/bash"
             scrollback = "512 KB"
@@ -638,6 +650,7 @@ mod tests {
                 nerd_font: true,
                 tree: false,
                 tree_width: 40,
+                toast_position: ToastPosition::TopLeft,
                 shell: Some(PathBuf::from("/bin/bash")),
                 scrollback: 512 * 1024,
                 exclude: vec!["target".to_string()],
@@ -682,6 +695,7 @@ mod tests {
             red = "#f00"
             [ui]
             theme = "Solarized"
+            toast_position = "middle"
             "##,
         );
         assert_eq!(
@@ -695,6 +709,7 @@ mod tests {
                 "terminal.scrollback should be a size such as \"10MB\", or a number of bytes",
                 "Unknown setting: colors.red",
                 "ui.theme should be a theme name from Select Theme, or { dark = \"…\", light = \"…\" }",
+                "ui.toast_position should be \"bottom-right\", \"bottom-left\", \"top-right\", or \"top-left\"",
             ]
         );
         assert_eq!(

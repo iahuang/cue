@@ -8,7 +8,8 @@
 - Drop messages that only say what's already on screen, such as "Copied 12 characters." or "Nothing to undo." (`6f30bf3`)
 - Start new terminals in the workspace folder with the tree's selection even when the tree isn't focused (`bd63178`)
 - Open a folder to an empty panel rather than an untitled file (`7e29bb0`)
-- Write crash reports to `~/.local/state/cue/crashes`, including for sessions in the background, and say where they are on the next start
+- Write crash reports to `~/.local/state/cue/crashes`, including for sessions in the background, and say where they are on the next start (`1f0ff06`)
+- Show messages in the corner `ui.toast_position` says, and say "Mark set." again
 
 ## v0.3.12 — 2026-10-08
 
