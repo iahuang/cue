@@ -3,9 +3,10 @@
 ## Unreleased
 
 - Fix a crash diffing a file with a lone carriage return in it (`4aecc87`)
-- Show messages as toasts over the bottom right, not in the status bar
-- Ask for a tab's, terminal's, or session's new name, or a new branch's, in a box at the top rather than in the status bar
-- Drop messages that only say what's already on screen, such as "Copied 12 characters." or "Nothing to undo."
+- Show messages as toasts over the bottom right, not in the status bar (`6f30bf3`)
+- Ask for a tab's, terminal's, or session's new name, or a new branch's, in a box at the top rather than in the status bar (`6f30bf3`)
+- Drop messages that only say what's already on screen, such as "Copied 12 characters." or "Nothing to undo." (`6f30bf3`)
+- Start new terminals in the workspace folder with the tree's selection even when the tree isn't focused
 
 ## v0.3.12 — 2026-10-08
 

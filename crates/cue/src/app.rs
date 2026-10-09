@@ -4139,14 +4139,31 @@ impl App {
         self.recovery.discard();
     }
 
-    /// The workspace folder being worked in, where terminals start: the one
-    /// with the tree's selection, if the tree has the keyboard, or else the
-    /// one with what's on screen, or the first.
+    /// The workspace folder being worked in: the one with the tree's
+    /// selection, if the tree has the keyboard, or else the one with what's
+    /// on screen, or the first.
     fn current_root(&self) -> PathBuf {
         let selected = match self.focus {
             Focus::Tree => self.sidebar_selected().map(|entry| entry.path),
             _ => None,
         };
+        self.root_with(selected)
+    }
+
+    /// The workspace folder new terminals start in: the one with the tree's
+    /// selection, while the tree shows, whether or not it has the keyboard,
+    /// or else the one being worked in.
+    fn terminal_root(&self) -> PathBuf {
+        let selected = match self.visible_tree_width() {
+            0 => None,
+            _ => self.sidebar_selected().map(|entry| entry.path),
+        };
+        self.root_with(selected)
+    }
+
+    /// The workspace folder with `selected` in it, or else the one with
+    /// what's on screen, or the first.
+    fn root_with(&self, selected: Option<PathBuf>) -> PathBuf {
         let path = selected
             .or_else(|| self.active_panel().path())
             .or_else(|| Some(self.active_terminal()?.borrow().cwd().to_path_buf()));
@@ -6503,7 +6520,7 @@ impl App {
 
     /// Starts a shell in the workspace's first folder, in the active panel.
     fn new_terminal(&mut self) {
-        self.new_terminal_in(&self.current_root());
+        self.new_terminal_in(&self.terminal_root());
     }
 
     /// Starts a shell in `cwd`, in the active panel.
@@ -11300,10 +11317,15 @@ mod tests {
         let files: Vec<String> = app.files.files().iter().map(|f| f.text.clone()).collect();
         assert_eq!(files, ["one/a.txt", "two/b.txt"]);
 
-        // Terminals start in the folder being worked in.
+        // The folder being worked in is the tree's selection while it has the
+        // keyboard; terminals start there while the tree shows.
         assert_eq!(app.current_root(), two, "the tree's selection");
         app.focus = Focus::Editor;
         assert_eq!(app.current_root(), one, "the file on screen");
+        assert_eq!(app.terminal_root(), two, "the tree's selection");
+        app.tree_visible = false;
+        assert_eq!(app.terminal_root(), one, "the file on screen");
+        app.tree_visible = true;
 
         app.run(Command::AddFolder, false);
         type_text(&mut app, "two/");
