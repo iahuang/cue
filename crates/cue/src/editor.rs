@@ -72,6 +72,13 @@ const LINK_HIGHLIGHTS: u16 = 3;
 /// Line numbers are hidden when they would leave the text less room than this.
 const MIN_TEXT_WIDTH: u32 = 20;
 
+thread_local! {
+    /// What the last copy with nothing selected copied: a whole line, which
+    /// pastes as a line, above the cursor's, as in VS Code, while it's
+    /// still what's on the clipboard.
+    static LINE_COPY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 pub enum Action {
     Continue,
     /// Put this text on the system clipboard.
@@ -461,13 +468,14 @@ impl Editor {
     /// row `y`: `None` off the text, or past the end of its line, or in
     /// reader or diff mode.
     pub fn byte_at(&self, x: u32, y: u32, text: &str) -> Option<usize> {
-        if self.reading() || self.diffing() {
+        self.byte_under(x, y, text, false)
+    }
+
+    /// As [`Editor::byte_at`], but past the end of a line, its end, with
+    /// `to_end`.
+    fn byte_under(&self, x: u32, y: u32, text: &str, to_end: bool) -> Option<usize> {
+        if self.reading() || self.diffing() || self.on_find_bar(x, y) {
             return None;
-        }
-        if let Some((find_x, width, rows)) = self.find_area() {
-            if (find_x..find_x + width).contains(&x) && (self.y..self.y + rows).contains(&y) {
-                return None;
-            }
         }
         let (gutter, _, height) = self.text_area();
         let column = x.checked_sub(self.x + gutter)?;
@@ -477,10 +485,61 @@ impl Editor {
             WrapMode::None => column + self.view.viewport().x,
             _ => column,
         };
-        if column >= shown.width {
+        let column = match column >= shown.width {
+            true if to_end => shown.width,
+            true => return None,
+            false => column,
+        };
+        self.byte_in_line(text, shown.line, shown.start + column)
+    }
+
+    /// Whether screen cell (`x`, `y`) is on the find bar.
+    fn on_find_bar(&self, x: u32, y: u32) -> bool {
+        self.find_area().is_some_and(|(find_x, width, rows)| {
+            (find_x..find_x + width).contains(&x) && (self.y..self.y + rows).contains(&y)
+        })
+    }
+
+    /// Readies the text for a context menu right-clicked at screen cell
+    /// (`x`, `y`): as in VS Code, the cursor goes there, unless that's in
+    /// the selection, which the menu's commands act on. Returns whether
+    /// there's a menu there; the find bar has none.
+    pub fn right_click(&mut self, x: u32, y: u32) -> bool {
+        if self.reading() || self.diffing() {
+            return true;
+        }
+        if self.on_find_bar(x, y) {
+            return false;
+        }
+        let text = self.buffer.text();
+        let Some(byte) = self.byte_under(x, y, &text, true) else {
+            return true;
+        };
+        let offset = self
+            .buffer
+            .bytes_to_cursors(&[byte as u32])
+            .first()
+            .map(|c| c.offset);
+        let selected = self
+            .view
+            .selection()
+            .filter(|(s, e)| s != e)
+            .zip(offset)
+            .is_some_and(|((start, end), offset)| (start..=end).contains(&offset));
+        if !selected {
+            self.put_cursor_at(byte);
+        }
+        true
+    }
+
+    /// The screen cell the cursor is on, if it's in view, while editing.
+    pub fn cursor_cell(&self) -> Option<(u32, u32)> {
+        if self.reading() || self.diffing() {
             return None;
         }
-        self.byte_in_line(text, shown.line, shown.start + column)
+        let (gutter, _, _) = self.text_area();
+        let (col, row) = self.cursor_in_view()?;
+        Some((self.x + gutter + col, self.y + row))
     }
 
     /// The byte of `text`, the buffer's text, the cursor is at.
@@ -1501,12 +1560,18 @@ impl Editor {
 
     // --- clipboard ---------------------------------------------------------
 
+    /// Copies the selection, or with nothing selected, the cursor's line
+    /// and its line break.
     fn copy(&mut self, clipboard: &mut Option<String>) -> Action {
         let text = self.view.selected_text();
-        if text.is_empty() {
-            return Action::Continue;
-        }
-        self.copy_text(text, clipboard)
+        let line = text.is_empty().then(|| {
+            let row = self.cursor().0;
+            let start = self.buffer.position_to_offset(row, 0);
+            let end = self.line_end_offset(row);
+            format!("{}\n", self.buffer.text_range(start, end))
+        });
+        LINE_COPY.with(|copy| *copy.borrow_mut() = line.clone());
+        self.copy_text(line.unwrap_or(text), clipboard)
     }
 
     fn copy_text(&mut self, text: String, clipboard: &mut Option<String>) -> Action {
@@ -1514,17 +1579,55 @@ impl Editor {
         Action::Copy(text)
     }
 
+    /// Cuts the selection, or with nothing selected, the cursor's line.
     fn cut(&mut self, clipboard: &mut Option<String>) -> Action {
+        let line = !self.has_selection();
         let action = self.copy(clipboard);
-        if let Action::Copy(_) = action {
-            let steps = self.delete_selection();
-            self.history().break_group();
-            self.history().record(EditKind::Other, steps);
-        }
+        let steps = match line {
+            true => self.delete_line(),
+            false => self.delete_selection(),
+        };
+        self.history().break_group();
+        self.history().record(EditKind::Other, steps);
         action
     }
 
+    /// Deletes the cursor's line, with a line break, keeping the cursor's
+    /// column on the line that takes its place.
+    fn delete_line(&mut self) -> u32 {
+        let eb = &*self.buffer;
+        let (row, col) = self.cursor();
+        let position = |offset| eb.offset_to_position(offset).map(|p| (p.row, p.col));
+        let (start, end) = if row + 1 < eb.line_count() {
+            ((row, 0), (row + 1, 0))
+        } else {
+            // The last line takes the break before it, if there's one.
+            let end = position(self.line_end_offset(row)).unwrap_or((row, 0));
+            let start = match row {
+                0 => (0, 0),
+                _ => position(self.line_end_offset(row - 1)).unwrap_or((row, 0)),
+            };
+            (start, end)
+        };
+        let steps = eb.delete_range(start, end);
+        eb.set_cursor(row.min(eb.line_count().saturating_sub(1)), col);
+        steps
+    }
+
     fn paste_clipboard(&mut self, clipboard: Option<&str>) {
+        let line = clipboard.filter(|&text| {
+            !self.has_selection() && LINE_COPY.with(|copy| copy.borrow().as_deref() == Some(text))
+        });
+        if let Some(text) = line {
+            let (row, col) = self.cursor();
+            let rows = text.matches('\n').count() as u32;
+            return self.edit(EditKind::Other, |eb| {
+                eb.set_cursor(row, 0);
+                let steps = eb.insert_text(text);
+                eb.set_cursor(row + rows, col);
+                steps
+            });
+        }
         match clipboard {
             Some(text) => self.edit(EditKind::Other, |eb| eb.insert_text(text)),
             None => self.show_message(
@@ -2517,6 +2620,7 @@ mod tests {
     fn serial() -> MutexGuard<'static, ()> {
         let guard = crate::test_serial();
         CLIPBOARD.with(|clipboard| clipboard.borrow_mut().take());
+        LINE_COPY.with(|copy| copy.borrow_mut().take());
         guard
     }
 
@@ -3266,10 +3370,50 @@ mod tests {
         ctrl(&mut editor, 'v');
         ctrl(&mut editor, 'v');
         assert_eq!(eb.text(), "one\ntwoone\ntwo");
-        assert!(
-            matches!(ctrl(&mut editor, 'c'), Action::Continue),
-            "nothing selected"
-        );
+    }
+
+    #[test]
+    fn with_nothing_selected_copy_and_cut_take_the_line() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("one\ntwo\nthree");
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 4).unwrap();
+        eb.set_cursor(0, 2);
+        let Action::Copy(text) = ctrl(&mut editor, 'c') else {
+            panic!("Ctrl+C should copy the line");
+        };
+        assert_eq!(text, "one\n");
+        assert_eq!(eb.text(), "one\ntwo\nthree");
+
+        // It pastes above the cursor's line, which keeps the cursor.
+        eb.set_cursor(2, 3);
+        ctrl(&mut editor, 'v');
+        assert_eq!(eb.text(), "one\ntwo\none\nthree");
+        assert_eq!(pos(&eb), (3, 3));
+
+        // Cut takes the line away, and the cursor stays in its column.
+        eb.set_cursor(1, 1);
+        let Action::Copy(text) = ctrl(&mut editor, 'x') else {
+            panic!("Ctrl+X should cut the line");
+        };
+        assert_eq!(text, "two\n");
+        assert_eq!(eb.text(), "one\none\nthree");
+        assert_eq!(pos(&eb), (1, 1));
+        // The last line takes the break before it.
+        eb.set_cursor(2, 0);
+        ctrl(&mut editor, 'x');
+        assert_eq!(eb.text(), "one\none");
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "one\none\nthree", "one undo");
+
+        // Copied from a selection, the same text pastes where the cursor is.
+        eb.set_cursor(0, 0);
+        shift(&mut editor, KeyCode::Down);
+        ctrl(&mut editor, 'c');
+        key(&mut editor, KeyCode::Right);
+        eb.set_cursor(2, 2);
+        ctrl(&mut editor, 'v');
+        assert_eq!(eb.text(), "one\none\nthone\nree");
     }
 
     #[test]

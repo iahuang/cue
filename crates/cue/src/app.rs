@@ -42,7 +42,9 @@
 //! Right-clicking the file tree, or Shift+F10 there, opens a context menu
 //! of file commands: renaming, moving, duplicating, and trashing files and
 //! folders, and so on. They have keys and palette entries too, and act on
-//! the tree's selection, or from elsewhere, on the file on screen.
+//! the tree's selection, or from elsewhere, on the file on screen. In an
+//! editor, the same opens a menu of commands for its text, at the cursor,
+//! which a right click first moves, unless it's in the selection.
 //!
 //! Terminals (Ctrl+Shift+N) are the app's too, like open files: a panel shows
 //! one, and it keeps running when the panel moves on. While one has the
@@ -1286,6 +1288,13 @@ impl App {
                 let id = self.tab().active;
                 self.open_panel_menu(id, None);
             }
+            Command::EditorContextMenu => {
+                let id = self.tab().active;
+                match self.active_panel().editor() {
+                    Some(_) => self.open_editor_menu(id, None),
+                    None => self.open_panel_menu(id, None),
+                }
+            }
             Command::TreeOpenToSide
             | Command::TreeNewFile
             | Command::TreeNewFolder
@@ -1628,6 +1637,11 @@ impl App {
                         self.mouse_target = None;
                         return AppAction::Continue;
                     }
+                }
+                if mouse.kind == MouseKind::Press(MouseButton::Right)
+                    && self.right_click_editor(id, mouse.x, mouse.y)
+                {
+                    return AppAction::Continue;
                 }
                 // The wheel scrolls any panel; the rest goes to the active one.
                 let link = self.tab_mut().panel_mut(id).and_then(|panel| {
@@ -6461,6 +6475,80 @@ impl App {
         items.push(item(ClosePanel, "Close Panel"));
         let area = panel.area();
         let (x, y) = at.unwrap_or((area.x, area.y));
+        let menu = ContextMenu::new(
+            items,
+            &self.keymap,
+            x,
+            y,
+            at.is_some(),
+            self.width,
+            self.height,
+        );
+        self.close_popups();
+        self.menu = Some((menu, MenuFor::Panel(id)));
+    }
+
+    /// A right click at screen cell (`x`, `y`) in panel `id`: on an
+    /// editor's text, it opens the editor's context menu there, and returns
+    /// `true`. Terminals, and the rest, have the click.
+    fn right_click_editor(&mut self, id: PanelId, x: u32, y: u32) -> bool {
+        let editor = self.tab_mut().panel_mut(id).and_then(Panel::editor_mut);
+        if !editor.is_some_and(|editor| editor.right_click(x, y)) {
+            return false;
+        }
+        self.activate(id);
+        self.open_editor_menu(id, Some((x, y)));
+        true
+    }
+
+    /// Panel `id`'s editor's menu, of commands for its text, at the cell
+    /// right-clicked, or from the keyboard, below the cursor. Commands that
+    /// would do nothing, such as Go to Definition off a name, are left out.
+    fn open_editor_menu(&mut self, id: PanelId, at: Option<(u32, u32)>) {
+        use Command::*;
+        let Some(panel) = self.tab().panels.iter().find(|panel| panel.id == id) else {
+            return;
+        };
+        let Some(editor) = panel.editor() else {
+            return;
+        };
+        let item = |command, label: &str| MenuItem::Command(command, label.to_string());
+        let selected = editor.selected_text().is_some();
+        let mut items = Vec::new();
+        if editor.reading() || editor.diffing() {
+            if selected {
+                items.push(item(Copy, "Copy"));
+            }
+            items.extend([item(SelectAll, "Select All"), MenuItem::Separator]);
+            items.push(match editor.reading() {
+                true => item(ToggleReader, "Exit Reader Mode"),
+                false => item(ToggleDiff, "Hide Diff"),
+            });
+        } else {
+            let doc = editor.document();
+            if reference_in(doc, |text| editor.cursor_byte(text), true).is_some() {
+                items.push(item(GoToDefinition, "Go to Definition"));
+            }
+            items.extend([
+                item(GoToSymbol, "Go to Symbol in File…"),
+                MenuItem::Separator,
+            ]);
+            // With nothing selected, they cut and copy the cursor's line.
+            items.extend(match selected {
+                true => [item(Cut, "Cut"), item(Copy, "Copy")],
+                false => [item(Cut, "Cut Line"), item(Copy, "Copy Line")],
+            });
+            items.extend([item(Paste, "Paste"), MenuItem::Separator]);
+            let comments = doc.language.get().and_then(|l| l.line_comment());
+            if comments.is_some() {
+                items.push(item(ToggleComment, "Toggle Line Comment"));
+            }
+            items.push(item(SelectAll, "Select All"));
+        }
+        let area = panel.area();
+        let (x, y) = at
+            .or_else(|| editor.cursor_cell())
+            .unwrap_or((area.x, area.y));
         let menu = ContextMenu::new(
             items,
             &self.keymap,
@@ -11744,11 +11832,134 @@ mod tests {
         assert!(text.contains("│ New Terminal"), "an empty panel's\n{text}");
         key(&mut app, KeyCode::Esc);
 
+        // Showing a file, Shift+F10 is the editor's, and the palette has
+        // the panel's.
         app.open(&root.join("a.md"), false);
-        app.handle_key(Key::new(KeyCode::F(10), shift));
+        app.run(Command::PanelContextMenu, false);
         // Enter Reader Mode is first.
         key(&mut app, KeyCode::Enter);
         assert!(app.editor().is_some_and(Editor::reading));
+    }
+
+    const MENU_RS: &str = "fn helper() {}\n\nfn main() {\n    helper();\n}\n";
+
+    /// Where `text` is on the 80x24 screen.
+    fn tall_find(app: &App, text: &str) -> (u32, u32) {
+        let screen = tall_screen(app);
+        screen
+            .lines()
+            .enumerate()
+            .find_map(|(y, line)| {
+                let byte = line.find(text)?;
+                Some((line[..byte].chars().count() as u32, y as u32))
+            })
+            .unwrap_or_else(|| panic!("no {text} in\n{screen}"))
+    }
+
+    #[test]
+    fn right_clicking_text_moves_the_cursor_and_opens_its_menu() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-editor", &[("a.rs", MENU_RS)]);
+        let mut app = tall_app(&root, Some("a.rs"));
+        app.focus = Focus::Tree;
+        let call = tall_find(&app, "helper();");
+        right_click(&mut app, call.0 + 2, call.1);
+        assert!(app.menu.is_some(), "the release left it open");
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(cursor(&app), (3, 6), "it moved the cursor");
+        let text = tall_screen(&app);
+        for label in [
+            "Go to Definition",
+            "Go to Symbol",
+            "Toggle Line Comment",
+            "Select All",
+        ] {
+            assert!(text.contains(label), "{label} in\n{text}");
+        }
+        for label in ["│ Cut Line", "│ Copy Line", "│ Paste"] {
+            assert!(text.contains(label), "nothing selected, the line's\n{text}");
+        }
+        key(&mut app, KeyCode::Esc);
+
+        // In the selection, it's kept, for Copy.
+        app.run(Command::SelectAll, false);
+        right_click(&mut app, call.0, call.1);
+        let text = tall_screen(&app);
+        assert!(!text.contains("Go to Definition"), "at the end\n{text}");
+        assert!(!text.contains("Copy Line"), "{text}");
+        click_item(&mut app, "Copy");
+        assert_eq!(app.clipboard.as_deref(), Some(MENU_RS));
+
+        // Past a line's end, it's at the end, and Cut Line cuts the line,
+        // which pastes as a line.
+        app.run(Command::ClearSelection, false);
+        let line = tall_find(&app, "fn helper");
+        right_click(&mut app, line.0 + 30, line.1);
+        assert_eq!(cursor(&app), (0, 14));
+        click_item(&mut app, "Cut Line");
+        assert_eq!(app.clipboard.as_deref(), Some("fn helper() {}\n"));
+        assert!(app.ed().text().starts_with("\nfn main"));
+        let main = tall_find(&app, "fn main");
+        right_click(&mut app, main.0 + 4, main.1);
+        click_item(&mut app, "Paste");
+        assert!(app.ed().text().starts_with("\nfn helper() {}\nfn main"));
+        assert_eq!(cursor(&app), (2, 4), "on the text it was on");
+
+        let helper = tall_find(&app, "fn helper");
+        right_click(&mut app, helper.0, helper.1);
+        click_item(&mut app, "Toggle Line Comment");
+        assert!(app.ed().text().starts_with("\n// fn helper() {}"));
+    }
+
+    #[test]
+    fn the_editor_menu_goes_to_definitions() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-editor-definition", &[("a.rs", MENU_RS)]);
+        let mut app = tall_app(&root, Some("a.rs"));
+        let call = tall_find(&app, "helper();");
+        right_click(&mut app, call.0, call.1);
+        click_item(&mut app, "Go to Definition");
+        wait_until(&mut app, "the definition", |app| cursor(app).0 == 0);
+
+        // From the keyboard, at the cursor, the first item's selected.
+        cursor_to(&mut app, 4, 7);
+        let shift = Mods {
+            shift: true,
+            ..Mods::NONE
+        };
+        app.handle_key(Key::new(KeyCode::F(10), shift));
+        assert!(app.menu.is_some());
+        let (_, menu_y) = tall_find(&app, "│ Go to Definition");
+        assert_eq!(
+            menu_y,
+            call.1 + 2,
+            "below the cursor's row, past the border"
+        );
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the definition", |app| cursor(app).0 == 0);
+    }
+
+    #[test]
+    fn the_editor_menu_in_reader_mode_copies_and_leaves() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-editor-reader", &[("a.md", "# Title\n\nSome text.\n")]);
+        let mut app = tall_app(&root, Some("a.md"));
+        app.run(Command::ToggleReader, false);
+        let at = tall_find(&app, "Some text.");
+        right_click(&mut app, at.0, at.1);
+        let text = tall_screen(&app);
+        assert!(!text.contains("│ Copy"), "nothing selected\n{text}");
+        assert!(!text.contains("Go to Symbol"), "{text}");
+        click_item(&mut app, "Select All");
+        right_click(&mut app, at.0, at.1);
+        click_item(&mut app, "Copy");
+        assert!(app
+            .clipboard
+            .as_deref()
+            .is_some_and(|text| text.contains("Some text.")));
+        right_click(&mut app, at.0, at.1);
+        click_item(&mut app, "Exit Reader Mode");
+        assert!(!app.ed().reading());
     }
 
     #[test]
