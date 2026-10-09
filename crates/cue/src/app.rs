@@ -589,9 +589,8 @@ impl QueryInput for FileDialog {
 }
 
 impl App {
-    /// Shows `workspace`, with `file` open, or a new, unnamed buffer. Focus
-    /// starts in the editor when there is a file or no tree, in the tree
-    /// otherwise.
+    /// Shows `workspace`, with `file` open, or an empty panel. Focus starts
+    /// in the editor when there is a file or no tree, in the tree otherwise.
     pub fn new(
         workspace: Workspace,
         file: Option<PathBuf>,
@@ -613,7 +612,6 @@ impl App {
             Focus::Tree
         };
         let theme = Rc::new(Theme::new().map_err(|e| e.to_string())?);
-        // An image is shown over the unnamed buffer, which then goes.
         let (file, image) = match file {
             Some(file) if image::is_image(&file) => {
                 let image = ImageView::open(&file)
@@ -622,11 +620,14 @@ impl App {
             }
             file => (file, None),
         };
-        let (doc, notice) =
-            Document::open(file.clone(), theme.clone()).map_err(|reason| match &file {
-                Some(file) => format!("{}: {reason}", file.display()),
-                None => reason,
-            })?;
+        let (doc, notice) = match file {
+            Some(file) => {
+                let (doc, notice) = Document::open(Some(file.clone()), theme.clone())
+                    .map_err(|reason| format!("{}: {reason}", file.display()))?;
+                (Some(doc), notice)
+            }
+            None => (None, None),
+        };
         let mut app = App {
             files: FileIndex::new(&workspace),
             symbols: SymbolIndex::new(&workspace),
@@ -643,7 +644,7 @@ impl App {
             workspace,
             keymap: Keymap::new(&config.keys),
             tree,
-            documents: vec![doc.clone()],
+            documents: doc.iter().cloned().collect(),
             theme,
             terminal_colors: TerminalColors::default(),
             theme_shown: None,
@@ -710,13 +711,12 @@ impl App {
             .as_ref()
             .and_then(|path| fs::read(path).ok())
             .map(|bytes| document::content_hash(&bytes));
-        if doc.path().is_none() {
-            doc.untitled.set(1);
-        }
         app.layout();
-        app.active_panel_mut()
-            .show(&doc)
-            .map_err(|e| e.to_string())?;
+        if let Some(doc) = &doc {
+            app.active_panel_mut()
+                .show(doc)
+                .map_err(|e| e.to_string())?;
+        }
         if let Some(notice) = notice {
             app.show_message(notice, false);
         }
@@ -7229,7 +7229,7 @@ mod tests {
         let mut app = app(&root, None);
         assert_eq!(app.focus, Focus::Tree);
         type_text(&mut app, "x");
-        assert!(app.ed().is_blank(), "typing in the tree doesn't edit");
+        assert!(app.documents.is_empty(), "typing in the tree doesn't edit");
 
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Down);
@@ -7239,7 +7239,6 @@ mod tests {
             app.ed().path().as_deref(),
             Some(root.join("b.txt").as_path())
         );
-        assert_eq!(app.documents.len(), 1, "the blank buffer was replaced");
         let text = screen(&app);
         assert!(text.contains("beta"), "{text}");
         assert!(text.contains("b.txt"), "the status bar names the file");
@@ -7268,8 +7267,8 @@ mod tests {
         assert!(shown.contains("alpha"), "{shown}");
         assert!(shown.contains("Space to close"), "{shown}");
         assert_eq!(app.focus, Focus::Tree);
-        assert!(app.ed().is_blank(), "nothing was opened");
-        assert!(app.documents.iter().all(|doc| doc.path().is_none()));
+        assert!(app.active_panel().is_empty(), "nothing was opened");
+        assert!(app.documents.is_empty());
 
         // It follows the selection.
         key(&mut app, KeyCode::Down);
@@ -7359,7 +7358,7 @@ mod tests {
             matches!(ctrl(&mut app, 'q'), AppAction::Quit),
             "nothing unsaved"
         );
-        app.focus = Focus::Editor;
+        ctrl(&mut app, 'n');
         type_text(&mut app, "x");
         assert!(matches!(ctrl(&mut app, 'q'), AppAction::Continue));
         // An untitled file can't be saved from the alert.
@@ -8525,7 +8524,7 @@ mod tests {
         };
         let status = |app: &App| screen(app).lines().nth(9).unwrap_or("").to_string();
         assert!(
-            status(&app).starts_with(" main +1 -2  Ln 1, Col 1"),
+            status(&app).starts_with(" main +1 -2  "),
             "{}",
             status(&app)
         );
@@ -8543,11 +8542,7 @@ mod tests {
         assert_eq!(changes[1], " ▾ app-badge");
         assert!(changes[2].starts_with("     a.txt") && changes[2].ends_with('M'));
         assert!(changes[3].starts_with("     b.txt") && changes[3].ends_with('D'));
-        assert!(
-            status(&app).starts_with(" ‹ Files  Ln 1"),
-            "{}",
-            status(&app)
-        );
+        assert!(status(&app).starts_with(" ‹ Files  "), "{}", status(&app));
 
         // A file that's gone isn't opened as a new one.
         left_click(&mut app, 6, 3);
@@ -8576,7 +8571,7 @@ mod tests {
         left_click(&mut app, 3, 9);
         assert_eq!(app.sidebar, Sidebar::Files);
         assert!(
-            status(&app).starts_with(" main +1 -2  Ln 1"),
+            status(&app).starts_with(" main +1 -2  "),
             "{}",
             status(&app)
         );
@@ -8883,7 +8878,7 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("save-as", &[]);
         let mut app = app(&root, None);
-        app.focus = Focus::Editor;
+        ctrl(&mut app, 'n');
         type_text(&mut app, "hi");
         ctrl(&mut app, 's');
         assert_eq!(
@@ -8923,7 +8918,8 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("save-from-tree", &[("dir/a.txt", "")]);
         let mut app = app(&root, None);
-        assert_eq!(app.focus, Focus::Tree);
+        ctrl(&mut app, 'n');
+        app.focus = Focus::Tree;
         key(&mut app, KeyCode::Down);
         ctrl(&mut app, 's');
         assert!(app.dialog.is_some());
@@ -9132,7 +9128,7 @@ mod tests {
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.focus, Focus::Tree);
-        assert!(app.ed().is_blank());
+        assert!(app.active_panel().is_empty());
         let text = screen(&app);
         assert!(
             text.contains("Can't open: not valid UTF-8 (bin.dat)"),
@@ -9252,13 +9248,13 @@ mod tests {
         // A click moves Quick Look, not the panel.
         left_click(&mut app, 6, 2);
         assert_eq!(app.quick_look.as_ref().unwrap().path(), root.join("b.txt"));
-        assert!(app.ed().is_blank(), "the panel shows what it did");
-        assert!(app.documents.iter().all(|doc| doc.path().is_none()));
+        assert!(app.active_panel().is_empty(), "the panel shows what it did");
+        assert!(app.documents.is_empty());
         assert_eq!(app.focus, Focus::Tree);
 
         // Closing it leaves the panel alone too.
         key(&mut app, KeyCode::Esc);
-        assert!(app.ed().is_blank());
+        assert!(app.active_panel().is_empty());
 
         // A double click opens the file, and puts Quick Look away.
         key(&mut app, KeyCode::Char(' '));
@@ -9989,6 +9985,7 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("close-new", &[]);
         let mut app = self::app(&root, None);
+        ctrl(&mut app, 'n');
         ctrl(&mut app, '\\');
         with_mods(&mut app, KeyCode::Left, CTRL_ALT);
         assert!(app.ed().is_blank());

@@ -6,7 +6,8 @@
 - Show messages as toasts over the bottom right, not in the status bar (`6f30bf3`)
 - Ask for a tab's, terminal's, or session's new name, or a new branch's, in a box at the top rather than in the status bar (`6f30bf3`)
 - Drop messages that only say what's already on screen, such as "Copied 12 characters." or "Nothing to undo." (`6f30bf3`)
-- Start new terminals in the workspace folder with the tree's selection even when the tree isn't focused
+- Start new terminals in the workspace folder with the tree's selection even when the tree isn't focused (`bd63178`)
+- Open a folder to an empty panel rather than an untitled file
 
 ## v0.3.12 — 2026-10-08
 
