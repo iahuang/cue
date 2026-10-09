@@ -323,7 +323,12 @@ mod tests {
     fn a_root_inside_an_ignored_folder_is_listed() {
         let root = fixture(
             "nested-ignored",
-            &[".gitignore", "a.rs", "worktrees/feature/b.rs", "worktrees/other/c.rs"],
+            &[
+                ".gitignore",
+                "a.rs",
+                "worktrees/feature/b.rs",
+                "worktrees/other/c.rs",
+            ],
         );
         fs::write(root.join(".gitignore"), "worktrees/\n").unwrap();
         let workspace = Workspace::new([root.clone(), root.join("worktrees/feature")]).unwrap();
@@ -331,7 +336,11 @@ mod tests {
         index.wait();
         assert_eq!(
             texts(&index),
-            ["feature/b.rs", "nested-ignored/.gitignore", "nested-ignored/a.rs"]
+            [
+                "feature/b.rs",
+                "nested-ignored/.gitignore",
+                "nested-ignored/a.rs"
+            ]
         );
     }
 

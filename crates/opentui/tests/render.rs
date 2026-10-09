@@ -53,7 +53,10 @@ fn decodes_and_draws_images() {
     let image = Image::decode(RED_PNG).unwrap();
     assert_eq!((image.width(), image.height()), (4, 2));
     assert_eq!(image.format(), Some("PNG"));
-    assert!(matches!(Image::decode(b"not an image"), Err(Error::Image(_))));
+    assert!(matches!(
+        Image::decode(b"not an image"),
+        Err(Error::Image(_))
+    ));
 
     let mut renderer = Renderer::new(12, 4, Output::Memory).unwrap();
     {

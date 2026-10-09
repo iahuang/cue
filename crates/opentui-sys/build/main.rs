@@ -193,7 +193,10 @@ fn build_cxx_runtime(zig: &str, out_dir: &Path) -> Vec<PathBuf> {
     let dir = out_dir.join("cxx-runtime").join(version.trim());
     let cache = dir.join("zig-global-cache");
     let find = || -> Option<Vec<PathBuf>> {
-        CXX_RUNTIME.iter().map(|name| find_file(&cache, name)).collect()
+        CXX_RUNTIME
+            .iter()
+            .map(|name| find_file(&cache, name))
+            .collect()
     };
     if let Some(archives) = find() {
         return archives;

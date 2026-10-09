@@ -133,14 +133,11 @@ impl ImageView {
                 self.zoom_by(factor, (mouse.x, mouse.y), cell, area);
             }
             MouseKind::Press(MouseButton::Left) => {
-                self.drag = self
-                    .zoom
-                    .and(self.place(cell, area))
-                    .map(|placed| Drag {
-                        x: mouse.x,
-                        y: mouse.y,
-                        origin: placed.origin,
-                    });
+                self.drag = self.zoom.and(self.place(cell, area)).map(|placed| Drag {
+                    x: mouse.x,
+                    y: mouse.y,
+                    origin: placed.origin,
+                });
             }
             MouseKind::Drag(MouseButton::Left) => {
                 if let (Some(drag), Some(zoom)) = (self.drag, &mut self.zoom) {
@@ -335,7 +332,10 @@ mod tests {
         // 800x400 into 50x20 cells of 10x20: 500 pixels wide at most.
         assert_eq!(placed((800, 400), None, area(50, 20)), Some((50, 13, 0, 4)));
         // Tall: the height limits it.
-        assert_eq!(placed((400, 800), None, area(50, 20)), Some((20, 20, 15, 0)));
+        assert_eq!(
+            placed((400, 800), None, area(50, 20)),
+            Some((20, 20, 15, 0))
+        );
         // Small images keep their size.
         assert_eq!(placed((100, 40), None, area(50, 20)), Some((10, 2, 20, 9)));
         // At least a cell, and nothing in no room.
@@ -374,8 +374,14 @@ mod tests {
         // 80x20 cells in 50x20: it moves left and right only, as far as
         // its edges.
         assert_eq!(placed(image, zoom((0.0, 0.0)), area), Some((80, 20, 0, 0)));
-        assert_eq!(placed(image, zoom((-1000.0, 90.0)), area), Some((80, 20, -30, 0)));
-        assert_eq!(placed(image, zoom((70.0, -90.0)), area), Some((80, 20, 0, 0)));
+        assert_eq!(
+            placed(image, zoom((-1000.0, 90.0)), area),
+            Some((80, 20, -30, 0))
+        );
+        assert_eq!(
+            placed(image, zoom((70.0, -90.0)), area),
+            Some((80, 20, 0, 0))
+        );
         // Zoomed less than fitting, as the panel grew, it fits.
         let small = Some(Zoom {
             scale: 0.1,

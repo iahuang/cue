@@ -90,7 +90,9 @@ fn changed_lines(old: &str, new: &str) -> (usize, usize, usize) {
     } else {
         // From the first line break in it, if any.
         let tail = &a[a.len() - suffix..];
-        tail.iter().position(|&c| c == b'\n').map_or(0, |i| suffix - i)
+        tail.iter()
+            .position(|&c| c == b'\n')
+            .map_or(0, |i| suffix - i)
     };
     (start, a.len() - suffix, b.len() - suffix)
 }

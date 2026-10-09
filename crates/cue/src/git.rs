@@ -1796,13 +1796,13 @@ pub(crate) mod tests {
             assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
             assert_eq!(stashes(&dir), before, "an older stash is never popped");
             assert_eq!(staged(&dir), changes);
-            let head = git(&dir).args(["branch", "--show-current"]).output().unwrap();
+            let head = git(&dir)
+                .args(["branch", "--show-current"])
+                .output()
+                .unwrap();
             assert_eq!(head.stdout, b"main\n");
             if dirty {
-                assert_eq!(
-                    fs::read_to_string(dir.join("b.txt")).unwrap(),
-                    "unstaged\n"
-                );
+                assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "unstaged\n");
                 assert_eq!(
                     file_at(&dir, "", Path::new("b.txt")),
                     Base::Text("staged\n".into())
