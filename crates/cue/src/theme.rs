@@ -132,6 +132,8 @@ pub struct Theme {
     style: Rc<SyntaxStyle>,
     /// The find bar's matches: a background alone, so text keeps its color.
     pub find_match: u32,
+    /// A name Ctrl+click goes to the definition of: an underline alone.
+    pub link: u32,
     syntax: SyntaxStyles,
 }
 
@@ -140,6 +142,7 @@ impl Theme {
         let style = SyntaxStyle::new()?;
         let colors = colors();
         let find_match = style.register(FIND_MATCH, None, Some(colors.match_bg), Attributes::NONE);
+        let link = style.register(LINK, None, None, Attributes::UNDERLINE);
         let syntax = SYNTAX
             .iter()
             .zip(&colors.syntax)
@@ -151,6 +154,7 @@ impl Theme {
         Ok(Theme {
             style: Rc::new(style),
             find_match,
+            link,
             syntax,
         })
     }
@@ -190,6 +194,7 @@ impl Theme {
 }
 
 const FIND_MATCH: &str = "find.match";
+const LINK: &str = "definition.link";
 
 // --- the colors in use ---------------------------------------------------------
 

@@ -11,6 +11,7 @@ mod commit_view;
 mod config;
 mod context_menu;
 mod crash;
+mod definition;
 mod diff;
 mod document;
 mod editor;

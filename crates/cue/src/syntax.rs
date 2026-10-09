@@ -870,6 +870,15 @@ impl Highlighter {
         Some((self.text.as_str(), |byte| region_at(tree, byte)))
     }
 
+    /// The text as the tree has it, and the tree, brought up to date with
+    /// `buffer` first. `None` if it isn't parsed.
+    pub fn tree(&mut self, buffer: &EditBuffer) -> Option<(&str, &Tree)> {
+        if !self.catch_up(buffer) {
+            return None;
+        }
+        Some((self.text.as_str(), self.tree.as_ref()?))
+    }
+
     /// Reparses `buffer`'s text if it changed since. False, leaving it
     /// plain, if it's given up on.
     fn catch_up(&mut self, buffer: &EditBuffer) -> bool {

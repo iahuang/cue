@@ -64,6 +64,8 @@ pub enum Mode {
     Symbols,
     /// The symbols the workspace's files define.
     WorkspaceSymbols,
+    /// The definitions a name may refer to.
+    Definitions,
     /// The terminals, as listed among what was shown recently.
     Terminals,
     /// A repository's branches, to switch to, or a new one.
@@ -74,7 +76,9 @@ impl Mode {
     /// The character that starts a query for this mode.
     fn prefix(self) -> Option<char> {
         match self {
-            Mode::Files | Mode::Languages | Mode::Themes | Mode::Branches => None,
+            Mode::Files | Mode::Languages | Mode::Themes | Mode::Branches | Mode::Definitions => {
+                None
+            }
             Mode::Unsaved => Some('!'),
             Mode::Commands => Some('>'),
             Mode::Line => Some(':'),
@@ -194,8 +198,8 @@ impl Item {
     }
 
     /// `symbol`, defined in the file at `path`, which is `shown` as named
-    /// in the workspace.
-    pub fn workspace_symbol(symbol: Symbol, path: PathBuf, shown: &str) -> Item {
+    /// in the workspace; or without a path, in the file on screen.
+    pub fn workspace_symbol(symbol: Symbol, path: Option<PathBuf>, shown: &str) -> Item {
         let name = symbol.name.chars().count();
         let text = format!("{} {shown}:{}", symbol.name, symbol.line + 1);
         Item {
@@ -203,7 +207,7 @@ impl Item {
             text,
             detail: symbol.kind.to_string(),
             color: symbols::color(symbol.kind),
-            choice: Choice::Symbol(Some(path), symbol.line, symbol.bytes),
+            choice: Choice::Symbol(path, symbol.line, symbol.bytes),
         }
     }
 
@@ -289,6 +293,8 @@ pub struct Picker {
     workspace_symbols: Rc<Vec<Item>>,
     /// Whether the workspace's symbols are still being indexed.
     indexing: bool,
+    /// The definitions a name may refer to, best first.
+    definitions: Vec<Item>,
     /// The workspace's symbols were asked for, and not yet given.
     wants_symbols: bool,
     /// What `:` and a line number go to, in line mode.
@@ -387,6 +393,7 @@ impl Picker {
             outline: None,
             workspace_symbols: Rc::new(Vec::new()),
             indexing: false,
+            definitions: Vec::new(),
             wants_symbols: false,
             line: Vec::new(),
             position: None,
@@ -432,7 +439,10 @@ impl Picker {
     /// Switches to listing `mode`, keeping what was typed.
     pub fn set_mode(&mut self, mode: Mode) {
         let needle = self.needle().to_string();
-        let fixed = matches!(mode, Mode::Languages | Mode::Themes | Mode::Branches);
+        let fixed = matches!(
+            mode,
+            Mode::Languages | Mode::Themes | Mode::Branches | Mode::Definitions
+        );
         self.fixed_mode = fixed.then_some(mode);
         self.query = match mode.prefix() {
             Some(prefix) => format!("{prefix}{needle}"),
@@ -476,6 +486,12 @@ impl Picker {
         if self.mode() == Mode::WorkspaceSymbols {
             self.refilter(selected);
         }
+    }
+
+    /// Lists `items` as the definitions, in order, selecting the first.
+    pub fn set_definitions(&mut self, items: Vec<Item>) {
+        self.definitions = items;
+        self.query_changed();
     }
 
     /// Lists `items` as the branches, in order, selecting the first.
@@ -760,6 +776,7 @@ impl Picker {
             Mode::Line => (&self.line, &[]),
             Mode::Symbols => (self.outline.as_deref().unwrap_or_default(), &[]),
             Mode::WorkspaceSymbols => (&self.workspace_symbols, &[]),
+            Mode::Definitions => (&self.definitions, &[]),
             Mode::Terminals => (&self.terminals, &[]),
             Mode::Branches => (&self.branches, &self.new_branch),
         }
@@ -946,6 +963,7 @@ impl Picker {
             Mode::Line => ("Go to Line", "lines"),
             Mode::Symbols => ("Go to Symbol in File", "symbols"),
             Mode::WorkspaceSymbols => ("Go to Symbol in Workspace", "symbols"),
+            Mode::Definitions => ("Go to Definition", "definitions"),
             Mode::Terminals => ("Go to Terminal", "terminals"),
             Mode::Branches => ("Switch Branch", "branches"),
         };
@@ -991,6 +1009,7 @@ impl Picker {
                 Mode::Line => "Enter a line number or line:column.",
                 Mode::Symbols => "Search symbols in this file",
                 Mode::WorkspaceSymbols => "Search symbols in the workspace",
+                Mode::Definitions => "Search definitions",
                 Mode::Terminals => "Search terminals by name or running program.",
                 Mode::Branches => "Search branches, or name a new one.",
             };

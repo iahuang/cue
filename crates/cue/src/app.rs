@@ -80,6 +80,7 @@ use crate::commit_diff::{CommitDiff, Outcome};
 use crate::commit_view::{CantCommit, CommitAction, CommitView};
 use crate::config::{self, Config, MIN_TREE_WIDTH};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
+use crate::definition::{self, Found, Reference};
 use crate::document::{self, Disk, DiskChange, Document, Spot};
 use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
@@ -91,6 +92,7 @@ use crate::indent::{self, Indent};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::input_box::{InputAction, InputBox};
 use crate::keymap::{Command, Context, Keymap};
+use crate::language::Language;
 use crate::layout::{self, Axis, Direction, Layout, PanelId, Rect};
 use crate::line_edit::Edit;
 use crate::location::{self, Position, Target};
@@ -103,7 +105,7 @@ use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::session::{self, Session, Shown};
 use crate::status::{self, GitBadge, StatusButton};
-use crate::symbols::{self, SymbolIndex};
+use crate::symbols::{self, Symbol, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
 use crate::theme::{self, TerminalColors, Theme, ThemeId, ThemeSetting};
@@ -124,6 +126,16 @@ const RECENT_FILES: usize = 50;
 const SESSION_INTERVAL: Duration = Duration::from_secs(1);
 /// And its terminals' screens at most this often, but when it's left.
 const SCREENS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Go to Definition, asked for before the workspace's symbols were first
+/// indexed: it goes once they are, if the editor is as it was.
+struct PendingDefinition {
+    doc: Weak<Document>,
+    /// The text's content epoch, and the cursor's row and column, then.
+    epoch: u64,
+    cursor: (u32, u32),
+    reference: Reference,
+}
 
 /// The place in a file to jump back to (see [`App::jump_to_mark`]).
 #[derive(Debug, Clone)]
@@ -433,6 +445,11 @@ pub struct App {
     /// The picker asked for the workspace's symbols before its files were
     /// all listed: index them once they are.
     index_symbols_after_listing: bool,
+    /// Go to Definition, waiting for the workspace's symbols.
+    pending_definition: Option<PendingDefinition>,
+    /// The panel whose editor underlines a name, with Ctrl held, to go to
+    /// the definition of.
+    underlined: Option<PanelId>,
     /// Hears of files other programs change, in the tree's open folders
     /// and those of open files, and of commits and the like in the `.git`
     /// folders of the workspace's repositories.
@@ -657,6 +674,8 @@ impl App {
             branch_root: None,
             sidebar: Sidebar::Files,
             index_symbols_after_listing: false,
+            pending_definition: None,
+            underlined: None,
             watcher: Watcher::new(),
             watching: None,
             workspace,
@@ -757,6 +776,7 @@ impl App {
 
     pub fn handle_key(&mut self, key: Key) -> AppAction {
         self.hover = None;
+        self.clear_underline();
         let action = self.dispatch_key(key);
         self.after_input();
         action
@@ -1074,6 +1094,7 @@ impl App {
             }
             Command::GoToSymbol => self.show_picker(Mode::Symbols),
             Command::GoToWorkspaceSymbol => self.show_picker(Mode::WorkspaceSymbols),
+            Command::GoToDefinition => self.go_to_definition(),
             Command::GoToTerminal => self.show_picker(Mode::Terminals),
             Command::Palette => self.show_picker(Mode::Commands),
             Command::SearchWorkspace => self.show_search(),
@@ -1334,6 +1355,7 @@ impl App {
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> AppAction {
         self.hover = (!matches!(mouse.kind, MouseKind::Press(_) | MouseKind::Drag(_)))
             .then_some((mouse.x, mouse.y));
+        self.underline_reference(mouse);
         if mouse.kind == MouseKind::Move {
             // Motion only updates appearance; it cannot focus or select anything.
             return AppAction::Continue;
@@ -1598,6 +1620,11 @@ impl App {
                     // As Cmd+click in terminals on macOS, which terminals
                     // keep for themselves.
                     if mouse.mods.ctrl && self.open_from_terminal(mouse.x, mouse.y) {
+                        self.mouse_target = None;
+                        return AppAction::Continue;
+                    }
+                    // As in VS Code.
+                    if mouse.mods.ctrl && self.click_to_definition(mouse.x, mouse.y) {
                         self.mouse_target = None;
                         return AppAction::Continue;
                     }
@@ -2211,6 +2238,12 @@ impl App {
             if let Some(picker) = &mut self.picker {
                 picker.set_workspace_symbols(self.symbols.items(), self.symbols.indexing());
                 changed = true;
+            }
+            if !self.symbols.indexing() {
+                if let Some(pending) = self.pending_definition.take() {
+                    self.go_to_pending_definition(pending);
+                    changed = true;
+                }
             }
         }
         self.recovery
@@ -2956,14 +2989,7 @@ impl App {
                         self.go_to(position);
                     }
                     Choice::Symbol(path, line, bytes) => {
-                        let go = |editor: &mut Editor| editor.select_in_line(line, bytes);
-                        let shown = match &path {
-                            Some(path) => self.open_and(path, go),
-                            None => self.editor_mut().map(go).is_some(),
-                        };
-                        if shown {
-                            self.focus = Focus::Editor;
-                        }
+                        self.go_to_symbol(path.as_deref(), line, bytes)
                     }
                     Choice::Theme(id) => self.choose_theme(id),
                     Choice::Language(name) => {
@@ -3047,6 +3073,231 @@ impl App {
             .filter_map(|item| item.path().map(Path::to_path_buf))
             .collect();
         self.symbols.refresh(files);
+    }
+
+    /// Selects the name of a symbol, on `line` in its `bytes` there, in the
+    /// file at `path`, or without one, in the active editor.
+    fn go_to_symbol(&mut self, path: Option<&Path>, line: u32, bytes: std::ops::Range<usize>) {
+        let go = |editor: &mut Editor| editor.select_in_line(line, bytes);
+        let shown = match path {
+            Some(path) => self.open_and(path, go),
+            None => self.editor_mut().map(go).is_some(),
+        };
+        if shown {
+            self.focus = Focus::Editor;
+        }
+    }
+
+    // --- go to definition -------------------------------------------------------
+
+    /// Goes to the definition of the name at the cursor: straight there if
+    /// one fits best, or else lists them to pick from.
+    fn go_to_definition(&mut self) {
+        let Some(editor) = self.editor().filter(|e| !e.reading() && !e.diffing()) else {
+            return;
+        };
+        let doc = Rc::clone(editor.document());
+        let cursor = editor.place();
+        let Some(reference) = reference_in(&doc, |text| editor.cursor_byte(text), true) else {
+            let message = match doc.language.get() {
+                Some(language) if tagged(language) => "No name at the cursor.".to_string(),
+                Some(language) => format!("Go to Definition doesn't know {}.", language.name),
+                None => "Go to Definition doesn't know plain text.".to_string(),
+            };
+            self.show_message(message, false);
+            return;
+        };
+        // Brought up to date for next time, or indexed for the first.
+        if !self.symbols.started() || !self.symbols.indexing() {
+            self.index_symbols();
+        }
+        if self.symbols.indexing() {
+            self.pending_definition = Some(PendingDefinition {
+                doc: Rc::downgrade(&doc),
+                epoch: doc.buffer.content_epoch(),
+                cursor: (cursor.0, cursor.1),
+                reference,
+            });
+            self.show_message("Indexing symbols…", false);
+            return;
+        }
+        self.show_definition(&doc, &reference);
+    }
+
+    /// Goes to the definition asked for while the workspace's symbols were
+    /// first indexed, unless the editor or its text changed since, or a
+    /// popup is open.
+    fn go_to_pending_definition(&mut self, pending: PendingDefinition) {
+        let Some(doc) = pending.doc.upgrade() else {
+            return;
+        };
+        let same = self.editor().is_some_and(|editor| {
+            let (row, col, _) = editor.place();
+            Rc::ptr_eq(editor.document(), &doc) && (row, col) == pending.cursor
+        });
+        if !same || self.popup_open() || doc.buffer.content_epoch() != pending.epoch {
+            return;
+        }
+        self.show_definition(&doc, &pending.reference);
+        self.after_input();
+    }
+
+    /// Goes to the definition of `reference`, a name in `doc`, if one fits
+    /// best, or else lists them to pick from.
+    fn show_definition(&mut self, doc: &Rc<Document>, reference: &Reference) {
+        let found = self.definitions(doc, reference);
+        if let Some(best) = found.best() {
+            let (line, bytes) = (best.symbol.line, best.symbol.bytes.clone());
+            self.go_to_symbol(best.path.clone().as_deref(), line, bytes);
+            return;
+        }
+        let name = &reference.name;
+        if found.candidates.is_empty() {
+            let message = match found.at_definition {
+                true => format!("This is where “{name}” is defined."),
+                false => format!("No definition of “{name}” found."),
+            };
+            self.show_message(message, false);
+            return;
+        }
+        let items = found
+            .candidates
+            .into_iter()
+            .map(|candidate| {
+                let shown = match &candidate.path {
+                    Some(path) => self.workspace.display_path(path),
+                    None => doc.untitled_name().unwrap_or_default(),
+                };
+                Item::workspace_symbol(candidate.symbol, candidate.path, &shown)
+            })
+            .collect();
+        self.show_picker(Mode::Definitions);
+        if let Some(picker) = &mut self.picker {
+            picker.set_definitions(items);
+        }
+    }
+
+    /// The definitions `reference`, a name in `doc`, may refer to: in the
+    /// file, and in the workspace's files in its language or one of its
+    /// family (see [`definition::family`]). Open files with unsaved changes
+    /// count as they are, not as they were indexed.
+    fn definitions(&self, doc: &Rc<Document>, reference: &Reference) -> Found {
+        let Some(language) = doc.language.get() else {
+            return Found::default();
+        };
+        let family = definition::family(language.name);
+        let in_family = |path: &Path| {
+            crate::language::detect(Some(path), String::new)
+                .is_some_and(|language| definition::family(language.name) == family)
+        };
+        let unsaved: Vec<(PathBuf, &Rc<Document>)> = self
+            .documents
+            .iter()
+            .filter(|other| !Rc::ptr_eq(other, doc) && other.is_modified())
+            .filter_map(|other| Some((other.path()?, other)))
+            .filter(|(path, _)| in_family(path))
+            .collect();
+        let named = |symbol: &&Symbol| symbol.name == reference.name;
+        let mut elsewhere: Vec<(PathBuf, Symbol)> = self
+            .symbols
+            .named(&reference.name)
+            .into_iter()
+            .filter(|(path, _)| in_family(path) && !unsaved.iter().any(|(p, _)| p == path))
+            .collect();
+        for (path, other) in &unsaved {
+            let outline = other.outline();
+            let found = outline.iter().filter(named).cloned();
+            elsewhere.extend(found.map(|symbol| (path.clone(), symbol)));
+        }
+        definition::rank(reference, doc.path().as_deref(), &doc.outline(), elsewhere)
+    }
+
+    /// Goes to the definition of the name at screen column `x`, row `y`, in
+    /// the active editor, putting the cursor there first, as a click does.
+    /// False if there's no name there.
+    fn click_to_definition(&mut self, x: u32, y: u32) -> bool {
+        let Some(editor) = self.editor() else {
+            return false;
+        };
+        let doc = Rc::clone(editor.document());
+        let mut byte = None;
+        let at = |text: &str| {
+            byte = editor.byte_at(x, y, text);
+            byte
+        };
+        if reference_in(&doc, at, false).is_none() {
+            return false;
+        }
+        self.clear_underline();
+        if let (Some(editor), Some(byte)) = (self.editor_mut(), byte) {
+            editor.put_cursor_at(byte);
+        }
+        self.focus = Focus::Editor;
+        self.go_to_definition();
+        true
+    }
+
+    /// With Ctrl held, underlines the name under the pointer in an editor,
+    /// if it has a definition to go to, as Ctrl+click does. Any other
+    /// mouse event takes the underline away.
+    fn underline_reference(&mut self, mouse: Mouse) {
+        let ctrl_move = mouse.kind == MouseKind::Move && mouse.mods.ctrl && !self.popup_open();
+        let panel = match ctrl_move
+            .then(|| self.target_at(mouse.x, mouse.y))
+            .flatten()
+        {
+            Some(MouseTarget::Panel(id)) => Some(id),
+            _ => None,
+        };
+        let bytes = panel.and_then(|id| self.reference_under(id, mouse.x, mouse.y));
+        if self.underlined != panel {
+            self.clear_underline();
+        }
+        let Some(id) = panel else {
+            return;
+        };
+        let underlined = bytes.is_some().then_some(id);
+        if let Some(editor) = self.tab_mut().panel_mut(id).and_then(Panel::editor_mut) {
+            editor.underline(bytes);
+            self.underlined = underlined;
+        }
+    }
+
+    /// The bytes of the name at screen column `x`, row `y`, in panel `id`'s
+    /// editor, if it has a definition to go to.
+    fn reference_under(&mut self, id: PanelId, x: u32, y: u32) -> Option<std::ops::Range<usize>> {
+        let editor = self.tab().panels.iter().find(|p| p.id == id)?.editor()?;
+        let doc = Rc::clone(editor.document());
+        let reference = reference_in(&doc, |text| editor.byte_at(x, y, text), false)?;
+        if editor.underlined() == Some(&reference.bytes) {
+            return Some(reference.bytes);
+        }
+        if !self.symbols.started() {
+            self.index_symbols();
+        }
+        let found = self.definitions(&doc, &reference);
+        (!found.candidates.is_empty()).then_some(reference.bytes)
+    }
+
+    /// Takes away the underline of a name to go to the definition of.
+    fn clear_underline(&mut self) {
+        let Some(id) = self.underlined.take() else {
+            return;
+        };
+        let panel = tab::all_panels_mut(&mut self.tabs).find(|panel| panel.id == id);
+        if let Some(editor) = panel.and_then(Panel::editor_mut) {
+            editor.underline(None);
+        }
+    }
+
+    /// Whether a popup is open over the panels.
+    fn popup_open(&self) -> bool {
+        self.alert.is_some()
+            || self.input.is_some()
+            || self.menu.is_some()
+            || self.search.is_some()
+            || self.picker.is_some()
+            || self.dialog.is_some()
     }
 
     /// Puts the active editor's cursor at `position`.
@@ -7215,6 +7466,39 @@ fn file_name(path: &Path) -> String {
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
+}
+
+/// Whether cue finds definitions in `language`: it has a tags query.
+fn tagged(language: &Language) -> bool {
+    language
+        .syntax
+        .as_ref()
+        .is_some_and(|syntax| !syntax.tags.is_empty())
+}
+
+/// The name in `doc` at the byte of its text `at` finds, or with `before`,
+/// just before it too, as at the end of a name, if cue finds definitions in
+/// its language.
+fn reference_in(
+    doc: &Document,
+    at: impl FnOnce(&str) -> Option<usize>,
+    before: bool,
+) -> Option<Reference> {
+    if !doc.language.get().is_some_and(tagged) {
+        return None;
+    }
+    let mut syntax = doc.syntax.borrow_mut();
+    let (text, tree) = syntax.as_mut()?.tree(&doc.buffer)?;
+    let byte = at(text)?;
+    let previous = text[..byte]
+        .chars()
+        .next_back()
+        .map(|c| byte - c.len_utf8());
+    definition::reference_at(tree, text, byte).or_else(|| {
+        previous
+            .filter(|_| before)
+            .and_then(|byte| definition::reference_at(tree, text, byte))
+    })
 }
 
 #[cfg(test)]
@@ -12737,5 +13021,191 @@ mod tests {
         key(&mut app, KeyCode::PageDown);
         key(&mut app, KeyCode::PageDown);
         assert_eq!(other_panel(&app).editor().unwrap().place().2, before);
+    }
+
+    /// Far enough from where it's used for going there to be a jump.
+    const DEFINITIONS_MAIN: &str = "\
+mod shapes;
+
+fn main() {
+    helper();
+    shapes::area();
+    missing();
+    shared();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+fn helper() {}
+";
+
+    /// A workspace whose `src/main.rs` uses what it and its other files
+    /// define, open on it, with its symbols indexed.
+    fn definitions_app(name: &str) -> (PathBuf, App) {
+        let root = fixture(
+            name,
+            &[
+                ("src/main.rs", DEFINITIONS_MAIN),
+                ("src/shapes.rs", "pub fn area() {}\n"),
+                ("src/a.rs", "pub fn shared() {}\n"),
+                ("src/b.rs", "pub fn shared() {}\n"),
+                ("notes.py", "def helper():\n    pass\n"),
+            ],
+        );
+        let mut app = app(&root, Some("src/main.rs"));
+        app.index_symbols();
+        wait_until(&mut app, "the symbols", |app| !app.symbols.indexing());
+        (root, app)
+    }
+
+    /// Puts the cursor at `line` and `column`, 1-based.
+    fn cursor_to(app: &mut App, line: u32, column: u32) {
+        app.ed_mut().go_to(Position::printed(line, Some(column)));
+        app.after_input();
+    }
+
+    fn cursor(app: &App) -> (u32, u32) {
+        let (row, col, _) = app.ed().place();
+        (row, col)
+    }
+
+    #[test]
+    fn go_to_definition_in_the_file_and_the_workspace() {
+        let _serial = crate::test_serial();
+        let (root, mut app) = definitions_app("definitions");
+        let f12 = |app: &mut App| key(app, KeyCode::F(12));
+
+        // In the file, from the end of the name, and back.
+        cursor_to(&mut app, 4, 11);
+        f12(&mut app);
+        assert_eq!(cursor(&app), (20, 9));
+        assert_eq!(app.ed().selected_text().as_deref(), Some("helper"));
+        ctrl(&mut app, '-');
+        assert_eq!(cursor(&app), (3, 10));
+
+        // In another file, by the module it's qualified with, and back.
+        cursor_to(&mut app, 5, 13);
+        f12(&mut app);
+        assert_eq!(shown_name(&app).as_deref(), Some("shapes.rs"));
+        assert_eq!(cursor(&app).0, 0);
+        ctrl(&mut app, '-');
+        assert_eq!(shown_name(&app).as_deref(), Some("main.rs"));
+        assert_eq!(cursor(&app), (4, 12));
+
+        // Defined nowhere, or right here.
+        cursor_to(&mut app, 6, 5);
+        f12(&mut app);
+        assert_eq!(
+            status_message(&app).as_deref(),
+            Some("No definition of “missing” found.")
+        );
+        cursor_to(&mut app, 21, 5);
+        f12(&mut app);
+        assert_eq!(
+            status_message(&app).as_deref(),
+            Some("This is where “helper” is defined.")
+        );
+
+        // Defined as well in two files: pick one.
+        cursor_to(&mut app, 7, 5);
+        f12(&mut app);
+        let picker = app.picker.as_ref().expect("a list of definitions");
+        assert_eq!(picker.mode(), Mode::Definitions);
+        let Some(Choice::Symbol(Some(path), 0, _)) = picker.selected_choice() else {
+            panic!("{:?}", picker.selected_choice());
+        };
+        assert_eq!(path, &root.join("src/a.rs"));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_name(&app).as_deref(), Some("a.rs"));
+    }
+
+    #[test]
+    fn go_to_definition_waits_for_the_first_indexing() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "definitions-waiting",
+            &[
+                ("main.rs", "fn main() { area(); }\n"),
+                ("shapes.rs", "pub fn area() {}\n"),
+            ],
+        );
+        let mut app = app(&root, Some("main.rs"));
+        assert!(!app.symbols.started());
+        cursor_to(&mut app, 1, 14);
+        key(&mut app, KeyCode::F(12));
+        assert_eq!(status_message(&app).as_deref(), Some("Indexing symbols…"));
+        wait_until(&mut app, "the definition", |app| {
+            shown_name(app).as_deref() == Some("shapes.rs")
+        });
+    }
+
+    fn ctrl_mouse(app: &mut App, kind: MouseKind, (x, y): (u32, u32)) {
+        let mouse = Mouse {
+            kind,
+            x,
+            y,
+            mods: Mods::CTRL,
+        };
+        app.handle_mouse(mouse, Instant::now());
+    }
+
+    /// Whether the character on screen at `at` is underlined.
+    fn underlined(app: &App, (x, y): (u32, u32)) -> bool {
+        let frame = OwnedBuffer::new(80, 10, false, WidthMethod::Unicode, "test").unwrap();
+        app.draw(&frame);
+        frame
+            .attributes_at(x, y)
+            .is_some_and(|attributes| attributes.contains(Attributes::UNDERLINE))
+    }
+
+    #[test]
+    fn ctrl_hover_underlines_names_and_ctrl_click_goes_to_their_definitions() {
+        let _serial = crate::test_serial();
+        let (_root, mut app) = definitions_app("definitions-mouse");
+        let call = find_on_screen(&app, "helper();").unwrap();
+        let after = (call.0 + 5, call.1);
+        let missing = find_on_screen(&app, "missing();").unwrap();
+        let keyword = find_on_screen(&app, "fn main").unwrap();
+
+        // With Ctrl, the name under the pointer is underlined, all of it,
+        // if it's defined somewhere.
+        ctrl_mouse(&mut app, MouseKind::Move, (call.0 + 2, call.1));
+        assert!(underlined(&app, call) && underlined(&app, after));
+        assert!(!underlined(&app, (call.0 + 6, call.1)));
+        ctrl_mouse(&mut app, MouseKind::Move, missing);
+        assert!(!underlined(&app, call) && !underlined(&app, missing));
+        ctrl_mouse(&mut app, MouseKind::Move, keyword);
+        assert!(!underlined(&app, keyword));
+
+        // Without Ctrl, or once a key is pressed, it isn't.
+        ctrl_mouse(&mut app, MouseKind::Move, call);
+        assert!(underlined(&app, call));
+        mouse_at(&mut app, MouseKind::Move, call.0, call.1);
+        assert!(!underlined(&app, call));
+        ctrl_mouse(&mut app, MouseKind::Move, call);
+        key(&mut app, KeyCode::Right);
+        assert!(!underlined(&app, call));
+
+        // Ctrl+click goes there; back is where it clicked.
+        ctrl_mouse(&mut app, MouseKind::Press(MouseButton::Left), after);
+        ctrl_mouse(&mut app, MouseKind::Release(MouseButton::Left), after);
+        assert_eq!(cursor(&app), (20, 9));
+        ctrl(&mut app, '-');
+        assert_eq!(cursor(&app), (3, 9));
+
+        // Off a name, it's a click.
+        let keyword = find_on_screen(&app, "fn main").unwrap();
+        ctrl_mouse(&mut app, MouseKind::Press(MouseButton::Left), keyword);
+        ctrl_mouse(&mut app, MouseKind::Release(MouseButton::Left), keyword);
+        assert_eq!(cursor(&app), (2, 0));
     }
 }

@@ -53,6 +53,11 @@ pub struct Viewport {
 pub struct VisibleLine {
     pub line: u32,
     pub wrap: u32,
+    /// The cursor offset (see [`LogicalCursor::offset`]) where the row
+    /// starts; without wrapping, where the line does.
+    pub start: u32,
+    /// The columns of text the row has.
+    pub width: u32,
 }
 
 fn local_selection_flags(move_cursor: bool, behavior: SelectionBehavior) -> u8 {
@@ -791,22 +796,31 @@ impl EditorView<'_> {
             width_cols_max: 0,
         };
         unsafe { sys::editorViewGetLineInfoDirect(self.handle, &mut info) };
-        let len = info.sources_len.min(info.wraps_len) as usize;
+        let len = info
+            .sources_len
+            .min(info.wraps_len)
+            .min(info.start_cols_len)
+            .min(info.width_cols_len) as usize;
         if len == 0 {
             return Vec::new();
         }
         // The arrays belong to the view's layout cache, which stays put until
         // the next layout; copy them out now.
-        let (sources, wraps) = unsafe {
+        let (sources, wraps, starts, widths) = unsafe {
             (
                 std::slice::from_raw_parts(info.sources_ptr, len),
                 std::slice::from_raw_parts(info.wraps_ptr, len),
+                std::slice::from_raw_parts(info.start_cols_ptr, len),
+                std::slice::from_raw_parts(info.width_cols_ptr, len),
             )
         };
-        sources
-            .iter()
-            .zip(wraps)
-            .map(|(&line, &wrap)| VisibleLine { line, wrap })
+        (0..len)
+            .map(|i| VisibleLine {
+                line: sources[i],
+                wrap: wraps[i],
+                start: starts[i],
+                width: widths[i],
+            })
             .collect()
     }
 

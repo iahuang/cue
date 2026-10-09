@@ -66,6 +66,8 @@ pub fn current_match() -> SelectionColors {
 }
 /// Tags the find bar's highlights.
 const FIND_HIGHLIGHTS: u16 = 1;
+/// Tags the underline of a name to go to the definition of.
+const LINK_HIGHLIGHTS: u16 = 3;
 
 /// Line numbers are hidden when they would leave the text less room than this.
 const MIN_TEXT_WIDTH: u32 = 20;
@@ -147,6 +149,8 @@ pub struct Editor {
     jumped: Option<(u32, u32)>,
     /// Where the cursor was when the find bar opened, while it's open.
     find_start: Option<(u32, u32)>,
+    /// The bytes of the name underlined to go to the definition of, if any.
+    underlined: Option<Range<usize>>,
 }
 
 impl Editor {
@@ -194,6 +198,7 @@ impl Editor {
             seen: Cell::new(None),
             jumped: None,
             find_start: None,
+            underlined: None,
         };
         editor.attach();
         Ok(editor)
@@ -448,6 +453,106 @@ impl Editor {
     /// whether it went far enough to go back to.
     pub fn take_jump(&mut self) -> Option<(u32, u32)> {
         self.jumped.take()
+    }
+
+    // --- names, for Go to Definition -----------------------------------------
+
+    /// The byte of `text`, the buffer's text, shown at screen column `x` and
+    /// row `y`: `None` off the text, or past the end of its line, or in
+    /// reader or diff mode.
+    pub fn byte_at(&self, x: u32, y: u32, text: &str) -> Option<usize> {
+        if self.reading() || self.diffing() {
+            return None;
+        }
+        if let Some((find_x, width, rows)) = self.find_area() {
+            if (find_x..find_x + width).contains(&x) && (self.y..self.y + rows).contains(&y) {
+                return None;
+            }
+        }
+        let (gutter, _, height) = self.text_area();
+        let column = x.checked_sub(self.x + gutter)?;
+        let row = y.checked_sub(self.y).filter(|&row| row < height)?;
+        let shown = *self.view.visible_lines().get(row as usize)?;
+        let column = match self.wrap {
+            WrapMode::None => column + self.view.viewport().x,
+            _ => column,
+        };
+        if column >= shown.width {
+            return None;
+        }
+        self.byte_in_line(text, shown.line, shown.start + column)
+    }
+
+    /// The byte of `text`, the buffer's text, the cursor is at.
+    pub fn cursor_byte(&self, text: &str) -> Option<usize> {
+        let (row, col) = self.cursor();
+        self.byte_in_line(text, row, self.buffer.position_to_offset(row, col))
+    }
+
+    /// The byte of `text`, the buffer's text, where the character at cursor
+    /// offset `offset` in line `line` starts, or past them all, the line's
+    /// end.
+    fn byte_in_line(&self, text: &str, line: u32, offset: u32) -> Option<usize> {
+        let start = match line {
+            0 => 0,
+            line => text.match_indices('\n').nth(line as usize - 1)?.0 + 1,
+        };
+        let end = text[start..]
+            .find('\n')
+            .map_or(text.len(), |end| start + end);
+        let bytes: Vec<u32> = text[start..end]
+            .char_indices()
+            .map(|(byte, _)| (start + byte) as u32)
+            .chain([end as u32])
+            .collect();
+        let cursors = self.buffer.bytes_to_cursors(&bytes);
+        let after = cursors.partition_point(|cursor| cursor.offset <= offset);
+        Some(bytes[after.saturating_sub(1)] as usize)
+    }
+
+    /// Puts the cursor at byte `byte` of the text, as clicking there does,
+    /// but without a jump for the panel's history: what's done there is
+    /// one.
+    pub fn put_cursor_at(&mut self, byte: usize) {
+        self.attach();
+        self.history().break_group();
+        self.anchor = None;
+        self.view.clear_selection();
+        if let Some(cursor) = self.buffer.bytes_to_cursors(&[byte as u32]).first() {
+            self.buffer.set_cursor(cursor.row, cursor.col);
+        }
+    }
+
+    /// Underlines `bytes` of the text, a name to go to the definition of,
+    /// or with `None`, nothing.
+    pub fn underline(&mut self, bytes: Option<Range<usize>>) {
+        if self.underlined == bytes {
+            return;
+        }
+        match &bytes {
+            Some(bytes) => {
+                let ends = self
+                    .buffer
+                    .bytes_to_cursors(&[bytes.start as u32, bytes.end as u32]);
+                let highlight = Highlight {
+                    line: ends[0].row,
+                    start: ends[0].col,
+                    end: ends[1].col,
+                    style: self.doc.theme.link,
+                    priority: 2,
+                    tag: LINK_HIGHLIGHTS,
+                };
+                self.buffer
+                    .replace_highlights(LINK_HIGHLIGHTS, &[highlight]);
+            }
+            None => self.buffer.remove_highlights(LINK_HIGHLIGHTS),
+        }
+        self.underlined = bytes;
+    }
+
+    /// The bytes of the name underlined, if any.
+    pub fn underlined(&self) -> Option<&Range<usize>> {
+        self.underlined.as_ref()
     }
 
     /// Scrolls the cursor's row a third of the way down if it was off screen
@@ -2346,6 +2451,9 @@ fn wrap_mode(wrap: bool) -> WrapMode {
 
 impl Drop for Editor {
     fn drop(&mut self) {
+        if self.underlined.is_some() {
+            self.buffer.remove_highlights(LINK_HIGHLIGHTS);
+        }
         self.doc.forget(self.id);
     }
 }

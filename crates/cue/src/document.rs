@@ -28,6 +28,7 @@ use crate::git::Tracked;
 use crate::history::{EditKind, History};
 use crate::indent::Indent;
 use crate::language::{self, Language};
+use crate::symbols::{self, Symbol};
 use crate::syntax::Highlighter;
 use crate::theme::{self, Theme};
 
@@ -170,6 +171,16 @@ pub struct Document {
     /// What git says of the file, if it's in a repository, as the app last
     /// heard (see [`Document::set_tracked`]).
     tracked: RefCell<Option<Rc<Tracked>>>,
+    /// What the text defines, as last outlined (see [`Document::outline`]).
+    outline: RefCell<Option<Outline>>,
+}
+
+/// What a document's text defines, as of its content epoch, in the
+/// language it was in then.
+struct Outline {
+    epoch: u64,
+    language: &'static str,
+    symbols: Rc<Vec<Symbol>>,
 }
 
 /// A new id, for an editor or a [`Spot`]: none is used twice.
@@ -327,6 +338,7 @@ impl Document {
             on_disk: RefCell::default(),
             saved: RefCell::new(Saved::of(&text)),
             tracked: RefCell::default(),
+            outline: RefCell::default(),
         }
     }
 
@@ -519,6 +531,28 @@ impl Document {
     /// The whole text, with `\n` line breaks.
     pub fn text(&self) -> String {
         self.buffer.text()
+    }
+
+    /// What the text defines, in order (see [`symbols::outline`]), outlined
+    /// again only once it changed.
+    pub fn outline(&self) -> Rc<Vec<Symbol>> {
+        let Some(language) = self.language.get() else {
+            return Rc::default();
+        };
+        let epoch = self.buffer.content_epoch();
+        let mut outline = self.outline.borrow_mut();
+        if let Some(seen) = &*outline {
+            if seen.epoch == epoch && seen.language == language.name {
+                return Rc::clone(&seen.symbols);
+            }
+        }
+        let symbols = Rc::new(symbols::outline(language, &self.text()));
+        *outline = Some(Outline {
+            epoch,
+            language: language.name,
+            symbols: Rc::clone(&symbols),
+        });
+        symbols
     }
 
     /// Writes the text to `path`, with the file's line endings, and marks

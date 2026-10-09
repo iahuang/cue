@@ -66,6 +66,7 @@ commands! {
     GoToLine => "editor:go-to-line", "Go to Line…";
     GoToSymbol => "editor:go-to-symbol", "Go to Symbol in File…";
     GoToWorkspaceSymbol => "search:symbols", "Go to Symbol in Workspace…";
+    GoToDefinition => "editor:go-to-definition", "Go to Definition";
     GoToTerminal => "terminal:go-to", "Go to Terminal…";
     RecoverUnsaved => "file:recover", "Recover Unsaved Changes…";
     SearchWorkspace => "search:workspace", "Search in Workspace";
@@ -495,6 +496,8 @@ impl Default for Keymap {
 
         bindings.extend([
             (key(Esc, Mods::NONE), ClearSelection),
+            // As in VS Code; Ctrl+click goes there too.
+            (key(F(12), Mods::NONE), GoToDefinition),
             (key(Enter, Mods::NONE), NewLine),
             (key(Tab, Mods::NONE), InsertTab),
             (key(Tab, SHIFT), Outdent),

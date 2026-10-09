@@ -268,11 +268,12 @@ pub fn color(kind: &str) -> Option<SyntaxColor> {
 
 // --- the workspace's symbols ----------------------------------------------------
 
-/// A file's symbols as listed, as of its modification time and size.
+/// A file's symbols, and as listed, as of its modification time and size.
 #[derive(Clone)]
 struct Indexed {
     modified: Option<SystemTime>,
     len: u64,
+    symbols: Vec<Symbol>,
     items: Vec<Item>,
 }
 
@@ -318,6 +319,26 @@ impl SymbolIndex {
     /// Whether the first indexing is in progress, or hasn't started.
     pub fn indexing(&self) -> bool {
         !self.complete
+    }
+
+    /// Whether indexing ever started.
+    pub fn started(&self) -> bool {
+        self.complete || self.indexing.is_some()
+    }
+
+    /// The symbols named `name`, and the files they're in, as of the last
+    /// indexing to complete.
+    pub fn named(&self, name: &str) -> Vec<(PathBuf, Symbol)> {
+        self.cache
+            .iter()
+            .flat_map(|(path, indexed)| {
+                indexed
+                    .symbols
+                    .iter()
+                    .filter(|symbol| symbol.name == name)
+                    .map(|symbol| (path.clone(), symbol.clone()))
+            })
+            .collect()
     }
 
     /// Indexes `files` in the background, reading only those that changed
@@ -428,6 +449,7 @@ fn index(
                 indexed.items.clear();
             }
             indexed.items.truncate(MAX_SYMBOLS - count);
+            indexed.symbols.truncate(indexed.items.len());
             count += indexed.items.len();
             pending.extend(indexed.items.iter().cloned());
             new_cache.insert(path, indexed);
@@ -463,19 +485,21 @@ fn index_file(
             return Some(cached.clone());
         }
     }
-    let items = if meta.len() > MAX_INDEXED_BYTES {
+    let symbols = if meta.len() > MAX_INDEXED_BYTES {
         Vec::new()
     } else {
         let text = fs::read_to_string(path).ok()?;
-        let shown = workspace.display_path(path);
         outline_with(&tags, parser, &text)
-            .into_iter()
-            .map(|symbol| Item::workspace_symbol(symbol, path.clone(), &shown))
-            .collect()
     };
+    let shown = workspace.display_path(path);
+    let items = symbols
+        .iter()
+        .map(|symbol| Item::workspace_symbol(symbol.clone(), Some(path.clone()), &shown))
+        .collect();
     Some(Indexed {
         modified,
         len: meta.len(),
+        symbols,
         items,
     })
 }
