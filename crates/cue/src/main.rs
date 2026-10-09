@@ -1056,3 +1056,18 @@ fn test_serial() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// Whether a lock this process let go of is free within a second, as
+/// `held` says. A `flock` lock lasts while any copy of its file is open,
+/// and a child another test forks meanwhile has a copy until it execs.
+#[cfg(test)]
+fn let_go(held: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while held() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}

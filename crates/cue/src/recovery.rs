@@ -355,6 +355,6 @@ mod tests {
         let held = lock(&dir, 7).unwrap();
         assert!(is_running(&dir, 7));
         drop(held);
-        assert!(!is_running(&dir, 7));
+        assert!(crate::let_go(|| is_running(&dir, 7)));
     }
 }

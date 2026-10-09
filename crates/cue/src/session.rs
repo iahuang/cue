@@ -1229,8 +1229,8 @@ mod tests {
         assert_eq!(session.screen(&screen).as_deref(), Some(&b"\x1b[1mhi"[..]));
 
         drop(session);
+        assert!(crate::let_go(|| list(&sessions)[0].live), "let go");
         let listed = list(&sessions);
-        assert!(!listed[0].live, "let go");
         let session = Session::open(&listed[0].dir).unwrap();
         session.end();
         assert!(list(&sessions).is_empty());
