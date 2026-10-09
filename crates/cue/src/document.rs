@@ -149,8 +149,10 @@ pub struct Document {
     /// What the file is written in, if known.
     pub language: Cell<Option<&'static Language>>,
     language_override: Cell<bool>,
-    /// What Tab inserts: inferred from the text as it was opened.
+    /// What Tab inserts: inferred from the text as it was opened, unless
+    /// chosen (see [`Document::set_indent`]).
     pub indent: Cell<Indent>,
+    indent_chosen: Cell<bool>,
     /// Highlights the text on screen as it's drawn, if cue knows how.
     pub syntax: RefCell<Option<Highlighter>>,
     pub history: RefCell<History>,
@@ -314,6 +316,7 @@ impl Document {
             language: Cell::new(language),
             language_override: Cell::new(false),
             indent: Cell::new(indent),
+            indent_chosen: Cell::new(false),
             syntax: RefCell::new(syntax),
             history: RefCell::new(History::new()),
             theme,
@@ -648,6 +651,18 @@ impl Document {
             language.and_then(|language| Highlighter::new(language, &self.theme));
     }
 
+    /// Indents with `indent` from now on, including after saving under
+    /// another name.
+    pub fn set_indent(&self, indent: Indent) {
+        self.indent_chosen.set(true);
+        self.indent.set(indent);
+    }
+
+    /// The indentation chosen for it, if any (see [`Document::set_indent`]).
+    pub fn chosen_indent(&self) -> Option<Indent> {
+        self.indent_chosen.get().then(|| self.indent.get())
+    }
+
     /// Saves to `path` from now on, highlighting and indenting for its
     /// language.
     pub fn rename(&self, path: PathBuf) {
@@ -658,8 +673,10 @@ impl Document {
         let language = detect_language(&self.buffer, self.path().as_deref());
         if language.map(|l| l.name) != self.language.get().map(|l| l.name) {
             self.language.set(language);
-            self.indent
-                .set(Indent::infer(&self.buffer.text(), language));
+            if !self.indent_chosen.get() {
+                self.indent
+                    .set(Indent::infer(&self.buffer.text(), language));
+            }
             self.buffer.remove_highlights(crate::syntax::HIGHLIGHTS);
             let highlighter = language.and_then(|language| Highlighter::new(language, &self.theme));
             *self.syntax.borrow_mut() = highlighter;

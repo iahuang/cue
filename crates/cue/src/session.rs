@@ -33,6 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use toml::{Table, Value};
 
 use crate::document::Document;
+use crate::indent::Indent;
 use crate::layout::{Axis, Layout, PanelId};
 
 /// What `session.toml` starts with; files of later versions are passed
@@ -53,6 +54,7 @@ const KNOWN: &[&str] = &[
     "documents",
     "terminals",
     "tabs",
+    "indents",
 ];
 const LOCK: &str = "lock";
 const SOCKET: &str = "sock";
@@ -168,6 +170,8 @@ pub struct State {
     pub mark: Option<Mark>,
     /// A terminal shows its screen there.
     pub attached: bool,
+    /// How files were chosen to indent, by path.
+    pub indents: Vec<(PathBuf, Indent)>,
     /// The keys at the top of the file this cue doesn't know, to write back.
     pub unknown: Table,
 }
@@ -796,6 +800,16 @@ pub fn encode(state: &State) -> String {
         Value::Table(table)
     });
     root.insert("tabs".into(), Value::Array(tabs.collect()));
+    let indents = state.indents.iter().map(|(path, indent)| {
+        let mut table = Table::new();
+        table.insert("path".into(), path_value(path));
+        match indent {
+            Indent::Tabs => table.insert("tabs".into(), Value::Boolean(true)),
+            Indent::Spaces(n) => table.insert("spaces".into(), int(*n as u64)),
+        };
+        Value::Table(table)
+    });
+    root.insert("indents".into(), Value::Array(indents.collect()));
     for (key, value) in &state.unknown {
         if !KNOWN.contains(&key.as_str()) {
             root.insert(key.clone(), value.clone());
@@ -940,6 +954,17 @@ pub fn decode(text: &str) -> Option<State> {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             })
+        })
+        .collect();
+    state.indents = get_array(&root, "indents")
+        .filter_map(|table| {
+            let indent = match get_u32(table, "spaces") {
+                Some(n @ 1..=16) => Indent::Spaces(n),
+                Some(_) => return None,
+                None if table.get("tabs")?.as_bool()? => Indent::Tabs,
+                None => return None,
+            };
+            Some((get_path(table, "path")?, indent))
         })
         .collect();
     state.terminals = get_array(&root, "terminals")
@@ -1124,6 +1149,10 @@ mod tests {
                 },
             }),
             attached: true,
+            indents: vec![
+                ("/w/cue/Makefile".into(), Indent::Tabs),
+                ("/w/cue/b.rs".into(), Indent::Spaces(2)),
+            ],
             ..State::default()
         }
     }

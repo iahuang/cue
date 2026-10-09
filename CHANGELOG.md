@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Change a file's indentation from the status bar, offering to convert its lines between tabs and spaces, and remember the choice for the file in the session (`HASH`)
+- Toggle word wrap, or go to a line, by clicking it in the status bar (`HASH`)
+
 ## v0.3.13 — 2026-10-08
 
 - Fix a crash diffing a file with a lone carriage return in it (`4aecc87`)

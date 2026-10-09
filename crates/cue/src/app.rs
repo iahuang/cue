@@ -87,6 +87,7 @@ use crate::file_index::FileIndex;
 use crate::find;
 use crate::git::{self, Carried, Change, Commit, Git, Repo, SwitchTo};
 use crate::image::{self, ImageView};
+use crate::indent::{self, Indent};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::input_box::{InputAction, InputBox};
 use crate::keymap::{Command, Context, Keymap};
@@ -101,7 +102,7 @@ use crate::recovery::{self, Orphan, Recovery};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::session::{self, Session, Shown};
-use crate::status::{self, GitBadge};
+use crate::status::{self, GitBadge, StatusButton};
 use crate::symbols::{self, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
@@ -188,7 +189,18 @@ enum Answer {
     DiscardRecovered(Vec<Orphan>),
     /// Keep everything as a session, then quit.
     KeepSession,
+    /// Indent this file this way from now on, first converting its lines
+    /// from how they indent, if given.
+    Indent(Rc<Document>, Indent, Option<Indent>),
 }
+
+/// The commands that choose how a file indents, and how each does.
+const INDENTS: [(Command, Indent); 4] = [
+    (Command::IndentUsingTabs, Indent::Tabs),
+    (Command::IndentUsing2Spaces, Indent::Spaces(2)),
+    (Command::IndentUsing4Spaces, Indent::Spaces(4)),
+    (Command::IndentUsing8Spaces, Indent::Spaces(8)),
+];
 
 /// What's left of saving files and then going ahead, while one that
 /// changed on disk is asked about.
@@ -270,6 +282,8 @@ enum MenuFor {
     File(Entry),
     /// The session, from the status bar's badge.
     Session,
+    /// The active panel's file, from the status bar.
+    Status,
     /// A panel, from its header.
     Panel(PanelId),
     /// What's selected in the sidebar, which its commands act on.
@@ -279,7 +293,8 @@ enum MenuFor {
 /// Where a mouse press landed; drags and the release go there too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MouseTarget {
-    Language,
+    /// A part of the status bar a click acts on.
+    Status(StatusButton),
     /// The status bar's session badge.
     Session,
     Tree,
@@ -463,6 +478,9 @@ pub struct App {
     screens: HashMap<u32, (String, u64)>,
     /// A terminal shows cue: it isn't detached.
     attached: bool,
+    /// How files were chosen to indent, from the status bar, while cue
+    /// runs, or the session does, by path.
+    indents: HashMap<PathBuf, Indent>,
 }
 
 /// A popup's query line, or a find bar's focused field, which typing,
@@ -705,6 +723,7 @@ impl App {
             screens_saved: None,
             screens: HashMap::new(),
             attached: true,
+            indents: HashMap::new(),
         };
         app.settings_hash = app
             .settings
@@ -1049,6 +1068,10 @@ impl App {
             Command::GoToFile => self.show_picker(Mode::Files),
             Command::GoToUnsaved => self.show_picker(Mode::Unsaved),
             Command::GoToLine => self.show_picker(Mode::Line),
+            command if INDENTS.iter().any(|&(c, _)| c == command) => {
+                let (_, indent) = INDENTS.into_iter().find(|&(c, _)| c == command).unwrap();
+                self.choose_indent(indent);
+            }
             Command::GoToSymbol => self.show_picker(Mode::Symbols),
             Command::GoToWorkspaceSymbol => self.show_picker(Mode::WorkspaceSymbols),
             Command::GoToTerminal => self.show_picker(Mode::Terminals),
@@ -1398,9 +1421,14 @@ impl App {
                     look.handle_mouse(mouse, now);
                 }
             }
-            MouseTarget::Language => {
+            MouseTarget::Status(button) => {
                 if let MouseKind::Press(MouseButton::Left) = mouse.kind {
-                    self.show_picker(Mode::Languages);
+                    match button {
+                        StatusButton::Position => self.show_picker(Mode::Line),
+                        StatusButton::Indent => self.open_indent_menu(),
+                        StatusButton::Language => self.show_picker(Mode::Languages),
+                        StatusButton::Wrap => return self.run(Command::ToggleWrap, false),
+                    }
                 }
             }
             MouseTarget::Session => {
@@ -1640,11 +1668,7 @@ impl App {
                 }
                 // What the status bar says starts after the git badge.
                 let x = x.wrapping_sub(git.map_or(0, |git| git.end));
-                if let crate::status::Status::EditorInfo { language, .. } = status {
-                    if language.contains(&x) {
-                        return Some(MouseTarget::Language);
-                    }
-                }
+                return status.button_at(x).map(MouseTarget::Status);
             }
             return None;
         }
@@ -2079,16 +2103,12 @@ impl App {
                 self.width,
             )
             .map(span),
-            MouseTarget::Language => {
+            MouseTarget::Status(button) => {
                 let status = self.active_panel().status();
                 let offset = status::git_badge(&status, self.git_badge().as_ref(), self.width)
                     .map_or(0, |badge| badge.end);
-                match status {
-                    status::Status::EditorInfo { language, .. } => {
-                        Some(span(language.start + offset..language.end + offset))
-                    }
-                    _ => None,
-                }
+                let columns = status.button(button)?;
+                Some(span(columns.start + offset..columns.end + offset))
             }
             MouseTarget::Panel(id) => {
                 let panel = self.tab().panels.iter().find(|panel| panel.id == id)?;
@@ -3161,6 +3181,7 @@ impl App {
             return false;
         }
         if existing.is_none() {
+            self.apply_indent(&doc);
             let replaced = match left {
                 Some(left) if left.is_blank() => Some(left),
                 _ if preview => self.preview.clone().filter(|doc| !doc.is_modified()),
@@ -3612,6 +3633,10 @@ impl App {
                     true => self.leave_session(),
                     false => AppAction::Continue,
                 };
+            }
+            Answer::Indent(doc, indent, from) => {
+                self.set_indent(&doc, indent, from);
+                return AppAction::Continue;
             }
             Answer::Save(docs, redo) => Saving { docs, redo },
             Answer::Overwrite(doc, saving) => {
@@ -4100,6 +4125,7 @@ impl App {
                     Some(doc) => doc,
                     None => match Document::open(Some(path.clone()), self.theme.clone()) {
                         Ok((doc, _)) => {
+                            self.apply_indent(&doc);
                             self.documents.push(doc.clone());
                             doc
                         }
@@ -4477,6 +4503,7 @@ impl App {
                 })
             }),
             attached: self.attached,
+            indents: self.saved_indents(),
             // The session's own, which it saves with this.
             name: None,
             unknown: Default::default(),
@@ -4509,6 +4536,7 @@ impl App {
         }
         self.documents.clear();
         self.preview = None;
+        self.indents = state.indents.iter().cloned().collect();
         let mut docs: Vec<(Shown, Rc<Document>)> = Vec::new();
         for saved in &state.documents {
             let text = saved
@@ -4563,6 +4591,7 @@ impl App {
                 Some(path) => Shown::File(path.clone()),
                 None => Shown::Untitled(saved.untitled),
             };
+            self.apply_indent(&doc);
             self.documents.push(doc.clone());
             docs.push((key, doc));
         }
@@ -4934,6 +4963,11 @@ impl App {
             Some(editor) => editor.save_as(document::resolve(path)),
             None => Action::Continue,
         };
+        // How it was chosen to indent goes with it.
+        let doc = self.active_panel().document();
+        if let Some(indent) = doc.and_then(|doc| doc.chosen_indent()) {
+            self.indents.insert(document::resolve(path), indent);
+        }
         self.focus = Focus::Editor;
         Ok(self.editor_action(action))
     }
@@ -6023,6 +6057,91 @@ impl App {
         self.menu = Some((menu, MenuFor::Session));
     }
 
+    /// The menu of ways to indent, above the status bar's button for it.
+    fn open_indent_menu(&mut self) {
+        let Some(current) = self.editor().map(|editor| editor.document().indent.get()) else {
+            return;
+        };
+        let status = self.active_panel().status();
+        let Some(button) = status.button(StatusButton::Indent) else {
+            return;
+        };
+        let offset = status::git_badge(&status, self.git_badge().as_ref(), self.width)
+            .map_or(0, |badge| badge.end);
+        let items = INDENTS
+            .iter()
+            .map(|&(command, indent)| {
+                let check = if indent == current { "✓ " } else { "  " };
+                MenuItem::Command(command, format!("{check}{}", command.title()))
+            })
+            .collect();
+        let menu = ContextMenu::new(
+            items,
+            &self.keymap,
+            (offset + button.start).saturating_sub(2),
+            self.height.saturating_sub(1),
+            true,
+            self.width,
+            self.height,
+        );
+        self.close_popups();
+        self.menu = Some((menu, MenuFor::Status));
+    }
+
+    /// Indents the active panel's file with `indent` from now on, first
+    /// asking whether to convert its lines if they indent the other way:
+    /// with spaces, for tabs, or with tabs, for spaces.
+    fn choose_indent(&mut self, indent: Indent) {
+        let Some(doc) = self.editor().map(|editor| editor.document().clone()) else {
+            return;
+        };
+        let lines = indent::detect(&doc.buffer.text());
+        let (from, title, with) = match (lines, indent) {
+            (Some(from @ Indent::Spaces(_)), Indent::Tabs) => (from, "Tabs", "spaces"),
+            (Some(from @ Indent::Tabs), Indent::Spaces(_)) => (from, "Spaces", "tabs"),
+            _ => return self.set_indent(&doc, indent, None),
+        };
+        let name = self.document_name(&doc);
+        let message = format!("Lines in {name} are indented with {with}.");
+        let buttons = vec![
+            Button::new("&Convert", Answer::Indent(doc.clone(), indent, Some(from))),
+            Button::new("&Don't Convert", Answer::Indent(doc, indent, None)),
+        ];
+        let title = format!("Convert Indentation to {title}?");
+        self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
+    }
+
+    /// Indents `doc` with `indent`, in every panel, and whenever it's opened
+    /// again while cue runs, or the session does. Lines indented as `from`
+    /// says are converted, in the active panel's editor, if it shows `doc`.
+    fn set_indent(&mut self, doc: &Rc<Document>, indent: Indent, from: Option<Indent>) {
+        doc.set_indent(indent);
+        if let Some(path) = doc.path() {
+            self.indents.insert(path, indent);
+        }
+        let editor = self
+            .editor_mut()
+            .filter(|editor| Rc::ptr_eq(editor.document(), doc));
+        if let (Some(from), Some(editor)) = (from, editor) {
+            editor.convert_indent(from, indent);
+            self.keep_if_edited();
+        }
+    }
+
+    /// How files were chosen to indent, by path, sorted.
+    fn saved_indents(&self) -> Vec<(PathBuf, Indent)> {
+        let mut indents: Vec<_> = self.indents.clone().into_iter().collect();
+        indents.sort_by(|a, b| a.0.cmp(&b.0));
+        indents
+    }
+
+    /// Indents `doc` as was chosen for its file, if anything was.
+    fn apply_indent(&self, doc: &Document) {
+        if let Some(&indent) = doc.path().and_then(|path| self.indents.get(&path)) {
+            doc.set_indent(indent);
+        }
+    }
+
     /// Panel `id`'s menu, of what it shows, at the cell right-clicked on its
     /// header, or from the keyboard, below the header's start.
     fn open_panel_menu(&mut self, id: PanelId, at: Option<(u32, u32)>) {
@@ -6113,7 +6232,9 @@ impl App {
             }
             MenuAction::Accept(command) => match self.menu.take() {
                 Some((_, MenuFor::File(target))) => self.file_command(command, target, true),
-                Some((_, MenuFor::Session | MenuFor::Sidebar)) => self.run(command, false),
+                Some((_, MenuFor::Session | MenuFor::Status | MenuFor::Sidebar)) => {
+                    self.run(command, false)
+                }
                 Some((_, MenuFor::Panel(id))) => {
                     self.activate(id);
                     self.run(command, false)
@@ -6290,6 +6411,9 @@ impl App {
         };
         for doc in &self.documents {
             if let Some(path) = doc.path().and_then(|path| moved(&path)) {
+                if let Some(indent) = doc.chosen_indent() {
+                    self.indents.insert(path.clone(), indent);
+                }
                 doc.rename(path);
             }
         }
@@ -7191,9 +7315,9 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("language-picker", &[("a.txt", "fn main() {}")]);
         let mut app = app(&root, Some("a.txt"));
-        let language_x = |app: &App| match app.ed().status() {
-            crate::status::Status::EditorInfo { language, .. } => language.start,
-            other => panic!("{other:?}"),
+        let language_x = |app: &App| {
+            let status = app.ed().status();
+            status.button(StatusButton::Language).unwrap().start
         };
         let x = language_x(&app);
         left_click(&mut app, x - 1, 9);
@@ -7230,6 +7354,78 @@ mod tests {
         assert!(app.picker.is_none());
         assert!(doc.language.get().is_none());
         assert!(doc.syntax.borrow().is_none());
+    }
+
+    #[test]
+    fn clicking_the_position_goes_to_a_line_and_wrap_toggles_wrapping() {
+        let _serial = crate::test_serial();
+        let root = fixture("status-buttons", &[("a.txt", "one\ntwo\n")]);
+        let mut app = app(&root, Some("a.txt"));
+        let click = |app: &mut App, button| {
+            let x = app.ed().status().button(button).unwrap().start;
+            left_click(app, x, 9);
+        };
+        click(&mut app, StatusButton::Position);
+        assert_eq!(app.picker.as_ref().map(Picker::mode), Some(Mode::Line));
+        key(&mut app, KeyCode::Esc);
+
+        let wrapping = |app: &App| app.ed().status().text().ends_with("  wrap");
+        let before = wrapping(&app);
+        click(&mut app, StatusButton::Wrap);
+        assert_ne!(wrapping(&app), before);
+        click(&mut app, StatusButton::Wrap);
+        assert_eq!(wrapping(&app), before);
+    }
+
+    #[test]
+    fn clicking_the_indentation_changes_it_and_offers_to_convert() {
+        let _serial = crate::test_serial();
+        let spaced = "fn a() {\n    b();\n}\n";
+        let files = [("a.rs", spaced), ("b.rs", "fn b() {}\n")];
+        let root = fixture("indent-button", &files);
+        let mut app = app(&root, Some("a.rs"));
+        let doc = app.ed().document().clone();
+        let x = app
+            .ed()
+            .status()
+            .button(StatusButton::Indent)
+            .unwrap()
+            .start;
+        left_click(&mut app, x, 9);
+        assert!(app.menu.is_some());
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        // Its lines indent with spaces: it asks first.
+        assert!(app.alert.is_some());
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(doc.indent.get(), Indent::Spaces(4), "cancelled");
+
+        app.run(Command::IndentUsingTabs, false);
+        key(&mut app, KeyCode::Char('c'));
+        assert_eq!(doc.indent.get(), Indent::Tabs);
+        assert_eq!(doc.buffer.text(), "fn a() {\n\tb();\n}\n");
+        assert!(app.ed().status().text().contains("  Tabs  "));
+        app.run(Command::Undo, false);
+        assert_eq!(doc.buffer.text(), spaced, "one undo step");
+
+        // Spaces for lines of spaces: nothing to ask.
+        app.run(Command::IndentUsing2Spaces, false);
+        assert!(app.alert.is_none());
+        assert_eq!(doc.indent.get(), Indent::Spaces(2));
+        app.run(Command::IndentUsingTabs, false);
+        key(&mut app, KeyCode::Char('d'));
+        assert_eq!(doc.indent.get(), Indent::Tabs);
+        assert_eq!(doc.buffer.text(), spaced, "not converted");
+
+        // It stays chosen for the file once closed, but not for others.
+        let path = app.ed().path().unwrap();
+        app.run(Command::CloseFile, false);
+        assert!(app.open(&root.join("b.rs"), false));
+        assert_eq!(app.ed().document().indent.get(), Indent::Spaces(4));
+        assert!(app.open(&path, false));
+        assert!(!Rc::ptr_eq(app.ed().document(), &doc));
+        assert_eq!(app.ed().document().indent.get(), Indent::Tabs);
+        assert_eq!(app.saved_indents(), [(path, Indent::Tabs)]);
     }
 
     #[test]
@@ -8566,10 +8762,8 @@ mod tests {
         app.run(Command::ToggleDiff, false);
 
         // The language, after the badge, is still where it's clicked.
-        let language = match app.ed().status() {
-            crate::status::Status::EditorInfo { language, .. } => language.start,
-            other => panic!("{other:?}"),
-        };
+        let language = app.ed().status().button(StatusButton::Language);
+        let language = language.unwrap().start;
         let status_now = app.active_panel().status();
         let badge = status::git_badge(&status_now, app.git_badge().as_ref(), 80).unwrap();
         left_click(&mut app, badge.end + language - 1, 9);

@@ -4,7 +4,8 @@
 //! whichever of tabs or spaces starts more lines wins, and for spaces, the
 //! step between one line's indentation and the next's that comes up most
 //! is the width. A file with no indented lines goes by its language's
-//! custom, or the `editor.indent` setting.
+//! custom, or the `editor.indent` setting. One chosen from the status bar
+//! overrides it, and can redo the file's indentation (see [`convert`]).
 
 use crate::config;
 use crate::language::Language;
@@ -25,7 +26,7 @@ impl Indent {
     /// How `text` indents, or failing that, `language`'s custom, or the
     /// setting.
     pub fn infer(text: &str, language: Option<&Language>) -> Indent {
-        guess(text)
+        detect(text)
             .or_else(|| language.and_then(|l| l.indent))
             .unwrap_or_else(|| config::get().indent)
     }
@@ -71,8 +72,33 @@ impl Indent {
     }
 }
 
+/// `text` with each line's indentation, as `from` indents, redone as `to`
+/// does: a level of one for a level of the other. What's left over past
+/// the last level, such as alignment, stays spaces.
+pub fn convert(text: &str, from: Indent, to: Indent) -> String {
+    let width = from.width().max(1);
+    let mut converted = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let rest = line.trim_start_matches([' ', '\t']);
+        let columns = columns(&line[..line.len() - rest.len()], width);
+        converted.push_str(&to.unit().repeat((columns / width) as usize));
+        converted.push_str(&" ".repeat((columns % width) as usize));
+        converted.push_str(rest);
+    }
+    converted
+}
+
+/// The columns `indentation`, of spaces and tabs, takes, each tab going on
+/// to the next multiple of `tab`.
+pub fn columns(indentation: &str, tab: u32) -> u32 {
+    indentation.chars().fold(0, |column, c| match c {
+        '\t' => (column / tab + 1) * tab,
+        _ => column + 1,
+    })
+}
+
 /// How `text` indents, if any line of it is indented.
-fn guess(text: &str) -> Option<Indent> {
+pub fn detect(text: &str) -> Option<Indent> {
     let (mut tabs, mut spaces) = (0, 0);
     // How often each change in indentation, in spaces, comes up.
     let mut steps = [0u32; 9];
@@ -118,22 +144,22 @@ mod tests {
 
     #[test]
     fn infers_tabs_or_the_width_of_spaces() {
-        assert_eq!(guess("fn a() {\n\tb();\n}\n"), Some(Indent::Tabs));
+        assert_eq!(detect("fn a() {\n\tb();\n}\n"), Some(Indent::Tabs));
         assert_eq!(
-            guess("a:\n  b:\n    c: 1\n  d: 2\n"),
+            detect("a:\n  b:\n    c: 1\n  d: 2\n"),
             Some(Indent::Spaces(2))
         );
         assert_eq!(
-            guess("fn a() {\n    if b {\n        c();\n    }\n}\n"),
+            detect("fn a() {\n    if b {\n        c();\n    }\n}\n"),
             Some(Indent::Spaces(4))
         );
         // Block comments' one-space steps and alignment don't count.
         let doc = "/**\n * one\n */\nint f() {\n    return 1 +\n           2;\n}\n";
-        assert_eq!(guess(doc), Some(Indent::Spaces(4)));
+        assert_eq!(detect(doc), Some(Indent::Spaces(4)));
         // More lines with tabs than spaces.
-        assert_eq!(guess("a\n\tb\n\tc\n  d\n"), Some(Indent::Tabs));
-        assert_eq!(guess("nothing\nindented\n\n"), None);
-        assert_eq!(guess(""), None);
+        assert_eq!(detect("a\n\tb\n\tc\n  d\n"), Some(Indent::Tabs));
+        assert_eq!(detect("nothing\nindented\n\n"), None);
+        assert_eq!(detect(""), None);
     }
 
     #[test]
@@ -148,6 +174,22 @@ mod tests {
             Indent::Tabs,
             "make needs tabs"
         );
+    }
+
+    #[test]
+    fn converts_a_level_for_a_level() {
+        let tabs = convert(
+            "a\n    b\n        c\n      d\n",
+            Indent::Spaces(4),
+            Indent::Tabs,
+        );
+        assert_eq!(tabs, "a\n\tb\n\t\tc\n\t  d\n");
+        let two = convert("a\n\tb\n\t\tc", Indent::Tabs, Indent::Spaces(2));
+        assert_eq!(two, "a\n  b\n    c");
+        // A stray tab among spaces goes to the next stop.
+        let mixed = convert("  \tx\r\n", Indent::Spaces(4), Indent::Tabs);
+        assert_eq!(mixed, "\tx\r\n");
+        assert_eq!(columns(" \t ", 8), 9);
     }
 
     #[test]

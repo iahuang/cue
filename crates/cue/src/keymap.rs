@@ -85,6 +85,10 @@ commands! {
     SelectAll => "editor:select-all", "Select All";
     ClearSelection => "editor:clear-selection", "Clear Selection";
     ToggleWrap => "editor:toggle-wrap", "Toggle Word Wrap";
+    IndentUsingTabs => "editor:indent-using-tabs", "Indent Using Tabs";
+    IndentUsing2Spaces => "editor:indent-using-2-spaces", "Indent Using 2 Spaces";
+    IndentUsing4Spaces => "editor:indent-using-4-spaces", "Indent Using 4 Spaces";
+    IndentUsing8Spaces => "editor:indent-using-8-spaces", "Indent Using 8 Spaces";
     ToggleReader => "markdown:toggle-reader", "Toggle Reader Mode";
     PreviewToSide => "markdown:preview-to-side", "Open Preview to the Side";
     NewLine => "editor:newline", "Insert Line Break";

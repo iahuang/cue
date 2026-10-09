@@ -33,7 +33,7 @@ use crate::document::File;
 use crate::document::{self, Disk, Document};
 use crate::find::{self, Field, FindBar, Match, Target};
 use crate::history::{EditKind, History};
-use crate::indent::Indent;
+use crate::indent::{self, Indent};
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::Edit;
@@ -41,7 +41,7 @@ use crate::location::Position;
 use crate::reader::{Reader, ReaderEvent};
 use crate::scroller::{Ran, Scrolled};
 use crate::search::Toggle;
-use crate::status::Status;
+use crate::status::{Status, StatusButton};
 use crate::syntax::Region;
 use crate::theme;
 #[cfg(test)]
@@ -1979,12 +1979,27 @@ impl Editor {
             WrapMode::None => "nowrap",
             _ => "wrap",
         };
-        let prefix = format!("Ln {}, Col {}{selected}  {indent}  ", row + 1, col + 1);
-        let start = 1 + prefix.chars().count() as u32;
-        Status::EditorInfo {
-            text: format!("{prefix}{language}  {line_ending}  {wrap}"),
-            language: start..start + language.chars().count() as u32,
+        let position = format!("Ln {}, Col {}{selected}", row + 1, col + 1);
+        let parts = [
+            (Some(StatusButton::Position), position.as_str()),
+            (Some(StatusButton::Indent), &indent),
+            (Some(StatusButton::Language), language),
+            (None, line_ending),
+            (Some(StatusButton::Wrap), wrap),
+        ];
+        let (mut text, mut buttons) = (String::new(), Vec::new());
+        for (button, part) in parts {
+            if !text.is_empty() {
+                text.push_str("  ");
+            }
+            // After the leading space.
+            let start = 1 + text.chars().count() as u32;
+            text.push_str(part);
+            if let Some(button) = button {
+                buttons.push((button, start..start + part.chars().count() as u32));
+            }
         }
+        Status::EditorInfo { text, buttons }
     }
 
     /// Writes the file to `path` from now on.
@@ -2045,6 +2060,37 @@ impl Editor {
             self.set_wrap(wrap_mode(new.wrap));
         }
         self.view.set_scroll_margin(new.scroll_margin);
+    }
+
+    /// Redoes the indentation of every line, as `from` indents, as `to`
+    /// does, as one undo step. The cursor keeps its place in the text.
+    pub fn convert_indent(&mut self, from: Indent, to: Indent) {
+        self.attach();
+        let text = self.buffer.text();
+        let converted = indent::convert(&text, from, to);
+        if converted == text {
+            return;
+        }
+        let cursor = self.buffer.cursor();
+        let tab = config::get().tab_width;
+        let leading = |text: &str| {
+            let line = text.split('\n').nth(cursor.row as usize).unwrap_or("");
+            let rest = line.trim_start_matches([' ', '\t']);
+            indent::columns(&line[..line.len() - rest.len()], tab)
+        };
+        let (old, new) = (leading(&text), leading(&converted));
+        let col = match cursor.col.checked_sub(old) {
+            Some(past) => new + past,
+            None => cursor.col.min(new),
+        };
+        self.history().break_group();
+        let steps = self.buffer.replace_changed_lines(&converted);
+        self.history().record(EditKind::Other, steps);
+        self.history().break_group();
+        self.anchor = None;
+        self.view.clear_selection();
+        self.buffer.set_cursor(cursor.row, col);
+        self.sync_find();
     }
 
     fn toggle_wrap(&mut self) {

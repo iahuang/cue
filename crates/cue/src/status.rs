@@ -1,6 +1,8 @@
 //! The status bar along the bottom of the screen. It's the active panel's:
 //! where its cursor is and what its file is written in, or what's wrong,
-//! such as a query that isn't a valid regex. Shortcut hints
+//! such as a query that isn't a valid regex. A click on an editor's
+//! position, indentation, language, or wrapping changes it (see
+//! [`StatusButton`]). Shortcut hints
 //! fill the right, and in a session, a badge with its name, or if it has
 //! none, its ID: a click on it offers to detach or end the session. In a
 //! git repository, a badge at the left end names the branch (see
@@ -16,15 +18,29 @@ use crate::keymap::{Command, Keymap};
 use crate::theme::{self, Hue};
 use crate::tree::truncate;
 
+/// A part of an editor's status that a click acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusButton {
+    /// The cursor's line and column: goes to a line.
+    Position,
+    /// How the file indents: changes it.
+    Indent,
+    /// What the file is written in: changes its highlighting.
+    Language,
+    /// Whether lines wrap: toggles it.
+    Wrap,
+}
+
 /// What the status bar shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     /// The cursor's position and the file's details.
     Info(String),
-    /// File details and the language's screen columns, offset by the leading space.
+    /// The cursor's position and the file's details, with the screen
+    /// columns of the parts a click acts on, offset by the leading space.
     EditorInfo {
         text: String,
-        language: std::ops::Range<u32>,
+        buttons: Vec<(StatusButton, Range<u32>)>,
     },
     /// A terminal's name and what it's running.
     Terminal(String),
@@ -42,6 +58,28 @@ impl Status {
             }
             Status::Message { text, .. } => format!(" {text}"),
         }
+    }
+
+    /// The button at column `x`, counted from where the text starts.
+    pub fn button_at(&self, x: u32) -> Option<StatusButton> {
+        let Status::EditorInfo { buttons, .. } = self else {
+            return None;
+        };
+        buttons
+            .iter()
+            .find(|(_, columns)| columns.contains(&x))
+            .map(|(button, _)| *button)
+    }
+
+    /// The columns `button` takes, counted from where the text starts.
+    pub fn button(&self, button: StatusButton) -> Option<Range<u32>> {
+        let Status::EditorInfo { buttons, .. } = self else {
+            return None;
+        };
+        buttons
+            .iter()
+            .find(|(b, _)| *b == button)
+            .map(|(_, columns)| columns.clone())
     }
 }
 
