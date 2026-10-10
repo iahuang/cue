@@ -51,12 +51,16 @@ const MANIFEST_VERSION: i64 = 1;
 const HANDOVER_SCREENS: &str = "handover";
 
 /// This build of cue, told from others of the same version by its binary,
-/// as it was when this process started.
+/// as it was when this process started: the original binary, if this runs
+/// from a copy (see [`crate::relocate`]).
 pub fn build() -> &'static str {
     static BUILD: OnceLock<String> = OnceLock::new();
     BUILD.get_or_init(|| {
+        if let Some(build) = crate::relocate::passed_build() {
+            return build.to_string();
+        }
         let version = env!("CARGO_PKG_VERSION");
-        let binary = std::env::current_exe().and_then(fs::metadata);
+        let binary = fs::metadata(crate::relocate::origin());
         match binary {
             Ok(meta) => {
                 let modified = meta
@@ -284,7 +288,7 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
 /// in this process's terminal.
 pub fn request_attach(path: &Path) -> io::Result<Control> {
     let stream = UnixStream::connect(path)?;
-    let exe = std::env::current_exe()?;
+    let exe = crate::relocate::origin();
     let mut text = format!("attach\nbuild {}\nexe {}\n", build(), exe.display());
     for (key, value) in std::env::vars_os() {
         let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {

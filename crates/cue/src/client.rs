@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use crate::attach::{self, Control};
+use crate::relocate;
 use crate::session::{self, Listing, Session};
 
 /// What the command line asked for.
@@ -155,17 +156,14 @@ fn serve(args: Vec<OsString>) -> ExitCode {
         Ok(pair) => pair,
         Err(err) => return fail(&format!("can't start: {err}")),
     };
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => return fail(&format!("can't find cue's binary: {err}")),
-    };
     let fd = theirs.as_raw_fd();
     unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
-    let mut command = Command::new(exe);
+    let mut command = Command::new(relocate::exe());
     command
         .arg("--serve")
         .args(args)
         .env(attach::CONTROL_VARIABLE, fd.to_string());
+    relocate::pass_on(&mut command);
     // A session of its own, so that it outlives this one, and the
     // terminal's signals are this process's.
     unsafe {
@@ -196,6 +194,8 @@ extern "C" fn resized(_: libc::c_int) {
 /// resizes, until it says to go, or goes. `child` is the server, if this
 /// process started it.
 fn wait(mut control: Control, child: Option<Child>) -> ExitCode {
+    // The server started, if this did start it.
+    relocate::release();
     unsafe {
         libc::signal(
             libc::SIGWINCH,

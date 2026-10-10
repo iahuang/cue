@@ -38,6 +38,7 @@ mod pty;
 mod quick_look;
 mod reader;
 mod recovery;
+mod relocate;
 mod resume;
 mod scroller;
 mod search;
@@ -95,13 +96,26 @@ const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
-    crash::install();
+    // Before anything else: it may start this process over, from a copy of
+    // its binary.
+    relocate::init();
     // Before the binary can be replaced, as when cue is updated.
     attach::build();
+    crash::install();
 
-    let start = match parse_args() {
+    let mode = parse_args();
+    // Only a client needs the copy it runs from, if it does: to start a
+    // server.
+    if !matches!(mode, Ok(Mode::Client(_))) {
+        relocate::release();
+    }
+    let start = match mode {
         Ok(Mode::Serve(start)) => start,
-        Ok(Mode::Client(args)) => return client::run(args),
+        Ok(Mode::Client(args)) => {
+            let code = client::run(args);
+            relocate::release();
+            return code;
+        }
         Ok(Mode::List) => return client::list(),
         Ok(Mode::End(id)) => return client::end(id),
         Err(code) => return code,
@@ -311,7 +325,7 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Outcome::Restart => {
-                let exe = std::env::current_exe()?;
+                let exe = relocate::origin().to_path_buf();
                 app = restart(app, &exe, control.as_ref(), None, &mut listener)?;
                 continue;
             }
