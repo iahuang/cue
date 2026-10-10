@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Use temporary binary when launched from NFS to avoid SIGBUS on remote instances (`c991ebf`)
+- Find in reader mode, in the text as shown, without leaving it
+
 ## v0.4.0 — 2026-10-09
 
 - Add custom theme "Tidepool" (`58045b1`)

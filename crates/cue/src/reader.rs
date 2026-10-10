@@ -14,6 +14,9 @@
 //! It can't be typed in. The wheel and the arrow and page keys scroll,
 //! dragging selects text to copy, a click on a link follows it, and a
 //! double click goes to editing with the cursor on the line clicked.
+//!
+//! The editor's find bar finds in the text as shown here, where a phrase
+//! that wrapping broke over two rows is still one (see [`Reader::find`]).
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -28,10 +31,12 @@ use pulldown_cmark::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::find::{self, Match};
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::language;
 use crate::math::{self, Formula, Typesetter};
 use crate::scroller::{Scrolled, Scroller, Spot};
+use crate::search::Query;
 use crate::status::Status;
 use crate::syntax::ExcerptHighlighter;
 use crate::theme::{self, Colors, Hue, SyntaxColor};
@@ -145,6 +150,18 @@ struct Line {
     spans: Vec<Span>,
     /// The line of the file it came from, 0-based.
     source: u32,
+    /// Whether wrapping broke its text from the row before's, so finding
+    /// sees them as one.
+    wrapped: Option<Wrapped>,
+}
+
+/// How a row's text goes on from the row before's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Wrapped {
+    /// The column the text starts at, after the containers' markers.
+    indent: usize,
+    /// Whether it broke at a space, rather than within a word.
+    space: bool,
 }
 
 impl Line {
@@ -197,6 +214,103 @@ impl Layout {
             Some(line) => line.source,
             None => 0,
         }
+    }
+}
+
+/// Stands for a formula in the text found in.
+const OBJECT: char = '\u{FFFC}';
+
+/// The text as shown, for finding in: a line for each row, but for rows
+/// that wrapping broke apart, which are one line, as they were before.
+struct Searchable {
+    text: String,
+    /// Where the parts of each row are in `text`, in order.
+    runs: Vec<Run>,
+}
+
+/// A part of a row in the text found in.
+struct Run {
+    /// Where it starts in the text.
+    byte: usize,
+    row: usize,
+    col: usize,
+    /// For a formula, its width; it's one [`OBJECT`] in the text.
+    object: Option<usize>,
+}
+
+impl Searchable {
+    fn new(layout: &Layout) -> Searchable {
+        let mut text = String::new();
+        let mut runs = Vec::new();
+        for (row, line) in layout.lines.iter().enumerate() {
+            let from = match line.wrapped {
+                Some(wrapped) if row > 0 => {
+                    if wrapped.space {
+                        let end = spans_width(&layout.lines[row - 1].spans);
+                        runs.push(Run {
+                            byte: text.len(),
+                            row: row - 1,
+                            col: end,
+                            object: None,
+                        });
+                        text.push(' ');
+                    }
+                    wrapped.indent
+                }
+                _ => {
+                    if row > 0 {
+                        text.push('\n');
+                    }
+                    0
+                }
+            };
+            let mut col = 0;
+            for span in &line.spans {
+                let width = span.text.width();
+                if col + width > from {
+                    let byte = text.len();
+                    let object = span.math.as_ref().map(|_| width);
+                    match object {
+                        Some(_) => text.push(OBJECT),
+                        None => {
+                            text.push_str(columns(&span.text, from.saturating_sub(col)..usize::MAX))
+                        }
+                    }
+                    runs.push(Run {
+                        byte,
+                        row,
+                        col: col.max(from),
+                        object,
+                    });
+                }
+                col += width;
+            }
+        }
+        Searchable { text, runs }
+    }
+
+    /// The spot of `byte` of the text: where its character starts, or with
+    /// `end`, where the one before it ends.
+    fn spot(&self, byte: usize, end: bool) -> Spot {
+        let i = self
+            .runs
+            .partition_point(|run| run.byte < byte || (!end && run.byte == byte));
+        let Some(run) = i.checked_sub(1).map(|i| &self.runs[i]) else {
+            return (0, 0);
+        };
+        let col = match run.object {
+            Some(width) if byte > run.byte => run.col + width,
+            Some(_) => run.col,
+            None => run.col + self.text[run.byte..byte].width(),
+        };
+        (run.row, col)
+    }
+
+    /// Where row `row`, or the first after it with text, starts in the
+    /// text.
+    fn offset_of(&self, row: usize) -> usize {
+        let i = self.runs.partition_point(|run| run.row < row);
+        self.runs.get(i).map_or(self.text.len(), |run| run.byte)
     }
 }
 
@@ -280,6 +394,10 @@ impl Inline {
     }
 }
 
+/// A wrapped line: its spans, the file line it's from, and whether it goes
+/// on from the line before (see [`wrap`]).
+type WrappedLine = (Vec<Span>, Option<u32>, Option<bool>);
+
 /// Words run together: what can't be broken between.
 fn words(pieces: &[Piece]) -> impl Iterator<Item = &[Piece]> {
     pieces
@@ -347,13 +465,16 @@ fn split_width(text: &str, width: usize) -> (&str, &str) {
 
 /// Wraps `pieces` into lines `width` wide, breaking between words, and
 /// within words longer than a line. Each line comes with the file line
-/// its first word is from.
-fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
+/// its first word is from, and if it goes on from the line before, whether
+/// they broke at a space.
+fn wrap(pieces: &[Piece], width: usize) -> Vec<WrappedLine> {
     let width = width.max(1);
     let mut out = Vec::new();
     let mut line = Vec::new();
     let mut col = 0;
     let mut source = None;
+    // How the line being filled goes on from the one before.
+    let mut join = None;
     // Whether a space goes before the next word.
     let mut space = false;
     // The style the last word ended in, which a space after it takes if
@@ -368,8 +489,9 @@ fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
             }
             Piece::Break => {
                 if col > 0 {
-                    out.push((std::mem::take(&mut line), source.take()));
+                    out.push((std::mem::take(&mut line), source.take(), join));
                 }
+                join = None;
                 col = 0;
                 space = false;
                 i += 1;
@@ -383,8 +505,9 @@ fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
                 math: Some(formula),
             } if formula.display => {
                 if col > 0 {
-                    out.push((std::mem::take(&mut line), source.take()));
+                    out.push((std::mem::take(&mut line), source.take(), join));
                 }
+                join = None;
                 let pad = width.saturating_sub(text.width()) / 2;
                 for row in 0..formula.rows {
                     let mut spans = Vec::new();
@@ -398,7 +521,7 @@ fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
                             row,
                         }),
                     });
-                    out.push((spans, Some(*from)));
+                    out.push((spans, Some(*from), None));
                 }
                 col = 0;
                 space = false;
@@ -412,7 +535,8 @@ fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
                 let word = &pieces[i..end];
                 let w = word_width(word);
                 if col > 0 && col + usize::from(space) + w > width {
-                    out.push((std::mem::take(&mut line), source.take()));
+                    out.push((std::mem::take(&mut line), source.take(), join));
+                    join = Some(space);
                     col = 0;
                     space = false;
                 }
@@ -449,7 +573,8 @@ fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
                     // line.
                     if let Some(formula) = math {
                         if col > 0 && col + text.width() > width {
-                            out.push((std::mem::take(&mut line), source.take()));
+                            out.push((std::mem::take(&mut line), source.take(), join));
+                            join = Some(false);
                             col = 0;
                         }
                         line.push(Span {
@@ -469,13 +594,15 @@ fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
                     let mut rest = text.as_str();
                     while !rest.is_empty() {
                         if col >= width {
-                            out.push((std::mem::take(&mut line), source.take()));
+                            out.push((std::mem::take(&mut line), source.take(), join));
+                            join = Some(false);
                             col = 0;
                         }
                         let (mut head, mut tail) = split_width(rest, width - col);
                         if head.is_empty() {
                             if col > 0 {
-                                out.push((std::mem::take(&mut line), source.take()));
+                                out.push((std::mem::take(&mut line), source.take(), join));
+                                join = Some(false);
                                 col = 0;
                                 continue;
                             }
@@ -496,7 +623,7 @@ fn wrap(pieces: &[Piece], width: usize) -> Vec<(Vec<Span>, Option<u32>)> {
         }
     }
     if col > 0 {
-        out.push((line, source));
+        out.push((line, source, join));
     }
     out
 }
@@ -757,13 +884,21 @@ impl Builder<'_> {
 
     /// Adds a row: the containers' markers, then `spans`.
     fn emit(&mut self, spans: Vec<Span>, source: u32) {
+        self.emit_wrapped(spans, source, None);
+    }
+
+    /// Adds a row that, if `space` isn't `None`, goes on from the row
+    /// before, broken at a space or not.
+    fn emit_wrapped(&mut self, spans: Vec<Span>, source: u32, space: Option<bool>) {
         let mut line = self.prefix(true);
+        let indent = spans_width(&line);
         for span in spans {
             append(&mut line, span);
         }
         self.layout.lines.push(Line {
             spans: line,
             source,
+            wrapped: space.map(|space| Wrapped { indent, space }),
         });
     }
 
@@ -780,7 +915,11 @@ impl Builder<'_> {
             let trimmed = last.text.trim_end().len();
             last.text.truncate(trimmed);
         }
-        self.layout.lines.push(Line { spans, source });
+        self.layout.lines.push(Line {
+            spans,
+            source,
+            wrapped: None,
+        });
     }
 
     /// Before a block: finishes a tight list item's text, and puts a blank
@@ -806,7 +945,7 @@ impl Builder<'_> {
     /// Wraps `inline` and adds its rows.
     fn emit_inline(&mut self, inline: &Inline, base: Style) {
         let fallback = self.layout.lines.last().map_or(0, |line| line.source);
-        for (spans, source) in wrap(&inline.pieces, self.avail()) {
+        for (spans, source, space) in wrap(&inline.pieces, self.avail()) {
             let spans = spans
                 .into_iter()
                 .map(|span| Span {
@@ -814,7 +953,7 @@ impl Builder<'_> {
                     ..span
                 })
                 .collect();
-            self.emit(spans, source.unwrap_or(fallback));
+            self.emit_wrapped(spans, source.unwrap_or(fallback), space);
         }
     }
 
@@ -1340,7 +1479,7 @@ impl Builder<'_> {
             if let Some(formula) = self.formula(&text, true, room) {
                 let mut inline = Inline::default();
                 inline.push_math(formula, Style::TEXT, None, code.source);
-                for (spans, _) in wrap(&inline.pieces, self.avail()) {
+                for (spans, ..) in wrap(&inline.pieces, self.avail()) {
                     self.emit(spans, code.source);
                 }
                 return;
@@ -1480,7 +1619,7 @@ impl Builder<'_> {
                     .map(|c| {
                         wrap(cell(row, c), widths[c])
                             .into_iter()
-                            .map(|(spans, _)| spans)
+                            .map(|(spans, ..)| spans)
                             .collect()
                     })
                     .collect()
@@ -1600,6 +1739,8 @@ pub enum ReaderEvent {
 
 struct Laid {
     layout: Layout,
+    /// Counts layouts (see [`Reader::generation`]).
+    generation: u64,
     epoch: u64,
     width: u32,
     /// The cell size math was laid out for, if it's drawn.
@@ -1619,6 +1760,17 @@ pub struct Reader {
     pending: Cell<Option<(u32, u32)>>,
     width: u32,
     height: u32,
+    found: Found,
+}
+
+/// The find bar's matches, in the layout they were found in.
+#[derive(Default)]
+struct Found {
+    generation: u64,
+    /// Where each starts in the text found in, and where it starts and
+    /// ends on screen. In order.
+    matches: Vec<(usize, Spot, Spot)>,
+    current: Option<usize>,
 }
 
 impl Reader {
@@ -1635,6 +1787,7 @@ impl Reader {
             pending: Cell::new(Some((top, 0))),
             width: 0,
             height: 0,
+            found: Found::default(),
         }
     }
 
@@ -1720,6 +1873,90 @@ impl Reader {
         row.is_some()
     }
 
+    // --- finding -----------------------------------------------------------
+
+    /// Counts layouts: the text, the width, or the theme changed since
+    /// matches found in a layout of another count.
+    pub fn generation(&self) -> u64 {
+        self.sync();
+        self.laid
+            .borrow()
+            .as_ref()
+            .map_or(0, |laid| laid.generation)
+    }
+
+    /// Finds `query` in the text as shown, and highlights the matches. The
+    /// current match stays current if it's still there. Fails with a
+    /// message if the query isn't a valid regex.
+    pub fn find(&mut self, query: &Query) -> Result<(Vec<Match>, bool), String> {
+        self.sync();
+        let searchable = self.with_layout(Searchable::new);
+        let current = self.found.current.map(|i| self.found.matches[i].0);
+        self.found = Found {
+            generation: self.generation(),
+            ..Found::default()
+        };
+        let (ranges, truncated) = find::find(&searchable.text, query)?;
+        let matches: Vec<Match> = ranges
+            .into_iter()
+            .map(|bytes| {
+                let start = searchable.spot(bytes.start, false);
+                let end = searchable.spot(bytes.end, true);
+                self.found.matches.push((bytes.start, start, end));
+                Match {
+                    row: start.0 as u32,
+                    cols: start.1 as u32..end.1 as u32,
+                    offsets: bytes.start as u32..bytes.end as u32,
+                    bytes,
+                }
+            })
+            .collect();
+        self.found.current =
+            current.and_then(|byte| self.found.matches.iter().position(|m| m.0 == byte));
+        Ok((matches, truncated))
+    }
+
+    /// Where the top of the view is in the text found in, to find from.
+    pub fn find_origin(&self) -> u32 {
+        self.sync();
+        let top = self.scroller.top.get();
+        self.with_layout(|layout| Searchable::new(layout).offset_of(top)) as u32
+    }
+
+    /// The current match, if any.
+    pub fn current_match(&self) -> Option<usize> {
+        self.found.current
+    }
+
+    /// Makes match `index` the current one, scrolling to it if it's out of
+    /// view or under the top `covered` rows, which the find bar covers.
+    pub fn select_match(&mut self, index: usize, covered: u32) {
+        self.sync();
+        let Some(&(_, start, end)) = self.found.matches.get(index) else {
+            return;
+        };
+        self.found.current = Some(index);
+        self.scroller.selection.set(None);
+        let height = self.height as usize;
+        let top = self.scroller.top.get();
+        let first = match height > covered as usize + 1 {
+            true => top + covered as usize,
+            false => top,
+        };
+        if start.0 < first || end.0 >= top + height {
+            let top = start.0.saturating_sub(height / 2);
+            self.scroller.top.set(top.min(self.max_top()));
+        }
+    }
+
+    /// Stops highlighting matches, leaving the current one selected.
+    pub fn clear_find(&mut self) {
+        let found = std::mem::take(&mut self.found);
+        if let Some(&(_, start, end)) = found.current.and_then(|i| found.matches.get(i)) {
+            self.scroller.selection.set(Some((start, end)));
+        }
+    }
+
     /// A mouse event at cell (`mouse.x`, `mouse.y`) of the view.
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> Option<ReaderEvent> {
         self.sync();
@@ -1767,6 +2004,17 @@ impl Reader {
             return;
         }
         let top = self.scroller.top.get();
+        let bottom = top + self.height as usize;
+        // The matches in view, if they're in this layout.
+        let found = &self.found;
+        let matches = match found.generation == laid.generation {
+            true => {
+                let first = found.matches.partition_point(|m| m.2 .0 < top);
+                let last = found.matches.partition_point(|m| m.1 .0 < bottom);
+                first..last.max(first)
+            }
+            false => 0..0,
+        };
         let mut formulas = Vec::new();
         for (i, line) in lines
             .iter()
@@ -1775,14 +2023,35 @@ impl Reader {
             .enumerate()
         {
             let row = top + i;
-            let selected = selection.and_then(|(start, end)| {
+            // The columns of the row `(start, end)` covers, from `indent`
+            // if it starts on a row before.
+            let cover = |(start, end): (Spot, Spot), indent: usize| {
                 if row < start.0 || row > end.0 {
                     return None;
                 }
-                let from = if row == start.0 { start.1 } else { 0 };
+                let from = if row == start.0 { start.1 } else { indent };
                 let to = if row == end.0 { end.1 } else { usize::MAX };
                 (from < to).then_some(from..to)
-            });
+            };
+            // What's shaded, as (columns, background, foreground), the last
+            // over the others.
+            let mut shades = Vec::new();
+            for n in matches.clone() {
+                let (_, start, end) = found.matches[n];
+                let (bg, fg) = match found.current == Some(n) {
+                    true => (colors.current_match_bg, Some(colors.current_match_fg)),
+                    false => (colors.match_bg, None),
+                };
+                // Text wrapped from the row before starts after the
+                // markers.
+                let indent = line.wrapped.map_or(0, |wrapped| wrapped.indent);
+                if let Some(columns) = cover((start, end), indent) {
+                    shades.push((columns, bg, fg));
+                }
+            }
+            if let Some(columns) = selection.and_then(|selection| cover(selection, 0)) {
+                shades.push((columns, colors.selection, None));
+            }
             let screen_y = y + i as u32;
             let mut col = 0;
             for span in &line.spans {
@@ -1790,24 +2059,22 @@ impl Reader {
                 let fg = span.style.fg.rgba(&colors);
                 let bg = span.style.code.then_some(colors.surface_inactive);
                 let attributes = span.style.attributes;
-                // Split where the selection starts and ends.
-                let bounds = [
-                    col,
-                    selected
-                        .as_ref()
-                        .map_or(col, |s| s.start.clamp(col, col + width)),
-                    selected
-                        .as_ref()
-                        .map_or(col, |s| s.end.clamp(col, col + width)),
-                    col + width,
-                ];
-                for (n, part) in bounds.windows(2).enumerate() {
+                // Split where shading starts and ends.
+                let mut bounds = vec![col, col + width];
+                for (columns, ..) in &shades {
+                    bounds.push(columns.start.clamp(col, col + width));
+                    bounds.push(columns.end.clamp(col, col + width));
+                }
+                bounds.sort_unstable();
+                bounds.dedup();
+                for part in bounds.windows(2) {
                     let (from, to) = (part[0], part[1]);
-                    if from >= to {
-                        continue;
-                    }
                     let text = columns(&span.text, from - col..to - col);
-                    let bg = if n == 1 { Some(colors.selection) } else { bg };
+                    let shade = shades.iter().rev().find(|(c, ..)| c.contains(&from));
+                    let (fg, bg) = match shade {
+                        Some((_, bg, shade_fg)) => (shade_fg.unwrap_or(fg), Some(*bg)),
+                        None => (fg, bg),
+                    };
                     let screen_x = x + margin + from as u32;
                     frame.draw_text(text, screen_x, screen_y, fg, bg, attributes);
                 }
@@ -1896,8 +2163,10 @@ impl Scrolled for Reader {
                     .top
                     .set(row + within.min(rows.saturating_sub(1)));
             }
+            let generation = old.map_or(0, |old| old.generation) + 1;
             *self.laid.borrow_mut() = Some(Laid {
                 layout,
+                generation,
                 epoch,
                 width,
                 cell,
@@ -2147,6 +2416,34 @@ mod tests {
         assert!(row_text(2).contains(" a "), "{}", row_text(2));
         assert!(row_text(4).contains("one"), "{}", row_text(4));
         assert!(row_text(5).contains("two"), "{}", row_text(5));
+    }
+
+    #[test]
+    fn finding_sees_wrapped_rows_as_the_line_they_were() {
+        let text = "- one two three four five\n\nabcdefghijklmn\n";
+        let laid = layout(text, 12);
+        let rows: Vec<String> = laid.lines.iter().map(Line::text).collect();
+        assert_eq!(rows[..3], ["• one two", "  three four", "  five"]);
+        let searchable = Searchable::new(&laid);
+        assert_eq!(rows[4..], ["abcdefghijkl", "mn"]);
+        assert_eq!(
+            searchable.text,
+            "• one two three four five\n\nabcdefghijklmn"
+        );
+        let spots = |needle: &str| {
+            let start = searchable.text.find(needle).unwrap();
+            let end = start + needle.len();
+            (searchable.spot(start, false), searchable.spot(end, true))
+        };
+        // Across a break at a space, and within a word.
+        assert_eq!(spots("two three"), ((0, 6), (1, 7)));
+        assert_eq!(spots("five"), ((2, 2), (2, 6)));
+        assert_eq!(spots("jklm"), ((4, 9), (5, 1)));
+        assert_eq!(
+            searchable.offset_of(1),
+            searchable.text.find("three").unwrap()
+        );
+        assert_eq!(searchable.offset_of(99), searchable.text.len());
     }
 
     #[test]

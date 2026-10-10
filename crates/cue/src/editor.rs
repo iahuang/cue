@@ -10,7 +10,8 @@
 //! in the file: it highlights every match and selects the current one.
 //!
 //! A Markdown file can be read rather than edited: in reader mode, the
-//! editor shows a [`Reader`] of its text instead. A file in a git
+//! editor shows a [`Reader`] of its text instead, and the find bar finds,
+//! but doesn't replace, in the text as the reader shows it. A file in a git
 //! repository can be shown as it changed since the last commit: in diff
 //! mode, the editor shows a [`DiffView`] of it instead.
 
@@ -246,12 +247,13 @@ impl Editor {
             self.view.scroll_away_from_cursor(vp.x, vp.y);
         }
         // The document's find highlights are this editor's matches.
+        let reading = self.reading();
         match &mut self.find {
-            Some(bar) => {
+            Some(bar) if !reading => {
                 bar.epoch = bar.epoch.map(|_| u64::MAX);
                 self.sync_find();
             }
-            None => self.buffer.remove_highlights(FIND_HIGHLIGHTS),
+            _ => self.buffer.remove_highlights(FIND_HIGHLIGHTS),
         }
     }
 
@@ -286,6 +288,7 @@ impl Editor {
         if let Some(diff) = &mut self.diff {
             diff.set_size(width, height);
         }
+        self.refresh_find();
     }
 
     /// Fits the view to the text area, which narrows or widens as the line
@@ -307,7 +310,10 @@ impl Editor {
     /// column in from the edge, as (screen column, width, rows).
     fn find_area(&self) -> Option<(u32, u32, u32)> {
         let bar = self.find.as_ref()?;
-        let (gutter, text_w, _) = self.text_area();
+        let (gutter, text_w, _) = match self.reading() {
+            true => (0, self.width, self.height),
+            false => self.text_area(),
+        };
         let width = find::MAX_WIDTH.min(text_w.saturating_sub(1)).max(1);
         let x = self.x + gutter + text_w.saturating_sub(width + 1);
         Some((x, width, bar.rows()))
@@ -681,10 +687,10 @@ impl Editor {
         select: bool,
         clipboard: &mut Option<String>,
     ) -> Action {
-        if self.diffing() || self.reading() {
-            return self.run_read_only(command, clipboard);
-        }
-        let action = self.run_command(command, select, clipboard);
+        let action = match self.diffing() || self.reading() {
+            true => self.run_read_only(command, clipboard),
+            false => self.run_command(command, select, clipboard),
+        };
         self.sync_find();
         action
     }
@@ -693,10 +699,21 @@ impl Editor {
     /// scroll, and those that edit don't.
     fn run_read_only(&mut self, command: Command, clipboard: &mut Option<String>) -> Action {
         let diffing = self.diffing();
+        let selected = self
+            .read_only_view()
+            .is_some_and(|view| view.has_selection());
         match command {
             Command::ToggleReader => self.set_reading(diffing),
             Command::ToggleDiff => self.set_diffing(!diffing),
             Command::Save => return self.save(),
+            // With nothing selected, Esc closes the find bar.
+            Command::ClearSelection if !selected && self.find.is_some() => self.close_find(),
+            Command::FindClose => self.close_find(),
+            command if Toggle::for_command(command).is_some() => {
+                if let (Some(bar), Some(toggle)) = (&mut self.find, Toggle::for_command(command)) {
+                    bar.toggle(toggle);
+                }
+            }
             _ => match self.read_only_view().map(|view| view.run(command)) {
                 Some(Ran::Copy(Some(text))) => return self.copy_text(text, clipboard),
                 Some(Ran::ReadOnly) => return Action::ReadOnly,
@@ -806,11 +823,20 @@ impl Editor {
             }
             return;
         }
+        if self.reading() {
+            // A drag in the text that goes over the bar stays the text's.
+            let pressed = matches!(mouse.kind, MouseKind::Press(_));
+            let on_bar = pressed || self.find.as_ref().is_some_and(FindBar::pressed);
+            if on_bar && self.handle_find_mouse(mouse, now) {
+                return;
+            }
+        }
         if let Some(reader) = self.reader_mut() {
             match reader.handle_mouse(mouse, now) {
                 Some(ReaderEvent::Edit { line, row }) => {
                     self.reader = None;
                     self.scroll_line_to(line, row, Some(line));
+                    self.refind();
                 }
                 Some(ReaderEvent::Link(url)) => self.link = Some(url),
                 None => {}
@@ -995,7 +1021,8 @@ impl Editor {
         }
         if let Some(reader) = self.reader() {
             reader.draw(frame, self.x, self.y);
-            return None;
+            let (bar, (x, width, _)) = self.find.as_ref().zip(self.find_area())?;
+            return bar.draw(frame, (x, self.y, width), self.find_current(), keymap);
         }
         self.sync_view_size();
         self.sync_syntax();
@@ -1010,7 +1037,7 @@ impl Editor {
             .zip(self.find_area())
             .and_then(|(bar, area)| {
                 let (x, width, _) = area;
-                bar.draw(frame, (x, self.y, width), self.current_match(), keymap)
+                bar.draw(frame, (x, self.y, width), self.find_current(), keymap)
             });
         find_cursor.or_else(|| {
             let (col, row) = self.cursor_in_view()?;
@@ -1803,10 +1830,11 @@ impl Editor {
     /// one line, and focuses the query. With the query focused already, it
     /// closes the bar. With `replacing`, it shows the replacement too and
     /// focuses it if there's a query; with the replacement focused already,
-    /// it hides it.
+    /// it hides it. Replacing leaves reader mode, for the text as written.
     pub fn show_find(&mut self, memory: &find::Memory, replacing: bool) {
-        // Find works on the text as written.
-        self.set_reading(false);
+        if replacing {
+            self.set_reading(false);
+        }
         self.set_diffing(false);
         let focus = self.find.as_ref().and_then(|bar| bar.focus);
         match focus {
@@ -1821,13 +1849,16 @@ impl Editor {
             _ => {}
         }
         let selected = self.selected_text().filter(|text| !text.contains('\n'));
-        let origin = self.selection_start();
+        let origin = self.find_origin();
         if self.find.is_none() {
             self.find_start = Some(self.cursor());
         }
-        let bar = self
-            .find
-            .get_or_insert_with(|| FindBar::new(memory.clone(), origin));
+        let reading = self.reading();
+        let bar = self.find.get_or_insert_with(|| {
+            let mut bar = FindBar::new(memory.clone(), origin);
+            bar.replaceable = !reading;
+            bar
+        });
         if let Some(text) = selected {
             if text != bar.memory.query.text {
                 bar.memory.query.text = text;
@@ -1856,25 +1887,27 @@ impl Editor {
     /// opens with `memory`'s query, keeping focus in the text, or if there's
     /// no query, to type one.
     pub fn find_step(&mut self, memory: &find::Memory, forward: bool) {
-        // Matches are in the text as written.
-        self.set_reading(false);
         self.set_diffing(false);
         if self.find.is_none() {
             if memory.query.text.is_empty() {
                 return self.show_find(memory, false);
             }
-            let mut bar = FindBar::new(memory.clone(), self.selection_start());
+            let mut bar = FindBar::new(memory.clone(), self.find_origin());
             bar.focus = None;
+            bar.replaceable = !self.reading();
             self.find = Some(bar);
             self.find_start = Some(self.cursor());
         }
         self.sync_find();
+        let cursor = match self.reader() {
+            Some(reader) => reader.find_origin(),
+            None => self.buffer.cursor().offset,
+        };
         let Some(bar) = &self.find else {
             return;
         };
-        let cursor = self.buffer.cursor().offset;
         let count = bar.matches.len();
-        let index = match self.current_match() {
+        let index = match self.find_current() {
             Some(i) if forward => Some((i + 1) % count),
             Some(i) => Some((i + count - 1) % count),
             None if forward => bar.next_from(cursor),
@@ -1940,6 +1973,9 @@ impl Editor {
         if self.find.take().is_none() {
             return;
         }
+        if let Some(reader) = &mut self.reader {
+            reader.clear_find();
+        }
         self.find_start = None;
         self.buffer.remove_highlights(FIND_HIGHLIGHTS);
         if let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) {
@@ -1960,6 +1996,9 @@ impl Editor {
     /// Finds the matches again if the text or the query changed. After the
     /// query changes, the first match from where finding started is selected.
     fn sync_find(&mut self) {
+        if self.reading() {
+            return self.sync_reader_find();
+        }
         let epoch = self.buffer.content_epoch();
         if self
             .find
@@ -2028,6 +2067,80 @@ impl Editor {
         }
     }
 
+    /// [`Editor::sync_find`] in reader mode, where matches are in the text
+    /// as shown, and found again as it's laid out again.
+    fn sync_reader_find(&mut self) {
+        let (Some(reader), Some(bar)) = (&mut self.reader, &mut self.find) else {
+            return;
+        };
+        let generation = reader.generation();
+        if bar.epoch == Some(generation) {
+            return;
+        }
+        let jump = bar.epoch.is_none() && bar.focus == Some(Field::Find);
+        bar.epoch = Some(generation);
+        (bar.matches, bar.truncated) = match reader.find(&bar.memory.query) {
+            Ok(found) => {
+                bar.error = None;
+                found
+            }
+            Err(error) => {
+                bar.error = Some(error);
+                (Vec::new(), false)
+            }
+        };
+        if jump {
+            if let Some(index) = bar.next_from(bar.origin) {
+                self.select_match(index);
+            }
+        }
+    }
+
+    /// Finds again in the text as written, or in reader mode as shown,
+    /// after switching between them. The reader's find bar can't replace.
+    fn refind(&mut self) {
+        let reading = self.reading();
+        let Some(bar) = &mut self.find else {
+            return;
+        };
+        bar.replaceable = !reading;
+        if reading {
+            bar.replacing = false;
+            if bar.focus == Some(Field::Replace) {
+                bar.focus = Some(Field::Find);
+            }
+            self.buffer.remove_highlights(FIND_HIGHLIGHTS);
+        }
+        // Found again, but not jumped to.
+        bar.epoch = Some(u64::MAX);
+        self.sync_find();
+    }
+
+    /// Finds the matches again in reader mode, if the text was laid out
+    /// again since, as when it was edited in another panel.
+    pub fn refresh_find(&mut self) {
+        if self.reading() {
+            self.sync_find();
+        }
+    }
+
+    /// Where finding starts from: the selection or the cursor, or in reader
+    /// mode, the top of the view.
+    fn find_origin(&self) -> u32 {
+        match self.reader() {
+            Some(reader) => reader.find_origin(),
+            None => self.selection_start(),
+        }
+    }
+
+    /// The find bar's current match, if any.
+    fn find_current(&self) -> Option<usize> {
+        match self.reader() {
+            Some(reader) => reader.current_match(),
+            None => self.current_match(),
+        }
+    }
+
     /// The match that is selected, if any.
     fn current_match(&self) -> Option<usize> {
         let bar = self.find.as_ref()?;
@@ -2036,7 +2149,9 @@ impl Editor {
     }
 
     /// Selects match `index`, with the cursor at its end, scrolling to it.
+    /// In reader mode, the reader shows it as the current one.
     fn select_match(&mut self, index: usize) {
+        let reading = self.reading();
         let Some(bar) = &mut self.find else {
             return;
         };
@@ -2044,6 +2159,10 @@ impl Editor {
             return;
         };
         bar.origin = m.offsets.start;
+        if let Some(reader) = self.reader.as_mut().filter(|_| reading) {
+            reader.select_match(index, bar.rows());
+            return;
+        }
         // However far it goes, going back is to before finding.
         if let Some(start) = self.find_start {
             self.jump_from(start);
@@ -2062,7 +2181,7 @@ impl Editor {
     /// a match near the top right. At the top of the file there's no room
     /// to, and the bar stays over it.
     fn keep_clear_of_find(&self) {
-        let Some((x, _, rows)) = self.find_area() else {
+        let Some((x, _, rows)) = self.find_area().filter(|_| !self.reading()) else {
             return;
         };
         let (gutter, _, _) = self.text_area();
@@ -2160,9 +2279,6 @@ impl Editor {
         if let Some(diff) = &self.diff {
             return diff.status();
         }
-        if let Some(reader) = self.reader() {
-            return reader.status();
-        }
         // While typing a query that isn't a valid regex, why.
         if let Some(error) = self
             .find
@@ -2174,6 +2290,9 @@ impl Editor {
                 text: format!("Invalid regex: {error}"),
                 error: true,
             };
+        }
+        if let Some(reader) = self.reader() {
+            return reader.status();
         }
         let (row, col) = self.cursor();
         let selected = match self.view.selection() {
@@ -2249,6 +2368,7 @@ impl Editor {
     pub fn restyle(&mut self) {
         if let Some(reader) = &mut self.reader {
             reader.invalidate();
+            self.refresh_find();
         }
         if let Some(diff) = &mut self.diff {
             diff.invalidate();
@@ -2359,6 +2479,7 @@ impl Editor {
         if !on {
             let top = self.reader.take().map_or(0, |reader| reader.top_line());
             self.scroll_line_to(top, 0, None);
+            self.refind();
             return;
         }
         if !self.is_markdown() {
@@ -2369,9 +2490,6 @@ impl Editor {
             Some(diff) => diff.top_line(),
             None => self.top_line(),
         };
-        if self.find.is_some() {
-            self.close_find();
-        }
         self.cancel_drag();
         self.read_from(top);
     }
@@ -2394,6 +2512,7 @@ impl Editor {
         let mut reader = Reader::new(self.buffer.clone(), name, top);
         reader.set_size(self.width, self.height);
         self.reader = Some(reader);
+        self.refind();
     }
 
     /// In reader mode, the file line at the top of the view.

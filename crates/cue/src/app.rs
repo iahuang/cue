@@ -1955,6 +1955,7 @@ impl App {
         for panel in tab::all_panels_mut(&mut self.tabs) {
             panel.note_jump();
         }
+        self.refresh_finds();
         self.sync_scroll();
         self.editor_mut();
         self.note_terminal_focus();
@@ -1962,6 +1963,14 @@ impl App {
         self.feed_picker();
         self.follow_settings();
         self.follow_quick_look();
+    }
+
+    /// Finds again in readers whose text was laid out again, as when it
+    /// was edited in another panel or on disk.
+    fn refresh_finds(&mut self) {
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            panel.editors_mut().for_each(Editor::refresh_find);
+        }
     }
 
     /// Draws the frame and returns where the terminal cursor goes (0-based
@@ -2270,6 +2279,7 @@ impl App {
         if let Some(changes) = self.watcher.poll() {
             self.git.refresh();
             changed |= self.disk_changed(changes);
+            self.refresh_finds();
             // Folders may have come back for open files, and the tree may
             // list others.
             self.watching = None;
@@ -12979,21 +12989,64 @@ mod tests {
         ctrl(&mut app, 'u');
         assert!(!app.ed().reading());
         assert!(screen(&app).contains("# Title"));
-        // Find and Find Next work on the text as written.
-        ctrl(&mut app, 'u');
-        ctrl(&mut app, 'f');
-        assert!(!app.ed().reading());
-        type_text(&mut app, "bold");
-        key(&mut app, KeyCode::Esc);
-        ctrl(&mut app, 'u');
-        ctrl(&mut app, 'g');
-        assert!(!app.ed().reading());
-        assert_eq!(app.ed().selected_text().as_deref(), Some("bold"));
         // Other files have no reader mode.
         app.open(&root.join("a.txt"), false);
         assert!(!screen(&app).contains(" Read "));
         app.run(Command::ToggleReader, false);
         assert!(!app.ed().reading());
+    }
+
+    #[test]
+    fn reader_mode_finds_in_the_text_as_shown() {
+        let _serial = crate::test_serial();
+        let text = "# Title\n\nSome **bold** text, and more bold.\n";
+        let root = fixture("reader-find", &[("doc.md", text)]);
+        let mut app = app(&root, Some("doc.md"));
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, 'f');
+        assert!(app.ed().reading(), "finding stays in reader mode");
+        type_text(&mut app, "bold");
+        let shown = screen(&app);
+        assert!(shown.contains("1 of 2"), "{shown}");
+        assert!(!shown.contains(" ▸ "), "no replacing: {shown}");
+
+        // The current match is shaded as such.
+        let frame = OwnedBuffer::new(80, 10, false, WidthMethod::Unicode, "test").unwrap();
+        app.draw(&frame);
+        let rows = frame.to_text(true);
+        let (y, row) = rows
+            .lines()
+            .enumerate()
+            .find(|(_, row)| row.contains("Some bold"))
+            .unwrap();
+        let x = row[..row.find("bold").unwrap()].chars().count() as u32;
+        let colors = theme::colors();
+        assert_eq!(frame.bg_at(x, y as u32), Some(colors.current_match_bg));
+        let other = row[..row.rfind("bold").unwrap()].chars().count() as u32;
+        assert_eq!(frame.bg_at(other, y as u32), Some(colors.match_bg));
+
+        // Esc leaves the current match selected; Find Next goes on.
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.ed().find_open());
+        assert_eq!(app.ed().selected_text().as_deref(), Some("bold"));
+        ctrl(&mut app, 'g');
+        ctrl(&mut app, 'g');
+        assert!(app.ed().reading());
+        assert!(screen(&app).contains("2 of 2"), "{}", screen(&app));
+
+        // The markup isn't there to find.
+        ctrl(&mut app, 'f');
+        type_text(&mut app, "**b");
+        assert!(screen(&app).contains("no matches"), "{}", screen(&app));
+
+        // Replacing is in the text as written.
+        ctrl(&mut app, 'h');
+        assert!(!app.ed().reading());
+        let shown = screen(&app);
+        assert!(
+            shown.contains(" ▾ ") && shown.contains("1 match"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -13103,6 +13156,15 @@ mod tests {
         app.run(Command::DocumentEnd, false);
         type_text(&mut app, "- new item");
         assert!(screen(&app).contains("• new item"), "{}", screen(&app));
+
+        // Its find bar finds again in what was added.
+        app.run(Command::FocusPanelRight, false);
+        ctrl(&mut app, 'f');
+        type_text(&mut app, "item");
+        assert!(screen(&app).contains("1 of 1"), "{}", screen(&app));
+        app.run(Command::FocusPanelLeft, false);
+        type_text(&mut app, " item");
+        assert!(screen(&app).contains("1 of 2"), "{}", screen(&app));
     }
 
     #[test]
