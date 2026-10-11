@@ -1957,13 +1957,14 @@ impl Reader {
         }
     }
 
-    /// A mouse event at cell (`mouse.x`, `mouse.y`) of the view.
-    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> Option<ReaderEvent> {
+    /// A mouse event at cell (`mouse.x`, `mouse.y`) of the view, or the
+    /// nearest one to it, `above` it when dragged there.
+    pub fn handle_mouse(&mut self, mouse: Mouse, above: bool, now: Instant) -> Option<ReaderEvent> {
         self.sync();
         let col = mouse.x.saturating_sub(self.margin()) as usize;
         if mouse.kind != MouseKind::Press(MouseButton::Left) {
             // A click that's not a drag follows a link.
-            let clicked = self.drag_or_scroll(mouse, col)?;
+            let clicked = self.drag_or_scroll(mouse, col, above, now)?;
             let link = self.link_at(clicked)?;
             if let Some(anchor) = link.strip_prefix('#') {
                 self.go_to_anchor(anchor);

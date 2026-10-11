@@ -301,13 +301,14 @@ impl DiffView {
         })
     }
 
-    /// A mouse event at cell (`mouse.x`, `mouse.y`) of the view.
-    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> Option<DiffEvent> {
+    /// A mouse event at cell (`mouse.x`, `mouse.y`) of the view, or the
+    /// nearest one to it, `above` it when dragged there.
+    pub fn handle_mouse(&mut self, mouse: Mouse, above: bool, now: Instant) -> Option<DiffEvent> {
         self.sync();
         // The line numbers count as the text's start.
         let col = (mouse.x as usize).saturating_sub(self.with_layout(Layout::gutter));
         if mouse.kind != MouseKind::Press(MouseButton::Left) {
-            self.drag_or_scroll(mouse, col);
+            self.drag_or_scroll(mouse, col, above, now);
             return None;
         }
         let at = self.scroller.spot(mouse.y, col);

@@ -815,11 +815,27 @@ impl App {
     }
 
     /// How long until something changes on screen by itself, if anything
-    /// is waiting to: the recently viewed list showing.
+    /// is waiting to: the recently viewed list showing, or text scrolling
+    /// under a drag held past its top or bottom.
     pub fn wakes_in(&self) -> Option<Duration> {
-        self.switcher
+        let now = Instant::now();
+        let switcher = self
+            .switcher
             .as_ref()
-            .and_then(|switcher| switcher.shows_in(Instant::now()))
+            .and_then(|switcher| switcher.shows_in(now));
+        let drag = self
+            .dragged_panel()
+            .and_then(|id| self.tab().panels.iter().find(|panel| panel.id == id))
+            .and_then(|panel| panel.drag_scrolls_in(now));
+        switcher.into_iter().chain(drag).min()
+    }
+
+    /// The panel a left drag in it is selecting in, if any.
+    fn dragged_panel(&self) -> Option<PanelId> {
+        match self.mouse_target {
+            Some(MouseTarget::Panel(id)) => Some(id),
+            _ => None,
+        }
     }
 
     /// Says whether the terminal can report keys going up. If not, the
@@ -2309,6 +2325,16 @@ impl App {
             .switcher
             .as_mut()
             .is_some_and(|switcher| switcher.reveal(now));
+        if let Some(id) = self.dragged_panel() {
+            let scrolled = self
+                .tab_mut()
+                .panel_mut(id)
+                .is_some_and(|panel| panel.drag_scroll(now));
+            if scrolled {
+                self.sync_scroll();
+                changed = true;
+            }
+        }
         for terminal in &self.terminals {
             let mut terminal = terminal.borrow_mut();
             changed |= terminal.poll();
@@ -10985,6 +11011,32 @@ mod tests {
         let area = app.active_panel().area();
         left_click(&mut app, area.x + 2, area.y);
         assert_eq!(app.picker.as_ref().map(Picker::mode), Some(Mode::Terminals));
+    }
+
+    #[test]
+    fn a_drag_held_below_the_text_keeps_scrolling_it() {
+        let _serial = crate::test_serial();
+        let text: Vec<_> = (0..40).map(|i| format!("line {i}")).collect();
+        let root = fixture("drag-scroll", &[("a.txt", &text.join("\n"))]);
+        let mut app = app(&root, Some("a.txt"));
+        let body = app.active_panel().body();
+        let top = |app: &App| app.active_panel().editor().unwrap().place().2;
+        let mouse = |app: &mut App, kind, y, now| {
+            let x = body.x + 10;
+            let mods = Mods::NONE;
+            app.handle_mouse(Mouse { kind, x, y, mods }, now);
+        };
+        let held = Instant::now() - Duration::from_secs(1);
+
+        mouse(&mut app, MouseKind::Press(MouseButton::Left), body.y, held);
+        mouse(&mut app, MouseKind::Drag(MouseButton::Left), 9, held);
+        assert_eq!(top(&app), 1);
+        assert_eq!(app.wakes_in(), Some(Duration::ZERO));
+        assert!(app.poll());
+        assert_eq!(top(&app), 2);
+        assert!(app.wakes_in().is_some_and(|wake| wake > Duration::ZERO));
+        mouse(&mut app, MouseKind::Release(MouseButton::Left), 9, held);
+        assert_eq!(app.wakes_in(), None);
     }
 
     #[test]

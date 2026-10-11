@@ -4,7 +4,7 @@
 //! as it is now.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use opentui::Buffer;
 
@@ -86,10 +86,20 @@ impl CommitDiff {
     }
 
     /// A mouse event at (`mouse.x`, `mouse.y`) from the top left of the
-    /// text.
-    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) {
+    /// text, `above` it when dragged there.
+    pub fn handle_mouse(&mut self, mouse: Mouse, above: bool, now: Instant) {
         // Double clicks don't go to editing: it's not the file as it is.
-        self.view.handle_mouse(mouse, now);
+        self.view.handle_mouse(mouse, above, now);
+    }
+
+    /// See [`Scrolled::drag_scroll`].
+    pub fn drag_scroll(&mut self, now: Instant) -> bool {
+        self.view.drag_scroll(now)
+    }
+
+    /// See [`Scrolled::drag_scrolls_in`].
+    pub fn drag_scrolls_in(&self, now: Instant) -> Option<Duration> {
+        self.view.drag_scrolls_in(now)
     }
 
     pub fn status(&self) -> Status {

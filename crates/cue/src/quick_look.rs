@@ -132,7 +132,7 @@ impl QuickLook {
                     y: mouse.y.saturating_sub(area.y),
                     ..mouse
                 };
-                editor.handle_mouse(local, now);
+                editor.handle_mouse(local, false, now);
             }
             Body::Folder(entries, scroll) => {
                 let max = entries.len().saturating_sub(area.height as usize);

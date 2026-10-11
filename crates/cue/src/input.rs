@@ -13,6 +13,10 @@ use std::time::Duration;
 /// Clicks on the same spot within this interval count as a double/triple click.
 pub const MULTI_CLICK: Duration = Duration::from_millis(400);
 
+/// How often a drag held past the top or bottom of text scrolls it another
+/// row.
+pub const DRAG_SCROLL_EVERY: Duration = Duration::from_millis(50);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Mods {
     pub shift: bool,

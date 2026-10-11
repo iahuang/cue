@@ -19,7 +19,7 @@ use std::cell::{Cell, RefMut};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use opentui::{
     Attributes, Buffer, EditBuffer, EditorView, Highlight, SelectionBehavior, SelectionColors,
@@ -35,7 +35,7 @@ use crate::document::{self, Disk, Document};
 use crate::find::{self, Field, FindBar, Match, Target};
 use crate::history::{EditKind, History};
 use crate::indent::{self, Indent};
-use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
+use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, DRAG_SCROLL_EVERY, MULTI_CLICK};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::Edit;
 use crate::location::Position;
@@ -111,9 +111,17 @@ enum Direction {
 
 /// A mouse selection in progress.
 struct Drag {
+    /// Where it started, in rows and columns of the text rather than the
+    /// screen, which may scroll.
     origin: (u32, u32),
-    focus: (u32, u32),
+    /// The cell of the text area the mouse is over, or nearest to.
+    at: (u32, u32),
     behavior: SelectionBehavior,
+    /// Which way the text scrolls with the mouse past its top or bottom:
+    /// -1 up, 1 down, or 0 not at all.
+    edge: i64,
+    /// When it last scrolled.
+    scrolled: Option<Instant>,
 }
 
 struct Click {
@@ -815,9 +823,11 @@ impl Editor {
         Action::Continue
     }
 
-    pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) {
+    /// A mouse event at cell (`mouse.x`, `mouse.y`) of the editor, or the
+    /// nearest one to it, `above` it when dragged there.
+    pub fn handle_mouse(&mut self, mouse: Mouse, above: bool, now: Instant) {
         if let Some(diff) = &mut self.diff {
-            if let Some(DiffEvent::Edit { line, row }) = diff.handle_mouse(mouse, now) {
+            if let Some(DiffEvent::Edit { line, row }) = diff.handle_mouse(mouse, above, now) {
                 self.diff = None;
                 self.scroll_line_to(line, row, Some(line));
             }
@@ -832,7 +842,7 @@ impl Editor {
             }
         }
         if let Some(reader) = self.reader_mut() {
-            match reader.handle_mouse(mouse, now) {
+            match reader.handle_mouse(mouse, above, now) {
                 Some(ReaderEvent::Edit { line, row }) => {
                     self.reader = None;
                     self.scroll_line_to(line, row, Some(line));
@@ -884,22 +894,31 @@ impl Editor {
                     true,
                     selection_colors(),
                 );
+                let vp = self.view.viewport();
                 self.drag = Some(Drag {
-                    origin: at,
-                    focus: at,
+                    origin: (vp.x + at.0, vp.y + at.1),
+                    at,
                     behavior,
+                    edge: 0,
+                    scrolled: None,
                 });
             }
             MouseKind::Drag(MouseButton::Left) => {
-                if let Some(drag) = &mut self.drag {
-                    drag.focus = at;
-                    self.view.update_local_selection(
-                        cell(drag.origin),
-                        cell(at),
-                        drag.behavior,
-                        true,
-                        selection_colors(),
-                    );
+                let Some(drag) = &mut self.drag else {
+                    return;
+                };
+                drag.at = at;
+                // Past the top or bottom, it scrolls as the text is held
+                // there (see [`Editor::drag_scroll`]), starting now.
+                drag.edge = if above {
+                    -1
+                } else if mouse.y >= text_h {
+                    1
+                } else {
+                    0
+                };
+                if !self.drag_scroll(now) {
+                    self.drag_select();
                 }
             }
             MouseKind::Release(MouseButton::Left) => {
@@ -1758,7 +1777,9 @@ impl Editor {
             self.anchor = None;
             return;
         };
-        let backwards = (drag.focus.1, drag.focus.0) < (drag.origin.1, drag.origin.0);
+        let vp = self.view.viewport();
+        let focus = (vp.x + drag.at.0, vp.y + drag.at.1);
+        let backwards = (focus.1, focus.0) < (drag.origin.1, drag.origin.0);
         let (anchor, cursor) = if backwards {
             (end, start)
         } else {
@@ -1770,6 +1791,69 @@ impl Editor {
         // off the gap at the end of a wrapped row, which the view can't show.
         self.view.set_selection_occupancy(SelectionOccupancy::Cell);
         self.anchor = Some(anchor);
+    }
+
+    /// Selects from where the drag started to the cell the mouse is at.
+    fn drag_select(&mut self) {
+        let Some(drag) = &self.drag else {
+            return;
+        };
+        // The start may have scrolled out of view, above or to the left.
+        let vp = self.view.viewport();
+        let origin = (
+            drag.origin.0 as i64 - vp.x as i64,
+            drag.origin.1 as i64 - vp.y as i64,
+        );
+        self.view.update_local_selection(
+            (origin.0 as i32, origin.1 as i32),
+            cell(drag.at),
+            drag.behavior,
+            true,
+            selection_colors(),
+        );
+    }
+
+    /// Scrolls the text a row, selecting along, while a drag is held past
+    /// its top or bottom and it's been [`DRAG_SCROLL_EVERY`] since it last
+    /// did. Returns whether it scrolled.
+    pub fn drag_scroll(&mut self, now: Instant) -> bool {
+        if let Some(view) = self.read_only_view() {
+            return view.drag_scroll(now);
+        }
+        if self.drag_scrolls_in(now) != Some(Duration::ZERO) {
+            return false;
+        }
+        let Some(drag) = &mut self.drag else {
+            return false;
+        };
+        drag.scrolled = Some(now);
+        let edge = drag.edge;
+        self.scroll(0, edge);
+        self.drag_select();
+        true
+    }
+
+    /// How long until a drag held past the top or bottom of the text
+    /// scrolls it, if it's held there and the text can scroll that way.
+    pub fn drag_scrolls_in(&self, now: Instant) -> Option<Duration> {
+        if let Some(diff) = &self.diff {
+            return diff.drag_scrolls_in(now);
+        }
+        if let Some(reader) = self.reader() {
+            return reader.drag_scrolls_in(now);
+        }
+        let drag = self.drag.as_ref()?;
+        let top = self.view.viewport().y;
+        let room = match drag.edge {
+            -1 => top > 0,
+            1 => top < self.max_scroll(),
+            _ => false,
+        };
+        room.then(|| {
+            drag.scrolled.map_or(Duration::ZERO, |at| {
+                DRAG_SCROLL_EVERY.saturating_sub(now.duration_since(at))
+            })
+        })
     }
 
     /// Stops a drag without making an offset selection of it.
@@ -2813,6 +2897,7 @@ mod tests {
                 y,
                 mods: Mods::NONE,
             },
+            false,
             now,
         );
     }
@@ -3731,6 +3816,7 @@ mod tests {
                 y: 1,
                 mods: Mods::SHIFT,
             },
+            false,
             t3 + Duration::from_secs(1),
         );
         assert_eq!(editor.view.selected_text(), "hello world\nsecon");
@@ -3781,6 +3867,67 @@ mod tests {
         let (lines, cursor) = screen_lines(&editor, 60, 8);
         assert_eq!(lines[0], "  1  line 0");
         assert_eq!(cursor, Some((6, 1)));
+    }
+
+    #[test]
+    fn dragging_past_the_top_or_bottom_scrolls_while_held_there() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let lines: Vec<_> = (0..20).map(|i| format!("line {i}")).collect();
+        eb.set_text(&lines.join("\n"));
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 40, 5).unwrap();
+        let left = MouseButton::Left;
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        // With over ten lines, line numbers take a column more than
+        // `mouse` allows for, so its column 1 is the text's first.
+
+        // On the top row, it selects without scrolling.
+        mouse(&mut editor, MouseKind::Press(left), 1, 0, t);
+        mouse(&mut editor, MouseKind::Drag(left), 5, 0, t);
+        assert_eq!(editor.drag_scrolls_in(t), None);
+        mouse(&mut editor, MouseKind::Release(left), 5, 0, t);
+        assert_eq!(editor.view.viewport().y, 0);
+
+        // Below the text, it scrolls a row at once, then a row at a time.
+        mouse(&mut editor, MouseKind::Press(left), 1, 1, t);
+        mouse(&mut editor, MouseKind::Drag(left), 3, 7, t);
+        assert_eq!(editor.view.viewport().y, 1);
+        assert!(!editor.drag_scroll(ms(20)));
+        assert_eq!(
+            editor.drag_scrolls_in(ms(20)),
+            Some(Duration::from_millis(30))
+        );
+        assert!(editor.drag_scroll(ms(50)));
+        // Moving the mouse doesn't scroll any sooner.
+        mouse(&mut editor, MouseKind::Drag(left), 4, 6, ms(60));
+        assert_eq!(editor.view.viewport().y, 2);
+        screen_lines(&editor, 40, 5);
+        assert_eq!(editor.view.viewport().y, 2, "the cursor doesn't pull it on");
+        mouse(&mut editor, MouseKind::Release(left), 4, 6, ms(60));
+        assert_eq!(
+            editor.view.selected_text(),
+            "line 1\nline 2\nline 3\nline 4\nline 5\nlin"
+        );
+        assert_eq!((eb.cursor().row, eb.cursor().col), (6, 3));
+        assert_eq!(editor.drag_scrolls_in(ms(60)), None);
+
+        // Above the text, it scrolls back, and selects back to the top row.
+        mouse(&mut editor, MouseKind::Press(left), 1, 2, ms(1000));
+        editor.handle_mouse(
+            Mouse {
+                kind: MouseKind::Drag(left),
+                x: GUTTER + 1,
+                y: 0,
+                mods: Mods::NONE,
+            },
+            true,
+            ms(1000),
+        );
+        mouse(&mut editor, MouseKind::Release(left), 1, 0, ms(1000));
+        assert_eq!(editor.view.viewport().y, 1);
+        assert_eq!(editor.view.selected_text(), "line 1\nline 2\nline 3\n");
+        assert_eq!((eb.cursor().row, eb.cursor().col), (1, 0));
     }
 
     #[test]
@@ -3845,6 +3992,7 @@ mod tests {
                     y: 0,
                     mods,
                 },
+                false,
                 now,
             );
             screen_lines(editor, 40, 6)
@@ -4493,6 +4641,7 @@ mod tests {
                     y,
                     mods: Mods::NONE,
                 },
+                false,
                 now,
             );
         };

@@ -3,9 +3,9 @@
 //! mouse, and refuse to be edited.
 
 use std::cell::Cell;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, MULTI_CLICK};
+use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, DRAG_SCROLL_EVERY, MULTI_CLICK};
 use crate::keymap::Command;
 
 /// A row, and a column of the text on it.
@@ -27,6 +27,14 @@ pub struct Scroller {
     /// Where the left button went down, until it's released.
     press: Option<Spot>,
     dragged: bool,
+    /// The screen row and the column of the text a drag is at, or nearest
+    /// to.
+    held: (u32, usize),
+    /// Which way the text scrolls with a drag past its top or bottom: -1
+    /// up, 1 down, or 0 not at all.
+    edge: i64,
+    /// When a drag last scrolled the text.
+    scrolled: Option<Instant>,
     last_click: Option<Click>,
 }
 
@@ -67,6 +75,8 @@ impl Scroller {
         }
         self.press = Some(at);
         self.dragged = false;
+        self.edge = 0;
+        self.scrolled = None;
     }
 }
 
@@ -136,25 +146,33 @@ pub trait Scrolled {
         }
     }
 
-    /// The mouse at column `col` of the text, but for a left press, which
-    /// the view sees to: a drag selects, scrolling past the top or bottom,
-    /// and the wheel scrolls. A release that ended no drag says where the
-    /// button went down.
-    fn drag_or_scroll(&mut self, mouse: Mouse, col: usize) -> Option<Spot> {
+    /// The mouse at column `col` of the text, `above` it when dragged
+    /// there, but for a left press, which the view sees to: a drag selects,
+    /// scrolling as it's held past the top or bottom (see
+    /// [`Scrolled::drag_scroll`]), and the wheel scrolls. A release that
+    /// ended no drag says where the button went down.
+    fn drag_or_scroll(
+        &mut self,
+        mouse: Mouse,
+        col: usize,
+        above: bool,
+        now: Instant,
+    ) -> Option<Spot> {
         match mouse.kind {
             MouseKind::Drag(MouseButton::Left) => {
-                let origin = self.scroller().press?;
+                self.scroller().press?;
                 let height = self.height();
-                if mouse.y >= height {
-                    self.scroll(1);
-                } else if mouse.y == 0 {
-                    self.scroll(-1);
-                }
                 let scroller = self.scroller_mut();
-                let at = scroller.spot(mouse.y.min(height.saturating_sub(1)), col);
-                scroller.dragged = scroller.dragged || at != origin;
-                if scroller.dragged {
-                    scroller.selection.set(Some((origin, at)));
+                scroller.held = (mouse.y.min(height.saturating_sub(1)), col);
+                scroller.edge = if above {
+                    -1
+                } else if mouse.y >= height {
+                    1
+                } else {
+                    0
+                };
+                if !self.drag_scroll(now) {
+                    self.drag_select();
                 }
             }
             MouseKind::Release(MouseButton::Left) => {
@@ -167,6 +185,54 @@ pub trait Scrolled {
             _ => {}
         }
         None
+    }
+
+    /// Selects from where the left button went down to where the drag is,
+    /// once it's moved from there.
+    fn drag_select(&mut self) {
+        let scroller = self.scroller_mut();
+        let Some(origin) = scroller.press else {
+            return;
+        };
+        let at = scroller.spot(scroller.held.0, scroller.held.1);
+        scroller.dragged = scroller.dragged || at != origin;
+        if scroller.dragged {
+            scroller.selection.set(Some((origin, at)));
+        }
+    }
+
+    /// Scrolls the text a row, selecting along, while a drag is held past
+    /// its top or bottom and it's been [`DRAG_SCROLL_EVERY`] since it last
+    /// did. Returns whether it scrolled.
+    fn drag_scroll(&mut self, now: Instant) -> bool {
+        if self.drag_scrolls_in(now) != Some(Duration::ZERO) {
+            return false;
+        }
+        let scroller = self.scroller_mut();
+        scroller.scrolled = Some(now);
+        let edge = scroller.edge;
+        self.scroll(edge);
+        self.drag_select();
+        true
+    }
+
+    /// How long until a drag held past the top or bottom of the text
+    /// scrolls it, if it's held there and the text can scroll that way.
+    fn drag_scrolls_in(&self, now: Instant) -> Option<Duration> {
+        self.sync();
+        let scroller = self.scroller();
+        scroller.press?;
+        let top = scroller.top.get();
+        let room = match scroller.edge {
+            -1 => top > 0,
+            1 => top < self.max_top(),
+            _ => false,
+        };
+        room.then(|| {
+            scroller.scrolled.map_or(Duration::ZERO, |at| {
+                DRAG_SCROLL_EVERY.saturating_sub(now.duration_since(at))
+            })
+        })
     }
 
     /// Runs an editor command: those that move the cursor scroll, and
@@ -216,5 +282,100 @@ pub trait Scrolled {
             KeyCode::Char(_) => key.mods.is_plain(),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::Mods;
+
+    /// Forty rows, five at a time.
+    #[derive(Default)]
+    struct Rows(Scroller);
+
+    impl Scrolled for Rows {
+        fn scroller(&self) -> &Scroller {
+            &self.0
+        }
+        fn scroller_mut(&mut self) -> &mut Scroller {
+            &mut self.0
+        }
+        fn sync(&self) {}
+        fn rows(&self) -> usize {
+            40
+        }
+        fn height(&self) -> u32 {
+            5
+        }
+        fn selected_text(&self) -> Option<String> {
+            None
+        }
+    }
+
+    fn drag(view: &mut Rows, y: u32, above: bool, now: Instant) {
+        let kind = MouseKind::Drag(MouseButton::Left);
+        let mods = Mods::NONE;
+        view.drag_or_scroll(
+            Mouse {
+                kind,
+                x: 0,
+                y,
+                mods,
+            },
+            2,
+            above,
+            now,
+        );
+    }
+
+    #[test]
+    fn a_drag_held_past_the_top_or_bottom_keeps_scrolling() {
+        let mut view = Rows::default();
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        view.0.top.set(10);
+
+        // On the top row, it selects without scrolling.
+        view.0.press(view.0.spot(2, 0), false);
+        drag(&mut view, 0, false, t);
+        assert_eq!(view.0.top.get(), 10);
+        assert_eq!(view.drag_scrolls_in(t), None);
+
+        // Above the text, it scrolls a row at once, then a row at a time.
+        drag(&mut view, 0, true, t);
+        assert_eq!(view.0.top.get(), 9);
+        assert!(!view.drag_scroll(ms(20)));
+        assert_eq!(
+            view.drag_scrolls_in(ms(20)),
+            Some(Duration::from_millis(30))
+        );
+        assert!(view.drag_scroll(ms(50)));
+        assert_eq!(view.0.top.get(), 8);
+        assert_eq!(view.0.selection.get(), Some(((12, 0), (8, 2))));
+
+        // Below, it turns around, and stops at the end.
+        drag(&mut view, 9, false, ms(100));
+        assert_eq!(view.0.top.get(), 9);
+        assert_eq!(view.0.selection.get(), Some(((12, 0), (13, 2))));
+        view.0.top.set(view.max_top());
+        assert_eq!(view.drag_scrolls_in(ms(200)), None);
+
+        // Let go, it stops.
+        view.0.top.set(10);
+        let kind = MouseKind::Release(MouseButton::Left);
+        let mods = Mods::NONE;
+        view.drag_or_scroll(
+            Mouse {
+                kind,
+                x: 0,
+                y: 9,
+                mods,
+            },
+            2,
+            false,
+            ms(200),
+        );
+        assert_eq!(view.drag_scrolls_in(ms(200)), None);
     }
 }

@@ -22,7 +22,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use opentui::{Attributes, Buffer};
 
@@ -711,12 +711,32 @@ impl Panel {
             y: mouse.y.saturating_sub(body.y),
             ..mouse
         };
+        let above = mouse.y < body.y;
         if let Some(commit) = &mut self.commit {
-            commit.handle_mouse(local, now);
+            commit.handle_mouse(local, above, now);
             return;
         }
         if let Some(editor) = self.editor_mut() {
-            editor.handle_mouse(local, now);
+            editor.handle_mouse(local, above, now);
+        }
+    }
+
+    /// Scrolls the text under a drag held past its top or bottom, if it's
+    /// time. Returns whether it scrolled.
+    pub fn drag_scroll(&mut self, now: Instant) -> bool {
+        if let Some(commit) = &mut self.commit {
+            return commit.drag_scroll(now);
+        }
+        self.editor_mut()
+            .is_some_and(|editor| editor.drag_scroll(now))
+    }
+
+    /// How long until the text under a drag held past its top or bottom
+    /// scrolls, if it's held there.
+    pub fn drag_scrolls_in(&self, now: Instant) -> Option<Duration> {
+        match &self.commit {
+            Some(commit) => commit.drag_scrolls_in(now),
+            None => self.editor()?.drag_scrolls_in(now),
         }
     }
 
