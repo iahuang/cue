@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.1 — 2026-10-10
 
 - Use temporary binary when launched from NFS to avoid SIGBUS on remote instances (`c991ebf`)
 - Find in reader mode (`691f95b`)
