@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Embedded PDF viewer (`c3deea1`)
+
 ## v0.4.1 — 2026-10-10
 
 - Use temporary binary when launched from NFS to avoid SIGBUS on remote instances (`c991ebf`)
