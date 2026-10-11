@@ -21,13 +21,14 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use opentui::{Attributes, Buffer};
 
 use crate::changes::{button_area, draw_look, file_rows, Look};
 use crate::git::{self, Change, Commit, Kind, Repo, Staged, Stash};
+use crate::host::{Call, Link, Reply, Request};
 use crate::icons;
 use crate::keymap::Command;
 use crate::line_edit::{Caret, Edit};
@@ -200,7 +201,7 @@ pub struct CommitView {
     filled: Option<String>,
     /// The commit git is making, if it is: then its hash, or what went
     /// wrong.
-    committing: Option<Receiver<Result<String, String>>>,
+    committing: Option<Call>,
     /// The file shown in the editor, highlighted.
     active: Option<PathBuf>,
     /// The active file is a preview, shown in italics.
@@ -749,9 +750,9 @@ impl CommitView {
     }
 
     /// Starts committing what's staged, with the message written, in the
-    /// background, unless there's nothing to commit yet, or a commit is
-    /// being made already.
-    pub fn commit(&mut self) -> Result<(), CantCommit> {
+    /// background, on `host`, unless there's nothing to commit yet, or a
+    /// commit is being made already.
+    pub fn commit(&mut self, host: &Link) -> Result<(), CantCommit> {
         if self.committing() {
             return Ok(());
         }
@@ -761,14 +762,11 @@ impl CommitView {
         if !self.amend && !self.merging && self.staged_count() == 0 {
             return Err(CantCommit::NothingStaged);
         }
-        let (sender, receiver) = mpsc::channel();
-        let root = self.root.clone();
-        let message = self.message.text.clone();
-        let amend = self.amend;
-        std::thread::spawn(move || {
-            let _ = sender.send(git::commit(&root, &message, amend));
-        });
-        self.committing = Some(receiver);
+        self.committing = Some(host.call(Request::Commit {
+            root: self.root.clone(),
+            message: self.message.text.clone(),
+            amend: self.amend,
+        }));
         Ok(())
     }
 
@@ -777,8 +775,8 @@ impl CommitView {
     /// box is emptied, and Amend turned off.
     pub fn poll(&mut self) -> Option<Result<String, String>> {
         let result = match self.committing.as_ref()?.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return None,
+            Ok(Reply::Committed(result)) => result,
+            Ok(_) | Err(TryRecvError::Empty) => return None,
             Err(TryRecvError::Disconnected) => Err(STOPPED.to_string()),
         };
         Some(self.finish(result))
@@ -787,8 +785,11 @@ impl CommitView {
     /// Waits for the commit being made, for tests.
     #[cfg(test)]
     pub fn wait(&mut self) -> Option<Result<String, String>> {
-        let result = self.committing.as_ref()?.recv();
-        Some(self.finish(result.unwrap_or_else(|_| Err(STOPPED.to_string()))))
+        let result = match self.committing.as_ref()?.recv() {
+            Some(Reply::Committed(result)) => result,
+            _ => Err(STOPPED.to_string()),
+        };
+        Some(self.finish(result))
     }
 
     fn finish(&mut self, result: Result<String, String>) -> Result<String, String> {
@@ -1518,7 +1519,7 @@ mod tests {
         git::tests::commit_as_cue(&root);
         std::fs::write(root.join("a.txt"), "old\n").unwrap();
         git::stash(&root, "old stash", false).unwrap();
-        let mut git = git::Git::new(std::slice::from_ref(&root));
+        let mut git = git::Git::new(&crate::host::Link::local(), std::slice::from_ref(&root));
         git.wait();
         let before = git.repos()[0].clone();
         let mut view = CommitView::open(&before, "cue".into());
@@ -1541,7 +1542,7 @@ mod tests {
         std::fs::write(root.join("new.txt"), "stashed addition\n").unwrap();
         git::stage(&root, &[root.join("new.txt")]).unwrap();
         git::stash(&root, "new file", true).unwrap();
-        let mut git = git::Git::new(std::slice::from_ref(&root));
+        let mut git = git::Git::new(&crate::host::Link::local(), std::slice::from_ref(&root));
         git.wait();
         let mut view = CommitView::open(&git.repos()[0], "cue".into());
         view.set_size(40, 24);
@@ -1559,8 +1560,8 @@ mod tests {
             .unwrap();
         let y = (view.list_top() + actions - view.scroll) as u32;
         let buttons = view.stash_buttons(view.rows[actions].depth);
-        let (sender, receiver) = mpsc::channel();
-        view.committing = Some(receiver);
+        let host = Link::local();
+        view.committing = Some(host.call(Request::Hold));
         for command in [Command::TreeApplyStash, Command::TreePopStash] {
             assert_eq!(view.run(command), CommitAction::None);
         }
@@ -1569,8 +1570,7 @@ mod tests {
                 assert_eq!(view.click(area.start, y, false), CommitAction::None);
             }
         }
-        sender.send(Ok("1234567".into())).unwrap();
-        assert!(view.poll().unwrap().is_ok());
+        assert!(view.finish(Ok("1234567".into())).is_ok());
         for (command, pop) in [
             (Command::TreeApplyStash, false),
             (Command::TreePopStash, true),
@@ -1605,7 +1605,7 @@ mod tests {
             assert!(!view.amend);
             assert_eq!(view.message(), if edited { &message } else { "" });
             assert_eq!(
-                view.commit(),
+                view.commit(&Link::local()),
                 Err(if edited {
                     CantCommit::NothingStaged
                 } else {
@@ -1784,12 +1784,12 @@ mod tests {
         assert!(root.join(".git/MERGE_HEAD").is_file());
         std::fs::write(root.join("a.txt"), "ours\n").unwrap();
         git::stage(&root, &[root.join("a.txt")]).unwrap();
-        let mut git = git::Git::new(std::slice::from_ref(&root));
+        let mut git = git::Git::new(&crate::host::Link::local(), std::slice::from_ref(&root));
         git.wait();
         assert!(git.repos()[0].changes.is_empty());
         let mut view = CommitView::open(&git.repos()[0], "cue".into());
         view.edit(Edit::Insert("Resolve using ours"), false);
-        assert_eq!(view.commit(), Ok(()));
+        assert_eq!(view.commit(&Link::local()), Ok(()));
         view.wait().unwrap().unwrap();
         assert!(!root.join(".git/MERGE_HEAD").exists());
         let parents = std::process::Command::new("git")
@@ -1810,7 +1810,7 @@ mod tests {
         git.wait();
         view.set_repo(&git.repos()[0]);
         view.edit(Edit::Insert("No further changes"), false);
-        assert_eq!(view.commit(), Err(CantCommit::NothingStaged));
+        assert_eq!(view.commit(&Link::local()), Err(CantCommit::NothingStaged));
     }
 
     #[test]
@@ -1833,7 +1833,7 @@ mod tests {
                 "     b.rs           M ○",
             ]
         );
-        assert_eq!(view.commit(), Err(CantCommit::NoMessage));
+        assert_eq!(view.commit(&Link::local()), Err(CantCommit::NoMessage));
         view.edit(Edit::Insert("Fix it\n\nAll of it, really"), false);
         assert_eq!(
             drawn(&view)[1..6],
@@ -1847,6 +1847,6 @@ mod tests {
             "the box grows"
         );
         view.set_staged(&[PathBuf::from("/w/cue/a.rs")], false);
-        assert_eq!(view.commit(), Err(CantCommit::NothingStaged));
+        assert_eq!(view.commit(&Link::local()), Err(CantCommit::NothingStaged));
     }
 }

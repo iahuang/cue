@@ -1329,7 +1329,7 @@ mod tests {
     /// The workspace at `root` and its files, listed.
     fn index(root: &Path) -> (Workspace, FileIndex) {
         let workspace = Workspace::new([root.to_path_buf()]).unwrap();
-        let mut index = FileIndex::new(&workspace);
+        let mut index = FileIndex::new(&crate::host::Link::local(), &workspace);
         index.wait();
         (workspace, index)
     }

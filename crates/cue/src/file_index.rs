@@ -1,21 +1,22 @@
 //! Every file in the workspace, for the file picker, skipping `.git` and
 //! whatever `.gitignore` and `.ignore` files exclude.
 //!
-//! Background threads do the listing, so a large folder never blocks the
-//! screen. The first listing starts with the app and shows up as it goes.
-//! After that the list is kept for the whole session: a refresh lists the
-//! files again in the background and swaps the new list in only when it's
-//! complete, so the picker always has a whole list to show. Nothing watches
-//! the file system yet, so the app refreshes when the picker opens and after
-//! saving.
+//! The host does the listing (see [`crate::host`]), so a large folder
+//! never blocks the screen. The first listing starts with the app and shows
+//! up as it goes. After that the list is kept for the whole session: a
+//! refresh lists the files again in the background and swaps the new list
+//! in only when it's complete, so the picker always has a whole list to
+//! show. Nothing watches the file system yet, so the app refreshes when the
+//! picker opens and after saving.
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
+use crate::host::{Call, Link, Reply, Request, Responder};
 use crate::picker::Item;
 use crate::tree;
 use crate::workspace::Workspace;
@@ -25,15 +26,8 @@ const MAX_FILES: usize = 200_000;
 /// How often the first listing reports the files found so far.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 
-/// What a listing sends back.
-enum Message {
-    /// More files, during the first listing.
-    Found(Vec<Item>),
-    /// The whole list, sorted by path ignoring case.
-    Done { files: Vec<Item>, truncated: bool },
-}
-
 pub struct FileIndex {
+    host: Link,
     workspace: Workspace,
     /// Shared with an open picker, which keeps its copy until given a new one.
     files: Rc<Vec<Item>>,
@@ -42,15 +36,16 @@ pub struct FileIndex {
     /// Whether some files went unlisted, past `MAX_FILES`.
     truncated: bool,
     /// The listing in progress, if any.
-    listing: Option<Receiver<Message>>,
+    listing: Option<Call>,
     /// A refresh was asked for during a listing: list again after it.
     again: bool,
 }
 
 impl FileIndex {
-    /// Starts listing the files in `workspace`.
-    pub fn new(workspace: &Workspace) -> FileIndex {
+    /// Starts listing the files in `workspace`, on `host`.
+    pub fn new(host: &Link, workspace: &Workspace) -> FileIndex {
         let mut index = FileIndex {
+            host: host.clone(),
             workspace: workspace.clone(),
             files: Rc::new(Vec::new()),
             complete: false,
@@ -84,7 +79,10 @@ impl FileIndex {
             // This listing may already have passed the change.
             self.again = true;
         } else {
-            self.listing = Some(list(&self.workspace, !self.complete));
+            self.listing = Some(self.host.call(Request::ListFiles {
+                workspace: self.workspace.clone(),
+                progress: !self.complete,
+            }));
         }
     }
 
@@ -97,17 +95,26 @@ impl FileIndex {
         let mut changed = false;
         loop {
             match listing.try_recv() {
-                Ok(Message::Found(found)) => {
+                Ok(Reply::FilesFound(found)) => {
+                    let workspace = &self.workspace;
+                    let found = found
+                        .into_iter()
+                        .map(|path| Item::file(path, workspace, ""));
                     Rc::make_mut(&mut self.files).extend(found);
                     changed = true;
                 }
-                Ok(Message::Done { files, truncated }) => {
-                    self.files = Rc::new(files);
+                Ok(Reply::Files { files, truncated }) => {
+                    let workspace = &self.workspace;
+                    let files = files
+                        .into_iter()
+                        .map(|path| Item::file(path, workspace, ""));
+                    self.files = Rc::new(files.collect());
                     self.truncated = truncated;
                     self.complete = true;
                     changed = true;
                     break;
                 }
+                Ok(_) => {}
                 Err(TryRecvError::Empty) => {
                     self.listing = Some(listing);
                     return changed;
@@ -135,19 +142,11 @@ impl FileIndex {
     }
 }
 
-/// Starts listing the files in `workspace` on other threads, reporting the
-/// files found so far along the way if `progress`. A root inside another is
-/// listed once, as itself. The listing stops early if the receiver is
-/// dropped.
-fn list(workspace: &Workspace, progress: bool) -> Receiver<Message> {
-    let (sender, receiver) = mpsc::channel();
-    let workspace = workspace.clone();
-    std::thread::spawn(move || collect(&workspace, progress, &sender));
-    receiver
-}
-
-/// Collects the paths the walk finds into items, and sends them.
-fn collect(workspace: &Workspace, progress: bool, sender: &Sender<Message>) {
+/// Lists the files in `workspace`, for the host, replying with the files
+/// found so far along the way if `progress`, and then all of them. A root
+/// inside another is listed once, as itself. The listing stops early if
+/// the call is cancelled.
+pub fn list(workspace: &Workspace, progress: bool, responder: &Responder) {
     let (found, paths) = mpsc::channel();
     let walker = walker(workspace);
     std::thread::spawn(move || walk(walker, found));
@@ -157,20 +156,23 @@ fn collect(workspace: &Workspace, progress: bool, sender: &Sender<Message>) {
     let mut last_sent = Instant::now();
     let mut truncated = false;
     loop {
+        if responder.is_cancelled() {
+            // Dropping the receiver stops the walk.
+            return;
+        }
         match paths.recv_timeout(PROGRESS_INTERVAL) {
             Ok(path) => {
                 if files.len() >= MAX_FILES {
-                    // Dropping the receiver stops the walk.
                     truncated = true;
                     break;
                 }
-                files.push(Item::file(path, workspace, ""));
+                files.push(path);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if progress && files.len() > sent && last_sent.elapsed() >= PROGRESS_INTERVAL {
-            if sender.send(Message::Found(files[sent..].to_vec())).is_err() {
+            if !responder.reply(Reply::FilesFound(files[sent..].to_vec())) {
                 return;
             }
             sent = files.len();
@@ -178,8 +180,11 @@ fn collect(workspace: &Workspace, progress: bool, sender: &Sender<Message>) {
         }
     }
     // Ignoring case, as in the tree.
-    files.sort_by_cached_key(|item| (item.text.to_lowercase(), item.text.clone()));
-    let _ = sender.send(Message::Done { files, truncated });
+    files.sort_by_cached_key(|path| {
+        let text = workspace.display_path(path);
+        (text.to_lowercase(), text)
+    });
+    responder.reply(Reply::Files { files, truncated });
 }
 
 /// A walk over the workspace's files, or `None` if it has no roots. It
@@ -271,7 +276,8 @@ mod tests {
     }
 
     fn index(root: &Path) -> FileIndex {
-        let mut index = FileIndex::new(&Workspace::new([root.to_path_buf()]).unwrap());
+        let workspace = Workspace::new([root.to_path_buf()]).unwrap();
+        let mut index = FileIndex::new(&Link::local(), &workspace);
         index.wait();
         index
     }
@@ -313,7 +319,7 @@ mod tests {
             [root.clone(), root.join("inner")],
             [root.join("inner"), root.clone()],
         ] {
-            let mut index = FileIndex::new(&Workspace::new(roots).unwrap());
+            let mut index = FileIndex::new(&Link::local(), &Workspace::new(roots).unwrap());
             index.wait();
             assert_eq!(texts(&index), ["inner/a.rs", "nested/b.rs"]);
         }
@@ -332,7 +338,7 @@ mod tests {
         );
         fs::write(root.join(".gitignore"), "worktrees/\n").unwrap();
         let workspace = Workspace::new([root.clone(), root.join("worktrees/feature")]).unwrap();
-        let mut index = FileIndex::new(&workspace);
+        let mut index = FileIndex::new(&Link::local(), &workspace);
         index.wait();
         assert_eq!(
             texts(&index),

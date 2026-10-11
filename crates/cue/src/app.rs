@@ -71,7 +71,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use opentui::{Attributes, Buffer};
@@ -89,6 +89,7 @@ use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
 use crate::find;
 use crate::git::{self, Carried, Change, Commit, Git, Repo, SwitchTo};
+use crate::host::{Call, Link, Notice, Reply, Request, Tell};
 use crate::image::{self, ImageView};
 use crate::indent::{self, Indent};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
@@ -115,7 +116,7 @@ use crate::theme::{self, TerminalColors, Theme, ThemeId, ThemeSetting};
 use crate::toast::Toasts;
 use crate::tree::{Entry, FileTree, TreeAction};
 use crate::wake;
-use crate::watch::{Changes, Watcher};
+use crate::watch::Changes;
 use crate::workspace::Workspace;
 
 /// How far sideways a header that resizes a split is dragged, before it's
@@ -232,7 +233,7 @@ struct Syncing {
     root: PathBuf,
     sync: git::Sync,
     /// How it went, once it's done.
-    done: Receiver<Result<(), String>>,
+    done: Call,
 }
 
 /// What the main loop should do after the app handled input.
@@ -359,6 +360,8 @@ struct HeaderDrag {
 }
 
 pub struct App {
+    /// Does what touches the machine the workspace is on.
+    host: Link,
     workspace: Workspace,
     keymap: Keymap,
     tree: FileTree,
@@ -454,12 +457,11 @@ pub struct App {
     /// The panel whose editor underlines a name, with Ctrl held, to go to
     /// the definition of.
     underlined: Option<PanelId>,
-    /// Hears of files other programs change, in the tree's open folders
-    /// and those of open files, and of commits and the like in the `.git`
-    /// folders of the workspace's repositories.
-    watcher: Watcher,
     /// The tree's listing, and open files' folders and `.git` folders, the
-    /// watcher last took, to tell when to update it.
+    /// host was last told to watch, to tell when to tell it again. It hears
+    /// of files other programs change, in the tree's open folders and those
+    /// of open files, and of commits and the like in the `.git` folders of
+    /// the workspace's repositories.
     watching: Option<(u64, BTreeSet<PathBuf>)>,
     /// Files and terminals shown in the active panel, most recent first.
     recent: Vec<Recent>,
@@ -674,10 +676,11 @@ impl App {
             }
             None => (None, None),
         };
+        let host = Link::local();
         let mut app = App {
-            files: FileIndex::new(&workspace),
+            files: FileIndex::new(&host, &workspace),
             symbols: SymbolIndex::new(&workspace),
-            git: Git::new(workspace.roots()),
+            git: Git::new(&host, workspace.roots()),
             changes: ChangesView::new(),
             log: None,
             commit_views: Vec::new(),
@@ -687,7 +690,7 @@ impl App {
             index_symbols_after_listing: false,
             pending_definition: None,
             underlined: None,
-            watcher: Watcher::new(),
+            host,
             watching: None,
             workspace,
             keymap: Keymap::new(&config.keys),
@@ -2385,15 +2388,19 @@ impl App {
             let screens = due(self.screens_saved, SCREENS_INTERVAL);
             self.save_session(screens);
         }
-        if let Some(changes) = self.watcher.poll() {
-            self.git.refresh();
-            changed |= self.disk_changed(changes);
-            self.refresh_finds();
-            // Folders may have come back for open files, and the tree may
-            // list others.
-            self.watching = None;
-            self.watch_folders();
-            changed |= self.follow_settings();
+        for notice in self.host.notices() {
+            match notice {
+                Notice::DiskChanged(changes) => {
+                    self.git.refresh();
+                    changed |= self.disk_changed(changes);
+                    self.refresh_finds();
+                    // Folders may have come back for open files, and the
+                    // tree may list others.
+                    self.watching = None;
+                    self.watch_folders();
+                    changed |= self.follow_settings();
+                }
+            }
         }
         let committed: Vec<_> = self
             .commit_views
@@ -2407,8 +2414,8 @@ impl App {
         let mut index = 0;
         while let Some(syncing) = self.syncing.get(index) {
             let result = match syncing.done.try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => {
+                Ok(Reply::Synced(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
                     index += 1;
                     continue;
                 }
@@ -2494,14 +2501,14 @@ impl App {
         if self.watching.as_ref() == Some(&watching) {
             return;
         }
+        // An open file's folder may be gone, which the host leaves out.
         let mut folders: BTreeSet<PathBuf> = self.tree.open_folders().cloned().collect();
-        for folder in &watching.1 {
-            // An open file's folder may be gone; the tree's were just listed.
-            if !folders.contains(folder) && folder.is_dir() {
-                folders.insert(folder.clone());
-            }
-        }
-        self.watcher.watch(folders);
+        folders.extend(watching.1.iter().cloned());
+        self.host.tell(Tell::Watch(folders));
+        // Tests change files right after, which a watch that hasn't
+        // started yet would miss.
+        #[cfg(test)]
+        self.host.settle();
         self.watching = Some(watching);
     }
 
@@ -3574,6 +3581,7 @@ impl App {
             .filter_map(|doc| Some((doc.path()?, doc.text())))
             .collect();
         self.search = Some(SearchModal::new(
+            &self.host,
             &self.workspace,
             &self.keymap,
             self.search_memory.clone(),
@@ -4411,7 +4419,7 @@ impl App {
         }
         if new.exclude != old.exclude {
             self.tree.refresh();
-            self.files = FileIndex::new(&self.workspace);
+            self.files = FileIndex::new(&self.host, &self.workspace);
             self.symbols = SymbolIndex::new(&self.workspace);
             self.show_active_in_tree();
         }
@@ -5764,17 +5772,12 @@ impl App {
             self.show_message("Wait for the commit to finish.", false);
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        let (dir, what) = (root.clone(), sync.clone());
-        std::thread::spawn(move || {
-            let _ = sender.send(git::sync(&dir, &what));
+        let done = self.host.call(Request::GitSync {
+            root: root.clone(),
+            sync: sync.clone(),
         });
         self.changes.set_syncing(&root, Some(sync.clone()));
-        self.syncing.push(Syncing {
-            root,
-            sync,
-            done: receiver,
-        });
+        self.syncing.push(Syncing { root, sync, done });
     }
 
     /// Says how `sync`, of the repository at `root`, went.
@@ -6017,7 +6020,7 @@ impl App {
         let Some(view) = self.commit_views.first_mut() else {
             return;
         };
-        match view.commit() {
+        match view.commit(&self.host) {
             Ok(()) => {}
             Err(CantCommit::NoMessage) => {
                 view.set_editing(true);
@@ -6934,7 +6937,7 @@ impl App {
     fn roots_changed(&mut self) {
         self.tree.set_roots(self.workspace.roots());
         self.git.set_roots(self.workspace.roots());
-        self.files = FileIndex::new(&self.workspace);
+        self.files = FileIndex::new(&self.host, &self.workspace);
         self.symbols = SymbolIndex::new(&self.workspace);
         self.watching = None;
         self.watch_folders();
@@ -12981,7 +12984,13 @@ mod tests {
     }
 
     fn reopen_dir(dir: &Path, sessions: Option<PathBuf>, adopted: Vec<Adopted>) -> App {
-        let session = Session::open(dir).unwrap();
+        // The app that had it may have only just let go (see `let_go`).
+        let session = RefCell::new(None);
+        crate::let_go(|| {
+            *session.borrow_mut() = Session::open(dir).ok();
+            session.borrow().is_none()
+        });
+        let session = session.into_inner().expect("the session let go");
         let state = session::read(dir).unwrap();
         let workspace = Workspace::new(state.roots.clone()).unwrap();
         let mut app = App::new(workspace, None, 80, 10).unwrap();

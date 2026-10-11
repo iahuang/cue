@@ -20,6 +20,7 @@ mod file_index;
 mod find;
 mod git;
 mod history;
+mod host;
 mod icons;
 mod image;
 mod indent;

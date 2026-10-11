@@ -1,8 +1,8 @@
 //! Searching the workspace's files for text, with ripgrep's engine.
 //!
-//! A search runs on background threads over the same files as the file
-//! picker, skipping `.git`, ignored files, binary files, and files that
-//! aren't UTF-8 (which cue can't open). Each file's matches come back with
+//! A search runs on the host (see [`crate::host`]), over the same files as
+//! the file picker, skipping `.git`, ignored files, binary files, and files
+//! that aren't UTF-8 (which cue can't open). Each file's matches come back with
 //! the lines around them, for showing excerpts. Open files with unsaved
 //! changes are searched as they are in the editor, not as saved.
 //!
@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::Mutex;
 
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -24,6 +24,7 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContex
 use ignore::WalkState;
 
 use crate::file_index;
+use crate::host::{Call, Link, Reply, Request, Responder};
 use crate::keymap::Command;
 use crate::language::{self, Language};
 use crate::syntax::{ExcerptHighlighter, LineColors, MAX_EXCERPT_BYTES};
@@ -182,6 +183,7 @@ impl FileMatches {
 }
 
 /// What a search found.
+#[derive(Debug)]
 pub enum Found {
     /// A file with matches, not colored yet.
     File(FileMatches),
@@ -195,46 +197,37 @@ pub enum Found {
     },
 }
 
-enum Message {
-    Found(Found),
-    Done,
-}
-
 /// A search in progress, or done.
 pub struct Search {
-    receiver: Receiver<Message>,
-    /// Stops the search, and coloring what it found.
-    dropped: Arc<AtomicBool>,
-    /// Matches found so far, across all threads.
-    found: Arc<AtomicUsize>,
+    /// Dropping it stops the search, and coloring what it found.
+    call: Call,
+    /// Matches found so far.
+    found: usize,
     done: bool,
 }
 
 impl Search {
-    /// Starts searching `workspace` for `query`. `open` has the text of
-    /// files open with unsaved changes, by path, to search instead of what's
-    /// on disk. Fails with a message if the query isn't a valid regex.
+    /// Starts searching `workspace` for `query`, on `host`. `open` has the
+    /// text of files open with unsaved changes, by path, to search instead
+    /// of what's on disk. Fails with a message if the query isn't a valid
+    /// regex.
     pub fn start(
+        host: &Link,
         workspace: &Workspace,
         query: &Query,
         open: HashMap<PathBuf, String>,
     ) -> Result<Search, String> {
-        let matcher = query.matcher()?;
-        let (sender, receiver) = mpsc::channel();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let found = Arc::new(AtomicUsize::new(0));
-        let search = Search {
-            receiver,
-            dropped: Arc::clone(&dropped),
-            found: Arc::clone(&found),
-            done: false,
-        };
-        let workspace = workspace.clone();
-        std::thread::spawn(move || {
-            run(&workspace, matcher, open, &dropped, &found, &sender);
-            let _ = sender.send(Message::Done);
+        query.matcher()?;
+        let call = host.call(Request::Search {
+            workspace: workspace.clone(),
+            query: query.clone(),
+            unsaved: open,
         });
-        Ok(search)
+        Ok(Search {
+            call,
+            found: 0,
+            done: false,
+        })
     }
 
     /// What was found since the last call, in order: a file's colors come
@@ -242,9 +235,15 @@ impl Search {
     pub fn poll(&mut self) -> Vec<Found> {
         let mut found = Vec::new();
         loop {
-            match self.receiver.try_recv() {
-                Ok(Message::Found(f)) => found.push(f),
-                Ok(Message::Done) | Err(TryRecvError::Disconnected) => {
+            match self.call.try_recv() {
+                Ok(Reply::Found(f)) => {
+                    if let Found::File(file) = &f {
+                        self.found += file.match_count;
+                    }
+                    found.push(f);
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Disconnected) => {
                     self.done = true;
                     break;
                 }
@@ -261,7 +260,7 @@ impl Search {
 
     /// Whether the search stopped at [`MAX_MATCHES`].
     pub fn truncated(&self) -> bool {
-        self.found.load(Ordering::Relaxed) >= MAX_MATCHES
+        self.found >= MAX_MATCHES
     }
 
     /// Waits for the search to finish, for tests: the files, colored.
@@ -284,26 +283,23 @@ impl Search {
     }
 }
 
-impl Drop for Search {
-    fn drop(&mut self) {
-        self.dropped.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Searches every file in the workspace, sending those with matches, and
-/// then their colors: files are colored on threads of their own, so
-/// searching goes on at full speed.
-fn run(
+/// Searches every file in `workspace` for `query`, for the host, replying
+/// with those with matches, and then their colors: files are colored on
+/// threads of their own, so searching goes on at full speed. Stops if the
+/// call is cancelled.
+pub fn run(
     workspace: &Workspace,
-    matcher: RegexMatcher,
+    query: &Query,
     open: HashMap<PathBuf, String>,
-    dropped: &AtomicBool,
-    found: &AtomicUsize,
-    sender: &Sender<Message>,
+    responder: &Responder,
 ) {
-    let Some(walker) = file_index::walker(workspace) else {
+    let (Ok(matcher), Some(walker)) = (query.matcher(), file_index::walker(workspace)) else {
         return;
     };
+    let dropped = responder.cancelled();
+    // Matches found so far, across all threads.
+    let found = AtomicUsize::new(0);
+    let found = &found;
     // Set once there are enough matches, which stops searching but not
     // coloring the files found.
     let full = AtomicBool::new(false);
@@ -315,7 +311,6 @@ fn run(
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         for _ in 0..threads {
             let queue = &queue;
-            let sender = sender.clone();
             scope.spawn(move || {
                 let mut highlighter = ExcerptHighlighter::new();
                 loop {
@@ -326,7 +321,7 @@ fn run(
                     let Some(colors) = job.color(&mut highlighter, dropped) else {
                         continue;
                     };
-                    if sender.send(Message::Found(colors)).is_err() {
+                    if !responder.reply(Reply::Found(colors)) {
                         return;
                     }
                 }
@@ -334,7 +329,6 @@ fn run(
         }
         walker.build_parallel().run(|| {
             let matcher = matcher.clone();
-            let sender = sender.clone();
             let jobs = jobs.clone();
             let mut searcher = SearcherBuilder::new()
                 .line_number(true)
@@ -374,7 +368,7 @@ fn run(
                     display: file.display.clone(),
                     excerpts,
                 });
-                if sender.send(Message::Found(Found::File(file))).is_err() {
+                if !responder.reply(Reply::Found(Found::File(file))) {
                     return WalkState::Quit;
                 }
                 if let Some(job) = job {
@@ -596,7 +590,9 @@ mod tests {
     /// The files matching `query`, sorted by path.
     fn search(root: &Path, query: &Query, open: HashMap<PathBuf, String>) -> Vec<FileMatches> {
         let workspace = Workspace::new([root.to_path_buf()]).unwrap();
-        let mut files = Search::start(&workspace, query, open).unwrap().wait();
+        let mut files = Search::start(&Link::local(), &workspace, query, open)
+            .unwrap()
+            .wait();
         files.sort_by(|a, b| a.display.cmp(&b.display));
         files
     }
@@ -685,7 +681,7 @@ mod tests {
             regex: true,
             ..query("(")
         };
-        let error = Search::start(&workspace, &bad, HashMap::new())
+        let error = Search::start(&Link::local(), &workspace, &bad, HashMap::new())
             .err()
             .unwrap();
         assert!(!error.contains('\n'), "{error}");
@@ -760,7 +756,8 @@ mod tests {
         let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (n.as_str(), *t)).collect();
         let root = fixture("many", &files);
         let workspace = Workspace::new([root]).unwrap();
-        let mut search = Search::start(&workspace, &query("x"), HashMap::new()).unwrap();
+        let mut search =
+            Search::start(&Link::local(), &workspace, &query("x"), HashMap::new()).unwrap();
         let found: usize = search.wait().iter().map(|f| f.match_count).sum();
         assert!(search.truncated());
         assert!((MAX_MATCHES..MAX_MATCHES * 2).contains(&found), "{found}");

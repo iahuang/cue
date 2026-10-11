@@ -22,9 +22,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
+use crate::host::{Call, Link, Reply, Request};
 use crate::theme::Hue;
 
 /// Changes past this many in a repository aren't listed.
@@ -930,11 +931,12 @@ fn run_with_input(mut command: Command, input: &[u8]) -> Result<String, String> 
 }
 
 pub struct Git {
+    host: Link,
     roots: Vec<PathBuf>,
     /// As of the last run, in the order of the roots they hold.
     repos: Vec<Repo>,
     /// The run in progress, if any, and when it started.
-    running: Option<(Receiver<Vec<Repo>>, Instant)>,
+    running: Option<(Call, Instant)>,
     /// Something asked for a run while one was in progress, or too soon
     /// after the last started.
     again: bool,
@@ -943,9 +945,11 @@ pub struct Git {
 }
 
 impl Git {
-    /// Starts finding out about the repositories `roots` are in.
-    pub fn new(roots: &[PathBuf]) -> Git {
+    /// Starts finding out about the repositories `roots` are in, on
+    /// `host`.
+    pub fn new(host: &Link, roots: &[PathBuf]) -> Git {
         let mut git = Git {
+            host: host.clone(),
             roots: roots.to_vec(),
             repos: Vec::new(),
             running: None,
@@ -1020,15 +1024,15 @@ impl Git {
     /// asked for or it's time. Returns whether the repositories changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        if let Some((receiver, started)) = &self.running {
-            match receiver.try_recv() {
-                Ok(repos) => {
+        if let Some((call, started)) = &self.running {
+            match call.try_recv() {
+                Ok(Reply::Repos(repos)) => {
                     self.last = Some((*started, started.elapsed()));
                     self.running = None;
                     changed = repos != self.repos;
                     self.repos = repos;
                 }
-                Err(TryRecvError::Empty) => return false,
+                Ok(_) | Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
                     self.last = Some((*started, started.elapsed()));
                     self.running = None;
@@ -1052,8 +1056,8 @@ impl Git {
     /// Waits for the run in progress, for tests.
     #[cfg(test)]
     pub fn wait(&mut self) {
-        while let Some((receiver, started)) = self.running.take() {
-            if let Ok(repos) = receiver.recv() {
+        while let Some((call, started)) = self.running.take() {
+            if let Some(Reply::Repos(repos)) = call.recv() {
                 self.repos = repos;
             }
             self.last = Some((started, started.elapsed()));
@@ -1061,18 +1065,16 @@ impl Git {
     }
 
     fn start(&mut self) {
-        let (sender, receiver) = mpsc::channel();
-        let roots = self.roots.clone();
-        std::thread::spawn(move || {
-            let _ = sender.send(read_repos(&roots));
+        let call = self.host.call(Request::GitStatus {
+            roots: self.roots.clone(),
         });
-        self.running = Some((receiver, Instant::now()));
+        self.running = Some((call, Instant::now()));
         self.again = false;
     }
 }
 
 /// The repositories `roots` are in, each once, in the order of the roots.
-fn read_repos(roots: &[PathBuf]) -> Vec<Repo> {
+pub fn read_repos(roots: &[PathBuf]) -> Vec<Repo> {
     let mut repos: Vec<Repo> = Vec::new();
     for root in roots {
         let Some((top, git_dir)) = locate(root) else {
@@ -1486,7 +1488,7 @@ pub(crate) mod tests {
         run(&dir, &["add", "."]);
         fs::write(dir.join("new.txt"), "1\n2\n3").unwrap();
         fs::write(dir.join("binary"), b"\0\n\n").unwrap();
-        let mut git = Git::new(std::slice::from_ref(&dir));
+        let mut git = Git::new(&Link::local(), std::slice::from_ref(&dir));
         git.wait();
         let repo = &git.repos()[0];
         assert_eq!(repo.head, Head::Branch("main".into()));
@@ -1500,7 +1502,7 @@ pub(crate) mod tests {
         fs::remove_file(dir.join("b.txt")).unwrap();
         fs::create_dir(dir.join("new")).unwrap();
         fs::write(dir.join("new/c.txt"), "c\n").unwrap();
-        let mut git = Git::new(std::slice::from_ref(&dir));
+        let mut git = Git::new(&Link::local(), std::slice::from_ref(&dir));
         git.wait();
         let [repo] = git.repos() else {
             panic!("one repository: {:?}", git.repos());
@@ -1533,7 +1535,7 @@ pub(crate) mod tests {
         fs::write(dir.join("a.txt"), "changed\n").unwrap();
         run(&dir, &["mv", "b.txt", "c.txt"]);
         fs::write(dir.join("new.txt"), "new\n").unwrap();
-        let mut git = Git::new(std::slice::from_ref(&dir));
+        let mut git = Git::new(&Link::local(), std::slice::from_ref(&dir));
         git.wait();
         let base = |name: &str| git.tracked(&dir.join(name)).map(|t| t.base().clone());
         assert_eq!(base("a.txt"), Some(Base::Text("a\n".into())));
@@ -1548,7 +1550,7 @@ pub(crate) mod tests {
     fn folders_in_one_repository_list_it_once() {
         let dir = repo("nested");
         fs::create_dir(dir.join("sub")).unwrap();
-        let mut git = Git::new(&[dir.join("sub"), dir.clone()]);
+        let mut git = Git::new(&Link::local(), &[dir.join("sub"), dir.clone()]);
         git.wait();
         assert_eq!(git.repos().len(), 1);
         assert_eq!(git.repos()[0].root, dir);
@@ -1557,7 +1559,7 @@ pub(crate) mod tests {
     #[test]
     fn a_folder_outside_any_repository_has_none() {
         let dir = fixture("none");
-        let mut git = Git::new(&[dir]);
+        let mut git = Git::new(&Link::local(), &[dir]);
         git.wait();
         assert!(git.repos().is_empty());
     }
@@ -1621,7 +1623,7 @@ pub(crate) mod tests {
     /// What git says of each file changed in the repository at `dir`, by
     /// name: how much of it is staged.
     fn staged(dir: &Path) -> Vec<(String, Staged)> {
-        let mut git = Git::new(&[dir.to_path_buf()]);
+        let mut git = Git::new(&Link::local(), &[dir.to_path_buf()]);
         git.wait();
         git.repos()[0]
             .changes
@@ -1752,7 +1754,7 @@ pub(crate) mod tests {
         );
 
         run(&dir, &["reset", "-q", "--hard"]);
-        let mut git = Git::new(std::slice::from_ref(&dir));
+        let mut git = Git::new(&Link::local(), std::slice::from_ref(&dir));
         git.wait();
         assert!(git.repos()[0].stashes.is_empty());
         stash(&dir, "again", false).unwrap();
@@ -1992,7 +1994,7 @@ pub(crate) mod tests {
     #[test]
     fn syncs_with_the_branch_it_tracks() {
         let status = |dir: &Path| {
-            let mut git = Git::new(&[dir.to_path_buf()]);
+            let mut git = Git::new(&Link::local(), &[dir.to_path_buf()]);
             git.wait();
             git.repos()[0].clone()
         };

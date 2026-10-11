@@ -40,10 +40,13 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    pub fn new() -> Watcher {
+    /// A watcher that calls `nudge` whenever it hears something, for
+    /// [`Watcher::poll`] to take in.
+    pub fn new(nudge: impl Fn() + Send + 'static) -> Watcher {
         let (sender, events) = mpsc::channel();
         let watcher = notify::recommended_watcher(move |event| {
             let _ = sender.send(event);
+            nudge();
         });
         Watcher {
             watcher: watcher.ok(),
@@ -77,6 +80,13 @@ impl Watcher {
             watched.clear();
         }
         self.watched = watched;
+    }
+
+    /// When changes heard will have settled, for [`Watcher::poll`] to hand
+    /// them over, if any were heard.
+    pub fn due(&self) -> Option<Instant> {
+        let (_, first, last) = self.pending.as_ref()?;
+        Some((*last + SETTLE).min(*first + MAX_WAIT))
     }
 
     /// The changes since the last batch, once they've settled.
@@ -159,7 +169,7 @@ mod tests {
     #[test]
     fn hears_files_in_watched_folders_but_not_in_folders_inside() {
         let dir = fixture("files");
-        let mut watcher = Watcher::new();
+        let mut watcher = Watcher::new(|| {});
         watcher.watch(BTreeSet::from([dir.clone()]));
         // Let the watch start before changing anything.
         std::thread::sleep(Duration::from_millis(100));

@@ -7,7 +7,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Workspace {
     /// Absolute, symlink-free paths, in the order they were added.
     roots: Vec<PathBuf>,

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Move file watching, file listing, workspace search, and git status, sync, and commits behind a message-based host, the first step toward a client/server split
+
 ## v0.4.2 — 2026-10-11
 
 - Embedded PDF viewer (`c3deea1`)
