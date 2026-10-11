@@ -13,10 +13,11 @@ curl -fsSL https://s3.ianhuang.dev/cue/install.sh | bash
 **features**
 
 - first-class mouse support
-- project-wide tree sitter
 - multi panel editing
+- project-wide tree sitter
 - on-keystroke `ripgrep` search
 - terminal buffers
+- embedded image rendering (kitty graphics protocol)
 - markdown reader mode; LaTeX equation support
 - detachable sessions (similar to `tmux`)
 - multiple themes
