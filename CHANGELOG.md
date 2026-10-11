@@ -3,7 +3,9 @@
 ## Unreleased
 
 - Use temporary binary when launched from NFS to avoid SIGBUS on remote instances (`c991ebf`)
-- Find in reader mode, in the text as shown, without leaving it
+- Find in reader mode (`691f95b`)
+- New themes: Lichen and Slate (`fa2bbe0`)
+- Automatically scroll while drag selecting offscreen (`691f95b`)
 
 ## v0.4.0 — 2026-10-09
 
