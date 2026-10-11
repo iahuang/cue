@@ -17,7 +17,7 @@ curl -fsSL https://s3.ianhuang.dev/cue/install.sh | bash
 - project-wide tree sitter
 - on-keystroke `ripgrep` search
 - terminal buffers
-- embedded image rendering (kitty graphics protocol)
+- embedded image and PDF rendering (kitty graphics protocol)
 - markdown reader mode; LaTeX equation support
 - detachable sessions (similar to `tmux`)
 - multiple themes

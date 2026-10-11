@@ -4,6 +4,8 @@ version = "0.4.1"
 description = "A terminal text editor built on OpenTUI's native core"
 edition.workspace = true
 license.workspace = true
+# For hayro.
+rust-version = "1.92"
 
 [dependencies]
 opentui = { path = "../opentui" }
@@ -76,6 +78,8 @@ ratex-types = "0.1.14"
 ratex-font = "0.1.14"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 ttf-parser = "0.25"
+# PDFs, read and rendered in Rust.
+hayro = "0.8"
 # Diff mode: line diffs, and which words in a changed line changed.
 similar = { version = "3", features = ["inline"] }
 

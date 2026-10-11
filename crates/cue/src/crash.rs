@@ -11,6 +11,7 @@
 //! cue to start says where the reports it hasn't said yet are.
 
 use std::backtrace::Backtrace;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
@@ -30,6 +31,11 @@ const SEEN: &str = ".seen";
 static PANIC: Mutex<Option<Panic>> = Mutex::new(None);
 /// The log stderr goes to, while in the background.
 static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+thread_local! {
+    /// Whether a panic on this thread is [`contain`]ed: not a crash.
+    static CONTAINED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Where reports go.
 pub fn default_dir() -> Option<PathBuf> {
@@ -54,6 +60,9 @@ pub struct Panic {
 pub fn install() {
     install_signal_handler();
     std::panic::set_hook(Box::new(|info| {
+        if CONTAINED.get() {
+            return;
+        }
         let backtrace = Backtrace::force_capture();
         let thread = std::thread::current();
         let thread = thread.name().unwrap_or("unnamed");
@@ -72,6 +81,22 @@ pub fn install() {
         };
         *PANIC.lock().unwrap_or_else(|e| e.into_inner()) = Some(Panic { text, report });
     }));
+}
+
+/// Runs `f`, and if it panics, says what the panic said rather than
+/// crashing: for code that can fail on what it's given, such as a
+/// renderer on a malformed file, where giving up on that is enough.
+pub fn contain<R>(f: impl FnOnce() -> R) -> Result<R, String> {
+    let was = CONTAINED.replace(true);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    CONTAINED.set(was);
+    result.map_err(
+        |panic| match (panic.downcast_ref::<&str>(), panic.downcast_ref::<String>()) {
+            (Some(text), _) => text.to_string(),
+            (_, Some(text)) => text.clone(),
+            _ => "it panicked".to_string(),
+        },
+    )
 }
 
 /// The panic there was, if any.
@@ -459,6 +484,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cue-crash-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn contained_panics_say_what_they_said() {
+        assert_eq!(contain(|| 1), Ok(1));
+        assert_eq!(
+            contain(|| -> u32 { panic!("bad xref") }).unwrap_err(),
+            "bad xref"
+        );
+        let at = 3;
+        let panicked = contain(|| -> u32 { panic!("bad object {at}") });
+        assert_eq!(panicked.unwrap_err(), "bad object 3");
+        assert!(take_panic().is_none());
+        assert!(!CONTAINED.get());
     }
 
     #[test]

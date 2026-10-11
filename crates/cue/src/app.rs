@@ -114,6 +114,7 @@ use crate::terminal::Terminal;
 use crate::theme::{self, TerminalColors, Theme, ThemeId, ThemeSetting};
 use crate::toast::Toasts;
 use crate::tree::{Entry, FileTree, TreeAction};
+use crate::wake;
 use crate::watch::{Changes, Watcher};
 use crate::workspace::Workspace;
 
@@ -1411,6 +1412,12 @@ impl App {
                     }
                 }
             },
+            command if self.active_panel().image().is_some() => {
+                let body = self.active_panel().body();
+                if let Some(image) = self.active_panel_mut().image_mut() {
+                    image.run(command, body);
+                }
+            }
             command if self.active_panel().commit().is_some() => {
                 let Some(commit) = self.active_panel_mut().commit_mut() else {
                     return AppAction::Continue;
@@ -2321,6 +2328,8 @@ impl App {
     pub fn poll(&mut self) -> bool {
         let now = Instant::now();
         let mut changed = self.toasts.expire(now);
+        // A thread finished something to show, such as a PDF's page.
+        changed |= wake::take();
         changed |= self
             .switcher
             .as_mut()
@@ -2476,6 +2485,10 @@ impl App {
             .iter()
             .filter_map(|doc| doc.path()?.parent().map(Path::to_path_buf))
             .collect();
+        files.extend(
+            tab::all_panels(&self.tabs)
+                .filter_map(|panel| panel.image()?.path().parent().map(Path::to_path_buf)),
+        );
         files.extend(self.git.repos().iter().map(|repo| repo.git_dir.clone()));
         let watching = (self.tree.listing(), files);
         if self.watching.as_ref() == Some(&watching) {
@@ -2494,30 +2507,35 @@ impl App {
 
     /// Catches up with `changes` to files: the tree lists what's in its
     /// open folders now, and open files take changes to them, or, with
-    /// unsaved changes, note them for saving to ask about. Returns whether
-    /// anything did.
+    /// unsaved changes, note them for saving to ask about. Images are read
+    /// again. Returns whether anything did.
     fn disk_changed(&mut self, changes: Changes) -> bool {
         let listed = changes.rescan || self.tree.is_changed_by(&changes.paths);
         if listed {
             self.tree.refresh();
         }
         // Those changed, or in a folder that moved or went.
-        let touched = |doc: &Rc<Document>| {
-            doc.path().is_some_and(|path| {
-                changes.rescan
-                    || changes
-                        .paths
-                        .iter()
-                        .any(|changed| path.starts_with(changed))
-            })
+        let touched = |path: &Path| {
+            changes.rescan
+                || changes
+                    .paths
+                    .iter()
+                    .any(|changed| path.starts_with(changed))
         };
+        let mut changed = listed;
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            if let Some(image) = panel.image_mut() {
+                if touched(image.path()) {
+                    changed |= image.reload();
+                }
+            }
+        }
         let touched: Vec<Rc<Document>> = self
             .documents
             .iter()
-            .filter(|doc| touched(doc))
+            .filter(|doc| doc.path().is_some_and(|path| touched(&path)))
             .cloned()
             .collect();
-        let mut changed = listed;
         for doc in touched {
             let Some(change) = doc.check_disk() else {
                 continue;
@@ -2539,11 +2557,13 @@ impl App {
     }
 
     /// The terminals' ptys, to wait on with the keyboard: for output, and
-    /// with `true`, for taking input that's waiting.
+    /// with `true`, for taking input that's waiting. And what other threads
+    /// wake the loop with (see [`wake`]).
     pub fn watched(&self) -> Vec<(RawFd, bool)> {
         self.terminals
             .iter()
             .filter_map(|terminal| terminal.borrow().watch())
+            .chain(wake::fd().map(|fd| (fd, false)))
             .collect()
     }
 
@@ -3701,13 +3721,16 @@ impl App {
     }
 
     /// Shows the image at `path` in the active panel, unless it's on
-    /// screen there already. Returns false, with a message, if it can't
-    /// be opened.
+    /// screen there already, though read again if it changed. Returns
+    /// false, with a message, if it can't be opened.
     fn open_image(&mut self, path: &Path) -> bool {
-        let shown = self
-            .active_panel()
-            .image()
-            .is_some_and(|image| image.path() == path);
+        let shown = match self.active_panel_mut().image_mut() {
+            Some(image) if image.path() == path => {
+                image.reload();
+                true
+            }
+            _ => false,
+        };
         if !shown {
             match ImageView::open(path) {
                 Ok(image) => self.show_image(image),
@@ -10058,6 +10081,75 @@ mod tests {
         let text = screen(&app);
         assert!(text.contains("Can't open: "), "{text}");
         assert!(text.contains("(broken.png)"), "{text}");
+    }
+
+    #[test]
+    fn pdfs_open_as_images_and_scroll_through_their_pages() {
+        let _serial = crate::test_serial();
+        let root = fixture("pdfs", &[("a.txt", "a"), ("broken.pdf", "%PDF-1.4")]);
+        let pages = vec![((100, 100), crate::pdf::RED_100); 3];
+        fs::write(root.join("paper.pdf"), crate::pdf::test_pdf(&pages)).unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        assert!(app.open(&root.join("paper.pdf"), false));
+        assert!(app.active_panel().image().is_some());
+        let text = screen(&app);
+        assert!(text.contains("Page 1 of 3  PDF"), "{text}");
+
+        // The keys that page through text page through it.
+        key(&mut app, KeyCode::PageDown);
+        key(&mut app, KeyCode::PageDown);
+        assert!(screen(&app).contains("Page 3 of 3"), "{}", screen(&app));
+        key(&mut app, KeyCode::Home);
+        assert!(screen(&app).contains("Page 1 of 3"), "{}", screen(&app));
+
+        // The wheel scrolls through the pages.
+        let body = app.active_panel().body();
+        let (x, y) = (body.x + body.width / 2, body.y + body.height / 2);
+        for _ in 0..body.height {
+            mouse_at(&mut app, MouseKind::ScrollDown, x, y);
+        }
+        assert!(!screen(&app).contains("Page 1 of 3"), "{}", screen(&app));
+        key(&mut app, KeyCode::Home);
+
+        // With Ctrl, it zooms past fitting, and back.
+        let wheel = |app: &mut App, kind| {
+            let mods = Mods {
+                ctrl: true,
+                ..Mods::NONE
+            };
+            app.handle_mouse(Mouse { kind, x, y, mods }, Instant::now());
+        };
+        wheel(&mut app, MouseKind::ScrollUp);
+        assert!(screen(&app).contains("110%"), "{}", screen(&app));
+        wheel(&mut app, MouseKind::ScrollDown);
+        assert!(!screen(&app).contains('%'), "{}", screen(&app));
+
+        // A PDF that doesn't read says why.
+        assert!(!app.open(&root.join("broken.pdf"), false));
+        let text = screen(&app);
+        assert!(text.contains("Can't open: "), "{text}");
+    }
+
+    #[test]
+    fn pdfs_are_read_again_when_they_change() {
+        let _serial = crate::test_serial();
+        let root = fixture("pdf-changes", &[("a.txt", "a")]);
+        // Outside the workspace, its folder is watched for it.
+        let out = fixture("pdf-changes-out", &[]);
+        let path = out.join("paper.pdf");
+        let pdf = |count| crate::pdf::test_pdf(&vec![((100, 100), crate::pdf::RED_100); count]);
+        fs::write(&path, pdf(2)).unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        assert!(app.open(&path, false));
+        key(&mut app, KeyCode::PageDown);
+        assert!(screen(&app).contains("Page 2 of 2"), "{}", screen(&app));
+        // Let the watcher start.
+        std::thread::sleep(Duration::from_millis(200));
+
+        fs::write(&path, pdf(3)).unwrap();
+        wait_until(&mut app, "the new pages", |app| {
+            screen(app).contains("Page 2 of 3")
+        });
     }
 
     #[test]
