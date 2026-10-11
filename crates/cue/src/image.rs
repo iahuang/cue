@@ -202,7 +202,7 @@ struct Drag {
 /// A file as it was on disk: if it has the same time and size, it's
 /// surely not changed.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Stamp {
+pub struct Stamp {
     modified: SystemTime,
     len: u64,
 }
@@ -233,9 +233,16 @@ struct Placement {
 
 impl ImageView {
     /// Reads and decodes the image or PDF at `path`, or says why it
-    /// can't.
+    /// can't, as the app has the host do, for tests.
+    #[cfg(test)]
     pub fn open(path: &Path) -> Result<ImageView, String> {
         let (data, stamp) = read(path).map_err(|err| err.to_string())?;
+        ImageView::decoded(path, data, stamp)
+    }
+
+    /// Decodes the image or PDF at `path`, read as `data` when the file was
+    /// as `stamp` says, or says why it can't.
+    pub fn decoded(path: &Path, data: Vec<u8>, stamp: Option<Stamp>) -> Result<ImageView, String> {
         let bytes = data.len() as u64;
         Ok(ImageView {
             path: path.to_path_buf(),
@@ -247,20 +254,27 @@ impl ImageView {
         })
     }
 
-    /// Reads the file again if it changed since it was last read, staying
-    /// as scrolled and zoomed. Returns whether it did. If it doesn't read,
-    /// or it's a PDF that looks half written, what's shown stays until the
-    /// file changes again.
+    /// Reads the file again if it changed since it was last read, as the
+    /// app has the host do, for tests. Returns whether it shows it.
+    #[cfg(test)]
     pub fn reload(&mut self) -> bool {
-        let Ok(meta) = fs::metadata(&self.path) else {
-            return false;
-        };
-        if Stamp::of(&meta).is_some_and(|stamp| Some(stamp) == self.stamp) {
-            return false;
+        match read_if_changed(&self.path, self.stamp) {
+            Ok(Some((data, stamp))) => self.reload_with(data, stamp),
+            _ => false,
         }
-        let Ok((data, stamp)) = read(&self.path) else {
-            return false;
-        };
+    }
+
+    /// The file as last read, for the host to read it again only if it
+    /// changed since.
+    pub fn stamp(&self) -> Option<Stamp> {
+        self.stamp
+    }
+
+    /// Takes the file as read again, as `data`, when it was as `stamp`
+    /// says, staying as scrolled and zoomed. Returns whether it shows it. A
+    /// PDF that looks half written, or a file that doesn't decode, leaves
+    /// what's shown until the file changes again.
+    pub fn reload_with(&mut self, data: Vec<u8>, stamp: Option<Stamp>) -> bool {
         self.stamp = stamp;
         if is_pdf(&self.path) && !looks_whole_pdf(&data) {
             return false;
@@ -951,9 +965,24 @@ fn dragged(drag: Drag, mouse: Mouse, cell: (u32, u32)) -> (f64, f64) {
     (drag.origin.0 + dx, drag.origin.1 + dy)
 }
 
+/// The file at `path`, for the host, and how it was on disk, unless it's
+/// as `unless` says it was last read: then `None`.
+pub fn read_if_changed(path: &Path, unless: Option<Stamp>) -> Result<Option<FileRead>, String> {
+    if let Some(unless) = unless {
+        let meta = fs::metadata(path).map_err(|err| err.to_string())?;
+        if Stamp::of(&meta) == Some(unless) {
+            return Ok(None);
+        }
+    }
+    read(path).map(Some).map_err(|err| err.to_string())
+}
+
+/// A file's bytes, and how it was on disk when they were read.
+pub type FileRead = (Vec<u8>, Option<Stamp>);
+
 /// Reads the file at `path`, and how it was on disk. Taken before it's
 /// read, so a change while it's read is seen as one after.
-fn read(path: &Path) -> io::Result<(Vec<u8>, Option<Stamp>)> {
+fn read(path: &Path) -> io::Result<FileRead> {
     let mut file = fs::File::open(path)?;
     let stamp = file.metadata().ok().and_then(|meta| Stamp::of(&meta));
     let mut data = Vec::new();

@@ -142,7 +142,7 @@ Progress:
   checked by the host (`Request::CheckDisk`), and a check against a stamp
   the document no longer has is dropped. Revert loads through the host.
 - [ ] 1.5 leftovers: `document::resolve` and `same_file` still
-  canonicalize on the client; Quick Look still reads files itself; the
+  canonicalize on the client; the
   first file at startup, crash recovery, and session restore load through
   the host but wait for it (`load_now`), until sessions move (1.9).
 - [x] 1.6 The rest of git, through one request (`Request::Git` with a
@@ -161,7 +161,14 @@ Progress:
   changes view, the dialog's starting folder, following a link in reader
   mode, and whether an image or a commit in a panel's history is still
   there.
-- [ ] 1.7 onwards.
+- [x] 1.7 Images and PDFs: the host reads their bytes (`Request::ReadFile`,
+  unless they're as last read) and the client decodes and renders them,
+  so zooming and paging never wait on it. Opening one waits for it as
+  opening a file does; a change on disk reads it again. Quick Look asks
+  the host what's at a path (`Request::Peek`: a folder's entries, an
+  image's bytes, a file's text, or why there's nothing to show), and
+  shows it once it's said.
+- [ ] 1.8 onwards.
 
 Notes from 1.1 and 1.2:
 

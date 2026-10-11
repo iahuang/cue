@@ -4,7 +4,8 @@
 
 - Move file watching, file listing, workspace search, and git status, sync, and commits behind a message-based host, the first step toward a client/server split (`56a2a65`)
 - Move symbol indexing, the file tree, the file dialog, file operations, and opening, saving, and reloading files to the host (`1322aae`)
-- Move the rest of git (staging, stashing, branches, the log, commit diffs, and diff bases) to the host
+- Move the rest of git (staging, stashing, branches, the log, commit diffs, and diff bases) to the host (`a4ba4bf`)
+- Read images, PDFs, and Quick Look's previews through the host
 
 ## v0.4.2 — 2026-10-11
 

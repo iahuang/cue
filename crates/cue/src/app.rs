@@ -286,6 +286,17 @@ enum GitThen {
     },
 }
 
+/// An image the host is reading, and what for.
+enum ImageRead {
+    /// To show in this tab and panel.
+    Open {
+        panel: (TabId, PanelId),
+        path: PathBuf,
+    },
+    /// To show again where it's shown, if it changed.
+    Reload { path: PathBuf },
+}
+
 /// A file the host is writing (see [`App::write`]).
 struct Writing {
     doc: Rc<Document>,
@@ -495,6 +506,8 @@ pub struct App {
     file_ops: Vec<PendingOp>,
     /// Files the host is loading, to show once it has.
     opening: Vec<(Opening, Call)>,
+    /// Images the host is reading.
+    reading_images: Vec<(ImageRead, Call)>,
     /// Files the host is writing.
     writing: Vec<Writing>,
     /// What git was asked, and what to do once it answers.
@@ -752,7 +765,7 @@ impl App {
         let theme = Rc::new(Theme::new().map_err(|e| e.to_string())?);
         let (file, image) = match file {
             Some(file) if image::is_image(&file) => {
-                let image = ImageView::open(&file)
+                let image = image_now(&host, &file)
                     .map_err(|reason| format!("{}: {reason}", file.display()))?;
                 (None, Some(image))
             }
@@ -776,6 +789,7 @@ impl App {
             syncing: Vec::new(),
             file_ops: Vec::new(),
             opening: Vec::new(),
+            reading_images: Vec::new(),
             writing: Vec::new(),
             checking: Vec::new(),
             asking_git: Vec::new(),
@@ -2458,6 +2472,8 @@ impl App {
         changed |= self.search.as_mut().is_some_and(SearchModal::poll);
         changed |= self.poll_file_ops();
         changed |= self.poll_opening();
+        changed |= self.poll_images();
+        changed |= self.quick_look.as_mut().is_some_and(QuickLook::poll);
         changed |= self.poll_checks();
         changed |= self.poll_git_answers();
         changed |= self.read_bases();
@@ -2529,7 +2545,8 @@ impl App {
             match notice {
                 Notice::DiskChanged(changes) => {
                     self.git.refresh();
-                    changed |= self.disk_changed(changes);
+                    self.disk_changed(changes);
+                    changed = true;
                     self.refresh_finds();
                     // Folders may have come back for open files, and the
                     // tree may list others.
@@ -2656,10 +2673,9 @@ impl App {
     }
 
     /// Catches up with `changes` to files: the tree lists what's in its
-    /// open folders now, and open files take changes to them, or, with
-    /// unsaved changes, note them for saving to ask about. Images are read
-    /// again. Returns whether anything did.
-    fn disk_changed(&mut self, changes: Changes) -> bool {
+    /// open folders again, and the host checks open files and images, to
+    /// take changes to them once it has.
+    fn disk_changed(&mut self, changes: Changes) {
         if changes.rescan || self.tree.is_changed_by(&changes) {
             self.tree.refresh();
         }
@@ -2671,13 +2687,12 @@ impl App {
                     .iter()
                     .any(|changed| path.starts_with(changed))
         };
-        let mut changed = false;
-        for panel in tab::all_panels_mut(&mut self.tabs) {
-            if let Some(image) = panel.image_mut() {
-                if touched(image.path()) {
-                    changed |= image.reload();
-                }
-            }
+        let images: BTreeSet<PathBuf> = tab::all_panels(&self.tabs)
+            .filter_map(|panel| Some(panel.image()?.path().to_path_buf()))
+            .filter(|path| touched(path))
+            .collect();
+        for path in images {
+            self.reload_images(&path);
         }
         let touched: Vec<Rc<Document>> = self
             .documents
@@ -2686,7 +2701,6 @@ impl App {
             .cloned()
             .collect();
         self.check_disk(touched);
-        changed
     }
 
     /// Has the host check `docs`' files, which may have changed on disk,
@@ -4063,27 +4077,136 @@ impl App {
     }
 
     /// Shows the image at `path` in the active panel, unless it's on
-    /// screen there already, though read again if it changed. Returns
-    /// false, with a message, if it can't be opened.
+    /// screen there already, though read again if it changed, once the
+    /// host has read it. Returns false, with a message, if it can't be
+    /// opened, as far as is known yet.
     fn open_image(&mut self, path: &Path) -> bool {
-        let shown = match self.active_panel_mut().image_mut() {
-            Some(image) if image.path() == path => {
-                image.reload();
-                true
-            }
-            _ => false,
+        let unless = match self.active_panel().image() {
+            Some(image) if image.path() == path => Some(image.stamp()),
+            _ => None,
         };
-        if !shown {
-            match ImageView::open(path) {
-                Ok(image) => self.show_image(image),
-                Err(reason) => {
-                    self.cant_open(&reason, path);
-                    return false;
+        let panel = (self.tab().id, self.tab().active);
+        // What the panel was to show before, it no longer is.
+        self.opening.retain(|(other, _)| other.panel != panel);
+        self.reading_images.retain(
+            |(read, _)| !matches!(read, ImageRead::Open { panel: other, .. } if *other == panel),
+        );
+        let call = self.host.call(Request::ReadFile {
+            path: path.to_path_buf(),
+            unless: unless.flatten(),
+        });
+        let path = path.to_path_buf();
+        self.reading_images
+            .push((ImageRead::Open { panel, path }, call));
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let mut shown = false;
+            while !self.reading_images.is_empty() {
+                shown |= self.poll_images();
+            }
+            return shown;
+        }
+        true
+    }
+
+    /// Has the host read the images shown from `path` again, if they
+    /// changed, to show once it has.
+    fn reload_images(&mut self, path: &Path) {
+        let unless = tab::all_panels(&self.tabs)
+            .filter_map(Panel::image)
+            .find(|image| image.path() == path)
+            .and_then(ImageView::stamp);
+        let call = self.host.call(Request::ReadFile {
+            path: path.to_path_buf(),
+            unless,
+        });
+        let path = path.to_path_buf();
+        self.reading_images.push((ImageRead::Reload { path }, call));
+        #[cfg(test)]
+        while crate::host::at_once() && !self.reading_images.is_empty() {
+            self.poll_images();
+        }
+    }
+
+    /// Shows the images the host read since the last call. Returns whether
+    /// any are shown.
+    fn poll_images(&mut self) -> bool {
+        let mut read = Vec::new();
+        let mut index = 0;
+        while index < self.reading_images.len() {
+            let result = match self.reading_images[index].1.try_recv() {
+                Ok(Reply::Bytes(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
                 }
+                Err(TryRecvError::Disconnected) => Err("The host stopped.".to_string()),
+            };
+            let (what, _) = self.reading_images.remove(index);
+            read.push((what, result));
+        }
+        let mut shown = false;
+        for (what, result) in read {
+            shown |= self.image_read(what, result);
+        }
+        shown
+    }
+
+    /// Shows an image the host read, as `what` asked. Returns whether it's
+    /// shown.
+    fn image_read(
+        &mut self,
+        what: ImageRead,
+        result: Result<Option<image::FileRead>, String>,
+    ) -> bool {
+        match what {
+            ImageRead::Reload { path } => {
+                let Ok(Some((data, stamp))) = result else {
+                    return false;
+                };
+                let mut shown = false;
+                for panel in tab::all_panels_mut(&mut self.tabs) {
+                    if let Some(image) = panel.image_mut().filter(|image| image.path() == path) {
+                        shown |= image.reload_with(data.clone(), stamp);
+                    }
+                }
+                shown
+            }
+            ImageRead::Open {
+                panel: (tab, panel),
+                path,
+            } => {
+                if self.tab().id == tab && self.tab().panels.iter().any(|p| p.id == panel) {
+                    self.tab_mut().active = panel;
+                }
+                let shown = match result {
+                    // Unchanged, and on screen there already.
+                    Ok(None) => true,
+                    Ok(Some((data, stamp))) => match self.active_panel_mut().image_mut() {
+                        Some(image) if image.path() == path => {
+                            image.reload_with(data, stamp);
+                            true
+                        }
+                        _ => match ImageView::decoded(&path, data, stamp) {
+                            Ok(image) => {
+                                self.show_image(image);
+                                true
+                            }
+                            Err(reason) => {
+                                self.cant_open(&reason, &path);
+                                false
+                            }
+                        },
+                    },
+                    Err(reason) => {
+                        self.cant_open(&reason, &path);
+                        false
+                    }
+                };
+                self.show_active_in_tree();
+                shown
             }
         }
-        self.show_active_in_tree();
-        true
     }
 
     fn show_image(&mut self, image: ImageView) {
@@ -5503,6 +5626,7 @@ impl App {
                 Shown::Image(path) => Some(Visit::Image(path.clone())),
             }
         };
+        let host = self.host.clone();
         for (tab, saved) in self.tabs.iter_mut().zip(&state.tabs) {
             for saved in &saved.panels {
                 let Some(panel) = tab.panel_mut(saved.id) else {
@@ -5528,7 +5652,7 @@ impl App {
                         .find(|terminal| terminal.borrow().id() == *id)
                         .map(|terminal| panel.show_terminal(terminal.clone()))
                         .is_some(),
-                    Some(Shown::Image(path)) => ImageView::open(path)
+                    Some(Shown::Image(path)) => image_now(&host, path)
                         .map(|image| panel.show_image(image))
                         .is_ok(),
                     Some(doc) => find_doc(doc).is_some_and(|doc| panel.show(&doc).is_ok()),
@@ -8118,7 +8242,7 @@ impl App {
             _ => String::new(),
         };
         let bounds = self.quick_look_bounds();
-        self.quick_look = Some(QuickLook::new(path, shown, &self.theme, bounds));
+        self.quick_look = Some(QuickLook::new(&self.host, path, shown, &self.theme, bounds));
     }
 
     /// Keeps Quick Look on the sidebar's selection as it moves, and puts it
@@ -8302,6 +8426,21 @@ impl Drop for App {
         self.recovery
             .sync(&self.documents, self.workspace.roots(), true);
         self.save_session(false);
+    }
+}
+
+/// The image at `path`, read by `host`, waiting for it, as [`load_now`].
+fn image_now(host: &Link, path: &Path) -> Result<ImageView, String> {
+    let call = host.call(Request::ReadFile {
+        path: path.to_path_buf(),
+        unless: None,
+    });
+    match call.wait() {
+        Some(Reply::Bytes(read)) => match read? {
+            Some((data, stamp)) => ImageView::decoded(path, data, stamp),
+            None => Err("The host read nothing.".to_string()),
+        },
+        _ => Err("The host stopped.".to_string()),
     }
 }
 

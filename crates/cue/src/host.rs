@@ -36,6 +36,8 @@ use crate::file_dialog;
 use crate::file_index;
 use crate::file_ops::{self, FileOp};
 use crate::git::{self, GitAnswer, GitCall, Repo};
+use crate::image;
+use crate::quick_look::{self, Peek};
 use crate::search::{self, Query};
 use crate::symbols::{self, FileSymbols};
 use crate::tree::{self, Listed};
@@ -105,6 +107,14 @@ pub enum Request {
     CheckDisk {
         files: Vec<(PathBuf, Option<Stamp>)>,
     },
+    /// The bytes of the file at `path`, for an image view (see
+    /// [`crate::image`]), unless it's as `unless` says it was last read.
+    ReadFile {
+        path: PathBuf,
+        unless: Option<image::Stamp>,
+    },
+    /// What's at `path`, for Quick Look (see [`quick_look::peek`]).
+    Peek { path: PathBuf },
     /// What's in `dir`, for the file dialog (see [`crate::file_dialog`]).
     ReadDir { dir: PathBuf },
     /// Doing something to files (see [`crate::file_ops`]).
@@ -139,6 +149,10 @@ pub enum Reply {
     },
     /// The file as written, or why it wasn't.
     Saved(Result<Stamp, Unsaved>),
+    /// A file's bytes, and how it was on disk then; `None` if it was as
+    /// last read; or why it couldn't be read.
+    Bytes(Result<Option<image::FileRead>, String>),
+    Peeked(Peek),
     /// What's in a folder, for the file dialog, or why it couldn't be read.
     Dir {
         dir: PathBuf,
@@ -498,6 +512,12 @@ fn answer(request: Request, state: &State, responder: Responder) {
                     return;
                 }
             }
+        }
+        Request::ReadFile { path, unless } => {
+            responder.reply(Reply::Bytes(image::read_if_changed(&path, unless)));
+        }
+        Request::Peek { path } => {
+            responder.reply(Reply::Peeked(quick_look::peek(&path)));
         }
         Request::ReadDir { dir } => {
             let entries = file_dialog::read(&dir);
