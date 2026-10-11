@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Move file watching, file listing, workspace search, and git status, sync, and commits behind a message-based host, the first step toward a client/server split
+- Move file watching, file listing, workspace search, and git status, sync, and commits behind a message-based host, the first step toward a client/server split (`56a2a65`)
+- Move symbol indexing, the file tree, the file dialog, file operations, and opening, saving, and reloading files to the host
 
 ## v0.4.2 — 2026-10-11
 

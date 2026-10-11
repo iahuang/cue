@@ -84,6 +84,12 @@ pub enum Action {
     Continue,
     /// Put this text on the system clipboard.
     Copy(String),
+    /// Write the file, unless it changed on disk since it was last loaded
+    /// or saved, or with `overwrite`, whatever's there: the app has the
+    /// host do it.
+    Save {
+        overwrite: bool,
+    },
     /// The file was written, possibly to a new path.
     Saved,
     /// The file has no name yet: the app asks where to save it, and calls
@@ -2415,34 +2421,21 @@ impl Editor {
 
     /// Writes the file to `path` from now on.
     pub fn save_as(&mut self, path: PathBuf) -> Action {
-        self.doc.rename(path.clone());
-        self.write(path)
+        self.doc.rename(path);
+        Action::Save { overwrite: true }
     }
 
     /// Writes the file, or asks for a name if it has none, or asks what to
     /// do if it changed on disk.
     fn save(&mut self) -> Action {
-        let Some(path) = self.path() else {
+        if self.path().is_none() {
             return Action::SaveAs;
-        };
-        // In case the change hasn't been heard of yet.
-        self.doc.check_disk();
+        }
         if self.doc.disk() == Disk::Changed {
             return Action::Conflict;
         }
-        self.write(path)
-    }
-
-    /// Writes the file to `path`, whatever is there.
-    pub fn write(&mut self, path: PathBuf) -> Action {
-        match self.doc.save(&path) {
-            Ok(()) => Action::Saved,
-            // Reason first: long paths are the least of it.
-            Err(err) => {
-                self.show_message(format!("Can't save: {err} ({})", path.display()), true);
-                Action::Continue
-            }
-        }
+        // The host makes sure it didn't change since.
+        Action::Save { overwrite: false }
     }
 
     /// Takes up the `editor.wrap` and `editor.scroll_margin` settings,
@@ -2940,7 +2933,12 @@ mod tests {
         press(&mut editor, "two");
         assert!(editor.is_modified());
 
-        ctrl(&mut editor, 's');
+        // The app has the host write it.
+        assert!(matches!(
+            ctrl(&mut editor, 's'),
+            Action::Save { overwrite: false }
+        ));
+        editor.document().save(&path).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "one\r\ntwo");
         key(&mut editor, KeyCode::Left);
         assert!(!editor.is_modified());
@@ -2966,6 +2964,7 @@ mod tests {
         // After a save, it compares with the text as saved.
         press(&mut editor, "two");
         ctrl(&mut editor, 's');
+        editor.document().save(&path).unwrap();
         key(&mut editor, KeyCode::Backspace);
         assert!(editor.is_modified());
         press(&mut editor, "o");
@@ -2992,8 +2991,10 @@ mod tests {
         assert!(matches!(ctrl(&mut editor, 's'), Action::SaveAs));
         assert!(editor.is_modified());
 
-        assert!(matches!(editor.save_as(path.clone()), Action::Saved));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "hi");
+        assert!(matches!(
+            editor.save_as(path.clone()),
+            Action::Save { overwrite: true }
+        ));
         assert_eq!(editor.path(), Some(path));
     }
 

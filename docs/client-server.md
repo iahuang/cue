@@ -114,7 +114,38 @@ Progress:
 - [x] 1.2 Watching (`Tell::Watch`, `Notice::DiskChanged`; the host does the
   settling and drops folders that don't exist), the file index, workspace
   search, git status, git sync, commits.
-- [ ] 1.3 onwards.
+- [x] 1.3 Symbol indexing. The host keeps the per-file cache (modification
+  times and symbols); the client keeps each file's symbols for Go to
+  Definition and builds the picker's items.
+- [x] 1.4 The tree lists folders through the host (`Request::ListFolders`)
+  and keeps the listings, showing a folder as last listed until a new
+  listing comes; a reveal waits for the listing that shows its path. Disk
+  change notices carry what the host saw of each path (`Changes::dirs`),
+  so the tree decides whether to list again without looking itself. File
+  operations (`Request::FileOp`: create, move, copy, trash) run on the
+  host; the file dialog stays open until one's done, showing its error if
+  it failed. The dialog lists folders through the host
+  (`Request::ReadDir`) and answers "is it there, is it a folder" from its
+  listing; Enter before the listing comes is taken once it does, and what
+  that leads to (Save As, then quit, say) reaches the main loop through
+  `App::take_deferred`.
+- [x] 1.5 Documents, as whole texts. Opening: a file not open yet is
+  loaded by the host (`Request::Load`) and shown in the panel it was
+  opened from once it comes, then what follows opening it (go to a line,
+  select a match, read a Markdown file) runs (`App::open_and`); a newer
+  open in the same panel replaces one on its way. Saving: the host writes
+  only over the file as the document last had it (`Request::Save` with
+  the stamp expected), so checking and writing take one round trip; text
+  typed while a save is on its way stays unsaved; Save All carries on
+  file by file as each is written, and what follows it (quitting, say)
+  reaches the main loop through `App::take_deferred`. Changes on disk are
+  checked by the host (`Request::CheckDisk`), and a check against a stamp
+  the document no longer has is dropped. Revert loads through the host.
+- [ ] 1.5 leftovers: `document::resolve` and `same_file` still
+  canonicalize on the client; Quick Look still reads files itself; the
+  first file at startup, crash recovery, and session restore load through
+  the host but wait for it (`load_now`), until sessions move (1.9).
+- [ ] 1.6 onwards.
 
 Notes from 1.1 and 1.2:
 
@@ -128,6 +159,17 @@ Notes from 1.1 and 1.2:
   process it needs its own config reload.
 - `Workspace::add_root` canonicalizes on the client; it moves with the tree
   (1.4).
+- Tests mostly expect the host to answer at once. `host::at_once()`
+  (test-only, on by default, per thread) makes the tree, the file dialog,
+  and file operations wait for their answers as they ask; their own tests
+  turn it off to see what shows meanwhile. The host's threads also get
+  the test's settings (`Tell::Config`, test-only), since in tests each
+  thread has its own.
+- Still on the client, for later steps: `document::resolve` and
+  `same_file` (canonicalizing), the "was it deleted" check before opening
+  from the tree, `Workspace::add_root`, and the dialog's starting folder.
+- `Symbol::kind` is a `&'static str`; it needs to become owned or an enum
+  to be serialized (step 2).
 - Git status is still scheduled by the client (`Git::poll` decides when to
   call). See open questions.
 

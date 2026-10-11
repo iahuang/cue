@@ -17,6 +17,7 @@ mod document;
 mod editor;
 mod file_dialog;
 mod file_index;
+mod file_ops;
 mod find;
 mod git;
 mod history;
@@ -676,6 +677,8 @@ fn headless(app: &mut App, listener: Option<&std::os::unix::net::UnixListener>) 
         HUNG_UP.store(false, Ordering::Relaxed);
         app.poll();
         let _ = app.take_copied();
+        // Nothing's typed while detached, to act on.
+        let _ = app.take_deferred();
         let Some(listener) = listener else {
             continue;
         };
@@ -832,6 +835,15 @@ fn attached(
                     Vec::new()
                 };
                 changed |= app.poll();
+                match app.take_deferred() {
+                    Some(AppAction::Quit) => return Ok(Outcome::Quit),
+                    Some(AppAction::Detach) => return Ok(Outcome::Detach),
+                    Some(AppAction::Restart) => return Ok(Outcome::Restart),
+                    Some(AppAction::Copy(text)) => {
+                        renderer.copy_to_clipboard(&text);
+                    }
+                    Some(AppAction::Continue) | None => {}
+                }
                 if let Some(text) = app.take_copied() {
                     renderer.copy_to_clipboard(&text);
                 }

@@ -785,7 +785,7 @@ impl CommitView {
     /// Waits for the commit being made, for tests.
     #[cfg(test)]
     pub fn wait(&mut self) -> Option<Result<String, String>> {
-        let result = match self.committing.as_ref()?.recv() {
+        let result = match self.committing.as_ref()?.wait() {
             Some(Reply::Committed(result)) => result,
             _ => Err(STOPPED.to_string()),
         };

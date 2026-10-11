@@ -1,8 +1,9 @@
 //! The file tree: the workspace roots and whichever folders are expanded,
 //! shown as an indented list.
 //!
-//! Folders are read when they are expanded and re-read on refresh; nothing
-//! watches the file system yet. Which folders are expanded is remembered by
+//! The host lists folders (see [`crate::host`]) when they are expanded and
+//! again on refresh. Until a listing comes, the tree shows the folder as it
+//! was last listed, or empty. Which folders are expanded is remembered by
 //! path, so collapsing a folder and expanding it again restores its subfolders.
 //! A root inside another shows in both, expanded apart in each.
 //! What `.gitignore` and `.ignore` files exclude is shown dimmed, and left
@@ -17,15 +18,18 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::TryRecvError;
 
 use ignore::WalkBuilder;
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::file_index;
 use crate::git::{Kind, Repo};
+use crate::host::{Call, Link, Reply, Request};
 use crate::icons;
 use crate::keymap::Command;
 use crate::theme;
+use crate::watch::Changes;
 use crate::workspace::{deepest_root, root_names};
 
 /// Entries never shown, here or in the file picker and workspace search,
@@ -43,6 +47,23 @@ pub fn is_hidden(name: &std::ffi::OsStr) -> bool {
 /// Whether a file named `name` says which entries are ignored.
 fn is_ignore_file(name: &std::ffi::OsStr) -> bool {
     name == ".gitignore" || name == ".ignore"
+}
+
+/// An entry of a folder, as the host lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub path: PathBuf,
+    pub name: String,
+    /// A folder, or a symlink to one.
+    pub is_dir: bool,
+    /// Excluded by an ignore file.
+    pub ignored: bool,
+}
+
+/// A folder's entries, as last listed, and by which listing.
+struct Listing {
+    entries: Vec<Listed>,
+    seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +229,7 @@ pub struct Entry {
 }
 
 pub struct FileTree {
+    host: Link,
     roots: Vec<PathBuf>,
     /// What each root is called.
     names: Vec<String>,
@@ -217,6 +239,16 @@ pub struct FileTree {
     rows: Vec<Row>,
     /// Counts changes to `rows`, to tell when the open folders may have.
     listing: u64,
+    /// Each folder's entries, as last listed.
+    listings: HashMap<PathBuf, Listing>,
+    /// The listings asked for and not done yet, with the folders each
+    /// lists, and the number of each: a listing is taken only if it's
+    /// newer than the one shown.
+    calls: Vec<(u64, Vec<PathBuf>, Call)>,
+    next_seq: u64,
+    /// The path to select once a listing shows it, after
+    /// [`FileTree::reveal`] found it unlisted.
+    revealing: Option<PathBuf>,
     selected: usize,
     /// The first row on screen.
     scroll: usize,
@@ -233,9 +265,14 @@ pub struct FileTree {
 }
 
 impl FileTree {
-    /// A tree of `roots`, each expanded.
-    pub fn new(roots: &[PathBuf]) -> FileTree {
+    /// A tree of `roots`, each expanded, listed by `host`.
+    pub fn new(host: &Link, roots: &[PathBuf]) -> FileTree {
         let mut tree = FileTree {
+            host: host.clone(),
+            listings: HashMap::new(),
+            calls: Vec::new(),
+            next_seq: 1,
+            revealing: None,
             roots: Vec::new(),
             names: Vec::new(),
             expanded: HashMap::new(),
@@ -266,14 +303,96 @@ impl FileTree {
         self.refresh();
     }
 
-    /// Re-reads every expanded folder, keeping the selection on the same
-    /// entry when it still exists.
+    /// Lists every open folder again. What's listed shows once the
+    /// listings come (see [`FileTree::poll`]).
     pub fn refresh(&mut self) {
+        self.rebuild();
+        let open: Vec<PathBuf> = self.open_folders().cloned().collect();
+        self.list(open);
+    }
+
+    /// Asks the host to list `folders`.
+    fn list(&mut self, folders: Vec<PathBuf>) {
+        if folders.is_empty() {
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let call = self.host.call(Request::ListFolders {
+            folders: folders.clone(),
+        });
+        self.calls.push((seq, folders, call));
+        #[cfg(test)]
+        if crate::host::at_once() {
+            self.wait();
+        }
+    }
+
+    /// Takes in the listings that came since the last call, showing what's
+    /// in the open folders now. Returns whether the rows changed.
+    pub fn poll(&mut self) -> bool {
+        let mut listed = Vec::new();
+        let mut ended = false;
+        self.calls.retain(|(seq, _, call)| loop {
+            match call.try_recv() {
+                Ok(Reply::Folder { dir, entries }) => listed.push((*seq, dir, entries)),
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => {
+                    ended = true;
+                    return false;
+                }
+            }
+        });
+        let mut changed = false;
+        for (seq, dir, entries) in listed {
+            let newer = self.listings.get(&dir).is_none_or(|old| old.seq < seq);
+            if newer {
+                self.listings.insert(dir, Listing { entries, seq });
+                changed = true;
+            }
+        }
+        if !changed && !ended {
+            return false;
+        }
+        let rebuilt = self.rebuild();
+        if let Some(path) = self.revealing.clone() {
+            let found = self
+                .roots
+                .iter()
+                .position(|root| deepest_root(&self.roots, &path) == Some(root))
+                .and_then(|root| self.index_of(root, &path));
+            if let Some(row) = found {
+                self.select(row);
+                self.revealing = None;
+            } else if self.calls.is_empty() {
+                // It isn't there.
+                self.revealing = None;
+            }
+        }
+        rebuilt
+    }
+
+    /// Waits for the listings asked for, for tests.
+    #[cfg(test)]
+    pub fn wait(&mut self) {
+        while !self.calls.is_empty() {
+            self.poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Lays out the rows from the folders as last listed, keeping the
+    /// selection on the same entry when it's still there. Asks for the
+    /// listings of open folders never listed. Returns whether the rows
+    /// changed.
+    fn rebuild(&mut self) -> bool {
         let selected = self
             .rows
             .get(self.selected)
             .map(|row| (self.roots.get(row.root).cloned(), row.path.clone()));
         let mut rows = Vec::new();
+        let mut unlisted = Vec::new();
         for (index, root) in self.roots.iter().enumerate() {
             rows.push(Row {
                 path: root.clone(),
@@ -284,8 +403,18 @@ impl FileTree {
                 ignored: false,
             });
             if self.expanded[root].contains(root) {
-                self.push_children(&mut rows, index, root, 1, false);
+                self.push_children(&mut rows, &mut unlisted, index, root, 1, false);
             }
+        }
+        let asked = |dir: &PathBuf| {
+            self.calls
+                .iter()
+                .any(|(_, folders, _)| folders.contains(dir))
+        };
+        unlisted.retain(|dir| !asked(dir));
+        if rows == self.rows {
+            self.list(unlisted);
+            return false;
         }
         self.rows = rows;
         self.listing += 1;
@@ -301,6 +430,8 @@ impl FileTree {
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         self.scroll_into_view();
+        self.list(unlisted);
+        true
     }
 
     /// A number that changes whenever what's listed does.
@@ -308,28 +439,37 @@ impl FileTree {
         self.listing
     }
 
-    /// Whether changes to `paths` change what's listed: an entry of an open
-    /// folder came, went, or became a folder or stopped being one, or an
-    /// ignore file there changed. Told by looking, not by what the changes
-    /// were said to be, which isn't to be trusted (see [`Changes`](crate::watch::Changes)).
-    pub fn is_changed_by<'a>(&self, paths: impl IntoIterator<Item = &'a PathBuf>) -> bool {
+    /// Whether `changes` change what's listed: an entry of an open folder
+    /// came, went, or became a folder or stopped being one, or an ignore
+    /// file there changed. Told by what the host saw of the paths after
+    /// they changed, not by what the changes were said to be, which isn't
+    /// to be trusted (see [`Changes`]).
+    pub fn is_changed_by(&self, changes: &Changes) -> bool {
         let open: HashSet<&Path> = self.open_folders().map(PathBuf::as_path).collect();
         let listed: HashMap<&Path, bool> = self
             .rows
             .iter()
             .map(|row| (row.path.as_path(), row.is_dir))
             .collect();
-        paths.into_iter().any(|path| {
+        changes.paths.iter().any(|path| {
             let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
                 return false;
             };
             if !open.contains(folder) || is_hidden(name) {
                 return false;
             }
-            // Whether it's a folder, as `read_dir` tells, if it's there.
-            let now = fs::symlink_metadata(path).ok().map(|_| path.is_dir());
+            let now = changes.dirs.get(path).copied();
             is_ignore_file(name) || now != listed.get(path.as_path()).copied()
         })
+    }
+
+    /// Whether `path` is in its folder, as last listed. False if its
+    /// folder hasn't been.
+    pub fn lists(&self, path: &Path) -> bool {
+        let Some(listing) = path.parent().and_then(|dir| self.listings.get(dir)) else {
+            return false;
+        };
+        listing.entries.iter().any(|entry| entry.path == path)
     }
 
     /// The folders listed with their contents showing.
@@ -494,12 +634,20 @@ impl FileTree {
             .map(Path::to_path_buf)
             .collect();
         let collapsed = folders.iter().any(|dir| !expanded.contains(dir));
-        expanded.extend(folders);
-        if collapsed || self.index_of(index, path).is_none() {
-            self.refresh();
+        expanded.extend(folders.iter().cloned());
+        if collapsed {
+            self.rebuild();
         }
         if let Some(row) = self.index_of(index, path) {
             self.select(row);
+            self.revealing = None;
+            if collapsed {
+                // Those folders may have changed while they were shut.
+                self.list(folders);
+            }
+        } else {
+            self.revealing = Some(path.to_path_buf());
+            self.list(folders);
         }
     }
 
@@ -659,14 +807,18 @@ impl FileTree {
         TreeAction::None
     }
 
+    /// Expands the folder at row `index`, showing what it had when last
+    /// listed, if it was, and listing it again, as it may have changed
+    /// while it was shut.
     fn expand(&mut self, index: usize) {
         let row = &self.rows[index];
-        let (path, depth, root, ignored) = (row.path.clone(), row.depth, row.root, row.ignored);
+        let (path, root) = (row.path.clone(), row.root);
         self.expanded_under(root).insert(path.clone());
-        let mut children = Vec::new();
-        self.push_children(&mut children, root, &path, depth + 1, ignored);
-        self.rows.splice(index + 1..index + 1, children);
-        self.listing += 1;
+        let listed = self.listings.contains_key(&path);
+        self.rebuild();
+        if listed {
+            self.list(vec![path]);
+        }
     }
 
     fn collapse(&mut self, index: usize) {
@@ -708,23 +860,37 @@ impl FileTree {
     }
 
     /// Appends the entries of `dir`, under the root at position `root`, and
-    /// of its expanded subfolders. Those of an `ignored` folder are all
-    /// ignored.
+    /// of its expanded subfolders, as last listed. Those of an `ignored`
+    /// folder are all ignored. Folders never listed are added to
+    /// `unlisted`.
     fn push_children(
         &self,
         rows: &mut Vec<Row>,
+        unlisted: &mut Vec<PathBuf>,
         root: usize,
         dir: &Path,
         depth: usize,
         ignored: bool,
     ) {
+        let Some(listing) = self.listings.get(dir) else {
+            unlisted.push(dir.to_path_buf());
+            return;
+        };
         let expanded = &self.expanded[&self.roots[root]];
-        for row in read_dir(dir, depth, root, ignored) {
+        for entry in &listing.entries {
+            let row = Row {
+                path: entry.path.clone(),
+                name: entry.name.clone(),
+                depth,
+                root,
+                is_dir: entry.is_dir,
+                ignored: ignored || entry.ignored,
+            };
             let expand = row.is_dir && expanded.contains(&row.path);
             let (path, ignored) = (row.path.clone(), row.ignored);
             rows.push(row);
             if expand {
-                self.push_children(rows, root, &path, depth + 1, ignored);
+                self.push_children(rows, unlisted, root, &path, depth + 1, ignored);
             }
         }
     }
@@ -768,19 +934,14 @@ impl Outline for FileTree {
     }
 }
 
-/// The entries of `dir`, listed under the root at position `root`, folders
-/// first, each group by name ignoring case. An unreadable folder shows as
-/// empty. The entries of an `ignored` folder are all ignored.
-fn read_dir(dir: &Path, depth: usize, root: usize, ignored: bool) -> Vec<Row> {
+/// The entries of `dir`, for the host, folders first, each group by name
+/// ignoring case. An unreadable folder lists as empty.
+pub fn read_dir(dir: &Path) -> Vec<Listed> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    let kept = if ignored {
-        HashSet::new()
-    } else {
-        not_ignored(dir)
-    };
-    let mut rows: Vec<Row> = entries
+    let kept = not_ignored(dir);
+    let mut rows: Vec<Listed> = entries
         .filter_map(Result::ok)
         .filter(|entry| !is_hidden(&entry.file_name()))
         .map(|entry| {
@@ -792,12 +953,10 @@ fn read_dir(dir: &Path, depth: usize, root: usize, ignored: bool) -> Vec<Row> {
                 Ok(kind) => kind.is_dir(),
                 Err(_) => false,
             };
-            Row {
+            Listed {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 ignored: !kept.contains(&path),
                 path,
-                depth,
-                root,
                 is_dir,
             }
         })
@@ -862,8 +1021,10 @@ mod tests {
 
     /// A tree with room for 20 rows.
     fn tree(roots: &[PathBuf]) -> FileTree {
-        let mut tree = FileTree::new(roots);
+        crate::host::set_at_once(false);
+        let mut tree = FileTree::new(&Link::local(), roots);
         tree.set_height(20);
+        tree.wait();
         tree
     }
 
@@ -886,7 +1047,12 @@ mod tests {
     fn tells_which_changes_change_the_listing() {
         let root = fixture("changed-by", &["a.txt", "shut/b.txt"]);
         let tree = tree(std::slice::from_ref(&root));
-        let changed = |path: &PathBuf| tree.is_changed_by([path]);
+        let changed = |path: &PathBuf| {
+            let mut changes = Changes::default();
+            changes.paths.insert(path.clone());
+            changes.look();
+            tree.is_changed_by(&changes)
+        };
         let a = root.join("a.txt");
         assert!(!changed(&a), "there, and listed: changed within");
         fs::write(root.join("new.txt"), "").unwrap();
@@ -940,7 +1106,9 @@ mod tests {
         fs::write(root.join("src/.gitignore"), "gen.rs\n").unwrap();
         let mut tree = tree(std::slice::from_ref(&root));
         tree.reveal(&root.join("target/debug/out"));
+        tree.wait();
         tree.reveal(&root.join("src/main.rs"));
+        tree.wait();
         let ignored: Vec<String> = tree
             .rows
             .iter()
@@ -955,15 +1123,19 @@ mod tests {
         let root = fixture("keys", &["src/tree/mod.rs", "src/main.rs", "z.txt"]);
         let mut tree = tree(&[root]);
         tree.run(Command::TreeDown);
+        tree.wait();
         assert_eq!(selected(&tree), "src");
         tree.run(Command::TreeExpand);
+        tree.wait();
         tree.run(Command::TreeExpand);
+        tree.wait();
         assert_eq!(
             selected(&tree),
             "tree",
             "Right steps into an expanded folder"
         );
         tree.run(Command::TreeExpand);
+        tree.wait();
         assert_eq!(
             listing(&tree),
             [
@@ -977,13 +1149,18 @@ mod tests {
         );
 
         tree.run(Command::TreeDown);
+        tree.wait();
         tree.run(Command::TreeCollapse);
+        tree.wait();
         assert_eq!(selected(&tree), "tree", "Left steps out to the parent");
         tree.run(Command::TreeUp);
+        tree.wait();
         tree.run(Command::TreeCollapse);
+        tree.wait();
         assert_eq!(listing(&tree), ["keys/", "  src/", "  z.txt"]);
 
         tree.run(Command::TreeExpand);
+        tree.wait();
         assert!(
             listing(&tree).contains(&"      mod.rs".to_string()),
             "subfolders stay expanded"
@@ -995,6 +1172,7 @@ mod tests {
         let root = fixture("open", &["dir/inner.txt", "file.txt"]);
         let mut tree = tree(std::slice::from_ref(&root));
         tree.run(Command::TreeLast);
+        tree.wait();
         assert_eq!(
             tree.run(Command::TreeOpen),
             TreeAction::Open {
@@ -1003,6 +1181,7 @@ mod tests {
                 preview: false,
             }
         );
+        tree.wait();
         assert_eq!(
             tree.run(Command::TreePreview),
             TreeAction::Open {
@@ -1011,19 +1190,23 @@ mod tests {
                 preview: true,
             }
         );
+        tree.wait();
         // Clicking a folder toggles it.
         assert_eq!(tree.click(1, false), TreeAction::None);
+        tree.wait();
         assert_eq!(
             listing(&tree),
             ["open/", "  dir/", "    inner.txt", "  file.txt"]
         );
         tree.click(1, false);
+        tree.wait();
         assert_eq!(listing(&tree), ["open/", "  dir/", "  file.txt"]);
         assert_eq!(
             tree.click(10, false),
             TreeAction::None,
             "below the last row"
         );
+        tree.wait();
     }
 
     #[test]
@@ -1031,9 +1214,11 @@ mod tests {
         let root = fixture("collapse", &["dir/a", "dir/b", "last"]);
         let mut tree = tree(&[root]);
         tree.click(1, false);
+        tree.wait();
         tree.select(3);
         assert_eq!(selected(&tree), "b");
         tree.click(1, false);
+        tree.wait();
         assert_eq!(selected(&tree), "dir");
         tree.select(2);
         assert_eq!(selected(&tree), "last");
@@ -1045,11 +1230,13 @@ mod tests {
         let mut tree = tree(std::slice::from_ref(&root));
         tree.set_height(3);
         tree.reveal(&root.join("a/b/c.rs"));
+        tree.wait();
         assert_eq!(selected(&tree), "c.rs");
         assert_eq!(tree.scroll, 1, "scrolled so the selection is visible");
 
         fs::write(root.join("a/b/new.rs"), "").unwrap();
         tree.refresh();
+        tree.wait();
         assert_eq!(selected(&tree), "c.rs");
         assert!(listing(&tree).contains(&"      new.rs".to_string()));
     }
@@ -1059,17 +1246,24 @@ mod tests {
         let root = fixture("active", &["a/b/c.rs", "a/d.rs", "e.rs"]);
         let mut tree = tree(std::slice::from_ref(&root));
         tree.set_active(Some(&root.join("a/b/c.rs")), true);
+        tree.wait();
         assert_eq!(selected(&tree), "c.rs");
 
         // The same file again leaves the tree as the user left it.
         tree.run(Command::TreeFirst);
+        tree.wait();
         tree.run(Command::TreeDown);
+        tree.wait();
         tree.run(Command::TreeCollapse);
+        tree.wait();
         tree.set_active(Some(&root.join("a/b/c.rs")), false);
+        tree.wait();
         assert_eq!(listing(&tree), ["active/", "  a/", "  e.rs"]);
 
         tree.set_active(None, false);
+        tree.wait();
         tree.set_active(Some(&root.join("a/b/c.rs")), false);
+        tree.wait();
         assert_eq!(selected(&tree), "c.rs");
     }
 
@@ -1106,6 +1300,7 @@ mod tests {
 
         // Revealed under the root it belongs to, not in outer's listing.
         tree.reveal(&inner.join("src/lib.rs"));
+        tree.wait();
         assert_eq!(tree.rows[tree.selected].root, 1);
         assert_eq!(selected(&tree), "lib.rs");
         assert_eq!(listing(&tree)[1], "  pkg/", "outer's pkg stays shut");
@@ -1116,12 +1311,15 @@ mod tests {
         tree.select(1);
         assert!(tree.selected().unwrap().is_root);
         tree.run(Command::TreeExpand);
+        tree.wait();
         assert_eq!(listing(&tree)[..3], ["outer/", "  pkg/", "    src/"]);
         tree.refresh();
+        tree.wait();
         assert_eq!(selected(&tree), "pkg");
         assert_eq!(tree.rows[tree.selected].root, 0, "the selection stays put");
 
         tree.set_roots(std::slice::from_ref(&outer));
+        tree.wait();
         assert_eq!(listing(&tree)[..3], ["outer/", "  pkg/", "    src/"]);
         assert_eq!(listing(&tree).len(), 5);
     }
@@ -1139,6 +1337,7 @@ mod tests {
         let root = fixture("deep", &["a/b/c/d/e/f/g/h/file.txt"]);
         let mut tree = tree(std::slice::from_ref(&root));
         tree.reveal(&root.join("a/b/c/d/e/f/g/h/file.txt"));
+        tree.wait();
         let screen =
             opentui::OwnedBuffer::new(16, 12, false, opentui::WidthMethod::Unicode, "test")
                 .unwrap();
@@ -1195,8 +1394,10 @@ mod tests {
         let root = fixture("sticky", &files);
         let mut tree = tree(std::slice::from_ref(&root));
         tree.reveal(&root.join("a/b/0.rs"));
+        tree.wait();
         tree.set_height(6);
         tree.run(Command::TreeFirst);
+        tree.wait();
         assert!(tree.sticky().is_empty(), "nothing scrolled past");
 
         // Scrolled 3 rows down: sticky, a, and b stick, over 0.rs to 2.rs.
@@ -1215,6 +1416,7 @@ mod tests {
         );
         // Clicking a stuck folder scrolls back to it.
         assert_eq!(tree.click(2, false), TreeAction::None);
+        tree.wait();
         assert_eq!(selected(&tree), "b");
         assert_eq!(tree.scroll, 0);
         assert_eq!(drawn(&tree, 16)[2], "     ▾ b", "not collapsed");
@@ -1248,10 +1450,12 @@ mod tests {
         // Stepping up from the first row below them scrolls, rather than
         // selecting a row they cover.
         tree.run(Command::TreeFirst);
+        tree.wait();
         tree.scroll(1);
         tree.select_at(3);
         assert_eq!(selected(&tree), "3.rs");
         tree.run(Command::TreeUp);
+        tree.wait();
         assert_eq!(selected(&tree), "2.rs");
         assert_eq!(tree.selected_position().map(|(_, y)| y), Some(3));
         assert_eq!(drawn(&tree, 16)[3], "         2.rs");

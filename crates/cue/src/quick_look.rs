@@ -248,7 +248,10 @@ fn load(path: &Path, theme: &Rc<Theme>) -> (Body, Option<String>) {
     if meta.len() > MAX_BYTES {
         return (Body::Note("Too large to preview".into()), Some(size));
     }
-    let doc = match Document::open(Some(path.to_path_buf()), theme.clone()) {
+    let loaded = crate::document::load(path).map_err(|err| err.to_string());
+    let doc = match loaded
+        .and_then(|loaded| Document::loaded(path.to_path_buf(), loaded, theme.clone()))
+    {
         Ok((doc, _)) => doc,
         Err(_) => return (Body::Note("No preview".into()), Some(size)),
     };

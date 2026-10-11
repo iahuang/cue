@@ -1057,7 +1057,7 @@ impl Git {
     #[cfg(test)]
     pub fn wait(&mut self) {
         while let Some((call, started)) = self.running.take() {
-            if let Some(Reply::Repos(repos)) = call.recv() {
+            if let Some(Reply::Repos(repos)) = call.wait() {
                 self.repos = repos;
             }
             self.last = Some((started, started.elapsed()));

@@ -7,7 +7,7 @@
 //! writes. A save is several changes in a row, so changes are handed over
 //! in batches, once they settle.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -26,8 +26,23 @@ pub struct Changes {
     /// isn't told: on macOS, a file created lately is told as created again
     /// each time it changes.
     pub paths: HashSet<PathBuf>,
+    /// Those of `paths` that are there, as [`Changes::look`] found them,
+    /// by whether each is a folder, or a symlink to one.
+    pub dirs: HashMap<PathBuf, bool>,
     /// Changes may have been missed: anything may have changed.
     pub rescan: bool,
+}
+
+impl Changes {
+    /// Looks at what `paths` are now, for `dirs`.
+    pub fn look(&mut self) {
+        self.dirs = self
+            .paths
+            .iter()
+            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+            .map(|path| (path.clone(), path.is_dir()))
+            .collect();
+    }
 }
 
 pub struct Watcher {

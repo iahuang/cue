@@ -23,6 +23,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
+use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,12 +31,35 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::document::{self, Checked, LineEnding, Loaded, Stamp, Unsaved};
+use crate::file_dialog;
 use crate::file_index;
+use crate::file_ops::{self, FileOp};
 use crate::git::{self, Repo};
 use crate::search::{self, Query};
+use crate::symbols::{self, FileSymbols};
+use crate::tree::{self, Listed};
 use crate::wake;
 use crate::watch::{Changes, Watcher};
 use crate::workspace::Workspace;
+
+#[cfg(test)]
+thread_local! {
+    static AT_ONCE: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Whether what's asked of the host is waited for as it's asked, in tests,
+/// as most expect. A test can turn it off for its thread, to see what
+/// shows meanwhile.
+#[cfg(test)]
+pub fn at_once() -> bool {
+    AT_ONCE.get()
+}
+
+#[cfg(test)]
+pub fn set_at_once(on: bool) {
+    AT_ONCE.set(on);
+}
 
 /// Tells a call from the others on the same link.
 type CallId = u64;
@@ -60,6 +84,34 @@ pub enum Request {
     GitStatus { roots: Vec<PathBuf> },
     /// Syncing the repository at `root` with its remote.
     GitSync { root: PathBuf, sync: git::Sync },
+    /// The symbols `files` define (see [`crate::symbols`]): those found so
+    /// far as it goes, if `progress`, and then all of them. Files that
+    /// haven't changed since the last indexing aren't read again.
+    IndexSymbols { files: Vec<PathBuf>, progress: bool },
+    /// The text of the file at `path`, to open (see [`crate::document`]).
+    Load { path: PathBuf },
+    /// Writing `text` to `path` (see [`document::write`]).
+    Save {
+        path: PathBuf,
+        text: String,
+        line_ending: LineEnding,
+        /// The file as last loaded or saved, to write over only if it
+        /// still is, if given.
+        expected: Option<Option<Stamp>>,
+        make_folder: bool,
+    },
+    /// How each of `files` compares with the file as a document last had
+    /// it (see [`document::check`]), a reply each.
+    CheckDisk {
+        files: Vec<(PathBuf, Option<Stamp>)>,
+    },
+    /// What's in `dir`, for the file dialog (see [`crate::file_dialog`]).
+    ReadDir { dir: PathBuf },
+    /// Doing something to files (see [`crate::file_ops`]).
+    FileOp(FileOp),
+    /// What's in each of `folders` (see [`crate::tree`]), a reply each, in
+    /// order.
+    ListFolders { folders: Vec<PathBuf> },
     /// Committing what's staged in the repository at `root`.
     Commit {
         root: PathBuf,
@@ -76,6 +128,25 @@ pub enum Request {
 pub enum Reply {
     /// Files found so far, during a [`Request::ListFiles`] with progress.
     FilesFound(Vec<PathBuf>),
+    /// A file's text, or why it couldn't be read.
+    Loaded(Result<Loaded, String>),
+    /// How a file was found, for a [`Request::CheckDisk`].
+    Checked {
+        path: PathBuf,
+        checked: Checked,
+    },
+    /// The file as written, or why it wasn't.
+    Saved(Result<Stamp, Unsaved>),
+    /// What's in a folder, for the file dialog, or why it couldn't be read.
+    Dir {
+        dir: PathBuf,
+        entries: Result<Vec<file_dialog::Entry>, io::ErrorKind>,
+    },
+    /// A folder's entries, folders first. Empty if it can't be read.
+    Folder {
+        dir: PathBuf,
+        entries: Vec<Listed>,
+    },
     /// Every file, sorted as the picker lists them, and whether some went
     /// unlisted, there being too many.
     Files {
@@ -84,9 +155,17 @@ pub enum Reply {
     },
     /// A file with matches, or the colors of one found before.
     Found(search::Found),
+    /// Symbols found so far, during a [`Request::IndexSymbols`] with
+    /// progress.
+    SymbolsFound(FileSymbols),
+    /// Every file's symbols, sorted by path.
+    Symbols(FileSymbols),
     Repos(Vec<Repo>),
     /// How a [`Request::GitSync`] went.
     Synced(Result<(), String>),
+    /// How a [`Request::FileOp`] went: why it couldn't be done, if it
+    /// couldn't.
+    FileOpDone(Result<(), String>),
     /// The new commit's abbreviated hash, or what went wrong.
     Committed(Result<String, String>),
 }
@@ -97,12 +176,16 @@ pub enum Tell {
     /// Watch these folders for changes (see [`crate::watch`]), and no
     /// others. Those that don't exist are left out.
     Watch(BTreeSet<PathBuf>),
+    /// Use these settings, for tests, where each thread has its own: the
+    /// host's threads would have the defaults.
+    #[cfg(test)]
+    Config(Arc<crate::config::Config>),
 }
 
 /// What the host says unasked.
 #[derive(Debug)]
 pub enum Notice {
-    /// Files in the watched folders changed.
+    /// Files in the watched folders changed, with what they are now.
     DiskChanged(Changes),
 }
 
@@ -222,9 +305,9 @@ impl Call {
         self.replies.try_recv()
     }
 
-    /// Waits for the next reply, for tests. `None` once the call ended.
-    #[cfg(test)]
-    pub fn recv(&self) -> Option<Reply> {
+    /// Waits for the next reply. `None` once the call ended. Only for
+    /// what can't go on without it yet, and tests: it holds up the screen.
+    pub fn wait(&self) -> Option<Reply> {
         self.replies.recv().ok()
     }
 }
@@ -307,6 +390,7 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
     });
     // Each call in progress, by whether it was cancelled.
     let mut calls: HashMap<CallId, Arc<AtomicBool>> = HashMap::new();
+    let state = Arc::new(State::default());
     loop {
         let input = match watcher.due() {
             Some(due) => inbox.recv_timeout(due.saturating_duration_since(Instant::now())),
@@ -322,7 +406,8 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
                     inbox: host_inbox.clone(),
                     cancelled,
                 };
-                std::thread::spawn(move || answer(request, responder));
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || answer(request, &state, responder));
             }
             Ok(Input::Cancel(id)) => {
                 if let Some(cancelled) = calls.remove(&id) {
@@ -331,6 +416,10 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
             }
             Ok(Input::Finished(id)) => {
                 calls.remove(&id);
+            }
+            #[cfg(test)]
+            Ok(Input::Tell(Tell::Config(config))) => {
+                *state.config.lock().unwrap_or_else(|e| e.into_inner()) = Some(config);
             }
             Ok(Input::Tell(Tell::Watch(folders))) => {
                 watcher.watch(folders.into_iter().filter(|f| f.is_dir()).collect());
@@ -342,7 +431,8 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
             }
             Ok(Input::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
-        if let Some(changes) = watcher.poll() {
+        if let Some(mut changes) = watcher.poll() {
+            changes.look();
             let _ = output.send(Output::Notice(Notice::DiskChanged(changes)));
         }
     }
@@ -351,8 +441,26 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
     }
 }
 
+/// What the host keeps from one call to the next.
+#[derive(Default)]
+struct State {
+    symbols: symbols::Cache,
+    /// The settings the app told of, for tests.
+    #[cfg(test)]
+    config: Mutex<Option<Arc<crate::config::Config>>>,
+}
+
 /// Does what `request` asks, replying as it goes.
-fn answer(request: Request, responder: Responder) {
+fn answer(request: Request, state: &State, responder: Responder) {
+    #[cfg(test)]
+    if let Some(config) = state
+        .config
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        crate::config::set((*config).clone());
+    }
     match request {
         Request::ListFiles {
             workspace,
@@ -363,6 +471,46 @@ fn answer(request: Request, responder: Responder) {
             query,
             unsaved,
         } => search::run(&workspace, &query, unsaved, &responder),
+        Request::IndexSymbols { files, progress } => {
+            symbols::index(&files, &state.symbols, progress, &responder)
+        }
+        Request::Load { path } => {
+            let loaded = document::load(&path).map_err(|err| err.to_string());
+            responder.reply(Reply::Loaded(loaded));
+        }
+        Request::Save {
+            path,
+            text,
+            line_ending,
+            expected,
+            make_folder,
+        } => {
+            let written = document::write(&path, &text, line_ending, expected, make_folder);
+            responder.reply(Reply::Saved(written));
+        }
+        Request::CheckDisk { files } => {
+            for (path, stamp) in files {
+                let checked = document::check(&path, stamp);
+                if !responder.reply(Reply::Checked { path, checked }) {
+                    return;
+                }
+            }
+        }
+        Request::ReadDir { dir } => {
+            let entries = file_dialog::read(&dir);
+            responder.reply(Reply::Dir { dir, entries });
+        }
+        Request::FileOp(op) => {
+            responder.reply(Reply::FileOpDone(file_ops::run(&op)));
+        }
+        Request::ListFolders { folders } => {
+            for dir in folders {
+                let entries = tree::read_dir(&dir);
+                if !responder.reply(Reply::Folder { dir, entries }) {
+                    return;
+                }
+            }
+        }
         Request::GitStatus { roots } => {
             responder.reply(Reply::Repos(git::read_repos(&roots)));
         }
@@ -410,14 +558,14 @@ mod tests {
             workspace,
             progress: false,
         });
-        match call.recv() {
+        match call.wait() {
             Some(Reply::Files { files, truncated }) => {
                 assert_eq!(files, [root.join("a.txt")]);
                 assert!(!truncated);
             }
             other => panic!("{other:?}"),
         }
-        assert!(call.recv().is_none());
+        assert!(call.wait().is_none());
     }
 
     #[test]

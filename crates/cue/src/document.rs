@@ -262,17 +262,27 @@ pub struct Parked {
 }
 
 impl Document {
-    /// Opens the file at `path`, or a new, unnamed document, and a notice
-    /// for the status bar if loading it had anything to say. The error is
-    /// the reason alone, without the path.
-    pub fn open(
-        path: Option<PathBuf>,
+    /// A new, unnamed document.
+    pub fn untitled(theme: Rc<Theme>) -> Result<Rc<Document>, String> {
+        Document::open(None, theme).map(|(doc, _)| doc)
+    }
+
+    /// A document of the file at `path`, as `loaded` (see [`load`]), and a
+    /// notice for the status bar if loading it had anything to say. The
+    /// error is the reason alone, without the path.
+    pub fn loaded(
+        path: PathBuf,
+        loaded: Loaded,
         theme: Rc<Theme>,
     ) -> Result<(Rc<Document>, Option<String>), String> {
-        let loaded = match &path {
-            Some(path) => Some(load(path).map_err(|e| e.to_string())?),
-            None => None,
-        };
+        Document::open(Some((path, loaded)), theme)
+    }
+
+    fn open(
+        file: Option<(PathBuf, Loaded)>,
+        theme: Rc<Theme>,
+    ) -> Result<(Rc<Document>, Option<String>), String> {
+        let (path, loaded) = file.unzip();
         let buffer = Rc::new(EditBuffer::new(WidthMethod::Unicode).map_err(|e| e.to_string())?);
         buffer.set_tab_width(config::get().tab_width as u8);
         let mut file = File {
@@ -305,7 +315,7 @@ impl Document {
         text: &str,
         theme: Rc<Theme>,
     ) -> Result<Rc<Document>, String> {
-        let (doc, _) = Self::open(None, theme)?;
+        let doc = Document::untitled(theme)?;
         doc.restore_text(text);
         doc.rename(path);
         doc.history.borrow_mut().mark_unsaved();
@@ -556,18 +566,51 @@ impl Document {
     }
 
     /// Writes the text to `path`, with the file's line endings, and marks
-    /// it saved.
+    /// it saved, for tests: the app has the host write it.
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let line_ending = self.file.borrow().line_ending;
         let text = self.buffer.text();
+        let epoch = self.buffer.content_epoch();
         let stamp = save(path, &text, line_ending)?;
-        self.history.borrow_mut().mark_saved();
-        *self.saved.borrow_mut() = Saved::of(&text);
+        self.saved_as(&text, epoch, stamp);
+        Ok(())
+    }
+
+    /// What to write to save it: the text, the buffer's content epoch then,
+    /// and how lines end.
+    pub fn to_write(&self) -> (String, u64, LineEnding) {
+        let text = self.buffer.text();
+        (
+            text,
+            self.buffer.content_epoch(),
+            self.file.borrow().line_ending,
+        )
+    }
+
+    /// The file on disk as last loaded or saved, to write over only if it
+    /// still is: `None` if there was no file.
+    pub fn stamp(&self) -> Option<Stamp> {
+        self.on_disk.borrow().stamp
+    }
+
+    /// Marks `text`, the text at content epoch `epoch`, written to the file
+    /// as `stamp`. It's saved, unless it was edited since.
+    pub fn saved_as(&self, text: &str, epoch: u64, stamp: Stamp) {
+        if self.buffer.content_epoch() == epoch {
+            self.history.borrow_mut().mark_saved();
+        }
+        *self.saved.borrow_mut() = Saved::of(text);
         *self.on_disk.borrow_mut() = OnDisk {
             stamp: Some(stamp),
             disk: Disk::Same,
         };
-        Ok(())
+    }
+
+    /// Notes that the file changed on disk since it was loaded or saved,
+    /// as found when saving: saving asks first from now on.
+    pub fn set_changed_on_disk(&self) {
+        self.on_disk.borrow_mut().disk = Disk::Changed;
     }
 
     /// How the file on disk compared with the document when last checked.
@@ -581,33 +624,40 @@ impl Document {
         self.on_disk.borrow().stamp.map(|stamp| stamp.hash)
     }
 
-    /// Catches up with the file on disk, which something else may have
-    /// changed. With no unsaved changes, the document takes the change, as
-    /// one undo step; with some, it keeps them, and saving asks first. A
-    /// file that can't be read is left for later.
+    /// Catches up with the file on disk, as the host found it, for tests.
+    #[cfg(test)]
     pub fn check_disk(&self) -> Option<DiskChange> {
-        let path = self.path()?;
-        let OnDisk { stamp, disk } = *self.on_disk.borrow();
-        let meta = match fs::metadata(&path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+        let checked = check(&self.path()?, self.stamp());
+        self.take_check(self.stamp(), checked)
+    }
+
+    /// Catches up with the file on disk, which something else may have
+    /// changed, as the host found it when it `checked`, against `stamp`.
+    /// With no unsaved changes, the document takes the change, as one undo
+    /// step; with some, it keeps them, and saving asks first. A file that
+    /// can't be read is left for later, as is a check against what the
+    /// document no longer has, having been saved since.
+    pub fn take_check(&self, stamp: Option<Stamp>, checked: Checked) -> Option<DiskChange> {
+        let disk = self.on_disk.borrow().disk;
+        if self.stamp() != stamp {
+            return None;
+        }
+        let loaded = match checked {
+            Checked::Missing => {
                 if stamp.is_none() || disk == Disk::Deleted {
                     return None;
                 }
                 self.on_disk.borrow_mut().disk = Disk::Deleted;
                 return Some(DiskChange::Deleted);
             }
-            Err(_) => return None,
+            Checked::Unreadable => return None,
+            Checked::Same(now) => {
+                // Touched, or changed back.
+                self.on_disk.borrow_mut().stamp = Some(now);
+                return self.restored();
+            }
+            Checked::Changed(loaded) => loaded,
         };
-        if stamp.is_some_and(|stamp| stamp.matches(&meta)) {
-            return self.restored();
-        }
-        let loaded = load(&path).ok()?;
-        if loaded.stamp.map(|s| s.hash) == stamp.map(|s| s.hash) {
-            // Touched, or changed back.
-            self.on_disk.borrow_mut().stamp = loaded.stamp;
-            return self.restored();
-        }
         if !self.is_modified() {
             if self.reload(loaded, true) {
                 return Some(DiskChange::Reloaded);
@@ -632,15 +682,23 @@ impl Document {
         Some(DiskChange::Restored)
     }
 
-    /// Loads the file again, dropping unsaved changes, as one undo step.
-    pub fn revert(&self) -> io::Result<()> {
+    /// Loads the file again, dropping unsaved changes, as one undo step,
+    /// for tests.
+    #[cfg(test)]
+    pub fn revert(&self) -> Result<(), String> {
         let Some(path) = self.path() else {
             return Ok(());
         };
-        if !self.reload(load(&path)?, false) {
-            return Err(io::Error::other("Couldn't load the entire file."));
+        self.revert_to(load(&path).map_err(|err| err.to_string())?)
+    }
+
+    /// Takes the file's text as `loaded` again, dropping unsaved changes,
+    /// as one undo step.
+    pub fn revert_to(&self, loaded: Loaded) -> Result<(), String> {
+        match self.reload(loaded, false) {
+            true => Ok(()),
+            false => Err("Couldn't load the entire file.".to_string()),
         }
-        Ok(())
     }
 
     /// Takes `loaded` as the text, changing only the lines that differ, as
@@ -767,7 +825,8 @@ pub struct Loaded {
     pub stamp: Option<Stamp>,
 }
 
-/// Reads `path`. A missing file loads as empty, to be created on save.
+/// Reads `path`, for the host. A missing file loads as empty, to be
+/// created on save.
 pub fn load(path: &Path) -> io::Result<Loaded> {
     let (bytes, stamp) = match fs::File::open(path) {
         Ok(mut file) => {
@@ -801,6 +860,87 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
         mixed_endings,
         stamp,
     })
+}
+
+/// How the host found a file compared with what a document last had of it
+/// (see [`check`]).
+#[derive(Debug)]
+pub enum Checked {
+    /// It isn't there.
+    Missing,
+    /// It couldn't be read, for now.
+    Unreadable,
+    /// Its text is the same, as of this.
+    Same(Stamp),
+    /// Its text changed, to this.
+    Changed(Loaded),
+}
+
+/// How the file at `path` is, for the host, compared with `stamp`, the
+/// file as a document last loaded or saved it (`None` if there was none).
+pub fn check(path: &Path, stamp: Option<Stamp>) -> Checked {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Checked::Missing,
+        Err(_) => return Checked::Unreadable,
+    };
+    if let Some(stamp) = stamp.filter(|stamp| stamp.matches(&meta)) {
+        return Checked::Same(stamp);
+    }
+    let Ok(loaded) = load(path) else {
+        return Checked::Unreadable;
+    };
+    match loaded.stamp {
+        Some(now) if Some(now.hash) == stamp.map(|s| s.hash) => Checked::Same(now),
+        _ => Checked::Changed(loaded),
+    }
+}
+
+/// Why the host didn't save a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unsaved {
+    /// It changed on disk since it was last loaded or saved.
+    Changed,
+    /// Writing failed, for this reason.
+    Failed(String),
+}
+
+/// Writes `text` to `path`, as [`save`] does, for the host, unless the file
+/// isn't as `expected` any more: as it was last loaded or saved (`None` if
+/// there was no file). A file that's gone is written again. With
+/// `make_folder`, the folder it goes in is made if need be.
+pub fn write(
+    path: &Path,
+    text: &str,
+    line_ending: LineEnding,
+    expected: Option<Option<Stamp>>,
+    make_folder: bool,
+) -> Result<Stamp, Unsaved> {
+    if let Some(expected) = expected {
+        if changed_since(path, expected) {
+            return Err(Unsaved::Changed);
+        }
+    }
+    if let Some(folder) = path.parent().filter(|_| make_folder) {
+        fs::create_dir_all(folder)
+            .map_err(|err| Unsaved::Failed(format!("Can't create the folder: {err}")))?;
+    }
+    save(path, text, line_ending).map_err(|err| Unsaved::Failed(err.to_string()))
+}
+
+/// Whether the file at `path` is there, and isn't the one `stamp` is of.
+fn changed_since(path: &Path, stamp: Option<Stamp>) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        // Gone, or unreadable, which writing will tell of.
+        return false;
+    };
+    if stamp.is_some_and(|stamp| stamp.matches(&meta)) {
+        return false;
+    }
+    match load(path) {
+        Ok(loaded) => loaded.stamp.map(|s| s.hash) != stamp.map(|s| s.hash),
+        Err(_) => false,
+    }
 }
 
 /// Writes `text` (with `\n` line breaks) to `path` atomically: a sibling
@@ -952,13 +1092,50 @@ mod tests {
     }
 
     #[test]
+    fn writes_only_over_the_file_as_last_known() {
+        let dir = temp_dir("write");
+        let path = dir.join("a.txt");
+        fs::write(&path, "one\n").unwrap();
+        let stamp = load(&path).unwrap().stamp;
+        let written = write(&path, "two\n", LineEnding::Lf, Some(stamp), false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two\n");
+
+        // Changed since, it's left alone, unless overwriting.
+        fs::write(&path, "other\n").unwrap();
+        let stale = Some(Some(written));
+        assert_eq!(
+            write(&path, "three\n", LineEnding::Lf, stale, false),
+            Err(Unsaved::Changed)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "other\n");
+        write(&path, "three\n", LineEnding::Lf, None, false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "three\n");
+
+        // Gone, it's written again; new, it's there only if it wasn't.
+        fs::remove_file(&path).unwrap();
+        write(&path, "four\n", LineEnding::Lf, stale, false).unwrap();
+        let new = dir.join("new.txt");
+        fs::write(&new, "there\n").unwrap();
+        assert_eq!(
+            write(&new, "", LineEnding::Lf, Some(None), false),
+            Err(Unsaved::Changed)
+        );
+
+        // Its folder is made only if asked.
+        let deep = dir.join("made/b.txt");
+        assert!(write(&deep, "", LineEnding::Lf, None, false).is_err());
+        write(&deep, "b\n", LineEnding::Lf, None, true).unwrap();
+        assert_eq!(fs::read_to_string(&deep).unwrap(), "b\n");
+    }
+
+    #[test]
     fn takes_changes_on_disk_unless_it_has_unsaved_ones() {
         let _serial = crate::test_serial();
         let dir = temp_dir("disk");
         let path = dir.join("a.txt");
         fs::write(&path, "one\ntwo\n").unwrap();
         let theme = Rc::new(Theme::new().unwrap());
-        let (doc, _) = Document::open(Some(path.clone()), theme).unwrap();
+        let (doc, _) = Document::loaded(path.clone(), load(&path).unwrap(), theme).unwrap();
         assert_eq!(doc.check_disk(), None);
         doc.save(&path).unwrap();
         assert_eq!(doc.check_disk(), None, "its own save isn't a change");

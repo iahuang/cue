@@ -83,10 +83,11 @@ use crate::commit_view::{CantCommit, CommitAction, CommitView};
 use crate::config::{self, Config, MIN_TREE_WIDTH};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
 use crate::definition::{self, Found, Reference};
-use crate::document::{self, Disk, DiskChange, Document, Spot};
+use crate::document::{self, Disk, DiskChange, Document, Loaded, Spot, Stamp, Unsaved};
 use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
+use crate::file_ops::{file_name, FileOp};
 use crate::find;
 use crate::git::{self, Carried, Change, Commit, Git, Repo, SwitchTo};
 use crate::host::{Call, Link, Notice, Reply, Request, Tell};
@@ -172,7 +173,7 @@ enum Redo {
     /// Closing a file or terminal the picker lists.
     CloseItem(Choice),
     /// Moving this to the Trash.
-    Trash(PathBuf),
+    Trash(Entry),
     /// Staging these files, in the repository at this root.
     Stage(PathBuf, Vec<PathBuf>),
     /// Stashing the changes in the repository at this root, as this
@@ -225,6 +226,48 @@ const INDENTS: [(Command, Indent); 4] = [
 struct Saving {
     docs: Vec<Rc<Document>>,
     redo: Redo,
+}
+
+/// A file operation the host is doing (see [`App::start_file_op`]).
+struct PendingOp {
+    op: FileOp,
+    call: Call,
+    /// The file dialog asked for it, and waits for it.
+    from_dialog: bool,
+}
+
+/// What follows opening a file, in the editor showing it.
+type Go = Box<dyn FnOnce(&mut Editor)>;
+
+/// A file being opened (see [`App::open_with`]), and how.
+struct Opening {
+    path: PathBuf,
+    /// The tab and panel it was opened from, to show it in.
+    panel: (TabId, PanelId),
+    preview: bool,
+    diff: bool,
+    go: Option<Go>,
+    /// What that panel showed then, to tell whether it went somewhere.
+    before: Option<Rc<Document>>,
+}
+
+/// An open file the host is checking (see [`App::check_disk`]), against
+/// what the document had of it then.
+struct Check {
+    path: PathBuf,
+    stamp: Option<Stamp>,
+    doc: Weak<Document>,
+}
+
+/// A file the host is writing (see [`App::write`]).
+struct Writing {
+    doc: Rc<Document>,
+    /// The text written, and the buffer's content epoch then.
+    text: String,
+    epoch: u64,
+    /// What's left of saving files, to carry on with once it's written.
+    saving: Option<Saving>,
+    call: Call,
 }
 
 /// A repository syncing with its remote, in the background.
@@ -421,6 +464,20 @@ pub struct App {
     commit_views: Vec<CommitView>,
     /// The repositories syncing with their remotes, in the background.
     syncing: Vec<Syncing>,
+    /// What the host is doing to files, in the background.
+    file_ops: Vec<PendingOp>,
+    /// Files the host is loading, to show once it has.
+    opening: Vec<(Opening, Call)>,
+    /// Files the host is writing.
+    writing: Vec<Writing>,
+    /// Open files the host is checking for changes on disk.
+    checking: Vec<(Vec<Check>, Call)>,
+    /// Open files the host is loading again, to revert to, and then what's
+    /// left of saving files, if anything.
+    reverting: Vec<(Rc<Document>, Option<Saving>, Call)>,
+    /// What the main loop should do, from something done in the
+    /// background (see [`App::take_deferred`]).
+    deferred: Option<AppAction>,
     /// The repository whose branches the picker lists, while it does.
     branch_root: Option<PathBuf>,
     /// What git says about the workspace's repositories.
@@ -646,7 +703,8 @@ impl App {
         height: u32,
     ) -> Result<App, String> {
         let file = file.map(|file| document::resolve(&file));
-        let mut tree = FileTree::new(workspace.roots());
+        let host = Link::local();
+        let mut tree = FileTree::new(&host, workspace.roots());
         // Before revealing, so the file's folders stay in view above it.
         // The status bar is below it.
         tree.set_height(height.saturating_sub(1));
@@ -670,21 +728,26 @@ impl App {
         };
         let (doc, notice) = match file {
             Some(file) => {
-                let (doc, notice) = Document::open(Some(file.clone()), theme.clone())
+                let (doc, notice) = load_now(&host, &file, &theme)
                     .map_err(|reason| format!("{}: {reason}", file.display()))?;
                 (Some(doc), notice)
             }
             None => (None, None),
         };
-        let host = Link::local();
         let mut app = App {
             files: FileIndex::new(&host, &workspace),
-            symbols: SymbolIndex::new(&workspace),
+            symbols: SymbolIndex::new(&host, &workspace),
             git: Git::new(&host, workspace.roots()),
             changes: ChangesView::new(),
             log: None,
             commit_views: Vec::new(),
             syncing: Vec::new(),
+            file_ops: Vec::new(),
+            opening: Vec::new(),
+            writing: Vec::new(),
+            checking: Vec::new(),
+            reverting: Vec::new(),
+            deferred: None,
             branch_root: None,
             sidebar: Sidebar::Files,
             index_symbols_after_listing: false,
@@ -2359,6 +2422,31 @@ impl App {
             self.prune_terminals();
         }
         changed |= self.search.as_mut().is_some_and(SearchModal::poll);
+        changed |= self.poll_file_ops();
+        changed |= self.poll_opening();
+        changed |= self.poll_checks();
+        for action in [self.poll_writing(), self.poll_reverting()]
+            .into_iter()
+            .flatten()
+        {
+            if !matches!(action, AppAction::Continue) {
+                self.deferred = Some(action);
+            }
+            changed = true;
+        }
+        if let Some(action) = self.dialog.as_mut().and_then(FileDialog::poll) {
+            // Enter, pressed before the folder was listed, may act now.
+            match self.dialog_action(action) {
+                AppAction::Continue => {}
+                action => self.deferred = Some(action),
+            }
+            changed = true;
+        }
+        if self.tree.poll() {
+            // The tree may list other folders, to watch.
+            self.watch_folders();
+            changed = true;
+        }
         if self.files.poll() {
             if self.index_symbols_after_listing && !self.files.listing() {
                 self.index_symbols_after_listing = false;
@@ -2478,6 +2566,12 @@ impl App {
         }
     }
 
+    /// What the main loop should do since the last call, from something
+    /// [`App::poll`] did, as if input had asked for it.
+    pub fn take_deferred(&mut self) -> Option<AppAction> {
+        self.deferred.take()
+    }
+
     /// Text a terminal's program copied since the last call, for the
     /// system clipboard.
     pub fn take_copied(&mut self) -> Option<String> {
@@ -2517,8 +2611,7 @@ impl App {
     /// unsaved changes, note them for saving to ask about. Images are read
     /// again. Returns whether anything did.
     fn disk_changed(&mut self, changes: Changes) -> bool {
-        let listed = changes.rescan || self.tree.is_changed_by(&changes.paths);
-        if listed {
+        if changes.rescan || self.tree.is_changed_by(&changes) {
             self.tree.refresh();
         }
         // Those changed, or in a folder that moved or went.
@@ -2529,7 +2622,7 @@ impl App {
                     .iter()
                     .any(|changed| path.starts_with(changed))
         };
-        let mut changed = listed;
+        let mut changed = false;
         for panel in tab::all_panels_mut(&mut self.tabs) {
             if let Some(image) = panel.image_mut() {
                 if touched(image.path()) {
@@ -2543,8 +2636,61 @@ impl App {
             .filter(|doc| doc.path().is_some_and(|path| touched(&path)))
             .cloned()
             .collect();
-        for doc in touched {
-            let Some(change) = doc.check_disk() else {
+        self.check_disk(touched);
+        changed
+    }
+
+    /// Has the host check `docs`' files, which may have changed on disk,
+    /// to catch up with once it has (see [`App::poll_checks`]).
+    fn check_disk(&mut self, docs: Vec<Rc<Document>>) {
+        let checks: Vec<Check> = docs
+            .into_iter()
+            .filter_map(|doc| {
+                Some(Check {
+                    path: doc.path()?,
+                    stamp: doc.stamp(),
+                    doc: Rc::downgrade(&doc),
+                })
+            })
+            .collect();
+        if checks.is_empty() {
+            return;
+        }
+        let files = checks
+            .iter()
+            .map(|check| (check.path.clone(), check.stamp))
+            .collect();
+        let call = self.host.call(Request::CheckDisk { files });
+        self.checking.push((checks, call));
+        #[cfg(test)]
+        while crate::host::at_once() && !self.checking.is_empty() {
+            self.poll_checks();
+        }
+    }
+
+    /// Catches up with the files the host checked since the last call: open
+    /// files take changes to them, or, with unsaved changes, note them for
+    /// saving to ask about. Returns whether any did.
+    fn poll_checks(&mut self) -> bool {
+        let mut checked = Vec::new();
+        self.checking.retain(|(checks, call)| loop {
+            match call.try_recv() {
+                Ok(Reply::Checked { path, checked: how }) => {
+                    if let Some(check) = checks.iter().find(|check| check.path == path) {
+                        checked.push((check.doc.clone(), check.stamp, how));
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        });
+        let mut changed = false;
+        for (doc, stamp, how) in checked {
+            let Some(doc) = doc.upgrade() else {
+                continue;
+            };
+            let Some(change) = doc.take_check(stamp, how) else {
                 continue;
             };
             changed = true;
@@ -2561,6 +2707,64 @@ impl App {
             self.editor_mut();
         }
         changed
+    }
+
+    /// Has the host load `doc`'s file again, to take its text, dropping
+    /// unsaved changes, and then carry on `saving`, if given.
+    fn revert_document(&mut self, doc: Rc<Document>, saving: Option<Saving>) -> AppAction {
+        let Some(path) = doc.path() else {
+            return AppAction::Continue;
+        };
+        let call = self.host.call(Request::Load { path });
+        self.reverting.push((doc, saving, call));
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let mut action = AppAction::Continue;
+            while !self.reverting.is_empty() {
+                if let Some(then) = self.poll_reverting() {
+                    action = then;
+                }
+            }
+            return action;
+        }
+        AppAction::Continue
+    }
+
+    /// Takes the text of the files loaded again since the last call. Returns
+    /// what to do then, if any were.
+    fn poll_reverting(&mut self) -> Option<AppAction> {
+        let mut loaded = Vec::new();
+        let mut index = 0;
+        while index < self.reverting.len() {
+            let result = match self.reverting[index].2.try_recv() {
+                Ok(Reply::Loaded(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => Err("The host stopped.".to_string()),
+            };
+            let (doc, saving, _) = self.reverting.remove(index);
+            loaded.push((doc, saving, result));
+        }
+        let mut action = None;
+        for (doc, saving, result) in loaded {
+            let reverted = result.and_then(|loaded| doc.revert_to(loaded));
+            action = Some(match (reverted, saving) {
+                (Err(err), _) => {
+                    let name = self.document_name(&doc);
+                    self.show_message(format!("Can't revert {name}: {err}"), true);
+                    AppAction::Continue
+                }
+                (Ok(()), Some(saving)) => self.save_then_go(saving),
+                (Ok(()), None) => {
+                    // Back into the buffer, for the cursor the reload parked.
+                    self.editor_mut();
+                    AppAction::Continue
+                }
+            });
+        }
+        action
     }
 
     /// The terminals' ptys, to wait on with the keyboard: for output, and
@@ -3227,7 +3431,7 @@ impl App {
                         }
                     }
                     Choice::FileAt(path, position) => {
-                        if self.open_and(&path, |editor| editor.go_to(position)) {
+                        if self.open_and(&path, move |editor| editor.go_to(position)) {
                             self.focus = Focus::Editor;
                         }
                     }
@@ -3325,7 +3529,7 @@ impl App {
     /// Selects the name of a symbol, on `line` in its `bytes` there, in the
     /// file at `path`, or without one, in the active editor.
     fn go_to_symbol(&mut self, path: Option<&Path>, line: u32, bytes: std::ops::Range<usize>) {
-        let go = |editor: &mut Editor| editor.select_in_line(line, bytes);
+        let go = move |editor: &mut Editor| editor.select_in_line(line, bytes);
         let shown = match path {
             Some(path) => self.open_and(path, go),
             None => self.editor_mut().map(go).is_some(),
@@ -3614,7 +3818,7 @@ impl App {
             SearchAction::Close => self.close_search(),
             SearchAction::Open { path, line, range } => {
                 self.close_search();
-                if self.open_and(&path, |editor| editor.select_in_line(line, range)) {
+                if self.open_and(&path, move |editor| editor.select_in_line(line, range)) {
                     self.focus = Focus::Editor;
                 }
             }
@@ -3625,37 +3829,32 @@ impl App {
     // --- files ------------------------------------------------------------------
 
     /// Shows the file at `path` in the active panel, opening it if it isn't
-    /// open yet. A newly opened file takes the place of an unnamed buffer
-    /// left behind that was never typed in, or as a `preview`, of the
-    /// previous preview, unless another panel shows it. Opening a preview
-    /// without `preview` keeps it. Returns false, with a message, if the
-    /// file can't be opened.
+    /// open yet: once the host has loaded it (see [`App::poll_opening`]).
+    /// A newly opened file takes the place of an unnamed buffer left
+    /// behind that was never typed in, or as a `preview`, of the previous
+    /// preview, unless another panel shows it. Opening a preview without
+    /// `preview` keeps it. Returns false, with a message, if the file can't
+    /// be opened, as far as is known yet.
     fn open(&mut self, path: &Path, preview: bool) -> bool {
-        self.open_as(path, preview, false)
+        self.open_with(path, preview, false, None)
     }
 
-    /// Opens `path` as [`App::open`] does, and moves in it with `go`. In a
-    /// file it went to, moving is part of going there, which the panel's
-    /// history notes already, rather than a jump within it.
-    fn open_and(&mut self, path: &Path, go: impl FnOnce(&mut Editor)) -> bool {
-        let before = self.active_panel().document().cloned();
-        if !self.open(path, false) {
-            return false;
-        }
-        let arrived = !before.is_some_and(|doc| self.active_panel().shows(&doc));
-        if let Some(editor) = self.editor_mut() {
-            go(editor);
-            if arrived {
-                editor.take_jump();
-            }
-        }
-        true
+    /// Opens `path` as [`App::open`] does, and moves in it with `go`, once
+    /// it's shown. In a file it went to, moving is part of going there,
+    /// which the panel's history notes already, rather than a jump within
+    /// it.
+    fn open_and(&mut self, path: &Path, go: impl FnOnce(&mut Editor) + 'static) -> bool {
+        self.open_with(path, false, false, Some(Box::new(go)))
     }
 
     /// Opens `path` as [`App::open`] does, and with `diff`, shows how it
     /// changed since the last commit rather than its text, unless it shows
     /// that already. Without, it shows the text.
     fn open_as(&mut self, path: &Path, preview: bool, diff: bool) -> bool {
+        self.open_with(path, preview, diff, None)
+    }
+
+    fn open_with(&mut self, path: &Path, preview: bool, diff: bool, go: Option<Go>) -> bool {
         let path = document::resolve(path);
         // Coming back to a file, the keyboard is for its text.
         if let Some(editor) = self.editor_mut() {
@@ -3664,11 +3863,68 @@ impl App {
         if image::is_image(&path) {
             return self.open_image(&path);
         }
-        let existing = self.find_document(&path);
-        let had_terminal = self.active_terminal().is_some();
-        let (doc, notice) = match &existing {
-            Some(doc) => (doc.clone(), None),
-            None => match Document::open(Some(path.clone()), self.theme.clone()) {
+        let opening = Opening {
+            panel: (self.tab().id, self.tab().active),
+            before: self.active_panel().document().cloned(),
+            path: path.clone(),
+            preview,
+            diff,
+            go,
+        };
+        if let Some(doc) = self.find_document(&path) {
+            return self.show_opened(doc, None, opening);
+        }
+        // What the panel was to show before, it no longer is.
+        self.opening
+            .retain(|(other, _)| other.panel != opening.panel);
+        let call = self.host.call(Request::Load { path });
+        self.opening.push((opening, call));
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let mut shown = false;
+            while !self.opening.is_empty() {
+                shown |= self.poll_opening();
+            }
+            return shown;
+        }
+        true
+    }
+
+    /// Shows the files the host loaded since the last call, in the panels
+    /// they were opened in. Returns whether any were shown.
+    fn poll_opening(&mut self) -> bool {
+        let mut loaded = Vec::new();
+        let mut index = 0;
+        while index < self.opening.len() {
+            let result = match self.opening[index].1.try_recv() {
+                Ok(Reply::Loaded(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => Err("The host stopped.".to_string()),
+            };
+            let (opening, _) = self.opening.remove(index);
+            loaded.push((opening, result));
+        }
+        let mut shown = false;
+        for (opening, result) in loaded {
+            shown |= self.opened(opening, result);
+        }
+        shown
+    }
+
+    /// Shows the file `opening` asked for, as `result` loaded it, in the
+    /// panel it was asked from if it's still in this tab. Returns false,
+    /// with a message, if it can't be.
+    fn opened(&mut self, opening: Opening, result: Result<Loaded, String>) -> bool {
+        let path = opening.path.clone();
+        // Opened another way meanwhile, it's that one.
+        let (doc, notice) = match self.find_document(&path) {
+            Some(doc) => (doc, None),
+            None => match result
+                .and_then(|loaded| Document::loaded(path.clone(), loaded, self.theme.clone()))
+            {
                 Ok(opened) => opened,
                 Err(reason) => {
                     self.cant_open(&reason, &path);
@@ -3676,12 +3932,32 @@ impl App {
                 }
             },
         };
+        let (tab, panel) = opening.panel;
+        if self.tab().id == tab && self.tab().panels.iter().any(|p| p.id == panel) {
+            self.tab_mut().active = panel;
+        }
+        self.show_opened(doc, notice, opening)
+    }
+
+    /// Shows `doc`, open or newly loaded with `notice`, in the active
+    /// panel, as `opening` asked.
+    fn show_opened(&mut self, doc: Rc<Document>, notice: Option<String>, opening: Opening) -> bool {
+        let Opening {
+            path,
+            preview,
+            diff,
+            go,
+            before,
+            ..
+        } = opening;
+        let existing = self.documents.iter().any(|open| Rc::ptr_eq(open, &doc));
+        let had_terminal = self.active_terminal().is_some();
         let left = self.active_panel().document().cloned();
         if let Err(err) = self.active_panel_mut().show(&doc) {
             self.cant_open(&err.to_string(), &path);
             return false;
         }
-        if existing.is_none() {
+        if !existing {
             self.apply_indent(&doc);
             let replaced = match left {
                 Some(left) if left.is_blank() => Some(left),
@@ -3718,6 +3994,15 @@ impl App {
                 true if !editor.diffing() => editor.diff_from(0),
                 true => {}
                 false => editor.set_diffing(false),
+            }
+        }
+        if let Some(go) = go {
+            let arrived = !before.is_some_and(|doc| self.active_panel().shows(&doc));
+            if let Some(editor) = self.editor_mut() {
+                go(editor);
+                if arrived {
+                    editor.take_jump();
+                }
             }
         }
         self.prune_documents();
@@ -4094,24 +4379,6 @@ impl App {
         self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
     }
 
-    /// Saves `doc` over its file, whatever is there.
-    fn overwrite(&mut self, doc: &Rc<Document>) -> AppAction {
-        let Some(path) = doc.path() else {
-            return AppAction::Continue;
-        };
-        let action = match self.editor_mut() {
-            Some(editor) if Rc::ptr_eq(editor.document(), doc) => editor.write(path),
-            _ => match doc.save(&path) {
-                Ok(()) => Action::Saved,
-                Err(err) => {
-                    self.show_message(format!("Can't save: {err} ({})", path.display()), true);
-                    Action::Continue
-                }
-            },
-        };
-        self.editor_action(action)
-    }
-
     fn alert_action(&mut self, action: AlertAction<Answer>) -> AppAction {
         let answer = match action {
             AlertAction::Continue => return AppAction::Continue,
@@ -4143,24 +4410,8 @@ impl App {
                 return AppAction::Continue;
             }
             Answer::Save(docs, redo) => Saving { docs, redo },
-            Answer::Overwrite(doc, saving) => {
-                let action = self.overwrite(&doc);
-                match saving {
-                    Some(saving) if !doc.is_modified() => saving,
-                    _ => return action,
-                }
-            }
-            Answer::Revert(doc, saving) => {
-                let name = self.document_name(&doc);
-                if let Err(err) = doc.revert() {
-                    self.show_message(format!("Can't revert {name}: {err}"), true);
-                    return AppAction::Continue;
-                }
-                match saving {
-                    Some(saving) => saving,
-                    None => return AppAction::Continue,
-                }
-            }
+            Answer::Overwrite(doc, saving) => return self.write(doc, true, false, saving),
+            Answer::Revert(doc, saving) => return self.revert_document(doc, saving),
         };
         self.save_then_go(saving)
     }
@@ -4170,27 +4421,23 @@ impl App {
     /// on; one that can't be saved stops it.
     fn save_then_go(&mut self, saving: Saving) -> AppAction {
         let Saving { mut docs, redo } = saving;
-        while !docs.is_empty() {
-            let doc = docs.remove(0);
-            let Some(path) = doc.path() else {
-                self.show_document(&doc);
-                self.show_dialog(Purpose::SaveAs);
-                self.saving = Some(Saving { docs, redo });
-                return AppAction::Continue;
-            };
-            // It may have changed since the alert was put up.
-            doc.check_disk();
-            if doc.disk() == Disk::Changed {
-                self.ask_overwrite(doc, Some(Saving { docs, redo }));
-                return AppAction::Continue;
-            }
-            if let Err(err) = doc.save(&path) {
-                let message = format!("Can't save: {err} ({})", path.display());
-                self.show_message(message, true);
-                return AppAction::Continue;
-            }
+        if docs.is_empty() {
+            return self.go(redo);
         }
-        self.go(redo)
+        let doc = docs.remove(0);
+        let rest = Saving { docs, redo };
+        if doc.path().is_none() {
+            self.show_document(&doc);
+            self.show_dialog(Purpose::SaveAs);
+            self.saving = Some(rest);
+            return AppAction::Continue;
+        }
+        if doc.disk() == Disk::Changed {
+            self.ask_overwrite(doc, Some(rest));
+            return AppAction::Continue;
+        }
+        // The host makes sure it didn't change since the alert was put up.
+        self.write(doc, false, false, Some(rest))
     }
 
     /// Goes ahead with `redo`, which the user confirmed.
@@ -4209,8 +4456,8 @@ impl App {
                 AppAction::Continue
             }
             Redo::CloseItem(choice) => self.picker_action(PickerAction::CloseItem(choice)),
-            Redo::Trash(path) => {
-                self.trash(&path, true);
+            Redo::Trash(target) => {
+                self.trash(&target, true);
                 AppAction::Continue
             }
             Redo::Stage(root, paths) => {
@@ -4305,8 +4552,8 @@ impl App {
     /// Opens a new, untitled file, numbered after the untitled files open,
     /// without showing it.
     fn open_untitled(&mut self) -> Option<Rc<Document>> {
-        let doc = match Document::open(None, self.theme.clone()) {
-            Ok((doc, _)) => doc,
+        let doc = match Document::untitled(self.theme.clone()) {
+            Ok(doc) => doc,
             Err(err) => {
                 self.show_message(format!("Can't open a new file: {err}"), true);
                 return None;
@@ -4397,6 +4644,10 @@ impl App {
         let old = config::get();
         config::set(config);
         let new = config::get();
+        // The host's threads share these settings, but for tests, where
+        // each thread has its own.
+        #[cfg(test)]
+        self.host.tell(Tell::Config(new.clone()));
         self.keymap = Keymap::new(&new.keys);
         if new.tree != old.tree {
             self.tree_visible = new.tree;
@@ -4420,7 +4671,7 @@ impl App {
         if new.exclude != old.exclude {
             self.tree.refresh();
             self.files = FileIndex::new(&self.host, &self.workspace);
-            self.symbols = SymbolIndex::new(&self.workspace);
+            self.symbols = SymbolIndex::new(&self.host, &self.workspace);
             self.show_active_in_tree();
         }
         self.layout();
@@ -4627,7 +4878,7 @@ impl App {
             let doc = match &orphan.path {
                 Some(path) => match self.find_document(path) {
                     Some(doc) => doc,
-                    None => match Document::open(Some(path.clone()), self.theme.clone()) {
+                    None => match load_now(&self.host, path, &self.theme) {
                         Ok((doc, _)) => {
                             self.apply_indent(&doc);
                             self.documents.push(doc.clone());
@@ -5055,7 +5306,7 @@ impl App {
             let opened = match &saved.path {
                 // A file that's gone comes back only with changes to it.
                 Some(path) if !path.exists() && text.is_none() => None,
-                Some(path) => match Document::open(Some(path.clone()), self.theme.clone()) {
+                Some(path) => match load_now(&self.host, path, &self.theme) {
                     Ok(doc) => Some(doc),
                     Err(err) if text.is_some() => {
                         self.show_message(
@@ -5076,7 +5327,7 @@ impl App {
                     }
                     Err(_) => None,
                 },
-                None => Some(Document::open(None, self.theme.clone())?),
+                None => Some((Document::untitled(self.theme.clone())?, None)),
             };
             let Some((doc, _)) = opened else {
                 continue;
@@ -5361,6 +5612,7 @@ impl App {
     fn open_dialog(&mut self, purpose: Purpose, dir: &Path, name: &str, current: Option<PathBuf>) {
         self.close_popups();
         self.dialog = Some(FileDialog::new(
+            &self.host,
             purpose,
             dir,
             name,
@@ -5405,6 +5657,44 @@ impl App {
                 let Some(mut dialog) = self.dialog.take() else {
                     return AppAction::Continue;
                 };
+                if self.file_ops.iter().any(|op| op.from_dialog) {
+                    // Still doing what it last chose.
+                    self.dialog = Some(dialog);
+                    return AppAction::Continue;
+                }
+                let op = match dialog.purpose() {
+                    Purpose::Create => Some(Ok(FileOp::CreateFile(path.clone()))),
+                    Purpose::CreateFolder => Some(Ok(FileOp::CreateFolder(path.clone()))),
+                    Purpose::Move | Purpose::Duplicate => dialog.current().map(|from| {
+                        let (from, to) = (from.to_path_buf(), path.clone());
+                        match dialog.purpose() {
+                            Purpose::Move if to.starts_with(&from) && to != from => {
+                                Err("Can't move a folder into itself.".to_string())
+                            }
+                            Purpose::Move => Ok(FileOp::Move { from, to }),
+                            _ if to.starts_with(&from) => {
+                                Err("Can't copy a folder into itself.".to_string())
+                            }
+                            _ => Ok(FileOp::Copy { from, to }),
+                        }
+                    }),
+                    _ => None,
+                };
+                if let Some(op) = op {
+                    // The dialog stays until it's done, or to choose
+                    // another path.
+                    match op {
+                        Ok(op) => {
+                            self.dialog = Some(dialog);
+                            self.start_file_op(op, true);
+                        }
+                        Err(error) => {
+                            dialog.show_error(error);
+                            self.dialog = Some(dialog);
+                        }
+                    }
+                    return AppAction::Continue;
+                }
                 let result = match dialog.purpose() {
                     Purpose::Open => {
                         if self.open(&path, false) {
@@ -5413,33 +5703,11 @@ impl App {
                         Ok(AppAction::Continue)
                     }
                     Purpose::SaveAs => self.save_as(&path),
-                    Purpose::Create => self.create_file(&path),
-                    Purpose::CreateFolder => self.create_folder(&path),
                     Purpose::AddFolder => self.add_folder(&path),
-                    Purpose::Move | Purpose::Duplicate => match dialog.current() {
-                        Some(from) => {
-                            let from = from.to_path_buf();
-                            match dialog.purpose() {
-                                Purpose::Move => self.move_entry(&from, &path),
-                                _ => self.duplicate(&from, &path),
-                            }
-                        }
-                        None => Ok(AppAction::Continue),
-                    },
+                    _ => Ok(AppAction::Continue),
                 };
                 match result {
-                    Ok(action) => {
-                        if let Some(saving) = self.saving.take() {
-                            if self
-                                .active_panel()
-                                .document()
-                                .is_some_and(|doc| !doc.is_modified())
-                            {
-                                return self.save_then_go(saving);
-                            }
-                        }
-                        return action;
-                    }
+                    Ok(action) => return action,
                     // The dialog stays, to choose another path.
                     Err(error) => {
                         dialog.show_error(error);
@@ -5453,43 +5721,136 @@ impl App {
 
     /// Saves the active file to `path` from now on, creating its folder if
     /// need be, unless another file open is that one.
+    /// Saving files, it carries on with the rest once it's saved.
     fn save_as(&mut self, path: &Path) -> Result<AppAction, String> {
-        let current = self.active_panel().document();
+        let current = self.active_panel().document().cloned();
         let open = self.find_document(&document::resolve(path));
-        if open.is_some_and(|open| !current.is_some_and(|current| Rc::ptr_eq(current, &open))) {
+        if open.is_some_and(|open| !current.as_ref().is_some_and(|c| Rc::ptr_eq(c, &open))) {
             return Err(format!("{} is open. Close it first.", file_name(path)));
         }
-        if let Some(folder) = path.parent() {
-            fs::create_dir_all(folder)
-                .map_err(|err| format!("Can't create the destination folder: {err}"))?;
-        }
-        let action = match self.editor_mut() {
-            Some(editor) => editor.save_as(document::resolve(path)),
-            None => Action::Continue,
+        let Some(doc) = current else {
+            return Ok(AppAction::Continue);
         };
+        if let Some(editor) = self.editor_mut() {
+            editor.save_as(document::resolve(path));
+        }
         // How it was chosen to indent goes with it.
-        let doc = self.active_panel().document();
-        if let Some(indent) = doc.and_then(|doc| doc.chosen_indent()) {
+        if let Some(indent) = doc.chosen_indent() {
             self.indents.insert(document::resolve(path), indent);
         }
         self.focus = Focus::Editor;
-        Ok(self.editor_action(action))
+        let saving = self.saving.take();
+        Ok(self.write(doc, true, true, saving))
     }
 
-    /// Creates an empty file at `path`, and its folder if need be, and
-    /// opens it.
-    fn create_file(&mut self, path: &Path) -> Result<AppAction, String> {
-        let created = (|| {
-            if let Some(folder) = path.parent() {
-                fs::create_dir_all(folder)?;
+    /// Has the host write `doc` to its file, unless it changed on disk since
+    /// it was last loaded or saved, or with `overwrite`, whatever's there,
+    /// making its folder with `make_folder`. Once it's written, it carries
+    /// on `saving`, if given (see [`App::wrote`]).
+    fn write(
+        &mut self,
+        doc: Rc<Document>,
+        overwrite: bool,
+        make_folder: bool,
+        saving: Option<Saving>,
+    ) -> AppAction {
+        let Some(path) = doc.path() else {
+            return AppAction::Continue;
+        };
+        let (text, epoch, line_ending) = doc.to_write();
+        let call = self.host.call(Request::Save {
+            path,
+            text: text.clone(),
+            line_ending,
+            expected: (!overwrite).then(|| doc.stamp()),
+            make_folder,
+        });
+        self.writing.push(Writing {
+            doc,
+            text,
+            epoch,
+            saving,
+            call,
+        });
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let mut action = AppAction::Continue;
+            while !self.writing.is_empty() {
+                if let Some(then) = self.poll_writing() {
+                    action = then;
+                }
             }
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map(drop)
-        })();
-        created.map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
+            return action;
+        }
+        AppAction::Continue
+    }
+
+    /// Takes in the files written since the last call. Returns what to do
+    /// then, if any were.
+    fn poll_writing(&mut self) -> Option<AppAction> {
+        let mut done = Vec::new();
+        let mut index = 0;
+        while index < self.writing.len() {
+            let result = match self.writing[index].call.try_recv() {
+                Ok(Reply::Saved(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    Err(Unsaved::Failed("The host stopped.".to_string()))
+                }
+            };
+            done.push((self.writing.remove(index), result));
+        }
+        let mut action = None;
+        for (writing, result) in done {
+            match self.wrote(writing, result) {
+                AppAction::Continue => {
+                    action.get_or_insert(AppAction::Continue);
+                }
+                then => action = Some(then),
+            }
+        }
+        action
+    }
+
+    /// Catches up with `writing` done: the file's saved, and saving goes
+    /// on, or it changed on disk, which asks whether to overwrite it, or it
+    /// couldn't be written.
+    fn wrote(&mut self, writing: Writing, result: Result<Stamp, Unsaved>) -> AppAction {
+        let Writing {
+            doc,
+            text,
+            epoch,
+            saving,
+            ..
+        } = writing;
+        match result {
+            Ok(stamp) => {
+                doc.saved_as(&text, epoch, stamp);
+                let action = self.editor_action(Action::Saved);
+                match saving {
+                    Some(saving) => self.save_then_go(saving),
+                    None => action,
+                }
+            }
+            Err(Unsaved::Changed) => {
+                doc.set_changed_on_disk();
+                self.ask_overwrite(doc, saving);
+                AppAction::Continue
+            }
+            Err(Unsaved::Failed(err)) => {
+                // Reason first: long paths are the least of it.
+                let path = doc.path().unwrap_or_default();
+                self.show_message(format!("Can't save: {err} ({})", path.display()), true);
+                AppAction::Continue
+            }
+        }
+    }
+
+    /// Opens the empty file just created at `path`.
+    fn created_file(&mut self, path: &Path) {
         self.tree.refresh();
         self.files.refresh();
         let path = document::resolve(path);
@@ -5497,7 +5858,72 @@ impl App {
             self.tree.reveal(&path);
             self.focus = Focus::Editor;
         }
-        Ok(AppAction::Continue)
+    }
+
+    /// Has the host do `op` to the files, and catches up once it's done
+    /// (see [`App::file_op_done`]). From the file dialog, the dialog stays
+    /// until then.
+    fn start_file_op(&mut self, op: FileOp, from_dialog: bool) {
+        let call = self.host.call(Request::FileOp(op.clone()));
+        self.file_ops.push(PendingOp {
+            op,
+            call,
+            from_dialog,
+        });
+        #[cfg(test)]
+        while crate::host::at_once() && !self.file_ops.is_empty() {
+            self.poll_file_ops();
+        }
+    }
+
+    /// Takes in the file operations done since the last call. Returns
+    /// whether any were.
+    fn poll_file_ops(&mut self) -> bool {
+        let mut done = Vec::new();
+        self.file_ops.retain(|pending| {
+            let result = match pending.call.try_recv() {
+                Ok(Reply::FileOpDone(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => Err("The host stopped.".to_string()),
+            };
+            done.push((pending.op.clone(), pending.from_dialog, result));
+            false
+        });
+        let any = !done.is_empty();
+        for (op, from_dialog, result) in done {
+            self.file_op_done(op, from_dialog, result);
+        }
+        any
+    }
+
+    /// Catches up with `op`, done: shows what it made and where, and open
+    /// files go with what moved. From the file dialog, it closes, or shows
+    /// why it couldn't be done, to choose another path.
+    fn file_op_done(&mut self, op: FileOp, from_dialog: bool, result: Result<(), String>) {
+        if let Err(error) = result {
+            match &mut self.dialog {
+                Some(dialog) if from_dialog => dialog.show_error(error),
+                _ => self.show_message(error, true),
+            }
+            return;
+        }
+        if from_dialog {
+            self.dialog = None;
+        }
+        match op {
+            FileOp::CreateFile(path) => self.created_file(&path),
+            FileOp::CreateFolder(path) => {
+                self.tree.refresh();
+                self.tree.reveal(&path);
+            }
+            FileOp::Move { from, to } => self.moved_entry(&from, &to),
+            FileOp::Copy { to, .. } => {
+                self.tree.refresh();
+                self.tree.reveal(&to);
+                self.files.refresh();
+            }
+            FileOp::Trash(path) => self.trashed(&path),
+        }
     }
 
     /// Quits, but for a session, which it leaves to come back to (see
@@ -6283,6 +6709,10 @@ impl App {
         match action {
             Action::Continue => AppAction::Continue,
             Action::Copy(text) => AppAction::Copy(text),
+            Action::Save { overwrite } => match self.active_panel().document().cloned() {
+                Some(doc) => self.write(doc, overwrite, false, None),
+                None => AppAction::Continue,
+            },
             Action::Saved => {
                 // The file may be new, or saved under a new name.
                 self.track_documents();
@@ -6867,11 +7297,11 @@ impl App {
                     Command::TreeRename => {
                         self.open_dialog(Purpose::Move, &parent, &name, Some(target.path));
                     }
-                    _ => self.trash(&target.path, from_menu),
+                    _ => self.trash(&target, from_menu),
                 }
             }
             Command::TreeDuplicate => {
-                let copy = copy_name(&target.path);
+                let copy = copy_name(&target, |path| self.tree.lists(path));
                 self.open_dialog(Purpose::Duplicate, &parent, &copy, Some(target.path));
             }
             Command::AddFolder => self.show_dialog(Purpose::AddFolder),
@@ -6938,7 +7368,7 @@ impl App {
         self.tree.set_roots(self.workspace.roots());
         self.git.set_roots(self.workspace.roots());
         self.files = FileIndex::new(&self.host, &self.workspace);
-        self.symbols = SymbolIndex::new(&self.workspace);
+        self.symbols = SymbolIndex::new(&self.host, &self.workspace);
         self.watching = None;
         self.watch_folders();
         self.show_active_in_tree();
@@ -6954,26 +7384,9 @@ impl App {
             .collect()
     }
 
-    /// Creates the folder `path`, and those it's in if need be.
-    fn create_folder(&mut self, path: &Path) -> Result<AppAction, String> {
-        fs::create_dir_all(path)
-            .map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
-        self.tree.refresh();
-        self.tree.reveal(path);
-        Ok(AppAction::Continue)
-    }
-
-    /// Renames or moves the file or folder `from` to `to`, creating the
-    /// folder it goes in if need be. Open files go with it.
-    fn move_entry(&mut self, from: &Path, to: &Path) -> Result<AppAction, String> {
-        if to.starts_with(from) && to != from {
-            return Err("Can't move a folder into itself.".to_string());
-        }
-        if let Some(folder) = to.parent() {
-            fs::create_dir_all(folder)
-                .map_err(|err| format!("Can't create the destination folder: {err}"))?;
-        }
-        fs::rename(from, to).map_err(|err| format!("Can't move {}: {err}", file_name(from)))?;
+    /// Catches up with the file or folder `from` having moved to `to`:
+    /// open files go with it.
+    fn moved_entry(&mut self, from: &Path, to: &Path) {
         // Open files have their paths resolved.
         let (resolved_from, resolved_to) = (document::resolve(from), document::resolve(to));
         let moved = |path: &Path| {
@@ -7008,47 +7421,30 @@ impl App {
         self.tree.moved(from, to);
         self.files.refresh();
         self.show_active_in_tree();
-        Ok(AppAction::Continue)
     }
 
-    /// Copies the file or folder `from` to `to`, creating the folder it goes
-    /// in if need be.
-    fn duplicate(&mut self, from: &Path, to: &Path) -> Result<AppAction, String> {
-        if to.starts_with(from) {
-            return Err("Can't copy a folder into itself.".to_string());
-        }
-        if let Some(folder) = to.parent() {
-            fs::create_dir_all(folder)
-                .map_err(|err| format!("Can't create the destination folder: {err}"))?;
-        }
-        copy_all(from, to).map_err(|err| format!("Can't copy {}: {err}", file_name(from)))?;
-        self.tree.refresh();
-        self.tree.reveal(to);
-        self.files.refresh();
-        Ok(AppAction::Continue)
-    }
-
-    /// Moves the file or folder at `path` to the Trash, after asking, unless
+    /// Moves the file or folder `target` to the Trash, after asking, unless
     /// `confirmed`. Open files that were in it close, unless they have
     /// unsaved changes, which saving puts back.
-    fn trash(&mut self, path: &Path, confirmed: bool) {
-        let name = file_name(path);
+    fn trash(&mut self, target: &Entry, confirmed: bool) {
         if !confirmed {
-            let message = match path.is_dir() {
+            let message = match target.is_dir {
                 true => "You can restore this folder and its contents from the Trash.",
                 false => "You can restore this file from the Trash.",
             };
-            let redo = Redo::Trash(path.to_path_buf());
+            let redo = Redo::Trash(target.clone());
             let buttons = vec![Button::new("Move to &Trash", Answer::Go(redo)).danger()];
-            let title = format!("Move {name} to the Trash?");
+            let title = format!("Move {} to the Trash?", file_name(&target.path));
             self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
             return;
         }
+        self.start_file_op(FileOp::Trash(target.path.clone()), false);
+    }
+
+    /// Catches up with `path` gone to the Trash: open files that were in it
+    /// close, unless they have unsaved changes.
+    fn trashed(&mut self, path: &Path) {
         let resolved = document::resolve(path);
-        if let Err(err) = move_to_trash(path) {
-            self.show_message(format!("Can't move {name} to the Trash: {err}"), true);
-            return;
-        }
         let closing: Vec<Rc<Document>> = self
             .documents
             .iter()
@@ -7130,17 +7526,19 @@ impl App {
             self.tree.reveal(&target);
             return;
         }
-        if !self.open(&target, false) {
-            return;
-        }
-        self.focus = Focus::Editor;
-        if let Some(editor) = self.editor_mut().filter(|editor| editor.is_markdown()) {
-            if !editor.reading() {
-                editor.read_from(0);
+        let anchor = anchor.map(str::to_string);
+        let go = move |editor: &mut Editor| {
+            if editor.is_markdown() {
+                if !editor.reading() {
+                    editor.read_from(0);
+                }
+                if let Some(anchor) = anchor {
+                    editor.go_to_anchor(&anchor);
+                }
             }
-            if let Some(anchor) = anchor {
-                editor.go_to_anchor(anchor);
-            }
+        };
+        if self.open_and(&target, go) {
+            self.focus = Focus::Editor;
         }
     }
 
@@ -7204,7 +7602,7 @@ impl App {
             // the terminal keeps running.
             None => self.split(Axis::Horizontal),
         }
-        let go = |editor: &mut Editor| {
+        let go = move |editor: &mut Editor| {
             if let Some(position) = position {
                 editor.go_to(position);
             }
@@ -7741,6 +8139,23 @@ impl Drop for App {
     }
 }
 
+/// The file at `path`, loaded by `host`, waiting for it. Only for what
+/// can't go on without it yet: starting, and restoring sessions and
+/// unsaved changes.
+fn load_now(
+    host: &Link,
+    path: &Path,
+    theme: &Rc<Theme>,
+) -> Result<(Rc<Document>, Option<String>), String> {
+    let call = host.call(Request::Load {
+        path: path.to_path_buf(),
+    });
+    match call.wait() {
+        Some(Reply::Loaded(loaded)) => Document::loaded(path.to_path_buf(), loaded?, theme.clone()),
+        _ => Err("The host stopped.".to_string()),
+    }
+}
+
 /// `doc`, as the picker lists it.
 fn document_target(doc: &Document) -> Recent {
     match doc.path() {
@@ -7749,12 +8164,13 @@ fn document_target(doc: &Document) -> Recent {
     }
 }
 
-/// A name for a copy of `path` next to it, as the Finder names them:
-/// `a copy.txt`, then `a copy 2.txt`, and so on.
-fn copy_name(path: &Path) -> String {
+/// A name for a copy of `target` next to it, as the Finder names them:
+/// `a copy.txt`, then `a copy 2.txt`, and so on, skipping those `taken`.
+fn copy_name(target: &Entry, taken: impl Fn(&Path) -> bool) -> String {
+    let path = &target.path;
     let name = file_name(path);
     let (stem, extension) = match path.extension() {
-        Some(extension) if !path.is_dir() => (
+        Some(extension) if !target.is_dir => (
             name.strip_suffix(&format!(".{}", extension.to_string_lossy()))
                 .unwrap_or(&name),
             format!(".{}", extension.to_string_lossy()),
@@ -7766,59 +8182,8 @@ fn copy_name(path: &Path) -> String {
             1 => format!("{stem} copy{extension}"),
             n => format!("{stem} copy {n}{extension}"),
         })
-        .find(|copy| fs::symlink_metadata(path.with_file_name(copy)).is_err())
+        .find(|copy| !taken(&path.with_file_name(copy)))
         .unwrap_or_default()
-}
-
-/// Copies the file, folder, or symlink `from` to `to`, which doesn't exist.
-fn copy_all(from: &Path, to: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(from)?;
-    if meta.file_type().is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(from)?, to)
-    } else if meta.is_dir() {
-        fs::create_dir(to)?;
-        for entry in fs::read_dir(from)? {
-            let entry = entry?;
-            copy_all(&entry.path(), &to.join(entry.file_name()))?;
-        }
-        Ok(())
-    } else {
-        fs::copy(from, to).map(drop)
-    }
-}
-
-/// Moves `path` to the Trash.
-#[cfg(not(test))]
-fn move_to_trash(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let trashed = {
-        use trash::macos::{DeleteMethod, TrashContextExtMacos};
-        let mut context = trash::TrashContext::default();
-        // The default, the Finder's AppleScript, asks for permission to
-        // control the Finder, and plays its sound.
-        context.set_delete_method(DeleteMethod::NsFileManager);
-        context.delete(path)
-    };
-    #[cfg(not(target_os = "macos"))]
-    let trashed = trash::delete(path);
-    trashed.map_err(|err| err.to_string())
-}
-
-/// Tests delete instead, to leave the Trash alone.
-#[cfg(test)]
-fn move_to_trash(path: &Path) -> Result<(), String> {
-    let removed = match path.is_dir() {
-        true => fs::remove_dir_all(path),
-        false => fs::remove_file(path),
-    };
-    removed.map_err(|err| err.to_string())
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
 }
 
 /// Whether cue finds definitions in `language`: it has a tags query.
@@ -8360,6 +8725,52 @@ mod tests {
             app.poll();
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn edits_made_while_saving_stay_unsaved() {
+        let _serial = crate::test_serial();
+        let root = fixture("saving", &[("a.txt", "alpha\n")]);
+        let mut app = app(&root, Some("a.txt"));
+        crate::host::set_at_once(false);
+        type_text(&mut app, "x");
+        ctrl(&mut app, 's');
+        // Typed before the host says it's written.
+        type_text(&mut app, "y");
+        wait_until(&mut app, "the save", |app| app.writing.is_empty());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "xalpha\n");
+        assert!(app.ed().document().is_modified());
+        key(&mut app, KeyCode::Backspace);
+        assert!(!app.ed().document().is_modified(), "back to the text saved");
+    }
+
+    #[test]
+    fn files_show_once_the_host_has_loaded_them() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "loading",
+            &[
+                ("a.txt", "alpha\n"),
+                ("b.txt", "one\ntwo\nthree\n"),
+                ("c.txt", ""),
+            ],
+        );
+        let mut app = app(&root, Some("a.txt"));
+        crate::host::set_at_once(false);
+        let (a, b, c) = (root.join("a.txt"), root.join("b.txt"), root.join("c.txt"));
+
+        // Until it's loaded, the panel shows what it did; a newer file to
+        // open there takes the place of the one on its way.
+        assert!(app.open(&b, false));
+        assert_eq!(app.ed().path(), Some(a.clone()));
+        assert!(app.open(&c, false));
+        wait_until(&mut app, "c.txt", |app| app.ed().path() == Some(c.clone()));
+        assert!(app.find_document(&b).is_none(), "b.txt never opened");
+
+        // What follows opening it happens once it's shown.
+        app.open_and(&b, |editor| editor.select_in_line(2, 0..5));
+        wait_until(&mut app, "b.txt", |app| app.ed().path() == Some(b.clone()));
+        assert_eq!(app.ed().selected_text().as_deref(), Some("three"));
     }
 
     #[test]
@@ -9981,7 +10392,7 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("save-as-open", &[("a.txt", "original")]);
         let mut app = app(&root, Some("a.txt"));
-        let (doc, _) = Document::open(None, app.theme.clone()).unwrap();
+        let doc = Document::untitled(app.theme.clone()).unwrap();
         app.documents.push(doc.clone());
         app.active_panel_mut().show(&doc).unwrap();
         type_text(&mut app, "other");
@@ -10071,8 +10482,8 @@ mod tests {
         assert!(app.active_panel().image().is_some());
 
         // It follows the file when it's renamed.
-        app.move_entry(&root.join("red.png"), &root.join("blue.png"))
-            .unwrap();
+        let (from, to) = (root.join("red.png"), root.join("blue.png"));
+        app.start_file_op(FileOp::Move { from, to }, false);
         assert_eq!(app.tab().title(), "blue.png");
 
         // Closing it empties the panel.
