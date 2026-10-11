@@ -37,6 +37,7 @@ use crate::file_index;
 use crate::file_ops::{self, FileOp};
 use crate::git::{self, GitAnswer, GitCall, Repo};
 use crate::image;
+use crate::pty;
 use crate::quick_look::{self, Peek};
 use crate::search::{self, Query};
 use crate::symbols::{self, FileSymbols};
@@ -64,7 +65,7 @@ pub fn set_at_once(on: bool) {
 }
 
 /// Tells a call from the others on the same link.
-type CallId = u64;
+pub type CallId = u64;
 
 /// What the app asks the host to do, answered with [`Reply`]s.
 #[derive(Debug, Clone)]
@@ -122,6 +123,9 @@ pub enum Request {
     /// What's in each of `folders` (see [`crate::tree`]), a reply each, in
     /// order.
     ListFolders { folders: Vec<PathBuf> },
+    /// A terminal's program (see [`pty::serve`]): what it writes, and how
+    /// it's doing, as it goes, until it ends. Cancelling it hangs up.
+    Terminal(pty::Start),
     /// Asking git, or having it do something (see [`git::run`]).
     Git(GitCall),
     /// Committing what's staged in the repository at `root`.
@@ -178,6 +182,7 @@ pub enum Reply {
     Symbols(FileSymbols),
     Repos(Vec<Repo>),
     Git(GitAnswer),
+    Term(pty::Event),
     /// How a [`Request::GitSync`] went.
     Synced(Result<(), String>),
     /// How a [`Request::FileOp`] went: why it couldn't be done, if it
@@ -193,6 +198,8 @@ pub enum Tell {
     /// Watch these folders for changes (see [`crate::watch`]), and no
     /// others. Those that don't exist are left out.
     Watch(BTreeSet<PathBuf>),
+    /// Have the terminal of this [`Request::Terminal`] call do something.
+    Term { call: CallId, control: pty::Control },
     /// Use these settings, for tests, where each thread has its own: the
     /// host's threads would have the defaults.
     #[cfg(test)]
@@ -322,6 +329,10 @@ impl Call {
         self.replies.try_recv()
     }
 
+    pub fn id(&self) -> CallId {
+        self.id
+    }
+
     /// Waits for the next reply. `None` once the call ended. Only for
     /// what can't go on without it yet, and tests: it holds up the screen.
     pub fn wait(&self) -> Option<Reply> {
@@ -408,12 +419,37 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
     // Each call in progress, by whether it was cancelled.
     let mut calls: HashMap<CallId, Arc<AtomicBool>> = HashMap::new();
     let state = Arc::new(State::default());
+    // Each terminal's controls, by the call it is.
+    let mut terminals: HashMap<CallId, pty::Controller> = HashMap::new();
     loop {
         let input = match watcher.due() {
             Some(due) => inbox.recv_timeout(due.saturating_duration_since(Instant::now())),
             None => inbox.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match input {
+            Ok(Input::Call(id, Request::Terminal(start))) => {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                calls.insert(id, Arc::clone(&cancelled));
+                let responder = Responder {
+                    id,
+                    output: output.clone(),
+                    inbox: host_inbox.clone(),
+                    cancelled,
+                };
+                let (controller, controls) = match pty::controls() {
+                    Ok(controls) => controls,
+                    Err(err) => {
+                        responder.reply(Reply::Term(pty::Event::Failed(err.to_string())));
+                        continue;
+                    }
+                };
+                terminals.insert(id, controller);
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    state.use_config();
+                    pty::serve(start, controls, |event| responder.reply(Reply::Term(event)));
+                });
+            }
             Ok(Input::Call(id, request)) => {
                 let cancelled = Arc::new(AtomicBool::new(false));
                 calls.insert(id, Arc::clone(&cancelled));
@@ -430,9 +466,18 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
                 if let Some(cancelled) = calls.remove(&id) {
                     cancelled.store(true, Ordering::Relaxed);
                 }
+                if let Some(terminal) = terminals.remove(&id) {
+                    terminal.send(pty::Control::HangUp);
+                }
             }
             Ok(Input::Finished(id)) => {
                 calls.remove(&id);
+                terminals.remove(&id);
+            }
+            Ok(Input::Tell(Tell::Term { call, control })) => {
+                if let Some(terminal) = terminals.get(&call) {
+                    terminal.send(control);
+                }
             }
             #[cfg(test)]
             Ok(Input::Tell(Tell::Config(config))) => {
@@ -456,6 +501,9 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
     for cancelled in calls.values() {
         cancelled.store(true, Ordering::Relaxed);
     }
+    for terminal in terminals.values() {
+        terminal.send(pty::Control::HangUp);
+    }
 }
 
 /// What the host keeps from one call to the next.
@@ -467,17 +515,24 @@ struct State {
     config: Mutex<Option<Arc<crate::config::Config>>>,
 }
 
+impl State {
+    /// Puts the settings the app told of in use on this thread, for tests.
+    fn use_config(&self) {
+        #[cfg(test)]
+        if let Some(config) = self
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            crate::config::set((*config).clone());
+        }
+    }
+}
+
 /// Does what `request` asks, replying as it goes.
 fn answer(request: Request, state: &State, responder: Responder) {
-    #[cfg(test)]
-    if let Some(config) = state
-        .config
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-    {
-        crate::config::set((*config).clone());
-    }
+    state.use_config();
     match request {
         Request::ListFiles {
             workspace,
@@ -534,6 +589,8 @@ fn answer(request: Request, state: &State, responder: Responder) {
                 }
             }
         }
+        // Started apart, in `serve`, with its controls.
+        Request::Terminal(_) => {}
         Request::Git(call) => {
             responder.reply(Reply::Git(git::run(&call)));
         }

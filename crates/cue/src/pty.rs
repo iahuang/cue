@@ -8,7 +8,7 @@
 //! `poll` says it's ready.
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -382,5 +382,195 @@ fn winsize(cols: u16, rows: u16) -> libc::winsize {
         ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
+    }
+}
+
+// --- on the host ------------------------------------------------------------
+
+/// How a terminal starts on the host.
+#[derive(Debug, Clone)]
+pub enum Start {
+    /// The user's shell (see [`Pty::shell`]).
+    Shell { cwd: PathBuf, cols: u16, rows: u16 },
+    /// A pty a process this one replaced left running (see [`Pty::adopt`]).
+    Adopt { fd: RawFd, pid: libc::pid_t },
+}
+
+/// What a terminal's program is doing, as the host last looked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Status {
+    /// A program other than the shell has the terminal.
+    pub busy: bool,
+    /// The program that has the terminal, such as `vim`.
+    pub program: Option<String>,
+    /// The folders the program that has the terminal, and the shell, are
+    /// working in, in that order (see [`Pty::working_folders`]).
+    pub folders: Vec<PathBuf>,
+    /// The folder the shell is working in.
+    pub shell_folder: Option<PathBuf>,
+}
+
+/// What the host says of a terminal.
+#[derive(Debug)]
+pub enum Event {
+    /// What the program wrote.
+    Output(Vec<u8>),
+    Status(Status),
+    /// The shell ended, as `waitpid` said.
+    Exited(i32),
+    /// The shell couldn't start, for this reason.
+    Failed(String),
+    /// Let go of without hanging up, for a process that replaces this one
+    /// (see [`Pty::release`]).
+    Released(RawFd, libc::pid_t),
+}
+
+/// What the app has a terminal's host thread do.
+#[derive(Debug, Clone)]
+pub enum Control {
+    /// Send the program this, as typed.
+    Input(Vec<u8>),
+    Resize(u16, u16),
+    /// See [`Pty::ask_to_redraw`].
+    Redraw,
+    /// Let go of the pty without hanging up (see [`Event::Released`]).
+    Release,
+    /// Hang up, as the app's done with it.
+    HangUp,
+}
+
+/// How often a terminal's program is looked at while it writes nothing.
+const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The host's end of a terminal's controls, which wakes its thread.
+pub struct Controller {
+    controls: std::sync::mpsc::Sender<Control>,
+    wake: std::os::unix::net::UnixStream,
+}
+
+impl Controller {
+    pub fn send(&self, control: Control) {
+        use std::io::Write;
+        if self.controls.send(control).is_ok() {
+            // Full means a wake is waiting.
+            let _ = (&self.wake).write(&[0]);
+        }
+    }
+}
+
+/// The thread's end of a terminal's controls.
+pub struct Controls {
+    controls: std::sync::mpsc::Receiver<Control>,
+    wake: std::os::unix::net::UnixStream,
+}
+
+/// A terminal's controls, for the host and its thread.
+pub fn controls() -> io::Result<(Controller, Controls)> {
+    let (sender, receiver) = std::os::unix::net::UnixStream::pair()?;
+    sender.set_nonblocking(true)?;
+    receiver.set_nonblocking(true)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    Ok((
+        Controller {
+            controls: tx,
+            wake: sender,
+        },
+        Controls {
+            controls: rx,
+            wake: receiver,
+        },
+    ))
+}
+
+/// Runs a terminal on the host: starts its program as `start` says, sends
+/// what it writes and how it's doing through `send`, which returns false
+/// once no one listens, and does what `controls` say, until the program
+/// and everything it started close the pty, or it's let go of.
+pub fn serve(start: Start, controls: Controls, mut send: impl FnMut(Event) -> bool) {
+    let pty = match start {
+        Start::Shell { cwd, cols, rows } => Pty::shell(&cwd, cols, rows),
+        Start::Adopt { fd, pid } => Pty::adopt(fd, pid),
+    };
+    let mut pty = match pty {
+        Ok(pty) => pty,
+        Err(err) => {
+            send(Event::Failed(err.to_string()));
+            return;
+        }
+    };
+    let mut status = Status::default();
+    let mut exited = false;
+    let mut closed = false;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: if closed { -1 } else { pty.fd() },
+                events: libc::POLLIN | if pty.has_unsent() { libc::POLLOUT } else { 0 },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: controls.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let timeout = STATUS_INTERVAL.as_millis() as libc::c_int;
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        let mut drain = [0u8; 64];
+        while matches!((&controls.wake).read(&mut drain), Ok(n) if n > 0) {}
+        while let Ok(control) = controls.controls.try_recv() {
+            match control {
+                Control::Input(bytes) => pty.write(&bytes),
+                Control::Resize(cols, rows) => pty.resize(cols, rows),
+                Control::Redraw => pty.ask_to_redraw(),
+                Control::Release => {
+                    let (fd, pid) = pty.release();
+                    send(Event::Released(fd, pid));
+                    return;
+                }
+                Control::HangUp => return,
+            }
+        }
+        pty.flush();
+        while !closed {
+            match pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if !send(Event::Output(buf[..n].to_vec())) {
+                        return;
+                    }
+                }
+                Err(_) => closed = true,
+            }
+        }
+        if !exited {
+            // A shell can exit leaving jobs that hold the pty open.
+            if let Some(exit) = pty.exit_status() {
+                exited = true;
+                if !send(Event::Exited(exit.into_raw())) {
+                    return;
+                }
+            }
+        }
+        if exited && closed {
+            return;
+        }
+        let now = Status {
+            busy: !exited && pty.is_busy(),
+            program: (!exited).then(|| pty.foreground_name()).flatten(),
+            folders: if exited {
+                Vec::new()
+            } else {
+                pty.working_folders()
+            },
+            shell_folder: (!exited).then(|| pty.working_folder()).flatten(),
+        };
+        if now != status {
+            status = now;
+            if !send(Event::Status(status.clone())) {
+                return;
+            }
+        }
     }
 }

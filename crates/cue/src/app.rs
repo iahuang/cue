@@ -2830,15 +2830,10 @@ impl App {
         action
     }
 
-    /// The terminals' ptys, to wait on with the keyboard: for output, and
-    /// with `true`, for taking input that's waiting. And what other threads
-    /// wake the loop with (see [`wake`]).
+    /// What to wait on with the keyboard: what other threads, such as the
+    /// host's, wake the loop with (see [`wake`]).
     pub fn watched(&self) -> Vec<(RawFd, bool)> {
-        self.terminals
-            .iter()
-            .filter_map(|terminal| terminal.borrow().watch())
-            .chain(wake::fd().map(|fd| (fd, false)))
-            .collect()
+        wake::fd().map(|fd| (fd, false)).into_iter().collect()
     }
 
     // --- panels -----------------------------------------------------------------
@@ -5547,11 +5542,13 @@ impl App {
             let terminal = match adopted.iter().position(|a| a.id == saved.id) {
                 Some(index) => {
                     let a = adopted.remove(index);
-                    Terminal::adopt(saved.id, &cwd, area, (a.fd, a.pid), &a.screen, a.size)
+                    let pty = (a.fd, a.pid);
+                    Terminal::adopt(&self.host, saved.id, &cwd, area, pty, &a.screen, a.size)
                 }
                 None => {
                     let screen = saved.screen.as_ref().and_then(|name| session.screen(name));
-                    Terminal::restore(saved.id, &cwd, area, screen.as_deref(), cols, state.saved)
+                    let screen = screen.as_deref();
+                    Terminal::restore(&self.host, saved.id, &cwd, area, screen, cols, state.saved)
                 }
             };
             match terminal {
@@ -5725,10 +5722,14 @@ impl App {
             };
             let mut terminal = terminal.into_inner();
             let id = terminal.id();
-            let Some((screen, size)) = terminal.screen(true) else {
+            // Released first, taking in what it wrote meanwhile, for the
+            // screen to have it.
+            let Some((fd, pid)) = terminal.release() else {
                 continue;
             };
-            let (fd, pid) = terminal.release();
+            let (screen, size) = terminal
+                .screen(true)
+                .unwrap_or_else(|| (Vec::new(), terminal.screen_size()));
             adopted.push(Adopted {
                 id,
                 fd,
@@ -7911,7 +7912,7 @@ impl App {
     fn new_terminal_in(&mut self, cwd: &Path) {
         let body = self.active_panel().body();
         let id = self.next_terminal;
-        match Terminal::new(id, cwd, body) {
+        match Terminal::new(&self.host, id, cwd, body) {
             Ok(terminal) => {
                 self.next_terminal += 1;
                 let terminal = Rc::new(RefCell::new(terminal));

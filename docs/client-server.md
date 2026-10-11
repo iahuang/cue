@@ -168,7 +168,22 @@ Progress:
   the host what's at a path (`Request::Peek`: a folder's entries, an
   image's bytes, a file's text, or why there's nothing to show), and
   shows it once it's said.
-- [ ] 1.8 onwards.
+- [x] 1.8 Terminals: the host runs each pty in a thread of its own
+  (`pty::serve`), which reads the program's output, writes input, resizes,
+  and reaps it. A terminal is one long call (`Request::Terminal`): replies
+  carry output, how the program's doing (busy, its name, its folders,
+  looked at as output comes and every 250ms), and its exit; controls go by
+  the call's id (`Tell::Term`); dropping the call hangs up. The VT stays
+  in the client for now, fed the output as bytes, and the main loop no
+  longer polls ptys. Handing over to a new process releases each pty
+  through the host first, taking in what it wrote meanwhile, then
+  snapshots the screen.
+- [ ] Later for terminals: the VT on the host, with screens sent as
+  snapshots and diffs rather than bytes (needs the host to keep the VT for
+  detached sessions anyway, and spares the wire a `cat` of a big log).
+  `Event::Released` hands over a raw fd, which only means anything in
+  the same process: re-exec becomes the server's own business in step 2.
+- [ ] 1.9 onwards.
 
 Notes from 1.1 and 1.2:
 
