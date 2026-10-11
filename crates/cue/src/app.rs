@@ -89,7 +89,7 @@ use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
 use crate::file_ops::{file_name, FileOp};
 use crate::find;
-use crate::git::{self, Carried, Change, Commit, Git, Repo, SwitchTo};
+use crate::git::{self, Carried, Change, Commit, Git, GitAnswer, GitCall, Repo, SwitchTo};
 use crate::host::{Call, Link, Notice, Reply, Request, Tell};
 use crate::image::{self, ImageView};
 use crate::indent::{self, Indent};
@@ -257,6 +257,33 @@ struct Check {
     path: PathBuf,
     stamp: Option<Stamp>,
     doc: Weak<Document>,
+}
+
+/// What to do once git answers (see [`App::git_answered`]).
+enum GitThen {
+    Revert {
+        short: String,
+    },
+    Stage {
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        stage: bool,
+    },
+    Stash {
+        root: PathBuf,
+        staged: bool,
+    },
+    ApplyStash {
+        pop: bool,
+    },
+    DropStash,
+    Branches {
+        root: PathBuf,
+    },
+    Switch {
+        root: PathBuf,
+        name: String,
+    },
 }
 
 /// A file the host is writing (see [`App::write`]).
@@ -470,6 +497,11 @@ pub struct App {
     opening: Vec<(Opening, Call)>,
     /// Files the host is writing.
     writing: Vec<Writing>,
+    /// What git was asked, and what to do once it answers.
+    asking_git: Vec<(GitThen, Call)>,
+    /// Open files' records from git, waiting to hear what they were in the
+    /// last commit.
+    reading_bases: Vec<(Rc<git::Tracked>, Call)>,
     /// Open files the host is checking for changes on disk.
     checking: Vec<(Vec<Check>, Call)>,
     /// Open files the host is loading again, to revert to, and then what's
@@ -746,6 +778,8 @@ impl App {
             opening: Vec::new(),
             writing: Vec::new(),
             checking: Vec::new(),
+            asking_git: Vec::new(),
+            reading_bases: Vec::new(),
             reverting: Vec::new(),
             deferred: None,
             branch_root: None,
@@ -2425,6 +2459,21 @@ impl App {
         changed |= self.poll_file_ops();
         changed |= self.poll_opening();
         changed |= self.poll_checks();
+        changed |= self.poll_git_answers();
+        changed |= self.read_bases();
+        for view in &mut self.commit_views {
+            changed |= view.poll_git();
+        }
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            changed |= panel.commit_mut().is_some_and(CommitDiff::poll);
+        }
+        if let Some(action) = self.log.as_mut().and_then(LogView::poll) {
+            changed = true;
+            match self.log_action(action) {
+                AppAction::Continue => {}
+                action => self.deferred = Some(action),
+            }
+        }
         for action in [self.poll_writing(), self.poll_reverting()]
             .into_iter()
             .flatten()
@@ -6013,7 +6062,7 @@ impl App {
                 return;
             };
             let name = self.changes.name_of(root).unwrap_or_default();
-            self.log = Some(LogView::open(repo, name));
+            self.log = Some(LogView::open(&self.host, repo, name));
         }
         self.sidebar = Sidebar::Log;
         self.layout();
@@ -6093,12 +6142,148 @@ impl App {
             self.show_message("Wait for the commit to finish.", false);
             return;
         }
-        match git::revert(root, &commit.hash) {
-            Ok(()) => self.show_message(format!("Reverted {}.", commit.short), false),
-            Err(err) if err.contains("CONFLICT") => {
-                self.show_git_error("Reverted with Conflicts", &err)
+        let call = GitCall::Revert {
+            root: root.to_path_buf(),
+            commit: commit.hash.clone(),
+        };
+        let short = commit.short.clone();
+        self.ask_git(call, GitThen::Revert { short });
+    }
+
+    /// Has the host ask git `call`, and once it's answered, carries on as
+    /// `then` says (see [`App::git_answered`]).
+    fn ask_git(&mut self, call: GitCall, then: GitThen) {
+        let call = self.host.call(Request::Git(call));
+        self.asking_git.push((then, call));
+        #[cfg(test)]
+        while crate::host::at_once() && !self.asking_git.is_empty() {
+            self.poll_git_answers();
+        }
+    }
+
+    /// Asks git what open files were in the last commit, for those whose
+    /// diffs want it, and takes what it said since the last call. Returns
+    /// whether it said anything.
+    fn read_bases(&mut self) -> bool {
+        for doc in &self.documents {
+            let Some(tracked) = doc.tracked() else {
+                continue;
+            };
+            if let Some(call) = tracked.wants_base() {
+                let call = self.host.call(Request::Git(call));
+                self.reading_bases.push((tracked, call));
             }
-            Err(err) => self.show_git_error("Can't Revert", &err),
+        }
+        let mut read = false;
+        self.reading_bases
+            .retain(|(tracked, call)| match call.try_recv() {
+                Ok(Reply::Git(GitAnswer::File(base))) => {
+                    tracked.set_base(base);
+                    read = true;
+                    false
+                }
+                Ok(_) | Err(TryRecvError::Empty) => true,
+                Err(TryRecvError::Disconnected) => false,
+            });
+        read
+    }
+
+    /// Takes git's answers since the last call. Returns whether there were
+    /// any.
+    fn poll_git_answers(&mut self) -> bool {
+        let mut answered = Vec::new();
+        let mut index = 0;
+        while index < self.asking_git.len() {
+            let answer = match self.asking_git[index].1.try_recv() {
+                Ok(Reply::Git(answer)) => Some(answer),
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => None,
+            };
+            let (then, _) = self.asking_git.remove(index);
+            answered.push((then, answer));
+        }
+        let any = !answered.is_empty();
+        for (then, answer) in answered {
+            match answer {
+                Some(answer) => self.git_answered(then, answer),
+                None => self.show_message("git stopped unexpectedly.", true),
+            }
+        }
+        any
+    }
+
+    /// Carries on with what git answered: says how it went, and has git
+    /// say what the repositories are like now.
+    fn git_answered(&mut self, then: GitThen, answer: GitAnswer) {
+        let done = |answer: GitAnswer| match answer {
+            GitAnswer::Done(result) => result,
+            _ => Err("git answered something else.".to_string()),
+        };
+        match then {
+            GitThen::Revert { short } => match done(answer) {
+                Ok(()) => self.show_message(format!("Reverted {short}."), false),
+                Err(err) if err.contains("CONFLICT") => {
+                    self.show_git_error("Reverted with Conflicts", &err)
+                }
+                Err(err) => self.show_git_error("Can't Revert", &err),
+            },
+            GitThen::Stage { root, paths, stage } => match done(answer) {
+                Ok(()) => {
+                    for view in &mut self.commit_views {
+                        if view.root() == root {
+                            view.set_staged(&paths, stage);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let what = if stage { "stage" } else { "unstage" };
+                    let reason = err.lines().next().unwrap_or("");
+                    self.show_message(format!("Can't {what}: {reason}"), true);
+                }
+            },
+            GitThen::Stash { root, staged } => match done(answer) {
+                Ok(()) => {
+                    if let Some(view) = self.commit_view_of(&root) {
+                        view.stashed();
+                    }
+                    let what = if staged {
+                        "the staged changes"
+                    } else {
+                        "the changes"
+                    };
+                    self.show_message(format!("Stashed {what}."), false);
+                }
+                Err(err) => self.show_git_error("Can't Stash", &err),
+            },
+            GitThen::ApplyStash { pop } => match done(answer) {
+                Ok(()) if pop => self.show_message("Popped the stash.", false),
+                Ok(()) => self.show_message("Applied the stash.", false),
+                Err(err) if err.contains("CONFLICT") => {
+                    self.show_git_error("Stash Applied with Conflicts", &err)
+                }
+                Err(err) => self.show_git_error("Can't Apply Stash", &err),
+            },
+            GitThen::DropStash => match done(answer) {
+                Ok(()) => self.show_message("Dropped the stash.", false),
+                Err(err) => self.show_git_error("Can't Drop Stash", &err),
+            },
+            GitThen::Branches { root } => {
+                let GitAnswer::Branches(branches) = answer else {
+                    return;
+                };
+                self.branches_listed(root, branches);
+                return;
+            }
+            GitThen::Switch { root, name } => {
+                let result = match answer {
+                    GitAnswer::Switched(result) => result,
+                    _ => Err("git answered something else.".to_string()),
+                };
+                self.switched(&root, &name, result);
+            }
         }
         self.git.restart();
     }
@@ -6120,7 +6305,8 @@ impl App {
                     return;
                 };
                 let name = self.changes.name_of(root).unwrap_or_default();
-                self.commit_views.insert(0, CommitView::open(repo, name));
+                self.commit_views
+                    .insert(0, CommitView::open(&self.host, repo, name));
             }
         }
         self.sidebar = Sidebar::Commit;
@@ -6392,11 +6578,8 @@ impl App {
     /// or unless `stage`, unstages them.
     fn stage(&mut self, root: PathBuf, paths: Vec<PathBuf>, stage: bool) -> AppAction {
         if stage {
-            // git has the paths as they really are.
-            let wanted = |path: &Path| {
-                paths.iter().any(|wanted| wanted == path)
-                    || path.canonicalize().is_ok_and(|path| paths.contains(&path))
-            };
+            // Open files' folders are resolved, as git has them.
+            let wanted = |path: &Path| paths.iter().any(|wanted| wanted == path);
             let docs: Vec<Rc<Document>> = self
                 .documents
                 .iter()
@@ -6419,25 +6602,19 @@ impl App {
             .repos()
             .iter()
             .any(|repo| repo.root == root && repo.commit.is_none());
-        let result = match stage {
-            true => git::stage(root, paths),
-            false => git::unstage(root, paths, initial),
+        let (root, paths) = (root.to_path_buf(), paths.to_vec());
+        let call = match stage {
+            true => GitCall::Stage {
+                root: root.clone(),
+                paths: paths.clone(),
+            },
+            false => GitCall::Unstage {
+                root: root.clone(),
+                paths: paths.clone(),
+                initial,
+            },
         };
-        match result {
-            Ok(()) => {
-                for view in &mut self.commit_views {
-                    if view.root() == root {
-                        view.set_staged(paths, stage);
-                    }
-                }
-            }
-            Err(err) => {
-                let what = if stage { "stage" } else { "unstage" };
-                let reason = err.lines().next().unwrap_or("");
-                self.show_message(format!("Can't {what}: {reason}"), true);
-            }
-        }
-        self.git.restart();
+        self.ask_git(call, GitThen::Stage { root, paths, stage });
     }
 
     /// Commits what's staged with the message written, in the commit view
@@ -6506,10 +6683,7 @@ impl App {
                 .documents
                 .iter()
                 .filter(|doc| doc.is_modified())
-                .filter(|doc| {
-                    let path = doc.path().and_then(|path| path.canonicalize().ok());
-                    path.is_some_and(|path| path.starts_with(&root))
-                })
+                .filter(|doc| doc.path().is_some_and(|path| path.starts_with(&root)))
                 .cloned()
                 .collect();
             if !docs.is_empty() {
@@ -6531,48 +6705,38 @@ impl App {
     }
 
     fn stash_now(&mut self, root: &Path, message: &str, staged: bool) {
-        match git::stash(root, message, staged) {
-            Ok(()) => {
-                if let Some(view) = self.commit_view_of(root) {
-                    view.stashed();
-                }
-                let what = if staged {
-                    "the staged changes"
-                } else {
-                    "the changes"
-                };
-                self.show_message(format!("Stashed {what}."), false);
-            }
-            Err(err) => self.show_git_error("Can't Stash", &err),
-        }
-        self.git.restart();
+        let call = GitCall::Stash {
+            root: root.to_path_buf(),
+            message: message.to_string(),
+            staged,
+        };
+        let root = root.to_path_buf();
+        self.ask_git(call, GitThen::Stash { root, staged });
     }
 
     /// Puts the changes stashed as `hash`, in the repository at `root`,
     /// back, and if `pop`, drops the stash.
     fn apply_stash(&mut self, root: &Path, hash: &str, pop: bool) {
-        let result = git::apply_stash(root, hash, pop);
-        if let Some(view) = self.commit_view_of(root) {
-            view.read_stashes();
-        }
-        self.git.restart();
-        match result {
-            Ok(()) if pop => self.show_message("Popped the stash.", false),
-            Ok(()) => self.show_message("Applied the stash.", false),
-            Err(err) if err.contains("CONFLICT") => {
-                self.show_git_error("Stash Applied with Conflicts", &err)
-            }
-            Err(err) => self.show_git_error("Can't Apply Stash", &err),
-        }
+        let call = GitCall::ApplyStash {
+            root: root.to_path_buf(),
+            hash: hash.to_string(),
+            pop,
+        };
+        self.ask_git(call, GitThen::ApplyStash { pop });
     }
 
     /// Lists the branches of the repository at `root`, to switch to one,
-    /// or to a new one.
+    /// or to a new one, once git has.
     fn show_branches(&mut self, root: PathBuf) {
+        let call = GitCall::Branches { root: root.clone() };
+        self.ask_git(call, GitThen::Branches { root });
+    }
+
+    fn branches_listed(&mut self, root: PathBuf, branches: Vec<git::Branch>) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs() as i64);
-        let items = git::branches(&root)
+        let items = branches
             .iter()
             .map(|branch| Item::branch(branch, now))
             .collect();
@@ -6596,10 +6760,7 @@ impl App {
             .documents
             .iter()
             .filter(|doc| doc.is_modified())
-            .filter(|doc| {
-                let path = doc.path().and_then(|path| path.canonicalize().ok());
-                path.is_some_and(|path| path.starts_with(&root))
-            })
+            .filter(|doc| doc.path().is_some_and(|path| path.starts_with(&root)))
             .cloned()
             .collect();
         if !docs.is_empty() {
@@ -6621,8 +6782,20 @@ impl App {
             );
             return;
         }
-        let name = to.name().to_string();
-        let result = git::switch(root, to);
+        let call = GitCall::Switch {
+            root: root.to_path_buf(),
+            to: to.clone(),
+        };
+        let then = GitThen::Switch {
+            root: root.to_path_buf(),
+            name: to.name().to_string(),
+        };
+        self.ask_git(call, then);
+    }
+
+    /// Says how switching the repository at `root` to the branch `name`
+    /// went.
+    fn switched(&mut self, root: &Path, name: &str, result: Result<Carried, String>) {
         if result.is_ok() {
             if let Some(view) = self.commit_view_of(root) {
                 view.clear_amend();
@@ -6649,23 +6822,15 @@ impl App {
             }
             Err(err) => self.show_git_error("Can't Switch Branch", &err),
         }
-        if let Some(view) = self.commit_view_of(root) {
-            view.read_stashes();
-        }
-        self.git.restart();
     }
 
     /// Drops the stash `hash`, in the repository at `root`.
     fn drop_stash(&mut self, root: &Path, hash: &str) {
-        let result = git::drop_stash(root, hash);
-        if let Some(view) = self.commit_view_of(root) {
-            view.read_stashes();
-        }
-        self.git.restart();
-        match result {
-            Ok(()) => self.show_message("Dropped the stash.", false),
-            Err(err) => self.show_git_error("Can't Drop Stash", &err),
-        }
+        let call = GitCall::DropStash {
+            root: root.to_path_buf(),
+            hash: hash.to_string(),
+        };
+        self.ask_git(call, GitThen::DropStash);
     }
 
     /// Shows how `commit`, in the repository at `root`, made `change`, in
@@ -6677,7 +6842,7 @@ impl App {
             .is_some_and(|shown| shown.is(root, &commit.hash, &change.path));
         if !shown {
             let had_terminal = self.active_terminal().is_some();
-            let diff = CommitDiff::open(root, commit, change);
+            let diff = CommitDiff::open(&self.host, root, commit, change);
             self.active_panel_mut().show_commit(diff);
             self.prune_documents();
             if had_terminal {
@@ -7260,7 +7425,8 @@ impl App {
             false => parent.clone(),
         };
         let name = file_name(&target.path);
-        if matches!(command, Command::TreeOpen | Command::TreeOpenToSide) && !target.path.exists() {
+        let gone = !target.is_root && self.tree.lists(&target.path) == Some(false);
+        if matches!(command, Command::TreeOpen | Command::TreeOpenToSide) && gone {
             self.show_message(format!("{name} was deleted."), false);
             return AppAction::Continue;
         }
@@ -7301,7 +7467,7 @@ impl App {
                 }
             }
             Command::TreeDuplicate => {
-                let copy = copy_name(&target, |path| self.tree.lists(path));
+                let copy = copy_name(&target, |path| self.tree.lists(path) == Some(true));
                 self.open_dialog(Purpose::Duplicate, &parent, &copy, Some(target.path));
             }
             Command::AddFolder => self.show_dialog(Purpose::AddFolder),
@@ -9892,6 +10058,23 @@ mod tests {
             "{}",
             status(&app)
         );
+    }
+
+    #[test]
+    fn diffs_show_once_git_says_what_the_file_was() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-diff-later");
+        fs::write(root.join("a.txt"), "a\nnew\n").unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+        crate::host::set_at_once(false);
+        app.run(Command::ToggleDiff, false);
+        assert!(app.ed().diffing());
+        assert!(screen(&app).contains("Reading the last commit"));
+        wait_until(&mut app, "the last commit", |app| {
+            !screen(app).contains("Reading the last commit")
+        });
+        assert!(screen(&app).contains("+ new"), "{}", screen(&app));
     }
 
     #[test]

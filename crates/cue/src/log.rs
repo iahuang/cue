@@ -11,12 +11,14 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::TryRecvError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use opentui::{Attributes, Buffer};
 
 use crate::changes::{button_area, draw_look, file_rows, Look};
-use crate::git::{self, Change, Commit, Kind, Repo};
+use crate::git::{Change, Commit, GitAnswer, GitCall, Kind, Repo};
+use crate::host::{Call, Link, Reply, Request};
 use crate::icons;
 use crate::keymap::Command;
 use crate::theme;
@@ -104,11 +106,31 @@ pub struct LogView {
     height: usize,
     /// The commit and file shown in the editor, highlighted.
     active: Option<(String, PathBuf)>,
+    host: Link,
+    /// What git was asked, and is yet to answer.
+    asking: Vec<(Asked, Call)>,
+    /// Counts the times the log was read again from the top, to drop pages
+    /// of the log as it was before.
+    generation: u64,
+    /// The row selected when the log was read again, by the hash of its
+    /// commit, to select again once it's read.
+    reselect: Option<(String, Row)>,
+}
+
+/// What the log asked git.
+#[derive(Clone)]
+enum Asked {
+    /// The commits from `skip` on, for the log as of `generation`.
+    Page { generation: u64, skip: usize },
+    /// The files the commit with this hash changed.
+    Files(String),
+    /// A commit's whole message, to copy.
+    Message(Commit),
 }
 
 impl LogView {
-    /// The log of `repo`, which is called `name`.
-    pub fn open(repo: &Repo, name: String) -> LogView {
+    /// The log of `repo`, which is called `name`, asking git on `host`.
+    pub fn open(host: &Link, repo: &Repo, name: String) -> LogView {
         let mut view = LogView {
             root: repo.root.clone(),
             name,
@@ -124,9 +146,79 @@ impl LogView {
             scroll: 0,
             height: 1,
             active: None,
+            host: host.clone(),
+            asking: Vec::new(),
+            generation: 0,
+            reselect: None,
         };
         view.read_more();
         view
+    }
+
+    /// Asks git `call`, to take in its answer in [`LogView::poll`].
+    fn ask(&mut self, call: GitCall, asked: Asked) {
+        let call = self.host.call(Request::Git(call));
+        self.asking.push((asked, call));
+        #[cfg(test)]
+        while crate::host::at_once() && !self.asking.is_empty() {
+            self.poll();
+        }
+    }
+
+    /// Takes in what git answered since the last call. Returns what to do
+    /// then, if anything changed: [`LogAction::Copy`] a message asked for,
+    /// or else [`LogAction::None`].
+    pub fn poll(&mut self) -> Option<LogAction> {
+        let mut answered = Vec::new();
+        self.asking.retain(|(asked, call)| match call.try_recv() {
+            Ok(Reply::Git(answer)) => {
+                answered.push((asked.clone(), answer));
+                false
+            }
+            Ok(_) | Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+        if answered.is_empty() {
+            return None;
+        }
+        let mut action = LogAction::None;
+        for (asked, answer) in answered {
+            match (asked, answer) {
+                (Asked::Page { generation, skip }, GitAnswer::Log(page)) => {
+                    if generation != self.generation {
+                        continue;
+                    }
+                    self.complete = page.len() < PAGE;
+                    if skip == 0 {
+                        self.commits = page;
+                    } else {
+                        self.commits.extend(page);
+                    }
+                    self.rebuild();
+                    if let Some((hash, row)) = self.reselect.take() {
+                        let index = self.rows.iter().position(|candidate| {
+                            self.hash_of(candidate).as_deref() == Some(hash.as_str())
+                                && std::mem::discriminant(&candidate.what)
+                                    == std::mem::discriminant(&row.what)
+                                && candidate.path == row.path
+                        });
+                        self.select(index.unwrap_or(0));
+                    }
+                }
+                (Asked::Files(hash), GitAnswer::Changes(changes)) => {
+                    self.files.insert(hash, changes);
+                    self.rebuild();
+                }
+                (Asked::Message(commit), GitAnswer::Message(text)) => {
+                    action = LogAction::Copy {
+                        said: format!("Copied the message of {}.", commit.short),
+                        text: text.unwrap_or(commit.subject),
+                    };
+                }
+                _ => {}
+            }
+        }
+        Some(action)
     }
 
     /// The repository's top folder.
@@ -143,20 +235,25 @@ impl LogView {
             return;
         }
         let selected = self.rows.get(self.selected).cloned();
-        let selected_hash = selected.as_ref().and_then(|row| self.hash_of(row));
+        self.reselect = selected.and_then(|row| Some((self.hash_of(&row)?, row)));
         self.head = repo.commit.clone();
-        self.commits.clear();
-        self.complete = false;
-        self.read_more();
-        let index = selected_hash.and_then(|hash| {
-            let row = selected?;
-            self.rows.iter().position(|candidate| {
-                self.hash_of(candidate).as_deref() == Some(hash.as_str())
-                    && std::mem::discriminant(&candidate.what) == std::mem::discriminant(&row.what)
-                    && candidate.path == row.path
-            })
-        });
-        self.select(index.unwrap_or(0));
+        // The log as it was shows until its first page is read again.
+        self.generation += 1;
+        self.asking
+            .retain(|(asked, _)| !matches!(asked, Asked::Page { .. }));
+        let root = self.root.clone();
+        let generation = self.generation;
+        self.ask(
+            GitCall::Log {
+                root,
+                skip: 0,
+                count: PAGE,
+            },
+            Asked::Page {
+                generation,
+                skip: 0,
+            },
+        );
     }
 
     pub fn set_height(&mut self, height: u32) {
@@ -435,15 +532,23 @@ impl LogView {
 
     // --- rows ------------------------------------------------------------------
 
-    /// Reads the next page of commits, if there's more.
+    /// Reads the next page of commits, if there's more, and it isn't being
+    /// read already.
     fn read_more(&mut self) {
-        if self.complete {
+        let reading = self
+            .asking
+            .iter()
+            .any(|(asked, _)| matches!(asked, Asked::Page { .. }));
+        if self.complete || reading {
             return;
         }
-        let page = git::log(&self.root, self.commits.len(), PAGE);
-        self.complete = page.len() < PAGE;
-        self.commits.extend(page);
-        self.rebuild();
+        let (root, skip, generation) = (self.root.clone(), self.commits.len(), self.generation);
+        let call = GitCall::Log {
+            root,
+            skip,
+            count: PAGE,
+        };
+        self.ask(call, Asked::Page { generation, skip });
     }
 
     /// Reads the next page once the selection or the view is near the end
@@ -530,18 +635,20 @@ impl LogView {
     }
 
     /// What `command`, from the log's menu, does to `commit`.
-    fn commit_command(&self, command: Command, commit: Commit) -> LogAction {
+    fn commit_command(&mut self, command: Command, commit: Commit) -> LogAction {
         match command {
             Command::TreeCopyHash => LogAction::Copy {
                 said: format!("Copied {}.", commit.hash),
                 text: commit.hash,
             },
+            // Copied once git says what it is (see [`LogView::poll`]).
             Command::TreeCopyMessage => {
-                let text = git::message(&self.root, &commit.hash).unwrap_or(commit.subject);
-                LogAction::Copy {
-                    said: format!("Copied the message of {}.", commit.short),
-                    text,
-                }
+                let call = GitCall::Message {
+                    root: self.root.clone(),
+                    commit: commit.hash.clone(),
+                };
+                self.ask(call, Asked::Message(commit));
+                LogAction::None
             }
             Command::TreeCheckOut => LogAction::CheckOut(commit),
             Command::TreeNewBranch => LogAction::NewBranch(commit),
@@ -552,12 +659,13 @@ impl LogView {
 
     /// Opens commit `i`, reading the files it changed the first time.
     fn open_commit(&mut self, i: usize) {
-        let commit = &self.commits[i];
-        if !self.files.contains_key(&commit.hash) {
-            let changes = git::commit_changes(&self.root, commit);
-            self.files.insert(commit.hash.clone(), changes);
-        }
+        let commit = self.commits[i].clone();
         self.open.insert(commit.hash.clone());
+        if !self.files.contains_key(&commit.hash) {
+            let hash = commit.hash.clone();
+            let root = self.root.clone();
+            self.ask(GitCall::CommitChanges { root, commit }, Asked::Files(hash));
+        }
     }
 }
 
@@ -630,7 +738,7 @@ pub(crate) fn ago(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::Head;
+    use crate::git::{self, Head};
     use opentui::Rgba;
 
     fn repo(root: &Path) -> Repo {
@@ -675,7 +783,7 @@ mod tests {
     #[test]
     fn commits_open_to_the_files_they_changed() {
         let root = crate::git::tests::history_repo("log-view");
-        let mut view = LogView::open(&repo(&root), "log-view".into());
+        let mut view = LogView::open(&Link::local(), &repo(&root), "log-view".into());
         view.set_height(20);
         assert_eq!(listing(&view), ["> third", "> second"], "a page at first");
         view.run(Command::TreeDown);
@@ -738,7 +846,7 @@ mod tests {
     #[test]
     fn a_new_commit_reads_the_log_again() {
         let root = crate::git::tests::repo("log-view-new");
-        let mut view = LogView::open(&repo(&root), "log-view-new".into());
+        let mut view = LogView::open(&Link::local(), &repo(&root), "log-view-new".into());
         view.set_height(20);
         view.click(2, 1, 20, false);
         assert_eq!(
@@ -759,7 +867,7 @@ mod tests {
     fn draws_the_repository_and_how_long_ago_commits_were() {
         let _serial = crate::test_serial();
         let root = crate::git::tests::repo("log-view-draw");
-        let mut view = LogView::open(&repo(&root), "log-view-draw".into());
+        let mut view = LogView::open(&Link::local(), &repo(&root), "log-view-draw".into());
         view.set_height(3);
         let screen =
             opentui::OwnedBuffer::new(24, 3, false, opentui::WidthMethod::Unicode, "test").unwrap();

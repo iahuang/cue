@@ -136,6 +136,8 @@ struct Key {
     /// The git record in use, by address: a new one is a new commit.
     tracked: Option<usize>,
     kind: Option<Kind>,
+    /// Whether git has said what it was in the last commit.
+    based: bool,
     width: u32,
     unfolded: usize,
 }
@@ -232,6 +234,7 @@ impl DiffView {
             },
             tracked: tracked.map(|tracked| Rc::as_ptr(tracked) as usize),
             kind: tracked.and_then(|tracked| tracked.kind.get()),
+            based: tracked.is_some_and(|tracked| tracked.base_if_read().is_some()),
             width: self.width,
             unfolded: self.unfolded.len(),
         }
@@ -265,7 +268,10 @@ impl DiffView {
         let Some(tracked) = tracked else {
             return Layout::note("Not in a git repository.");
         };
-        let old = match tracked.base() {
+        let Some(base) = tracked.base() else {
+            return Layout::note("Reading the last commit…");
+        };
+        let old = match base {
             Base::Text(text) => text.as_str(),
             Base::Binary => return Layout::note("The file was binary in the last commit."),
             // Ignored, or so git says.
@@ -524,6 +530,8 @@ struct HunksKey {
     tracked: Option<Rc<Tracked>>,
     kind: Option<Kind>,
     modified: bool,
+    /// Whether git has said what it was in the last commit.
+    based: bool,
 }
 
 impl PartialEq for HunksKey {
@@ -533,7 +541,8 @@ impl PartialEq for HunksKey {
             (a, b) => a.is_none() && b.is_none(),
         };
         same_tracked
-            && (self.epoch, self.kind, self.modified) == (other.epoch, other.kind, other.modified)
+            && (self.epoch, self.kind, self.modified, self.based)
+                == (other.epoch, other.kind, other.modified, other.based)
     }
 }
 
@@ -553,6 +562,9 @@ impl Hunks {
         let key = HunksKey {
             epoch: doc.buffer.content_epoch(),
             kind: tracked.as_ref().and_then(|tracked| tracked.kind.get()),
+            based: tracked
+                .as_ref()
+                .is_some_and(|tracked| tracked.base_if_read().is_some()),
             tracked,
             modified: doc.is_modified(),
         };
@@ -580,7 +592,7 @@ fn hunk_base(tracked: &Tracked, modified: bool) -> Option<&str> {
     if kind.is_none() && !modified && tracked.base_if_read().is_none() {
         return None;
     }
-    match tracked.base() {
+    match tracked.base()? {
         Base::Text(text) => Some(text),
         Base::Binary => None,
         // Ignored, or so git says.

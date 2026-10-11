@@ -35,7 +35,7 @@ use crate::document::{self, Checked, LineEnding, Loaded, Stamp, Unsaved};
 use crate::file_dialog;
 use crate::file_index;
 use crate::file_ops::{self, FileOp};
-use crate::git::{self, Repo};
+use crate::git::{self, GitAnswer, GitCall, Repo};
 use crate::search::{self, Query};
 use crate::symbols::{self, FileSymbols};
 use crate::tree::{self, Listed};
@@ -112,6 +112,8 @@ pub enum Request {
     /// What's in each of `folders` (see [`crate::tree`]), a reply each, in
     /// order.
     ListFolders { folders: Vec<PathBuf> },
+    /// Asking git, or having it do something (see [`git::run`]).
+    Git(GitCall),
     /// Committing what's staged in the repository at `root`.
     Commit {
         root: PathBuf,
@@ -161,6 +163,7 @@ pub enum Reply {
     /// Every file's symbols, sorted by path.
     Symbols(FileSymbols),
     Repos(Vec<Repo>),
+    Git(GitAnswer),
     /// How a [`Request::GitSync`] went.
     Synced(Result<(), String>),
     /// How a [`Request::FileOp`] went: why it couldn't be done, if it
@@ -510,6 +513,9 @@ fn answer(request: Request, state: &State, responder: Responder) {
                     return;
                 }
             }
+        }
+        Request::Git(call) => {
+            responder.reply(Reply::Git(git::run(&call)));
         }
         Request::GitStatus { roots } => {
             responder.reply(Reply::Repos(git::read_repos(&roots)));

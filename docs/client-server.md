@@ -145,7 +145,23 @@ Progress:
   canonicalize on the client; Quick Look still reads files itself; the
   first file at startup, crash recovery, and session restore load through
   the host but wait for it (`load_now`), until sessions move (1.9).
-- [ ] 1.6 onwards.
+- [x] 1.6 The rest of git, through one request (`Request::Git` with a
+  `GitCall`, answered by `git::run`): staging, stashing, reverting,
+  branches, and switching from the app, which says how it went once git
+  answers (`GitThen`); Amend's last message and a stash's files in the
+  commit view; the log's pages, a commit's files, and copying a message;
+  both sides of a commit diff, which shows empty until they come. What a
+  file was in the last commit, for diffs and the gutter, is still read
+  when a draw first wants it, but now that wakes the app to ask the host,
+  and the diff shows once it's said (the caches' keys note whether it
+  has). Matching open files to a repository no longer canonicalizes on the
+  client.
+- [ ] Small checks still on the client, for a sweep later: the picker's
+  recent files (`is_file`), the tree's "was deleted" check for the
+  changes view, the dialog's starting folder, following a link in reader
+  mode, and whether an image or a commit in a panel's history is still
+  there.
+- [ ] 1.7 onwards.
 
 Notes from 1.1 and 1.2:
 

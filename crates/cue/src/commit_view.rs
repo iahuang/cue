@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use opentui::{Attributes, Buffer};
 
 use crate::changes::{button_area, draw_look, file_rows, Look};
-use crate::git::{self, Change, Commit, Kind, Repo, Staged, Stash};
+use crate::git::{Change, Commit, GitAnswer, GitCall, Kind, Repo, Staged, Stash};
 use crate::host::{Call, Link, Reply, Request};
 use crate::icons;
 use crate::keymap::Command;
@@ -219,11 +219,24 @@ pub struct CommitView {
     stash_collapsed: HashSet<(String, PathBuf)>,
     /// The stashed file shown in the editor, by its commit's hash and path.
     active_stashed: Option<(String, PathBuf)>,
+    host: Link,
+    /// What git was asked, and is yet to answer.
+    asking: Vec<(Asked, Call)>,
+}
+
+/// What the commit view asked git.
+#[derive(Clone)]
+enum Asked {
+    /// The last commit's message, for Amend.
+    LastMessage,
+    /// The files the stash with this hash changed.
+    StashFiles(String),
 }
 
 impl CommitView {
-    /// The commit view of `repo`, which is called `name`.
-    pub fn open(repo: &Repo, name: String) -> CommitView {
+    /// The commit view of `repo`, which is called `name`, asking git on
+    /// `host`.
+    pub fn open(host: &Link, repo: &Repo, name: String) -> CommitView {
         let mut view = CommitView {
             root: repo.root.clone(),
             name,
@@ -250,6 +263,8 @@ impl CommitView {
             open_stashes: HashSet::new(),
             stash_collapsed: HashSet::new(),
             active_stashed: None,
+            host: host.clone(),
+            asking: Vec::new(),
         };
         view.set_repo(repo);
         view
@@ -281,10 +296,6 @@ impl CommitView {
 
     /// Reads the stashes again, as after stashing, applying, or dropping
     /// one, keeping those still there open.
-    pub fn read_stashes(&mut self) {
-        self.set_stashes(git::stashes(&self.root));
-    }
-
     fn set_stashes(&mut self, stashes: Vec<Stash>) {
         self.stashes = stashes;
         let hashes: HashSet<&String> = self.stashes.iter().map(|s| &s.commit.hash).collect();
@@ -298,7 +309,53 @@ impl CommitView {
         self.message = Message::default();
         self.amend = false;
         self.filled = None;
-        self.read_stashes();
+    }
+
+    /// Asks git `call`, to take in its answer in [`CommitView::poll_git`].
+    fn ask(&mut self, call: GitCall, asked: Asked) {
+        let call = self.host.call(Request::Git(call));
+        self.asking.push((asked, call));
+        #[cfg(test)]
+        while crate::host::at_once() && !self.asking.is_empty() {
+            self.poll_git();
+        }
+    }
+
+    /// Takes in what git answered since the last call. Returns whether
+    /// anything changed.
+    pub fn poll_git(&mut self) -> bool {
+        let mut answered = Vec::new();
+        self.asking.retain(|(asked, call)| match call.try_recv() {
+            Ok(Reply::Git(answer)) => {
+                answered.push((asked.clone(), answer));
+                false
+            }
+            Ok(_) | Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+        let changed = !answered.is_empty();
+        for (asked, answer) in answered {
+            match (asked, answer) {
+                (Asked::LastMessage, GitAnswer::Message(Some(last))) => {
+                    // Unless Amend was turned off, or a message written,
+                    // meanwhile.
+                    if self.amend && self.message.text.trim().is_empty() {
+                        self.message = Message::default();
+                        self.message.text = last.clone();
+                        self.filled = Some(last);
+                        self.show_cursor();
+                    }
+                }
+                (Asked::StashFiles(hash), GitAnswer::StashChanges(files)) => {
+                    if self.stashes.iter().any(|stash| stash.commit.hash == hash) {
+                        self.stash_files.insert(hash, files);
+                        self.rebuild();
+                    }
+                }
+                _ => {}
+            }
+        }
+        changed
     }
 
     /// Marks the files at `paths` staged, or not, as they are once git's
@@ -730,11 +787,8 @@ impl CommitView {
         }
         self.amend = !self.amend;
         if self.amend && self.message.text.trim().is_empty() {
-            if let Some(last) = git::last_message(&self.root) {
-                self.message = Message::default();
-                self.message.text = last.clone();
-                self.filled = Some(last);
-            }
+            let root = self.root.clone();
+            self.ask(GitCall::LastMessage { root }, Asked::LastMessage);
         } else if !self.amend && self.filled.take().as_ref() == Some(&self.message.text) {
             self.message = Message::default();
         }
@@ -1318,11 +1372,16 @@ impl Outline for CommitView {
             What::Stashes => self.stashes_collapsed = !self.stashes_collapsed,
             What::Stash(i) => {
                 if !self.open_stashes.remove(&hash) {
+                    self.open_stashes.insert(hash.clone());
                     if !self.stash_files.contains_key(&hash) {
-                        let files = git::stash_changes(&self.root, &self.stashes[*i]);
-                        self.stash_files.insert(hash.clone(), files);
+                        let call = GitCall::StashChanges {
+                            root: self.root.clone(),
+                            stash: self.stashes[*i].clone(),
+                        };
+                        self.rebuild();
+                        self.ask(call, Asked::StashFiles(hash));
+                        return;
                     }
-                    self.open_stashes.insert(hash);
                 }
             }
             What::StashFolder(_) => {
@@ -1432,7 +1491,7 @@ fn offset_at(text: &str, line: &Line, column: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::Head;
+    use crate::git::{self, Head};
     use opentui::Rgba;
 
     fn repo(changes: &[(&str, Kind, Staged)]) -> Repo {
@@ -1461,7 +1520,7 @@ mod tests {
     }
 
     fn view(changes: &[(&str, Kind, Staged)]) -> CommitView {
-        let mut view = CommitView::open(&repo(changes), "cue".into());
+        let mut view = CommitView::open(&Link::local(), &repo(changes), "cue".into());
         view.set_size(24, 12);
         view
     }
@@ -1522,7 +1581,7 @@ mod tests {
         let mut git = git::Git::new(&crate::host::Link::local(), std::slice::from_ref(&root));
         git.wait();
         let before = git.repos()[0].clone();
-        let mut view = CommitView::open(&before, "cue".into());
+        let mut view = CommitView::open(&Link::local(), &before, "cue".into());
         git::drop_stash(&root, &view.stashes[0].commit.hash).unwrap();
         std::fs::write(root.join("a.txt"), "new\n").unwrap();
         git::stash(&root, "new stash", false).unwrap();
@@ -1544,7 +1603,7 @@ mod tests {
         git::stash(&root, "new file", true).unwrap();
         let mut git = git::Git::new(&crate::host::Link::local(), std::slice::from_ref(&root));
         git.wait();
-        let mut view = CommitView::open(&git.repos()[0], "cue".into());
+        let mut view = CommitView::open(&Link::local(), &git.repos()[0], "cue".into());
         view.set_size(40, 24);
         let stash = view
             .rows
@@ -1591,7 +1650,7 @@ mod tests {
         repo.root = git::tests::repo("amend-switch");
         for edited in [false, true] {
             repo.head = Head::Branch("main".into());
-            let mut view = CommitView::open(&repo, "cue".into());
+            let mut view = CommitView::open(&Link::local(), &repo, "cue".into());
             view.toggle_amend();
             assert_eq!(view.message(), "first");
             if edited {
@@ -1705,7 +1764,7 @@ mod tests {
             ("z/e.rs", Kind::Untracked, Staged::No),
         ]);
         changes.changes[0].from = Some(PathBuf::from("/w/cue/old.rs"));
-        let mut view = CommitView::open(&changes, "cue".into());
+        let mut view = CommitView::open(&Link::local(), &changes, "cue".into());
         view.set_size(24, 12);
         let paths = |names: &[&str]| -> Vec<PathBuf> {
             names
@@ -1787,7 +1846,7 @@ mod tests {
         let mut git = git::Git::new(&crate::host::Link::local(), std::slice::from_ref(&root));
         git.wait();
         assert!(git.repos()[0].changes.is_empty());
-        let mut view = CommitView::open(&git.repos()[0], "cue".into());
+        let mut view = CommitView::open(&Link::local(), &git.repos()[0], "cue".into());
         view.edit(Edit::Insert("Resolve using ours"), false);
         assert_eq!(view.commit(&Link::local()), Ok(()));
         view.wait().unwrap().unwrap();

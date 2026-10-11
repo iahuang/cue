@@ -463,13 +463,11 @@ impl FileTree {
         })
     }
 
-    /// Whether `path` is in its folder, as last listed. False if its
+    /// Whether `path` is in its folder, as last listed. `None` if its
     /// folder hasn't been.
-    pub fn lists(&self, path: &Path) -> bool {
-        let Some(listing) = path.parent().and_then(|dir| self.listings.get(dir)) else {
-            return false;
-        };
-        listing.entries.iter().any(|entry| entry.path == path)
+    pub fn lists(&self, path: &Path) -> Option<bool> {
+        let listing = self.listings.get(path.parent()?)?;
+        Some(listing.entries.iter().any(|entry| entry.path == path))
     }
 
     /// The folders listed with their contents showing.

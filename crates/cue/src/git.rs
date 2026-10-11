@@ -210,6 +210,8 @@ pub struct Tracked {
     /// How it changed, if git says it did.
     pub kind: Cell<Option<Kind>>,
     base: OnceCell<Base>,
+    /// Something asked what it was in the last commit, before git said.
+    wanted: Cell<bool>,
 }
 
 /// What a file was in the last commit.
@@ -229,19 +231,49 @@ impl Tracked {
         (&self.root, &self.commit, &self.old_path) == (&other.root, &other.commit, &other.old_path)
     }
 
-    /// What the file was in the last commit, asking git the first time.
-    pub fn base(&self) -> &Base {
-        self.base.get_or_init(|| {
-            let Some(commit) = &self.commit else {
-                return Base::Missing;
-            };
-            file_at(&self.root, commit, &self.old_path)
-        })
+    /// What the file was in the last commit, once git has said. Until
+    /// then, `None`, and the app hears that it's wanted (see
+    /// [`Tracked::wants_base`]), and is woken to ask git.
+    pub fn base(&self) -> Option<&Base> {
+        if self.commit.is_none() {
+            return Some(self.base.get_or_init(|| Base::Missing));
+        }
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let commit = self.commit.as_deref().unwrap_or_default();
+            return Some(
+                self.base
+                    .get_or_init(|| file_at(&self.root, commit, &self.old_path)),
+            );
+        }
+        let base = self.base.get();
+        if base.is_none() && !self.wanted.replace(true) {
+            crate::wake::wake();
+        }
+        base
     }
 
     /// What the file was in the last commit, if git was asked already.
     pub fn base_if_read(&self) -> Option<&Base> {
         self.base.get()
+    }
+
+    /// What to ask git, if what the file was in the last commit is wanted
+    /// and not known yet. Asking once is enough: it's not wanted again.
+    pub fn wants_base(&self) -> Option<GitCall> {
+        if self.base.get().is_some() || !self.wanted.replace(false) {
+            return None;
+        }
+        Some(GitCall::FileAt {
+            root: self.root.clone(),
+            commit: self.commit.clone()?,
+            path: self.old_path.clone(),
+        })
+    }
+
+    /// Takes what git said the file was in the last commit.
+    pub fn set_base(&self, base: Base) {
+        let _ = self.base.set(base);
     }
 }
 
@@ -930,6 +962,148 @@ fn run_with_input(mut command: Command, input: &[u8]) -> Result<String, String> 
     })
 }
 
+/// What the file was in `commit`'s first parent, and in `commit`, as it
+/// made `change`, in the repository at `root`.
+pub fn sides(root: &Path, commit: &Commit, change: &Change) -> (Base, Base) {
+    let relative = |path: &Path| path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    let old_path = relative(change.from.as_deref().unwrap_or(&change.path));
+    let old = match (&commit.parent, change.kind) {
+        (Some(parent), kind) if kind != Kind::Added => file_at(root, parent, &old_path),
+        _ => Base::Missing,
+    };
+    let new = match change.kind {
+        Kind::Deleted => Base::Missing,
+        _ => file_at(root, &commit.hash, &relative(&change.path)),
+    };
+    (old, new)
+}
+
+/// What the app asks git, through the host (see [`run`]), but for status,
+/// syncing, and committing, which have requests of their own.
+#[derive(Debug, Clone)]
+pub enum GitCall {
+    Log {
+        root: PathBuf,
+        skip: usize,
+        count: usize,
+    },
+    CommitChanges {
+        root: PathBuf,
+        commit: Commit,
+    },
+    FileAt {
+        root: PathBuf,
+        commit: String,
+        path: PathBuf,
+    },
+    /// What a file was before and after `commit` made `change`.
+    Sides {
+        root: PathBuf,
+        commit: Commit,
+        change: Change,
+    },
+    Stage {
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+    },
+    Unstage {
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        initial: bool,
+    },
+    LastMessage {
+        root: PathBuf,
+    },
+    Message {
+        root: PathBuf,
+        commit: String,
+    },
+    Revert {
+        root: PathBuf,
+        commit: String,
+    },
+    StashChanges {
+        root: PathBuf,
+        stash: Stash,
+    },
+    Stash {
+        root: PathBuf,
+        message: String,
+        staged: bool,
+    },
+    ApplyStash {
+        root: PathBuf,
+        hash: String,
+        pop: bool,
+    },
+    DropStash {
+        root: PathBuf,
+        hash: String,
+    },
+    Branches {
+        root: PathBuf,
+    },
+    Switch {
+        root: PathBuf,
+        to: SwitchTo,
+    },
+}
+
+/// What git answered a [`GitCall`], as the function of the same name
+/// returns it.
+#[derive(Debug)]
+pub enum GitAnswer {
+    Log(Vec<Commit>),
+    Changes(Vec<Change>),
+    File(Base),
+    /// Before and after.
+    Sides(Base, Base),
+    /// From staging, unstaging, reverting, and stashing.
+    Done(Result<(), String>),
+    Message(Option<String>),
+    StashChanges(Vec<(Commit, Change)>),
+    Branches(Vec<Branch>),
+    Switched(Result<Carried, String>),
+}
+
+/// Does what `call` asks, for the host.
+pub fn run(call: &GitCall) -> GitAnswer {
+    match call {
+        GitCall::Log { root, skip, count } => GitAnswer::Log(log(root, *skip, *count)),
+        GitCall::CommitChanges { root, commit } => GitAnswer::Changes(commit_changes(root, commit)),
+        GitCall::FileAt { root, commit, path } => GitAnswer::File(file_at(root, commit, path)),
+        GitCall::Sides {
+            root,
+            commit,
+            change,
+        } => {
+            let (old, new) = sides(root, commit, change);
+            GitAnswer::Sides(old, new)
+        }
+        GitCall::Stage { root, paths } => GitAnswer::Done(stage(root, paths)),
+        GitCall::Unstage {
+            root,
+            paths,
+            initial,
+        } => GitAnswer::Done(unstage(root, paths, *initial)),
+        GitCall::LastMessage { root } => GitAnswer::Message(last_message(root)),
+        GitCall::Message { root, commit } => GitAnswer::Message(message(root, commit)),
+        GitCall::Revert { root, commit } => GitAnswer::Done(revert(root, commit)),
+        GitCall::StashChanges { root, stash } => {
+            GitAnswer::StashChanges(stash_changes(root, stash))
+        }
+        GitCall::Stash {
+            root,
+            message,
+            staged,
+        } => GitAnswer::Done(stash(root, message, *staged)),
+        GitCall::ApplyStash { root, hash, pop } => GitAnswer::Done(apply_stash(root, hash, *pop)),
+        GitCall::DropStash { root, hash } => GitAnswer::Done(drop_stash(root, hash)),
+        GitCall::Branches { root } => GitAnswer::Branches(branches(root)),
+        GitCall::Switch { root, to } => GitAnswer::Switched(switch(root, to)),
+    }
+}
+
 pub struct Git {
     host: Link,
     roots: Vec<PathBuf>,
@@ -998,6 +1172,7 @@ impl Git {
             old_path: old.strip_prefix(&repo.root).ok()?.to_path_buf(),
             kind: Cell::new(change.map(|change| change.kind)),
             base: OnceCell::new(),
+            wanted: Cell::new(false),
         })
     }
 
@@ -1537,7 +1712,7 @@ pub(crate) mod tests {
         fs::write(dir.join("new.txt"), "new\n").unwrap();
         let mut git = Git::new(&Link::local(), std::slice::from_ref(&dir));
         git.wait();
-        let base = |name: &str| git.tracked(&dir.join(name)).map(|t| t.base().clone());
+        let base = |name: &str| git.tracked(&dir.join(name)).and_then(|t| t.base().cloned());
         assert_eq!(base("a.txt"), Some(Base::Text("a\n".into())));
         assert_eq!(base("c.txt"), Some(Base::Text("b\n".into())), "renamed");
         assert_eq!(base("new.txt"), Some(Base::Missing));
