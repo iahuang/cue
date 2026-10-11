@@ -139,6 +139,10 @@ pub enum Event {
     Key(Key),
     Mouse(Mouse),
     Paste(String),
+    /// A key was let go, with these modifiers held still: reported by the
+    /// kitty keyboard protocol with event types on, as cue asks for only
+    /// while it waits for a modifier to go up.
+    Release(Mods),
     /// A terminal reply (DECRPM, DA, OSC color, cursor report, ...), to be
     /// passed to `Renderer::process_capability_response`.
     Reply(Vec<u8>),
@@ -369,6 +373,19 @@ fn parse_csi(b: &[u8]) -> Option<(Token, usize)> {
             .filter(|&n| n != 0)
     };
     let mods = Mods::from_param(field(1, 0).unwrap_or(1));
+    // Kitty: `CSI code ; mods:event final`, event 3 a release (2, a repeat,
+    // counts as a press).
+    let key_final = matches!(
+        final_byte,
+        b'u' | b'~' | b'A'..=b'D' | b'H' | b'F' | b'P' | b'Q' | b'S'
+    );
+    if key_final && field(1, 1) == Some(3) {
+        let mods = match final_byte {
+            b'u' => released(field(0, 0), mods),
+            _ => mods,
+        };
+        return Some((Token::Event(Event::Release(mods)), len));
+    }
 
     let code = match final_byte {
         b'A' => KeyCode::Up,
@@ -407,15 +424,21 @@ fn parse_csi(b: &[u8]) -> Option<(Token, usize)> {
             },
             _ => return Some((Token::Ignored, len)),
         },
-        // Kitty: CSI codepoint[:alternates] ; mods[:event] u. Event 3 is a release.
+        // Kitty: CSI codepoint[:shifted[:base]] ; mods[:event] [; text] u.
         b'u' => {
-            if field(1, 1) == Some(3) {
+            let Some(cp) = field(0, 0) else {
                 return Some((Token::Ignored, len));
-            }
-            match field(0, 0) {
-                Some(cp) => return Some((codepoint_token(cp, mods), len)),
-                None => return Some((Token::Ignored, len)),
-            }
+            };
+            // With every key reported this way, typing is too: the text
+            // a key types, if reported (one character), or else the
+            // shifted key, if Shift is held.
+            let text = fields
+                .get(2)
+                .filter(|text| text.len() == 1)
+                .and_then(|_| field(2, 0));
+            let shifted = field(0, 1).filter(|_| mods.shift);
+            let typed = text.or(shifted).filter(|_| mods.is_plain());
+            return Some((codepoint_token(typed.unwrap_or(cp), mods), len));
         }
         // Focus in/out.
         b'I' | b'O' => return Some((Token::Ignored, len)),
@@ -471,6 +494,22 @@ fn parse_sgr_mouse(params: &[u8], release: bool) -> Token {
         y: y.saturating_sub(1),
         mods,
     }))
+}
+
+/// The modifiers held after a key with kitty's `code` was let go, which
+/// `mods` were reported with: if it was a modifier, without it. Terminals
+/// differ on whether the report still has it.
+fn released(code: Option<u32>, mods: Mods) -> Mods {
+    let mut mods = mods;
+    match code {
+        // Left and right Shift, Control, Alt, Super, Hyper, and Meta.
+        Some(57441 | 57447) => mods.shift = false,
+        Some(57442 | 57448) => mods.ctrl = false,
+        Some(57443 | 57449 | 57446 | 57452) => mods.alt = false,
+        Some(57444 | 57450 | 57445 | 57451) => mods.sup = false,
+        _ => {}
+    }
+    mods
 }
 
 fn codepoint_token(cp: u32, mods: Mods) -> Token {
@@ -591,9 +630,64 @@ mod tests {
     fn kitty_and_modify_other_keys() {
         let mut p = Parser::new();
         assert_eq!(
-            keys(p.feed(b"\x1b[113;5u\x1b[27;5;113~\x1b[13u\x1b[27u\x1b[97;1:3u")),
-            [ctrl('q'), ctrl('q'), key(KeyCode::Enter), key(KeyCode::Esc)],
-            "the key release (event 3) is dropped"
+            keys(p.feed(b"\x1b[113;5u\x1b[27;5;113~\x1b[13u\x1b[27u\x1b[97;5:2u")),
+            [
+                ctrl('q'),
+                ctrl('q'),
+                key(KeyCode::Enter),
+                key(KeyCode::Esc),
+                ctrl('a')
+            ],
+            "a repeat (event 2) is a press"
+        );
+    }
+
+    #[test]
+    fn kitty_key_releases() {
+        let mut p = Parser::new();
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        assert_eq!(
+            p.feed(b"\x1b[45:95;6:3u\x1b[57441;6:3u\x1b[57442;5:3u\x1b[57448;1:3u\x1b[1;5:3B\x1b[5;1:3~"),
+            [
+                Event::Release(ctrl_shift),
+                // Letting go of a modifier: without it, whether or not the
+                // terminal still reports it.
+                Event::Release(Mods::CTRL),
+                Event::Release(Mods::NONE),
+                Event::Release(Mods::NONE),
+                // Not another Down or Page Up.
+                Event::Release(Mods::CTRL),
+                Event::Release(Mods::NONE),
+            ]
+        );
+    }
+
+    #[test]
+    fn kitty_every_key_as_an_escape_code() {
+        let mut p = Parser::new();
+        let shift = Mods::SHIFT;
+        assert_eq!(
+            keys(p.feed(
+                b"\x1b[97u\x1b[97:65;2u\x1b[97;65;65u\x1b[45:95;2;95u\x1b[57441;2u\x1b[97:65;6u"
+            )),
+            [
+                key(KeyCode::Char('a')),
+                // The shifted key, or the text it types, as with Caps Lock.
+                Key::new(KeyCode::Char('A'), shift),
+                key(KeyCode::Char('A')),
+                Key::new(KeyCode::Char('_'), shift),
+                // Shift going down is dropped; with Ctrl, the base key.
+                Key::new(
+                    KeyCode::Char('a'),
+                    Mods {
+                        shift: true,
+                        ..Mods::CTRL
+                    }
+                ),
+            ]
         );
     }
 

@@ -108,6 +108,12 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
 - `src/terminal.zig`: `resetState` clears the title only if `setTerminalTitle`
   set one, so it doesn't clear the title cue put back from the terminal's
   title stack on exit.
+- `src/terminal.zig`, `src/renderer.zig`, `src/lib.zig`:
+  `changeKittyKeyboardFlags` changes the kitty keyboard protocol's flags
+  while it's on (popping and pushing them), and `restoreTerminalModes`
+  pushes the new ones from then on. Returns whether the protocol is on.
+  cue asks for key releases while the panel's recently viewed list is held
+  open.
 
 ## `tree-sitter-latex/`
 

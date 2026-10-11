@@ -3464,6 +3464,13 @@ pub const CliRenderer = struct {
         self.writeOut(writer.buffered());
     }
 
+    pub fn changeKittyKeyboardFlags(self: *CliRenderer, flags: u8) bool {
+        var writer: std.Io.Writer = .fixed(&self.writeOutBuf);
+        const on = self.terminal.changeKittyKeyboardFlags(&writer, flags) catch false;
+        self.writeOut(writer.buffered());
+        return on;
+    }
+
     pub fn disableKittyKeyboard(self: *CliRenderer) void {
         var writer: std.Io.Writer = .fixed(&self.writeOutBuf);
         self.terminal.setKittyKeyboard(&writer, false, 0) catch {};

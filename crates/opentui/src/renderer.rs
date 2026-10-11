@@ -260,6 +260,20 @@ impl Renderer {
         unsafe { sys::disableMouse(self.handle) }
     }
 
+    /// The kitty keyboard protocol's flags the renderer asks for when the
+    /// terminal has it (see [`Renderer::change_kitty_keyboard_flags`]).
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        unsafe { sys::getKittyKeyboardFlags(self.handle) }
+    }
+
+    /// Changes the kitty keyboard protocol's flags (progressive
+    /// enhancement: 1 disambiguates, 2 reports releases, 4 alternate keys,
+    /// 8 every key as an escape code, 16 the text) while the terminal has
+    /// it on. Returns whether it does.
+    pub fn change_kitty_keyboard_flags(&mut self, flags: u8) -> bool {
+        unsafe { sys::changeKittyKeyboardFlags(self.handle, flags) }
+    }
+
     /// Copies `text` to the system clipboard through the terminal (OSC 52).
     /// Terminals may ignore or refuse the request; there is no confirmation.
     pub fn copy_to_clipboard(&mut self, text: &str) -> bool {

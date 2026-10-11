@@ -45,6 +45,7 @@ mod search;
 mod search_modal;
 mod session;
 mod status;
+mod switcher;
 mod symbols;
 mod syntax;
 mod tab;
@@ -94,6 +95,10 @@ const FRAMES_IN_FLIGHT: usize = 2;
 const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long to wait for a terminal that answers, before drawing anyway.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+/// The kitty keyboard protocol's flags while the app waits for a key to
+/// go up: every key as an escape code (8), modifiers included, with the
+/// text it types (16), and whether it went up (2), besides the renderer's.
+const KEY_RELEASE_FLAGS: u8 = 0b11010;
 
 fn main() -> ExitCode {
     // Before anything else: it may start this process over, from a copy of
@@ -737,6 +742,10 @@ fn attached(
     // Whether something happened since the last frame.
     let mut dirty = true;
     let mut drawn = Instant::now();
+    // Whether the terminal was asked to report keys going up, which this
+    // one may do.
+    let mut asked_key_releases = false;
+    app.set_key_releases(true);
     loop {
         // Kept as a session meanwhile, it takes clients.
         let _ = listen(app, listener);
@@ -773,6 +782,9 @@ fn attached(
                 }
                 if dirty {
                     timeout = timeout.min(pacing.time_left());
+                }
+                if let Some(wake) = app.wakes_in() {
+                    timeout = timeout.min(wake);
                 }
                 let mut watched = app.watched();
                 watched.extend(control.as_ref().map(|control| (control.fd(), false)));
@@ -845,6 +857,7 @@ fn attached(
                     app.paste(&text);
                     AppAction::Continue
                 }
+                Event::Release(mods) => app.handle_release(mods),
                 Event::Reply(bytes) => {
                     take_reply(&mut renderer, app, &bytes);
                     AppAction::Continue
@@ -858,6 +871,17 @@ fn attached(
                     renderer.copy_to_clipboard(&text);
                 }
                 AppAction::Continue => {}
+            }
+        }
+
+        if app.wants_key_releases() != asked_key_releases {
+            asked_key_releases = !asked_key_releases;
+            let mut flags = renderer.kitty_keyboard_flags();
+            if asked_key_releases {
+                flags |= KEY_RELEASE_FLAGS;
+            }
+            if !renderer.change_kitty_keyboard_flags(flags) {
+                app.set_key_releases(false);
             }
         }
 

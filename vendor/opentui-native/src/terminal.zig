@@ -1078,6 +1078,20 @@ pub fn setKittyKeyboard(self: *Terminal, tty: anytype, enable: bool, flags: u8) 
     }
 }
 
+/// Changes the flags of the kitty keyboard protocol while it's on, as
+/// pushed by `setKittyKeyboard`: pops them and pushes `flags`, as
+/// `restoreTerminalModes` does, which pushes `flags` from now on. Returns
+/// whether the protocol is on.
+pub fn changeKittyKeyboardFlags(self: *Terminal, tty: anytype, flags: u8) !bool {
+    if (!self.state.kitty_keyboard) return false;
+    if (self.state.kitty_keyboard_flags != flags) {
+        try tty.writeAll(ansi.ANSI.csiUPop);
+        try tty.print(ansi.ANSI.csiUPush, .{flags});
+        self.state.kitty_keyboard_flags = flags;
+    }
+    return true;
+}
+
 pub fn setModifyOtherKeys(self: *Terminal, tty: anytype, enable: bool) !void {
     const seq = if (enable) ansi.ANSI.modifyOtherKeysSet else ansi.ANSI.modifyOtherKeysReset;
     try tty.writeAll(seq);

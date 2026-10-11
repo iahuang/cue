@@ -107,6 +107,7 @@ use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::session::{self, Session, Shown};
 use crate::status::{self, GitBadge, StatusButton};
+use crate::switcher::{Switcher, SwitcherAction};
 use crate::symbols::{self, Symbol, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
@@ -472,6 +473,13 @@ pub struct App {
     /// A context menu, while open, and what its commands act on. Never
     /// open with another popup.
     menu: Option<(ContextMenu, MenuFor)>,
+    /// The active panel's recently viewed list, while open. Never open with
+    /// another popup.
+    switcher: Option<Switcher>,
+    /// The modifiers of the key being handled.
+    pressed: Mods,
+    /// Whether the terminal can report keys going up, as far as known.
+    key_releases: bool,
     /// What the last search left behind, for the next one.
     search_memory: Memory,
     /// The last find bar's query and replacement.
@@ -722,6 +730,9 @@ impl App {
             dialog: None,
             saving: None,
             menu: None,
+            switcher: None,
+            pressed: Mods::NONE,
+            key_releases: true,
             search_memory: Memory::default(),
             find_memory: find::Memory::default(),
             // Tests keep none; those of recovery set a folder of their own.
@@ -779,9 +790,42 @@ impl App {
     pub fn handle_key(&mut self, key: Key) -> AppAction {
         self.hover = None;
         self.clear_underline();
+        self.pressed = key.mods;
         let action = self.dispatch_key(key);
+        self.pressed = Mods::NONE;
         self.after_input();
         action
+    }
+
+    /// A key went up, with `mods` held still. Only reported while
+    /// [`App::wants_key_releases`].
+    pub fn handle_release(&mut self, mods: Mods) -> AppAction {
+        if let Some(switcher) = &self.switcher {
+            let action = switcher.release(mods);
+            self.switcher_action(action);
+            self.after_input();
+        }
+        AppAction::Continue
+    }
+
+    /// Whether the terminal should report keys going up: while the
+    /// recently viewed list is held open.
+    pub fn wants_key_releases(&self) -> bool {
+        self.key_releases && self.switcher.as_ref().is_some_and(Switcher::is_held)
+    }
+
+    /// How long until something changes on screen by itself, if anything
+    /// is waiting to: the recently viewed list showing.
+    pub fn wakes_in(&self) -> Option<Duration> {
+        self.switcher
+            .as_ref()
+            .and_then(|switcher| switcher.shows_in(Instant::now()))
+    }
+
+    /// Says whether the terminal can report keys going up. If not, the
+    /// recently viewed list stays open until Enter, Esc, or another key.
+    pub fn set_key_releases(&mut self, reported: bool) {
+        self.key_releases = reported;
     }
 
     fn dispatch_key(&mut self, key: Key) -> AppAction {
@@ -791,6 +835,14 @@ impl App {
         }
         if self.input.is_some() {
             return self.input_key(key);
+        }
+        if let Some(switcher) = &mut self.switcher {
+            let action = switcher.handle_key(key);
+            if !matches!(action, SwitcherAction::AcceptAndPass(_)) {
+                self.switcher_action(action);
+                return AppAction::Continue;
+            }
+            self.switcher_action(action);
         }
         // While its find bar has the keyboard, keys are the bar's.
         if let Some(terminal) = self
@@ -1124,6 +1176,7 @@ impl App {
             Command::Pop => self.pop(),
             Command::GoBack => self.go_history(true),
             Command::GoForward => self.go_history(false),
+            Command::RecentlyViewed => self.show_recently_viewed(),
             Command::SetMark => self.set_mark(),
             Command::JumpToMark => self.jump_to_mark(),
             Command::FocusPanelLeft => self.focus_panel(Direction::Left),
@@ -1394,6 +1447,13 @@ impl App {
             if input.handle_mouse(mouse, now) == InputAction::Cancel {
                 self.input = None;
             }
+            return AppAction::Continue;
+        }
+        if let Some(switcher) = &mut self.switcher {
+            // Nor does the rest of a click on it go anywhere else.
+            self.mouse_target = None;
+            let action = switcher.handle_mouse(mouse);
+            self.switcher_action(action);
             return AppAction::Continue;
         }
         if let Some((menu, _)) = &mut self.menu {
@@ -1671,6 +1731,7 @@ impl App {
         };
         let popup = self.alert.is_some()
             || self.menu.is_some()
+            || self.switcher.is_some()
             || self.search.is_some()
             || self.picker.is_some()
             || self.dialog.is_some();
@@ -2088,6 +2149,9 @@ impl App {
         if let Some((menu, _)) = &self.menu {
             return menu.hover_area(x, y).map(rect);
         }
+        if let Some(switcher) = &self.switcher {
+            return switcher.hover_area(x, y).map(rect);
+        }
         if let Some(search) = &self.search {
             return search.hover_area(x, y).map(rect);
         }
@@ -2178,6 +2242,7 @@ impl App {
                 && self.input.is_none()
                 && self.toasts.at(area.x, area.y, self.toast_area()).is_none()
                 && self.menu.is_none()
+                && self.switcher.is_none()
                 && self.search.is_none()
                 && self.picker.is_none()
                 && self.dialog.is_none()
@@ -2210,6 +2275,10 @@ impl App {
             menu.draw(frame);
             return None;
         }
+        if let Some(switcher) = &self.switcher {
+            switcher.draw(frame);
+            return None;
+        }
         if let Some(search) = &self.search {
             return search.draw(frame);
         }
@@ -2234,7 +2303,12 @@ impl App {
     /// programs changed, and puts away toasts whose time is up. Returns
     /// whether the screen needs redrawing.
     pub fn poll(&mut self) -> bool {
-        let mut changed = self.toasts.expire(Instant::now());
+        let now = Instant::now();
+        let mut changed = self.toasts.expire(now);
+        changed |= self
+            .switcher
+            .as_mut()
+            .is_some_and(|switcher| switcher.reveal(now));
         for terminal in &self.terminals {
             let mut terminal = terminal.borrow_mut();
             changed |= terminal.poll();
@@ -2609,27 +2683,33 @@ impl App {
     /// again; closed terminals, and those another panel shows now, are
     /// skipped. Returns false if there was nowhere to go.
     fn step_history(&mut self, back: bool) -> bool {
-        let active = self.tab().active;
-        let elsewhere: Vec<u32> = tab::all_panels(&self.tabs)
-            .filter(|panel| panel.id != active)
-            .filter_map(Panel::terminal)
-            .map(|terminal| terminal.borrow().id())
-            .collect();
+        let elsewhere = self.terminals_elsewhere();
         let (documents, terminals) = (&self.documents, &self.terminals);
-        let usable = |visit: &Visit| match visit {
-            Visit::File(doc, path, _) => file_usable(documents, doc, path.as_deref()),
-            Visit::Terminal(id) => {
-                !elsewhere.contains(id) && terminals.iter().any(|t| t.borrow().id() == *id)
-            }
-            Visit::Image(path) => path.is_file(),
-            Visit::Commit { root, .. } => root.is_dir(),
-        };
+        let usable = |visit: &Visit| visit_usable(visit, documents, terminals, &elsewhere);
         let Some(visit) = self.tabs[self.tab]
             .active_panel_mut()
             .step_history(back, usable)
         else {
             return false;
         };
+        self.show_visit(visit);
+        true
+    }
+
+    /// The terminals panels other than the active one show, which it
+    /// can't go back to.
+    fn terminals_elsewhere(&self) -> Vec<u32> {
+        let active = self.tab().active;
+        tab::all_panels(&self.tabs)
+            .filter(|panel| panel.id != active)
+            .filter_map(Panel::terminal)
+            .map(|terminal| terminal.borrow().id())
+            .collect()
+    }
+
+    /// Shows `visit`, which the active panel's history gave, without it
+    /// counting as going somewhere new.
+    fn show_visit(&mut self, visit: Visit) {
         let history = self.active_panel_mut().take_history();
         match visit {
             Visit::File(doc, path, spot) => {
@@ -2658,7 +2738,97 @@ impl App {
             } => self.open_commit(&root, commit, change, true),
         }
         self.active_panel_mut().restore_history(history);
-        true
+    }
+
+    /// Opens the active panel's recently viewed list (see [`Switcher`]),
+    /// unless it has nothing to go back to.
+    fn show_recently_viewed(&mut self) {
+        let entries = self.recently_viewed();
+        if !entries.iter().any(|entry| entry.back.is_some()) {
+            return;
+        }
+        self.close_popups();
+        let panel = self.active_panel();
+        self.switcher = Some(Switcher::new(
+            panel.id,
+            entries,
+            self.pressed,
+            header_of(panel.area()),
+            (self.width, self.height),
+            Instant::now(),
+        ));
+    }
+
+    /// What the active panel shows, then each file, terminal, image, or
+    /// file in a commit it showed before and can go back to, most recent
+    /// first, at the latest place in it.
+    fn recently_viewed(&self) -> Vec<crate::switcher::Entry> {
+        let panel = self.active_panel();
+        let elsewhere = self.terminals_elsewhere();
+        let mut listed: Vec<&Visit> = Vec::new();
+        let mut entries = Vec::new();
+        let current = panel.visit();
+        let current = current.as_ref().map(|visit| (None, visit));
+        let (back, _) = panel.history();
+        let earlier = back
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, visit)| (Some(i), visit));
+        for (index, visit) in current.into_iter().chain(earlier) {
+            let usable = index.is_none()
+                || visit_usable(visit, &self.documents, &self.terminals, &elsewhere);
+            if !usable || listed.iter().any(|seen| seen.shows_same(visit)) {
+                continue;
+            }
+            if let Some(item) = self.visit_item(visit) {
+                listed.push(visit);
+                entries.push(crate::switcher::Entry { item, back: index });
+            }
+        }
+        entries
+    }
+
+    /// `visit`, as the picker would list it.
+    fn visit_item(&self, visit: &Visit) -> Option<Item> {
+        Some(match visit {
+            Visit::File(doc, path, _) => match (path, doc.upgrade()) {
+                (Some(path), _) => Item::file(path.clone(), &self.workspace, ""),
+                (None, Some(doc)) => Item::untitled(doc.untitled.get()),
+                (None, None) => return None,
+            },
+            Visit::Terminal(id) => {
+                let terminal = self.terminals.iter().find(|t| t.borrow().id() == *id)?;
+                let (name, about) = terminal.borrow().label();
+                Item::terminal(*id, &name, &about)
+            }
+            Visit::Image(path) => Item::file(path.clone(), &self.workspace, ""),
+            Visit::Commit {
+                root,
+                commit,
+                change,
+            } => Item::file(root.join(&change.path), &self.workspace, "")
+                .with_detail(&format!("@ {}", commit.short)),
+        })
+    }
+
+    /// Goes back to where the recently viewed list picked, as it says to,
+    /// closing it.
+    fn switcher_action(&mut self, action: SwitcherAction) {
+        let back = match action {
+            SwitcherAction::Continue => return,
+            SwitcherAction::Close => None,
+            SwitcherAction::Accept(back) | SwitcherAction::AcceptAndPass(back) => back,
+        };
+        let Some(switcher) = self.switcher.take() else {
+            return;
+        };
+        let Some(index) = back.filter(|_| self.tab().active == switcher.panel) else {
+            return;
+        };
+        if let Some(visit) = self.active_panel_mut().step_history_to(true, index) {
+            self.show_visit(visit);
+        }
     }
 
     /// Shows `doc` in the active panel if it's open, or else opens `path`
@@ -3319,6 +3489,7 @@ impl App {
         self.alert.is_some()
             || self.input.is_some()
             || self.menu.is_some()
+            || self.switcher.is_some()
             || self.search.is_some()
             || self.picker.is_some()
             || self.dialog.is_some()
@@ -3376,6 +3547,7 @@ impl App {
 
     fn close_popups(&mut self) {
         self.menu = None;
+        self.switcher = None;
         self.picker = None;
         self.dialog = None;
         self.saving = None;
@@ -5605,6 +5777,7 @@ impl App {
         self.focus == Focus::Tree
             && self.sidebar == Sidebar::Commit
             && self.menu.is_none()
+            && self.switcher.is_none()
             && self.search.is_none()
             && self.dialog.is_none()
             && self.picker.is_none()
@@ -7063,6 +7236,7 @@ impl App {
             || self.search.is_some()
             || self.dialog.is_some()
             || self.menu.is_some()
+            || self.switcher.is_some()
             || self.input.is_some();
         if self.focus != Focus::Editor || popup {
             return None;
@@ -7281,6 +7455,10 @@ impl App {
         // Tabs off screen are laid out when they come back.
         let area = self.main_area();
         self.tab_mut().set_area(area);
+        if let Some(switcher) = &mut self.switcher {
+            let header = header_of(self.tabs[self.tab].active_panel().area());
+            switcher.set_size(self.width, self.height, header);
+        }
     }
 
     /// Where Quick Look floats: over the panels, or the whole screen when
@@ -7335,6 +7513,7 @@ impl App {
         };
         let popup = self.alert.is_some()
             || self.menu.is_some()
+            || self.switcher.is_some()
             || self.search.is_some()
             || self.picker.is_some()
             || self.dialog.is_some()
@@ -7423,6 +7602,30 @@ fn file_usable(documents: &[Rc<Document>], doc: &Weak<Document>, path: Option<&P
         .upgrade()
         .is_some_and(|doc| documents.iter().any(|d| Rc::ptr_eq(d, &doc)));
     open || path.is_some_and(Path::is_file)
+}
+
+/// Whether the active panel can go back to `visit`: its file can be
+/// shown, its terminal is still running and not shown in a panel
+/// `elsewhere`, its image is there, or its repository.
+fn visit_usable(
+    visit: &Visit,
+    documents: &[Rc<Document>],
+    terminals: &[Rc<RefCell<Terminal>>],
+    elsewhere: &[u32],
+) -> bool {
+    match visit {
+        Visit::File(doc, path, _) => file_usable(documents, doc, path.as_deref()),
+        Visit::Terminal(id) => {
+            !elsewhere.contains(id) && terminals.iter().any(|t| t.borrow().id() == *id)
+        }
+        Visit::Image(path) => path.is_file(),
+        Visit::Commit { root, .. } => root.is_dir(),
+    }
+}
+
+/// The header row of a panel in `area`.
+fn header_of(area: Rect) -> Rect {
+    Rect { height: 1, ..area }
 }
 
 /// What a session calls `visit`, if it's still about.
@@ -8379,6 +8582,71 @@ mod tests {
             "the terminal is the other panel's"
         );
         assert_eq!(shown_name(&app), shown, "nothing else to go forward to");
+    }
+
+    #[test]
+    fn recently_viewed_goes_back_a_file_at_a_time_while_ctrl_is_held() {
+        let _serial = crate::test_serial();
+        let text: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let files = [("a.txt", text.as_str()), ("b.txt", "b"), ("c.txt", "c")];
+        let root = fixture("recently-viewed", &files);
+        let mut app = app(&root, Some("a.txt"));
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        let row = |app: &App| app.ed().place().0;
+        let chord = |app: &mut App, c, mods| app.handle_key(Key::new(KeyCode::Char(c), mods));
+        let listed = |app: &App| app.switcher.as_ref().map(Switcher::listed);
+        let list = |names: &[&str]| Some(names.iter().map(|name| name.to_string()).collect());
+
+        // Two places in a.txt, then b.txt and c.txt.
+        app.handle_key(Key::new(KeyCode::End, Mods::CTRL));
+        app.open(&root.join("b.txt"), false);
+        app.open(&root.join("c.txt"), false);
+        chord(&mut app, '-', ctrl_shift);
+        assert_eq!(listed(&app), list(&["c.txt", ">b.txt", "a.txt"]));
+        assert!(app.wants_key_releases());
+        // Shift goes up first; - and = with Ctrl alone move too.
+        app.handle_release(Mods::CTRL);
+        chord(&mut app, '-', Mods::CTRL);
+        chord(&mut app, '-', Mods::CTRL);
+        assert_eq!(listed(&app), list(&["c.txt", "b.txt", ">a.txt"]));
+        chord(&mut app, '=', Mods::CTRL);
+        chord(&mut app, '-', ctrl_shift);
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"), "still open");
+        app.handle_release(Mods::NONE);
+        assert!(app.switcher.is_none() && !app.wants_key_releases());
+        assert_eq!(
+            (shown_name(&app).as_deref(), row(&app)),
+            (Some("a.txt"), 200)
+        );
+
+        // As Go Back went there, Go Forward comes back a place at a time.
+        ctrl(&mut app, '=');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        // A tap goes back one.
+        chord(&mut app, '-', ctrl_shift);
+        app.handle_release(Mods::SHIFT);
+        assert_eq!(
+            (shown_name(&app).as_deref(), row(&app)),
+            (Some("a.txt"), 200)
+        );
+        // Only other places in what's shown: nothing to go back to.
+        chord(&mut app, '-', ctrl_shift);
+        assert_eq!(listed(&app), None);
+
+        // Esc stays; from the palette, it's open until Enter.
+        ctrl(&mut app, '=');
+        chord(&mut app, '-', ctrl_shift);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        app.run(Command::RecentlyViewed, false);
+        assert!(!app.wants_key_releases());
+        app.handle_release(Mods::NONE);
+        assert_eq!(listed(&app), list(&["b.txt", ">a.txt"]));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
     }
 
     #[test]

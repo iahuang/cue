@@ -247,6 +247,24 @@ impl Item {
         }
     }
 
+    /// The same, with `detail` on the right instead.
+    pub fn with_detail(self, detail: &str) -> Item {
+        Item {
+            detail: detail.to_string(),
+            ..self
+        }
+    }
+
+    /// The columns it takes to draw in full (see [`draw_item`]), its
+    /// icon's included.
+    pub fn width(&self) -> usize {
+        let detail = match self.detail.is_empty() {
+            true => 0,
+            false => self.detail.chars().count() + 2,
+        };
+        icons::WIDTH as usize + self.text.chars().count() + detail
+    }
+
     /// The file it is, if it's one.
     pub fn path(&self) -> Option<&Path> {
         match &self.choice {
@@ -1080,43 +1098,9 @@ impl Picker {
         }
     }
 
-    /// Draws `item` in the `room` columns from `x`: its text with the matched
-    /// characters highlighted, and its detail on the right. A long file path
-    /// is cut on the left, to keep its name.
+    /// Draws `item` in the `room` columns from `x`, with the characters
+    /// the query matches highlighted (see [`draw_item`]).
     fn draw_item(&self, frame: &Buffer, item: &Item, x: u32, y: u32, room: usize) {
-        let colors = theme::colors();
-        let icon = match &item.choice {
-            Choice::File(path) => Some(icons::file(
-                &path.file_name().unwrap_or_default().to_string_lossy(),
-            )),
-            Choice::Untitled(_) => Some(icons::file("")),
-            Choice::Terminal(_) => Some(icons::terminal()),
-            Choice::Branch(_) => Some(icons::branch()),
-            _ => None,
-        };
-        let (x, room) = match icon.filter(|_| icons::enabled() && room > 2 * icons::WIDTH as usize)
-        {
-            Some(icon) => (icon.draw(frame, x, y, None), room - icons::WIDTH as usize),
-            None => (x, room),
-        };
-        let detail = item.detail.chars().count();
-        if detail > 0 && detail + 2 < room {
-            let detail_x = x + (room - detail) as u32;
-            frame.draw_text(
-                &item.detail,
-                detail_x,
-                y,
-                colors.muted,
-                None,
-                Attributes::NONE,
-            );
-        }
-        let room = if detail > 0 && detail + 2 < room {
-            room - detail - 2
-        } else {
-            room
-        };
-
         let mut highlights = Vec::new();
         let mut buf = Vec::new();
         self.pattern.indices(
@@ -1125,59 +1109,104 @@ impl Picker {
             &mut highlights,
         );
         let highlights: HashSet<usize> = highlights.into_iter().map(|i| i as usize).collect();
+        draw_item(frame, item, x, y, room, &highlights);
+    }
+}
 
-        let chars: Vec<char> = item.text.chars().collect();
-        let (shown, ellipsis): (Range<usize>, &str) = if chars.len() <= room {
-            (0..chars.len(), "")
-        } else if matches!(item.choice, Choice::File(_)) {
-            (chars.len() + 1 - room..chars.len(), "…")
-        } else {
-            (0..room.saturating_sub(1), "…")
-        };
-        let mut x = x;
-        // A colored name's matches keep its color, as the match color
-        // could be the name's own.
-        let color = item
-            .color
-            .map(|color| (color.fg().unwrap_or(colors.text), color.attributes()));
-        let style = |i: usize| {
-            let dim = item.dim.contains(&i);
-            match (highlights.contains(&i), color.filter(|_| !dim)) {
-                (true, Some((fg, attributes))) => {
-                    (fg, attributes | Attributes::BOLD | Attributes::UNDERLINE)
-                }
-                (true, None) => (colors.accent, Attributes::BOLD),
-                (false, _) if dim => (colors.muted, Attributes::NONE),
-                (false, Some(style)) => style,
-                (false, None) => (colors.text, Attributes::NONE),
+/// Draws `item` in the `room` columns from `x`: its icon, its text with the
+/// characters at `highlights` highlighted, and its detail on the right. A
+/// long file path is cut on the left, to keep its name.
+pub fn draw_item(
+    frame: &Buffer,
+    item: &Item,
+    x: u32,
+    y: u32,
+    room: usize,
+    highlights: &HashSet<usize>,
+) {
+    let colors = theme::colors();
+    let icon = match &item.choice {
+        Choice::File(path) => Some(icons::file(
+            &path.file_name().unwrap_or_default().to_string_lossy(),
+        )),
+        Choice::Untitled(_) => Some(icons::file("")),
+        Choice::Terminal(_) => Some(icons::terminal()),
+        Choice::Branch(_) => Some(icons::branch()),
+        _ => None,
+    };
+    let (x, room) = match icon.filter(|_| icons::enabled() && room > 2 * icons::WIDTH as usize) {
+        Some(icon) => (icon.draw(frame, x, y, None), room - icons::WIDTH as usize),
+        None => (x, room),
+    };
+    let detail = item.detail.chars().count();
+    if detail > 0 && detail + 2 < room {
+        let detail_x = x + (room - detail) as u32;
+        frame.draw_text(
+            &item.detail,
+            detail_x,
+            y,
+            colors.muted,
+            None,
+            Attributes::NONE,
+        );
+    }
+    let room = if detail > 0 && detail + 2 < room {
+        room - detail - 2
+    } else {
+        room
+    };
+
+    let chars: Vec<char> = item.text.chars().collect();
+    let (shown, ellipsis): (Range<usize>, &str) = if chars.len() <= room {
+        (0..chars.len(), "")
+    } else if matches!(item.choice, Choice::File(_)) {
+        (chars.len() + 1 - room..chars.len(), "…")
+    } else {
+        (0..room.saturating_sub(1), "…")
+    };
+    let mut x = x;
+    // A colored name's matches keep its color, as the match color
+    // could be the name's own.
+    let color = item
+        .color
+        .map(|color| (color.fg().unwrap_or(colors.text), color.attributes()));
+    let style = |i: usize| {
+        let dim = item.dim.contains(&i);
+        match (highlights.contains(&i), color.filter(|_| !dim)) {
+            (true, Some((fg, attributes))) => {
+                (fg, attributes | Attributes::BOLD | Attributes::UNDERLINE)
             }
-        };
-        let mut draw = |text: &str, (fg, attributes): (Rgba, Attributes)| {
-            frame.draw_text(text, x, y, fg, None, attributes);
-            x += text.chars().count() as u32;
-        };
-        let cut_left = shown.start > 0;
-        if cut_left {
-            draw(ellipsis, (colors.muted, Attributes::NONE));
+            (true, None) => (colors.accent, Attributes::BOLD),
+            (false, _) if dim => (colors.muted, Attributes::NONE),
+            (false, Some(style)) => style,
+            (false, None) => (colors.text, Attributes::NONE),
         }
-        // Runs of characters with the same style.
-        let mut run = String::new();
-        let mut run_style = None;
-        for i in shown.clone() {
-            let style = style(i);
-            if let Some(previous) = run_style.filter(|&s| s != style) {
-                draw(&run, previous);
-                run.clear();
-            }
-            run.push(chars[i]);
-            run_style = Some(style);
+    };
+    let mut draw = |text: &str, (fg, attributes): (Rgba, Attributes)| {
+        frame.draw_text(text, x, y, fg, None, attributes);
+        x += text.chars().count() as u32;
+    };
+    let cut_left = shown.start > 0;
+    if cut_left {
+        draw(ellipsis, (colors.muted, Attributes::NONE));
+    }
+    // Runs of characters with the same style.
+    let mut run = String::new();
+    let mut run_style = None;
+    for i in shown.clone() {
+        let style = style(i);
+        if let Some(previous) = run_style.filter(|&s| s != style) {
+            draw(&run, previous);
+            run.clear();
         }
-        if let Some(style) = run_style {
-            draw(&run, style);
-        }
-        if !cut_left && shown.end < chars.len() {
-            draw(ellipsis, (colors.muted, Attributes::NONE));
-        }
+        run.push(chars[i]);
+        run_style = Some(style);
+    }
+    if let Some(style) = run_style {
+        draw(&run, style);
+    }
+    if !cut_left && shown.end < chars.len() {
+        draw(ellipsis, (colors.muted, Attributes::NONE));
     }
 }
 

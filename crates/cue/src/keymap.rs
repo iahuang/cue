@@ -128,6 +128,7 @@ commands! {
     Pop => "panel:pop", "Pop";
     GoBack => "panel:go-back", "Go Back";
     GoForward => "panel:go-forward", "Go Forward";
+    RecentlyViewed => "panel:recently-viewed", "Show Recently Viewed";
     SetMark => "mark:set", "Set Mark";
     JumpToMark => "mark:jump", "Jump to Mark";
     FocusPanelLeft => "panel:focus-left", "Focus Panel Left";
@@ -269,12 +270,12 @@ impl Command {
             | OpenFile | GoToFile | GoToUnsaved | GoToLine | GoToSymbol | GoToWorkspaceSymbol
             | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext
             | FindPrevious | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight
-            | SplitDown | ClosePanel | Pop | GoBack | GoForward | SetMark | JumpToMark
-            | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal
-            | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft | MoveTabRight
-            | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6
-            | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch | GitPull
-            | GitPush => Context::Global,
+            | SplitDown | ClosePanel | Pop | GoBack | GoForward | RecentlyViewed | SetMark
+            | JumpToMark | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown
+            | NewTerminal | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
+            | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5
+            | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch
+            | GitPull | GitPush => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
@@ -474,6 +475,10 @@ impl Default for Keymap {
         bindings.push((key(Char('-'), Mods::CTRL), GoBack));
         bindings.push((key(Char('_'), Mods::CTRL), GoBack));
         bindings.push((key(Char('='), Mods::CTRL), GoForward));
+        // Held, as macOS's Cmd+Tab, to go back further. Some terminals
+        // report the shifted key, `_`; legacy terminals send it as Ctrl+-.
+        bindings.push((key(Char('-'), CTRL_SHIFT), RecentlyViewed));
+        bindings.push((key(Char('_'), CTRL_SHIFT), RecentlyViewed));
         // Ctrl+' sets the mark and Ctrl+Shift+' jumps to it. Some terminals
         // report the shifted key, `"`. Legacy terminals can't send these;
         // the kitty protocol can.

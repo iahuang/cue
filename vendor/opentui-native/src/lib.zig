@@ -2400,6 +2400,11 @@ export fn enableKittyKeyboard(renderer_handle: NativeHandle, flags: u8) void {
     object_ptr.enableKittyKeyboard(flags);
 }
 
+export fn changeKittyKeyboardFlags(renderer_handle: NativeHandle, flags: u8) bool {
+    const object_ptr = acquireRenderer(renderer_handle) orelse return false;
+    return object_ptr.changeKittyKeyboardFlags(flags);
+}
+
 export fn disableKittyKeyboard(renderer_handle: NativeHandle) void {
     const object_ptr = acquireRenderer(renderer_handle) orelse return;
     object_ptr.disableKittyKeyboard();
