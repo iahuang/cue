@@ -31,7 +31,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::document::{self, Checked, LineEnding, Loaded, Stamp, Unsaved};
+use crate::document::{self, Checked, LineEnding, Loaded, Stamp, Unsaved, Written};
 use crate::file_dialog;
 use crate::file_index;
 use crate::file_ops::{self, FileOp};
@@ -92,9 +92,11 @@ pub enum Request {
     /// far as it goes, if `progress`, and then all of them. Files that
     /// haven't changed since the last indexing aren't read again.
     IndexSymbols { files: Vec<PathBuf>, progress: bool },
-    /// The text of the file at `path`, to open (see [`crate::document`]).
+    /// The text of the file at `path`, to open, and where it is,
+    /// [`document::resolve`]d (see [`document::load`]).
     Load { path: PathBuf },
-    /// Writing `text` to `path` (see [`document::write`]).
+    /// Writing `text` to `path`, [`document::resolve`]d (see
+    /// [`document::write`]).
     Save {
         path: PathBuf,
         text: String,
@@ -115,6 +117,8 @@ pub enum Request {
         path: PathBuf,
         unless: Option<image::Stamp>,
     },
+    /// What each of `paths` is, a reply in all.
+    Look { paths: Vec<PathBuf> },
     /// What's at `path`, for Quick Look (see [`quick_look::peek`]).
     Peek { path: PathBuf },
     /// What's in `dir`, for the file dialog (see [`crate::file_dialog`]).
@@ -155,11 +159,14 @@ pub enum Reply {
         checked: Checked,
     },
     /// The file as written, or why it wasn't.
-    Saved(Result<Stamp, Unsaved>),
+    Saved(Result<Written, Unsaved>),
     /// A file's bytes, and how it was on disk then; `None` if it was as
     /// last read; or why it couldn't be read.
     Bytes(Result<Option<image::FileRead>, String>),
     Peeked(Peek),
+    /// What each path of a [`Request::Look`] is, or `None` if it isn't
+    /// there.
+    Looked(Vec<Option<Look>>),
     /// What's in a folder, for the file dialog, or why it couldn't be read.
     Dir {
         dir: PathBuf,
@@ -194,6 +201,14 @@ pub enum Reply {
     FileOpDone(Result<(), String>),
     /// The new commit's abbreviated hash, or what went wrong.
     Committed(Result<String, String>),
+}
+
+/// What a path is, as the host found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Look {
+    /// Where it really is: absolute, with symlinks followed.
+    pub real: PathBuf,
+    pub is_dir: bool,
 }
 
 /// What the app asks of the host with no answer.
@@ -563,7 +578,15 @@ fn answer(request: Request, state: &State, responder: Responder) {
             expected,
             make_folder,
         } => {
-            let written = document::write(&path, &text, line_ending, expected, make_folder);
+            let path = document::resolve(&path);
+            let written =
+                document::write(&path, &text, line_ending, expected, make_folder).map(|stamp| {
+                    Written {
+                        real: std::fs::canonicalize(&path).ok(),
+                        path,
+                        stamp,
+                    }
+                });
             responder.reply(Reply::Saved(written));
         }
         Request::CheckDisk { files } => {
@@ -576,6 +599,17 @@ fn answer(request: Request, state: &State, responder: Responder) {
         }
         Request::ReadFile { path, unless } => {
             responder.reply(Reply::Bytes(image::read_if_changed(&path, unless)));
+        }
+        Request::Look { paths } => {
+            let looked = paths
+                .iter()
+                .map(|path| {
+                    let real = std::fs::canonicalize(path).ok()?;
+                    let is_dir = real.is_dir();
+                    Some(Look { real, is_dir })
+                })
+                .collect();
+            responder.reply(Reply::Looked(looked));
         }
         Request::Peek { path } => {
             responder.reply(Reply::Peeked(quick_look::peek(&path)));

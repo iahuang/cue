@@ -7,7 +7,8 @@
 - Move the rest of git (staging, stashing, branches, the log, commit diffs, and diff bases) to the host (`a4ba4bf`)
 - Read images, PDFs, and Quick Look's previews through the host (`e34e41e`)
 - Run terminals' shells on the host (`bfc16b2`)
-- Keep sessions' files on the host
+- Keep sessions' files on the host (`a71b305`)
+- Finish moving file system checks to the host: it resolves paths, startup and session restore load in one round trip, and periodic session saves don't wait
 
 ## v0.4.2 — 2026-10-11
 

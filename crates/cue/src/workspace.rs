@@ -32,7 +32,9 @@ impl Workspace {
         &self.roots
     }
 
-    /// Adds the directory `path`, unless it is already a root.
+    /// Adds the directory `path`, unless it is already a root. It looks
+    /// at the file system, so it's for starting, before there's a host;
+    /// after, see [`Workspace::add_folder`].
     pub fn add_root(&mut self, path: &Path) -> io::Result<()> {
         let root = path.canonicalize()?;
         if !root.is_dir() {
@@ -41,11 +43,17 @@ impl Workspace {
                 format!("{} is not a directory", path.display()),
             ));
         }
+        self.add_folder(root);
+        Ok(())
+    }
+
+    /// Adds `root`, a folder the host found, absolute and symlink-free,
+    /// unless it is already a root.
+    pub fn add_folder(&mut self, root: PathBuf) {
         if !self.roots.contains(&root) {
             self.roots.push(root);
             self.names = root_names(&self.roots);
         }
-        Ok(())
     }
 
     /// Removes the root `root`. Returns false if it isn't one.

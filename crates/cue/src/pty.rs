@@ -390,8 +390,14 @@ fn winsize(cols: u16, rows: u16) -> libc::winsize {
 /// How a terminal starts on the host.
 #[derive(Debug, Clone)]
 pub enum Start {
-    /// The user's shell (see [`Pty::shell`]).
-    Shell { cwd: PathBuf, cols: u16, rows: u16 },
+    /// The user's shell (see [`Pty::shell`]), in `cwd`, or in `or` if
+    /// that isn't a folder (any more).
+    Shell {
+        cwd: PathBuf,
+        or: Option<PathBuf>,
+        cols: u16,
+        rows: u16,
+    },
     /// A pty a process this one replaced left running (see [`Pty::adopt`]).
     Adopt { fd: RawFd, pid: libc::pid_t },
 }
@@ -488,7 +494,15 @@ pub fn controls() -> io::Result<(Controller, Controls)> {
 /// and everything it started close the pty, or it's let go of.
 pub fn serve(start: Start, controls: Controls, mut send: impl FnMut(Event) -> bool) {
     let pty = match start {
-        Start::Shell { cwd, cols, rows } => Pty::shell(&cwd, cols, rows),
+        Start::Shell {
+            cwd,
+            or,
+            cols,
+            rows,
+        } => match or.filter(|_| !cwd.is_dir()) {
+            Some(or) => Pty::shell(&or, cols, rows),
+            None => Pty::shell(&cwd, cols, rows),
+        },
         Start::Adopt { fd, pid } => Pty::adopt(fd, pid),
     };
     let mut pty = match pty {

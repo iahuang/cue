@@ -324,7 +324,7 @@ fn body_of(path: &Path, peek: Peek, theme: &Rc<Theme>) -> (Body, Option<String>)
         }
         Peek::Text(loaded, size) => (loaded, human_size(size)),
     };
-    let doc = match Document::loaded(path.to_path_buf(), loaded, theme.clone()) {
+    let doc = match Document::loaded(loaded, theme.clone()) {
         Ok((doc, _)) => doc,
         Err(_) => return (Body::Note("No preview".into()), Some(size)),
     };

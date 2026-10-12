@@ -173,6 +173,7 @@ impl Terminal {
             host,
             Start::Shell {
                 cwd: cwd.clone(),
+                or: None,
                 cols,
                 rows,
             },
@@ -182,11 +183,14 @@ impl Terminal {
 
     /// A terminal of a session saved before: `screen`, the text it showed
     /// `cols` wide (see [`Terminal::screen`]), then below a line saying it
-    /// was saved at `saved` (seconds since the epoch), a new shell in `cwd`.
+    /// was saved at `saved` (seconds since the epoch), a new shell in `cwd`,
+    /// or `or` if it's gone.
+    #[allow(clippy::too_many_arguments)]
     pub fn restore(
         host: &Link,
         id: u32,
         cwd: &Path,
+        or: &Path,
         area: Rect,
         screen: Option<&[u8]>,
         cols: u16,
@@ -208,6 +212,7 @@ impl Terminal {
         let _ = vt.resize(width, rows);
         let start = Start::Shell {
             cwd: cwd.to_path_buf(),
+            or: Some(or.to_path_buf()),
             cols: width,
             rows,
         };
@@ -349,6 +354,7 @@ impl Terminal {
         let (cols, rows) = size(self.area);
         let start = Start::Shell {
             cwd: self.cwd.clone(),
+            or: None,
             cols,
             rows,
         };

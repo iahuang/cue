@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use toml::{Table, Value};
 
 use crate::document::Document;
-use crate::host::{Link, Reply, Request};
+use crate::host::{Call, Link, Reply, Request};
 use crate::indent::Indent;
 use crate::layout::{Axis, Layout, PanelId};
 
@@ -208,8 +208,6 @@ pub struct Session {
     unknown: Table,
     /// The state last written, to write only what changed.
     written: Option<String>,
-    /// Names the next document's text.
-    next_text: u32,
 }
 
 /// A document's unsaved text, in `docs/`.
@@ -267,16 +265,6 @@ impl Session {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // After the texts it kept already.
-        let next_text = fs::read_dir(dir.join("docs"))
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.ok()?.file_name();
-                name.to_str()?.strip_suffix(".txt")?.parse::<u32>().ok()
-            })
-            .max()
-            .map_or(1, |n| n + 1);
         Ok(Session {
             id,
             name: None,
@@ -284,7 +272,6 @@ impl Session {
             dir: dir.to_path_buf(),
             _lock: lock,
             written: None,
-            next_text,
         })
     }
 
@@ -334,30 +321,52 @@ impl Session {
         Ok(true)
     }
 
-    /// Keeps unsaved `text` in `docs/`, as `name`, or under a new name.
-    /// Returns its name there.
-    pub fn write_text(&mut self, name: Option<&str>, text: &str) -> io::Result<String> {
-        let name = match name {
-            Some(name) => name.to_string(),
-            None => {
-                self.next_text += 1;
-                format!("{}.txt", self.next_text - 1)
-            }
-        };
+    /// Writes what `snapshot` has: its texts and screens, then its state,
+    /// as [`Session::save`] does, and once that's written, removes the
+    /// texts, and with `prune_screens` the screens, that it no longer
+    /// names. Returns whether the state was written.
+    pub fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<bool> {
+        for (name, text) in &snapshot.texts {
+            self.write_text(name, text)?;
+        }
+        for (id, screen) in &snapshot.screens {
+            self.save_screen(*id, screen)?;
+        }
+        let state = &snapshot.state;
+        let written = self.save(state)?;
+        // Only the committed state decides which may go.
+        let texts: Vec<String> = state
+            .documents
+            .iter()
+            .filter_map(|doc| doc.unsaved.clone())
+            .collect();
+        self.prune_texts(&texts);
+        if snapshot.prune_screens {
+            let screens: Vec<String> = state
+                .terminals
+                .iter()
+                .filter_map(|terminal| terminal.screen.clone())
+                .collect();
+            self.prune_screens(&screens);
+        }
+        Ok(written)
+    }
+
+    /// Keeps unsaved `text` in `docs/`, as `name`.
+    fn write_text(&mut self, name: &str, text: &str) -> io::Result<()> {
         let docs = self.dir.join("docs");
         fs::create_dir_all(&docs)?;
-        write_atomic(&docs.join(&name), text.as_bytes())?;
-        Ok(name)
+        write_atomic(&docs.join(name), text.as_bytes())
     }
 
     /// Removes the texts in `docs/` but `kept`.
-    pub fn prune_texts(&mut self, kept: &[String]) {
+    fn prune_texts(&mut self, kept: &[String]) {
         prune(&self.dir.join("docs"), kept);
     }
 
     /// Keeps terminal `id`'s `screen`, returning its name in `terminals/`.
     pub fn save_screen(&self, id: u32, screen: &[u8]) -> io::Result<String> {
-        let name = format!("{id}.vt");
+        let name = screen_name(id);
         let terminals = self.dir.join("terminals");
         fs::create_dir_all(&terminals)?;
         write_atomic(&terminals.join(&name), screen)?;
@@ -365,11 +374,11 @@ impl Session {
     }
 
     /// Removes the screens in `terminals/` but `kept`.
-    pub fn prune_screens(&self, kept: &[String]) {
+    fn prune_screens(&self, kept: &[String]) {
         prune(&self.dir.join("terminals"), kept);
     }
 
-    /// Unsaved text kept by [`Session::save_text`], by name.
+    /// Unsaved text kept by [`Session::snapshot`], by name.
     pub fn text(&self, name: &str) -> io::Result<String> {
         fs::read_to_string(self.dir.join("docs").join(name))
     }
@@ -385,6 +394,23 @@ impl Session {
     }
 }
 
+/// What terminal `id`'s screen is kept as, in `terminals/`.
+pub fn screen_name(id: u32) -> String {
+    format!("{id}.vt")
+}
+
+/// Everything a session saves at once (see [`Session::snapshot`]).
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub state: State,
+    /// Unsaved texts that changed, by name.
+    pub texts: Vec<(String, String)>,
+    /// Terminals' screens that changed, by terminal.
+    pub screens: Vec<(u32, Vec<u8>)>,
+    /// Whether the screens the state doesn't name go.
+    pub prune_screens: bool,
+}
+
 /// What the app asks of its session's files, which the host keeps (see
 /// [`run`]).
 #[derive(Debug, Clone)]
@@ -396,21 +422,12 @@ pub enum SessionCall {
     Rename(Option<String>),
     /// Takes its name and the keys this cue doesn't know from this, as
     /// restored.
-    Carry(State),
-    Save(State),
-    /// Unsaved text, under its name, or a new one.
-    WriteText {
-        name: Option<String>,
-        text: String,
-    },
-    PruneTexts(Vec<String>),
-    Text(String),
-    SaveScreen {
-        id: u32,
-        screen: Vec<u8>,
-    },
-    PruneScreens(Vec<String>),
-    Screen(String),
+    Carry(Box<State>),
+    Save(Box<Snapshot>),
+    /// Unsaved texts, by name.
+    Texts(Vec<String>),
+    /// Terminals' screens, by name.
+    Screens(Vec<String>),
     /// Lets it go, removing everything it kept.
     End,
 }
@@ -422,10 +439,8 @@ pub enum SessionAnswer {
     Opened(Result<(String, PathBuf), String>),
     /// Whether it was written.
     Saved(Result<bool, String>),
-    /// What a text or screen is kept as.
-    Named(Result<String, String>),
-    Text(Result<String, String>),
-    Screen(Option<Vec<u8>>),
+    Texts(Vec<Result<String, String>>),
+    Screens(Vec<Option<Vec<u8>>>),
     Done,
 }
 
@@ -448,11 +463,10 @@ pub fn run(call: SessionCall, session: &mut Option<Session>) -> SessionAnswer {
         let none = "Not a session.".to_string();
         return match call {
             SessionCall::Save(_) => SessionAnswer::Saved(Err(none)),
-            SessionCall::WriteText { .. } | SessionCall::SaveScreen { .. } => {
-                SessionAnswer::Named(Err(none))
+            SessionCall::Texts(names) => {
+                SessionAnswer::Texts(names.iter().map(|_| Err(none.clone())).collect())
             }
-            SessionCall::Text(_) => SessionAnswer::Text(Err(none)),
-            SessionCall::Screen(_) => SessionAnswer::Screen(None),
+            SessionCall::Screens(names) => SessionAnswer::Screens(vec![None; names.len()]),
             _ => SessionAnswer::Done,
         };
     };
@@ -466,23 +480,18 @@ pub fn run(call: SessionCall, session: &mut Option<Session>) -> SessionAnswer {
             current.carry(&state);
             SessionAnswer::Done
         }
-        SessionCall::Save(state) => SessionAnswer::Saved(current.save(&state).map_err(err)),
-        SessionCall::WriteText { name, text } => {
-            SessionAnswer::Named(current.write_text(name.as_deref(), &text).map_err(err))
+        SessionCall::Save(snapshot) => {
+            SessionAnswer::Saved(current.snapshot(&snapshot).map_err(err))
         }
-        SessionCall::PruneTexts(kept) => {
-            current.prune_texts(&kept);
-            SessionAnswer::Done
+        SessionCall::Texts(names) => SessionAnswer::Texts(
+            names
+                .iter()
+                .map(|name| current.text(name).map_err(err))
+                .collect(),
+        ),
+        SessionCall::Screens(names) => {
+            SessionAnswer::Screens(names.iter().map(|name| current.screen(name)).collect())
         }
-        SessionCall::Text(name) => SessionAnswer::Text(current.text(&name).map_err(err)),
-        SessionCall::SaveScreen { id, screen } => {
-            SessionAnswer::Named(current.save_screen(id, &screen).map_err(err))
-        }
-        SessionCall::PruneScreens(kept) => {
-            current.prune_screens(&kept);
-            SessionAnswer::Done
-        }
-        SessionCall::Screen(name) => SessionAnswer::Screen(current.screen(&name)),
         SessionCall::End => {
             if let Some(ended) = session.take() {
                 ended.end();
@@ -493,15 +502,21 @@ pub fn run(call: SessionCall, session: &mut Option<Session>) -> SessionAnswer {
 }
 
 /// The app's end of its session, whose files the host keeps: which of
-/// them has each document's unsaved text. Each call waits for the host,
-/// which for now is at hand.
+/// them has each document's unsaved text, and what's to be written with
+/// the next save. Saving waits for the host only if asked to; the rest of
+/// its calls, rare, wait.
 pub struct SessionLink {
     host: Link,
     id: String,
     dir: PathBuf,
     name: Option<String>,
-    /// The documents whose unsaved text is in `docs/`.
+    /// The documents whose unsaved text is in `docs/`, or is on its way.
     texts: Vec<Text>,
+    /// Names the next document's text.
+    next_text: u32,
+    /// Texts and screens for the next save.
+    pending_texts: Vec<(String, String)>,
+    pending_screens: Vec<(u32, Vec<u8>)>,
 }
 
 impl SessionLink {
@@ -524,6 +539,9 @@ impl SessionLink {
                 dir,
                 name: None,
                 texts: Vec::new(),
+                next_text: 1,
+                pending_texts: Vec::new(),
+                pending_screens: Vec::new(),
             }),
             SessionAnswer::Opened(Err(err)) => Err(io::Error::other(err)),
             _ => Err(other_answer()),
@@ -556,7 +574,7 @@ impl SessionLink {
     /// Takes what's its own from `state`, as restored.
     pub fn carry(&mut self, state: &State) {
         self.name = state.name.clone();
-        self.ask(SessionCall::Carry(state.clone()));
+        self.ask(SessionCall::Carry(Box::new(state.clone())));
     }
 
     /// Where it takes attaching while it runs.
@@ -564,17 +582,47 @@ impl SessionLink {
         socket_path(&self.dir)
     }
 
-    /// Writes `state`, as [`Session::save`] does.
-    pub fn save(&mut self, state: &State) -> io::Result<bool> {
-        match self.ask(SessionCall::Save(state.clone())) {
-            SessionAnswer::Saved(saved) => saved.map_err(io::Error::other),
-            _ => Err(other_answer()),
-        }
+    /// Has the host write `state`, with the texts and screens noted for it
+    /// since the last save (see [`Session::snapshot`]). Its answer comes
+    /// to the call (see [`SessionLink::saved`]).
+    pub fn save(&mut self, state: State, prune_screens: bool) -> Call {
+        let kept: Vec<&String> = state
+            .documents
+            .iter()
+            .filter_map(|doc| doc.unsaved.as_ref())
+            .collect();
+        self.texts.retain(|text| kept.contains(&&text.name));
+        let snapshot = Snapshot {
+            state,
+            texts: std::mem::take(&mut self.pending_texts),
+            screens: std::mem::take(&mut self.pending_screens),
+            prune_screens,
+        };
+        self.host
+            .call(Request::Session(SessionCall::Save(Box::new(snapshot))))
     }
 
-    /// Keeps `doc`'s unsaved text in `docs/`, unless it's there as it is
-    /// now. Returns its name there, or `None` if it has no unsaved changes.
-    pub fn save_text(&mut self, doc: &Rc<Document>) -> io::Result<Option<String>> {
+    /// How a save went, from the host's `reply`, if it's said: whether
+    /// the state was written. If it failed, the texts are written again
+    /// with the next save.
+    pub fn saved(&mut self, reply: Option<Reply>) -> io::Result<bool> {
+        let saved = match reply {
+            Some(Reply::Session(SessionAnswer::Saved(saved))) => saved.map_err(io::Error::other),
+            Some(_) => Err(other_answer()),
+            None => Err(io::Error::other("The host stopped.")),
+        };
+        if saved.is_err() {
+            for text in &mut self.texts {
+                text.epoch = u64::MAX;
+            }
+        }
+        saved
+    }
+
+    /// Notes `doc`'s unsaved text for the next save, unless it's kept as
+    /// it is now. Returns its name in `docs/`, or `None` if it has no
+    /// unsaved changes.
+    pub fn save_text(&mut self, doc: &Rc<Document>) -> Option<String> {
         let epoch = doc.buffer.content_epoch();
         let index = self
             .texts
@@ -582,20 +630,18 @@ impl SessionLink {
             .position(|text| text.doc.as_ptr() == Rc::as_ptr(doc));
         if let Some(text) = index.map(|index| &self.texts[index]) {
             if text.epoch == epoch && doc.is_modified() {
-                return Ok(Some(text.name.clone()));
+                return Some(text.name.clone());
             }
         }
-        let Some(unsaved) = doc.unsaved_text() else {
-            return Ok(None);
+        let unsaved = doc.unsaved_text()?;
+        let name = match index {
+            Some(index) => self.texts[index].name.clone(),
+            None => {
+                self.next_text += 1;
+                format!("{}.txt", self.next_text - 1)
+            }
         };
-        let name = index.map(|index| self.texts[index].name.clone());
-        let name = match self.ask(SessionCall::WriteText {
-            name,
-            text: unsaved,
-        }) {
-            SessionAnswer::Named(name) => name.map_err(io::Error::other)?,
-            _ => return Err(other_answer()),
-        };
+        self.pending_texts.push((name.clone(), unsaved));
         let text = Text {
             doc: Rc::downgrade(doc),
             name: name.clone(),
@@ -605,18 +651,18 @@ impl SessionLink {
             Some(index) => self.texts[index] = text,
             None => self.texts.push(text),
         }
-        Ok(Some(name))
-    }
-
-    /// Removes the texts in `docs/` but `kept`.
-    pub fn prune_texts(&mut self, kept: &[String]) {
-        self.texts.retain(|text| kept.contains(&text.name));
-        self.ask(SessionCall::PruneTexts(kept.to_vec()));
+        Some(name)
     }
 
     /// Notes that `doc`'s unsaved text is kept as `name`, as restored from
     /// it, so that it isn't written again until it changes.
     pub fn note_text(&mut self, doc: &Rc<Document>, name: &str) {
+        let number = name
+            .strip_suffix(".txt")
+            .and_then(|n| n.parse::<u32>().ok());
+        if let Some(number) = number {
+            self.next_text = self.next_text.max(number + 1);
+        }
         self.texts.push(Text {
             doc: Rc::downgrade(doc),
             name: name.to_string(),
@@ -624,33 +670,31 @@ impl SessionLink {
         });
     }
 
-    /// Keeps terminal `id`'s `screen`, returning its name in `terminals/`.
-    pub fn save_screen(&self, id: u32, screen: &[u8]) -> io::Result<String> {
-        let screen = screen.to_vec();
-        match self.ask(SessionCall::SaveScreen { id, screen }) {
-            SessionAnswer::Named(name) => name.map_err(io::Error::other),
-            _ => Err(other_answer()),
+    /// Notes terminal `id`'s `screen` for the next save, returning its
+    /// name in `terminals/`.
+    pub fn save_screen(&mut self, id: u32, screen: Vec<u8>) -> String {
+        self.pending_screens.push((id, screen));
+        screen_name(id)
+    }
+
+    /// Unsaved texts kept by [`SessionLink::save_text`], by name.
+    pub fn texts(&self, names: Vec<String>) -> Vec<io::Result<String>> {
+        let count = names.len();
+        match self.ask(SessionCall::Texts(names)) {
+            SessionAnswer::Texts(texts) => texts
+                .into_iter()
+                .map(|text| text.map_err(io::Error::other))
+                .collect(),
+            _ => (0..count).map(|_| Err(other_answer())).collect(),
         }
     }
 
-    /// Removes the screens in `terminals/` but `kept`.
-    pub fn prune_screens(&self, kept: &[String]) {
-        self.ask(SessionCall::PruneScreens(kept.to_vec()));
-    }
-
-    /// Unsaved text kept by [`SessionLink::save_text`], by name.
-    pub fn text(&self, name: &str) -> io::Result<String> {
-        match self.ask(SessionCall::Text(name.to_string())) {
-            SessionAnswer::Text(text) => text.map_err(io::Error::other),
-            _ => Err(other_answer()),
-        }
-    }
-
-    /// A screen kept by [`SessionLink::save_screen`], by name.
-    pub fn screen(&self, name: &str) -> Option<Vec<u8>> {
-        match self.ask(SessionCall::Screen(name.to_string())) {
-            SessionAnswer::Screen(screen) => screen,
-            _ => None,
+    /// Screens kept by [`SessionLink::save_screen`], by name.
+    pub fn screens(&self, names: Vec<String>) -> Vec<Option<Vec<u8>>> {
+        let count = names.len();
+        match self.ask(SessionCall::Screens(names)) {
+            SessionAnswer::Screens(screens) => screens,
+            _ => vec![None; count],
         }
     }
 

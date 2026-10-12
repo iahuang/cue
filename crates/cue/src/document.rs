@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -121,6 +121,9 @@ struct OnDisk {
     /// `None` if there was no file.
     stamp: Option<Stamp>,
     disk: Disk,
+    /// The file it is, links followed, as the host last said; `None` if
+    /// there was none, or it's been renamed since.
+    real: Option<PathBuf>,
 }
 
 /// The text as last loaded or saved, so that edits which put it back, like
@@ -271,11 +274,10 @@ impl Document {
     /// notice for the status bar if loading it had anything to say. The
     /// error is the reason alone, without the path.
     pub fn loaded(
-        path: PathBuf,
         loaded: Loaded,
         theme: Rc<Theme>,
     ) -> Result<(Rc<Document>, Option<String>), String> {
-        Document::open(Some((path, loaded)), theme)
+        Document::open(Some((loaded.path.clone(), loaded)), theme)
     }
 
     fn open(
@@ -291,8 +293,10 @@ impl Document {
         };
         let mut notice = None;
         let mut stamp = None;
+        let mut real = None;
         if let Some(loaded) = loaded {
             stamp = loaded.stamp;
+            real = loaded.real;
             buffer.set_text(&loaded.text);
             buffer.set_cursor(0, 0);
             file.line_ending = loaded.line_ending;
@@ -305,6 +309,7 @@ impl Document {
         }
         let doc = Document::new(buffer, file, theme);
         doc.on_disk.borrow_mut().stamp = stamp;
+        doc.on_disk.borrow_mut().real = real;
         Ok((Rc::new(doc), notice))
     }
 
@@ -464,13 +469,16 @@ impl Document {
             .then(|| untitled_name(self.untitled.get()))
     }
 
-    /// Whether the document is the file at `path`, however it's named.
+    /// Whether the document is the file at `path`, which has been
+    /// [`resolve`]d (as the host does) or [`normalize`]d.
     pub fn is_file(&self, path: &Path) -> bool {
-        self.file
-            .borrow()
-            .path
-            .as_deref()
-            .is_some_and(|open| same_file(open, path))
+        self.file.borrow().path.as_deref() == Some(path)
+    }
+
+    /// Whether the document is the file `loaded` is, however it's named:
+    /// a symlink and the file it points to are one.
+    pub fn is_loaded(&self, loaded: &Loaded) -> bool {
+        self.is_file(&loaded.path) || loaded.real.is_some() && self.real() == loaded.real
     }
 
     /// Whether the text differs from the saved state: undoing back to it,
@@ -601,10 +609,19 @@ impl Document {
             self.history.borrow_mut().mark_saved();
         }
         *self.saved.borrow_mut() = Saved::of(text);
-        *self.on_disk.borrow_mut() = OnDisk {
-            stamp: Some(stamp),
-            disk: Disk::Same,
-        };
+        let mut on_disk = self.on_disk.borrow_mut();
+        on_disk.stamp = Some(stamp);
+        on_disk.disk = Disk::Same;
+    }
+
+    /// The file it is, links followed, as the host last said.
+    pub fn real(&self) -> Option<PathBuf> {
+        self.on_disk.borrow().real.clone()
+    }
+
+    /// Notes the file it is, links followed, as the host said on saving.
+    pub fn set_real(&self, real: Option<PathBuf>) {
+        self.on_disk.borrow_mut().real = real;
     }
 
     /// Notes that the file changed on disk since it was loaded or saved,
@@ -722,6 +739,7 @@ impl Document {
             *self.on_disk.borrow_mut() = OnDisk {
                 stamp: loaded.stamp,
                 disk: Disk::Same,
+                real: loaded.real,
             };
         } else {
             history.break_group();
@@ -759,6 +777,7 @@ impl Document {
     /// language.
     pub fn rename(&self, path: PathBuf) {
         self.file.borrow_mut().path = Some(path);
+        self.on_disk.borrow_mut().real = None;
         if self.language_override.get() {
             return;
         }
@@ -816,6 +835,10 @@ fn detect_language(buffer: &EditBuffer, path: Option<&Path>) -> Option<&'static 
 
 #[derive(Debug)]
 pub struct Loaded {
+    /// Where it is, [`resolve`]d.
+    pub path: PathBuf,
+    /// The file it is, links followed; `None` if there's none.
+    pub real: Option<PathBuf>,
     /// The text with `\n` line breaks.
     pub text: String,
     pub line_ending: LineEnding,
@@ -825,10 +848,21 @@ pub struct Loaded {
     pub stamp: Option<Stamp>,
 }
 
+/// A file as the host wrote it.
+#[derive(Debug)]
+pub struct Written {
+    /// Where it was written, [`resolve`]d.
+    pub path: PathBuf,
+    /// The file it is, links followed.
+    pub real: Option<PathBuf>,
+    pub stamp: Stamp,
+}
+
 /// Reads `path`, for the host. A missing file loads as empty, to be
 /// created on save.
 pub fn load(path: &Path) -> io::Result<Loaded> {
-    let (bytes, stamp) = match fs::File::open(path) {
+    let path = resolve(path);
+    let (bytes, stamp) = match fs::File::open(&path) {
         Ok(mut file) => {
             let meta = file.metadata()?;
             let mut bytes = Vec::new();
@@ -855,6 +889,8 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
 
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     Ok(Loaded {
+        real: fs::canonicalize(&path).ok(),
+        path,
         text,
         line_ending,
         mixed_endings,
@@ -987,25 +1023,39 @@ pub fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Result<Stam
 /// `path` made absolute, with `.`, `..`, and symlinked folders resolved, so
 /// that however a file is named it gets the same path as in the file tree.
 /// The file name is kept even if it is a symlink, as the tree shows it. A
-/// path whose folder doesn't exist is only made absolute.
+/// path whose folder doesn't exist is only [`normalize`]d.
+///
+/// It looks at the file system, so it's the host's (loading and saving
+/// resolve the paths they're given), and the client's only for its own
+/// files, such as its settings. The client normalizes what it opens, and
+/// takes the path the host loaded it from.
 pub fn resolve(path: &Path) -> PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     match (absolute.parent(), absolute.file_name()) {
         (Some(parent), Some(name)) => match parent.canonicalize() {
             Ok(parent) => parent.join(name),
-            Err(_) => absolute,
+            Err(_) => normalize(&absolute),
         },
-        _ => absolute,
+        _ => normalize(&absolute),
     }
 }
 
-/// Whether `a` and `b` name the same file, following symlinks.
-pub fn same_file(a: &Path, b: &Path) -> bool {
-    a == b
-        || match (a.canonicalize(), b.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
+/// `path` made absolute, with `.` and `..` taken out, without looking at
+/// the file system: a `..` after a symlinked folder goes back up the
+/// link's name, not the folder it points to.
+pub fn normalize(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut normal = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normal.pop();
+            }
+            component => normal.push(component),
         }
+    }
+    normal
 }
 
 fn resolve_symlinks(path: &Path) -> io::Result<PathBuf> {
@@ -1135,7 +1185,7 @@ mod tests {
         let path = dir.join("a.txt");
         fs::write(&path, "one\ntwo\n").unwrap();
         let theme = Rc::new(Theme::new().unwrap());
-        let (doc, _) = Document::loaded(path.clone(), load(&path).unwrap(), theme).unwrap();
+        let (doc, _) = Document::loaded(load(&path).unwrap(), theme).unwrap();
         assert_eq!(doc.check_disk(), None);
         doc.save(&path).unwrap();
         assert_eq!(doc.check_disk(), None, "its own save isn't a change");
@@ -1261,8 +1311,16 @@ mod tests {
         // Symlinked file names are kept, but still count as the same file.
         let link = dir.join("real/link.txt");
         assert_eq!(resolve(&link), link);
-        assert!(same_file(&link, &a));
-        assert!(!same_file(&a, &dir.join("real/new.txt")));
+        let (link, a) = (load(&link).unwrap(), load(&a).unwrap());
+        assert_eq!(link.real, a.real);
+        assert_eq!(load(&dir.join("real/new.txt")).unwrap().real, None);
+    }
+
+    #[test]
+    fn normalize_leaves_the_file_system_alone() {
+        assert_eq!(normalize(Path::new("/a/./b/../c/")), PathBuf::from("/a/c"));
+        assert_eq!(normalize(Path::new("/..")), PathBuf::from("/"));
+        assert!(normalize(Path::new("x")).is_absolute());
     }
 
     #[cfg(unix)]

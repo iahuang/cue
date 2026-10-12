@@ -147,10 +147,15 @@ Progress:
   reaches the main loop through `App::take_deferred`. Changes on disk are
   checked by the host (`Request::CheckDisk`), and a check against a stamp
   the document no longer has is dropped. Revert loads through the host.
-- [ ] 1.5 leftovers: `document::resolve` and `same_file` still
-  canonicalize on the client; the
-  first file at startup, crash recovery, and session restore load through
-  the host but wait for it (`load_now`), until sessions move (1.9).
+- [x] 1.5 leftovers: the host resolves paths as it loads and saves
+  them (`document::resolve`), and says where each file really is,
+  symlinks followed (`Loaded::real`, `Written::real`), so a symlink and
+  its file open as one document; the client only normalizes paths
+  (`document::normalize`), and `same_file` is gone. The file named at
+  startup opens as any other, once loaded, and a line given with it is
+  gone to then (`App::go_to`). Recovery and session restore still wait,
+  but for one round trip in all (`load_all`, `images_now`, and the
+  session's texts and screens asked for at once), not one each.
 - [x] 1.6 The rest of git, through one request (`Request::Git` with a
   `GitCall`, answered by `git::run`): staging, stashing, reverting,
   branches, and switching from the app, which says how it went once git
@@ -162,11 +167,16 @@ Progress:
   and the diff shows once it's said (the caches' keys note whether it
   has). Matching open files to a repository no longer canonicalizes on the
   client.
-- [ ] Small checks still on the client, for a sweep later: the picker's
-  recent files (`is_file`), the tree's "was deleted" check for the
-  changes view, the dialog's starting folder, following a link in reader
-  mode, and whether an image or a commit in a panel's history is still
-  there.
+- [x] Small checks: the app keeps what the host's disk change notices
+  said went (`App::gone`), which the picker's recent files, panels'
+  history, and the dialog's starting folder go by; what it never heard
+  of is taken to be there. A file opened from the changes list that
+  isn't there says it was deleted once the host's loaded nothing
+  (`Opening::existing`). The file dialog goes up from a starting folder
+  that went. Following a link in reader mode, and adding a folder to the
+  workspace, ask the host what's there (`Request::Look`). Terminals
+  start in their saved folder, or the workspace's if that went, as the
+  host finds (`Start::Shell`'s `or`).
 - [x] 1.7 Images and PDFs: the host reads their bytes (`Request::ReadFile`,
   unless they're as last read) and the client decodes and renders them,
   so zooming and paging never wait on it. Opening one waits for it as
@@ -192,14 +202,33 @@ Progress:
 - [x] 1.9 Sessions are the host's: it holds the session's lock and files
   (`Request::Session` with a `SessionCall`, answered by `session::run`),
   and the app keeps a `SessionLink`: the session's id, folder, and name,
-  and which file has each document's unsaved text. Its calls wait for
-  the host for now, as saving a session before leaving must anyway; the
-  periodic saves should stop waiting once the host is across a network
-  (step 4). Recovery copies stay the client's. Settings are classified
+  and which file has each document's unsaved text. A save is one call
+  (`SessionCall::Save` with a `Snapshot`: the texts and screens that
+  changed, under names the client gives them, then the state, then
+  pruning). Periodic saves don't wait for it (`App::session_saving`),
+  one at a time; saves before leaving do. Taking, renaming, and ending a
+  session still wait: they're rare. Recovery copies stay the client's. Settings are classified
   in `config.rs`'s docs: `[ui]` and `[keys]` the client's, the rest the
   host's; one file and one reload until step 2.
-- [ ] 1.10: what stays local (clipboard, opening files externally, the
-  terminal's colors and capabilities), and the leftovers above.
+- [x] 1.10 What stays the client's, by design: the clipboard (OSC 52,
+  and copies to it); opening a file or link outside cue (`open`,
+  `xdg-open`), which across a network will mean fetching the file
+  first; the terminal's colors and capabilities, which the host will
+  need for embedded terminals' color queries once the VT is on it; the
+  client's settings file (reading it, Open Settings making it); and
+  recovery copies.
+- [x] Leftovers: `document::resolve` and `same_file`, the small checks,
+  the blocking loads at startup and restore, and periodic session saves
+  (see above).
+- [ ] Left for later: Ctrl+hover and Ctrl+click on a path in a
+  terminal look for the file on the client (`location::find_file`), on
+  every hover. That wants either a batch ask per hover or to move with
+  the VT to the host. `Workspace::new` canonicalizes the folders it's
+  started with, on the client, before there's a host: step 3's
+  handshake should have the host do it.
+
+Step 1 is done but for those: the app touches the machine only through
+the host, apart from what's the client's by design.
 
 Notes from 1.1 and 1.2:
 
@@ -211,17 +240,15 @@ Notes from 1.1 and 1.2:
 - The walker reads `config::get()` for excludes. That's the host's config,
   which matches the config decision, but once the host is a separate
   process it needs its own config reload.
-- `Workspace::add_root` canonicalizes on the client; it moves with the tree
-  (1.4).
+- `Workspace::add_root` canonicalizes on the client; it's only for
+  starting now, and folders added later come from the host
+  (`Workspace::add_folder`).
 - Tests mostly expect the host to answer at once. `host::at_once()`
   (test-only, on by default, per thread) makes the tree, the file dialog,
   and file operations wait for their answers as they ask; their own tests
   turn it off to see what shows meanwhile. The host's threads also get
   the test's settings (`Tell::Config`, test-only), since in tests each
   thread has its own.
-- Still on the client, for later steps: `document::resolve` and
-  `same_file` (canonicalizing), the "was it deleted" check before opening
-  from the tree, `Workspace::add_root`, and the dialog's starting folder.
 - `Symbol::kind` is a `&'static str`; it needs to become owned or an enum
   to be serialized (step 2).
 - Git status is still scheduled by the client (`Git::poll` decides when to

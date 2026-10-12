@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
 
@@ -190,7 +190,7 @@ impl FileDialog {
             .filter_map(|&(command, name)| Some(format!("{} {name}", keymap.shortcut(command)?)))
             .collect::<Vec<_>>()
             .join(" · ");
-        let dir = normalize(dir);
+        let dir = document::normalize(dir);
         let mut dialog = FileDialog {
             host: host.clone(),
             purpose,
@@ -245,6 +245,15 @@ impl FileDialog {
             None => Err(io::ErrorKind::Other),
         };
         match entries {
+            // The folder it started in went: it starts in the one above.
+            Err(io::ErrorKind::NotFound) if self.listing.dir == self.base => {
+                if let Some(parent) = self.base.parent().map(Path::to_path_buf) {
+                    self.base = parent.clone();
+                    self.navigate(&parent, true);
+                    return Some(DialogAction::Continue);
+                }
+                self.listing.error = Some(io::ErrorKind::NotFound);
+            }
             Ok(entries) => {
                 self.listing.entries = entries
                     .into_iter()
@@ -507,7 +516,7 @@ impl FileDialog {
             },
             _ => self.base.join(typed),
         };
-        normalize(&path)
+        document::normalize(&path)
     }
 
     fn text_changed(&mut self) {
@@ -682,15 +691,6 @@ impl FileDialog {
                 DialogAction::Continue
             }
             Purpose::Create => DialogAction::Accept(path),
-            // A new name for the same file, as when only its case changes.
-            Purpose::Move
-                if self
-                    .current
-                    .as_deref()
-                    .is_some_and(|current| document::same_file(current, &path)) =>
-            {
-                DialogAction::Accept(path)
-            }
             Purpose::CreateFolder | Purpose::Move | Purpose::Duplicate if exists => {
                 self.show_error(format!("{name} already exists."));
                 DialogAction::Continue
@@ -699,10 +699,7 @@ impl FileDialog {
                 DialogAction::Accept(path)
             }
             Purpose::SaveAs => {
-                let current = self
-                    .current
-                    .as_deref()
-                    .is_some_and(|current| document::same_file(current, &path));
+                let current = self.current.as_ref() == Some(&path);
                 if !exists || current || self.confirm.as_ref() == Some(&path) {
                     return DialogAction::Accept(path);
                 }
@@ -1079,23 +1076,6 @@ fn display_dir(dir: &Path) -> String {
     shown
 }
 
-/// `path` without `.` and `..`, which go nowhere and up. Symlinks are kept,
-/// so `..` may not go where the file system would take it; the folder
-/// listed is the one the path names.
-fn normalize(path: &Path) -> PathBuf {
-    let mut normal = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normal.pop();
-            }
-            component => normal.push(component),
-        }
-    }
-    normal
-}
-
 fn file_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),
@@ -1154,6 +1134,15 @@ mod tests {
             80,
             24,
         )
+    }
+
+    #[test]
+    fn a_folder_that_went_starts_the_dialog_above_it() {
+        let root = fixture("went", &["a.txt"]);
+        let dialog = dialog(Purpose::SaveAs, &root.join("gone/deeper"), "b.txt");
+        assert_eq!(dialog.listing.dir, root);
+        assert_eq!(dialog.text, format!("{}b.txt", display_dir(&root)));
+        assert_eq!(listed(&dialog), ["../", "a.txt"]);
     }
 
     /// The rows listed, folders ending in `/`.
