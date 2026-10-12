@@ -398,6 +398,10 @@ pub enum Start {
         or: Option<PathBuf>,
         cols: u16,
         rows: u16,
+        /// What the terminal shows above what the shell writes, as a
+        /// session's restored (see [`crate::terminal::Terminal::restore`]),
+        /// for the host's screen of it (see [`crate::term_hub`]).
+        above: Vec<u8>,
     },
     /// A pty a process this one replaced left running (see [`Pty::adopt`]).
     Adopt { fd: RawFd, pid: libc::pid_t },
@@ -512,6 +516,7 @@ pub fn serve(start: Start, controls: Controls, mut send: impl FnMut(Event) -> bo
             or,
             cols,
             rows,
+            ..
         } => match or.filter(|_| !cwd.is_dir()) {
             Some(or) => Pty::shell(&or, cols, rows),
             None => Pty::shell(&cwd, cols, rows),

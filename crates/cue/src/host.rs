@@ -8,8 +8,10 @@
 //! process of its own (`cue --host`, see [`serve_listener`]); either way
 //! the app talks to it over a socket: each message serialized
 //! ([`postcard`]), after its length. A host process serves one client at a
-//! time, of its own build: one that connects takes over from the one
-//! before, which hears it [`Notice::Moved`].
+//! time, of its own build: one that connects takes over once the one
+//! before, told [`Notice::Moved`], has saved and left (see
+//! [`Link::leave`]). While it keeps a session, it takes clients on the
+//! session's socket too, which is how `cue` finds it again.
 //!
 //! - A [`Request`] is a call: the host answers it with [`Reply`]s, as many
 //!   as it takes, and then ends it. Dropping the [`Call`] cancels it, and
@@ -25,7 +27,7 @@
 //! [`crate::wake`]), which takes it in with [`Call::try_recv`] and
 //! [`Link::notices`].
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -88,6 +90,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a host process with no client looks whether it's to go on.
 const DETACHED_POLL: Duration = Duration::from_secs(1);
+/// How long a client taken over from gets to save and leave, before the
+/// next is served regardless.
+const MOVE_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 5000 });
 
 /// What the app asks the host to do, answered with [`Reply`]s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +167,14 @@ pub enum Request {
         message: String,
         amend: bool,
     },
+    /// Which terminals are running, by their ids on the host, for a
+    /// client attaching to them (see [`crate::term_hub`]).
+    Terminals,
+    /// Stop sending the output of this link's terminals, for a client
+    /// that's leaving (see [`App::leave`](crate::app::App::leave)). Ends
+    /// once the last of it is sent: what comes later, the host answers
+    /// the queries in.
+    LetGo,
     /// Nothing, until cancelled, for tests.
     #[cfg(test)]
     Hold,
@@ -223,6 +236,7 @@ pub enum Reply {
     FileOpDone(Result<(), String>),
     /// The new commit's abbreviated hash, or what went wrong.
     Committed(Result<String, String>),
+    Terminals(Vec<TermId>),
 }
 
 /// An [`io::ErrorKind`] in a result, as sent: those the app tells apart,
@@ -277,9 +291,14 @@ pub enum Tell {
 pub enum Notice {
     /// Files in the watched folders changed, with what they are now.
     DiskChanged(Changes),
-    /// Another client took over: this one's calls end, and it hears
-    /// nothing more.
+    /// Another client is taking over: this one's to save what it has,
+    /// and leave (see [`Link::leave`]), within [`MOVE_TIMEOUT`].
     Moved,
+    /// The session was ended from elsewhere (see [`end_session`]): its
+    /// terminals are hung up on, and this client's served no more.
+    Ended,
+    /// The host's gone. Not sent: the link says so itself.
+    Gone,
 }
 
 /// What a client says first, to a host process.
@@ -287,6 +306,23 @@ pub enum Notice {
 struct Hello {
     /// Which build of cue it is (see [`crate::attach::build`]).
     build: String,
+    /// The cue whose terminal it runs in, if it does (see
+    /// [`crate::attach::PID_VARIABLE`]): a host doesn't take a client in
+    /// its own terminal, which would show it in itself.
+    inside: Option<u32>,
+    /// To end the host's session, not to be served.
+    end: bool,
+}
+
+impl Hello {
+    fn new(build: &str, end: bool) -> Hello {
+        let inside = std::env::var(crate::attach::PID_VARIABLE).ok();
+        Hello {
+            build: build.to_string(),
+            inside: inside.and_then(|pid| pid.parse().ok()),
+            end,
+        }
+    }
 }
 
 /// What the app sends the host.
@@ -295,6 +331,9 @@ enum ToHost {
     Call(CallId, Request),
     Cancel(CallId),
     Tell(Tell),
+    /// The app's leaving its terminals running, for another client: what
+    /// comes after, such as cancelling them, is ignored.
+    Leave,
     /// Answered with [`Output::Settled`] once what came before is done
     /// with, for tests.
     #[cfg(test)]
@@ -311,10 +350,15 @@ enum Input {
     Finished(CallId),
     /// The watcher heard something.
     Watched,
-    /// The app is gone.
+    /// The app is gone, or left.
     Shutdown,
-    /// Another client took over.
-    Moved,
+    /// Another client is taking over: the app's told so, and served on
+    /// until it leaves.
+    Moving,
+    /// Another client took over, this one having taken too long to leave.
+    Evicted,
+    /// The session was ended: the app's told so.
+    Ended,
     #[cfg(test)]
     Settle,
 }
@@ -325,6 +369,7 @@ impl From<ToHost> for Input {
             ToHost::Call(id, request) => Input::Call(id, request),
             ToHost::Cancel(id) => Input::Cancel(id),
             ToHost::Tell(tell) => Input::Tell(tell),
+            ToHost::Leave => Input::Shutdown,
             #[cfg(test)]
             ToHost::Settle => Input::Settle,
         }
@@ -342,6 +387,10 @@ enum Output {
     Settled,
 }
 
+/// Where each call's replies go, until it ends; `None` once the host's
+/// gone, or left.
+type Routes = Option<HashMap<CallId, Sender<Reply>>>;
+
 /// The app's end of its connection to a host.
 #[derive(Clone)]
 pub struct Link {
@@ -354,8 +403,11 @@ struct Shared {
     to_host: Sender<ToHost>,
     next: Cell<CallId>,
     /// Where each call's replies go, until it ends.
-    routes: Arc<Mutex<HashMap<CallId, Sender<Reply>>>>,
+    routes: Arc<Mutex<Routes>>,
     notices: Receiver<Notice>,
+    /// Disconnected once everything asked of the host is sent (see
+    /// [`Link::closed`]).
+    sent: RefCell<Option<Receiver<()>>>,
     /// The host is on a thread of this process.
     local: bool,
     #[cfg(test)]
@@ -384,7 +436,7 @@ impl Link {
     pub fn local() -> Link {
         let (ours, theirs) = UnixStream::pair().expect("can't make a socket pair");
         // The process's native core is the app's.
-        let state = Arc::new(State::new(false));
+        let state = Arc::new(State::new(false, None));
         let link = Link::over(ours, true);
         #[cfg(test)]
         let _ = link.shared.state.set(Arc::clone(&state));
@@ -427,22 +479,18 @@ impl Link {
         Link::connect(&path)
     }
 
-    /// Connects to the host process listening on `path`.
+    /// Connects to the host process listening on `path`. If it serves
+    /// another client, that one leaves first (see [`Notice::Moved`]), and
+    /// what's asked meanwhile waits.
     pub fn connect(path: &Path) -> io::Result<Link> {
-        Link::connect_as(path, crate::attach::build())
+        let stream = greeted(path, &Hello::new(crate::attach::build(), false))?;
+        Ok(Link::over(stream, false))
     }
 
     /// Connects to the host process on `path` as a client of `build`.
+    #[cfg(test)]
     fn connect_as(path: &Path, build: &str) -> io::Result<Link> {
-        let stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        let hello = Hello {
-            build: build.to_string(),
-        };
-        write_frame(&mut &stream, &hello)?;
-        let welcome: Result<(), String> = read_frame(&mut &stream)?;
-        welcome.map_err(io::Error::other)?;
-        stream.set_read_timeout(None)?;
+        let stream = greeted(path, &Hello::new(build, false))?;
         Ok(Link::over(stream, false))
     }
 
@@ -455,7 +503,8 @@ impl Link {
     /// `stream`, in this process if `local`.
     fn over(stream: UnixStream, local: bool) -> Link {
         let (to_host, outbox) = mpsc::channel();
-        let routes: Arc<Mutex<HashMap<CallId, Sender<Reply>>>> = Arc::default();
+        let (all_sent, sent) = mpsc::channel::<()>();
+        let routes = Arc::new(Mutex::new(Some(HashMap::new())));
         let (notify, notices) = mpsc::channel();
         #[cfg(test)]
         let (settle, settled) = mpsc::channel();
@@ -471,7 +520,10 @@ impl Link {
                         settle,
                     )
                 });
-                std::thread::spawn(move || write_frames(stream, outbox));
+                std::thread::spawn(move || {
+                    write_frames(stream, outbox);
+                    drop(all_sent);
+                });
             }
             // As if the host were gone: calls end unanswered.
             Err(_) => drop(outbox),
@@ -482,6 +534,7 @@ impl Link {
                 next: Cell::new(1),
                 routes,
                 notices,
+                sent: RefCell::new(Some(sent)),
                 local,
                 #[cfg(test)]
                 settled,
@@ -497,7 +550,10 @@ impl Link {
         let id = shared.next.get();
         shared.next.set(id + 1);
         let (sender, replies) = mpsc::channel();
-        lock(&shared.routes).insert(id, sender);
+        // Once the host's gone, or left, it ends unanswered.
+        if let Some(routes) = lock(&shared.routes).as_mut() {
+            routes.insert(id, sender);
+        }
         let _ = shared.to_host.send(ToHost::Call(id, request));
         Call {
             id,
@@ -508,6 +564,22 @@ impl Link {
 
     pub fn tell(&self, tell: Tell) {
         let _ = self.shared.to_host.send(ToHost::Tell(tell));
+    }
+
+    /// Leaves the host, for another client to come to: its terminals run
+    /// on, and dropping their calls from now on doesn't hang up. Calls end,
+    /// unanswered, as do those made later, such as saving as the app's
+    /// dropped.
+    pub fn leave(&self) {
+        let _ = self.shared.to_host.send(ToHost::Leave);
+        *lock(&self.shared.routes) = None;
+    }
+
+    /// What says when everything asked of the host is sent, which is once
+    /// the link and its calls are dropped: as when quitting, cancelling
+    /// terminals' calls hangs up, which only the host can do.
+    pub fn closed(&self) -> Closed {
+        Closed(self.shared.sent.borrow_mut().take())
     }
 
     /// Waits for the host to take in what was asked of it so far, for
@@ -530,6 +602,18 @@ impl Link {
     /// What the host said since the last call, in order.
     pub fn notices(&self) -> Vec<Notice> {
         self.shared.notices.try_iter().collect()
+    }
+}
+
+/// Says when a link's done sending (see [`Link::closed`]).
+pub struct Closed(Option<Receiver<()>>);
+
+impl Closed {
+    /// Waits until it's done, or `timeout` passes.
+    pub fn wait(self, timeout: Duration) {
+        if let Some(sent) = self.0 {
+            let _ = sent.recv_timeout(timeout);
+        }
     }
 }
 
@@ -570,20 +654,22 @@ impl Drop for Call {
 /// waking the main loop, until the host's gone. Then the calls left end.
 fn read(
     from_host: UnixStream,
-    routes: &Mutex<HashMap<CallId, Sender<Reply>>>,
+    routes: &Mutex<Routes>,
     notices: Sender<Notice>,
     #[cfg(test)] settled: Sender<()>,
 ) {
     read_frames(from_host, |output| {
         match output {
             Output::Reply(id, reply) => {
-                if let Some(route) = lock(routes).get(&id) {
+                if let Some(route) = lock(routes).as_ref().and_then(|r| r.get(&id)) {
                     // The call may be gone, its replies unwanted.
                     let _ = route.send(reply);
                 }
             }
             Output::End(id) => {
-                lock(routes).remove(&id);
+                if let Some(routes) = lock(routes).as_mut() {
+                    routes.remove(&id);
+                }
             }
             Output::Notice(notice) => {
                 let _ = notices.send(notice);
@@ -596,7 +682,8 @@ fn read(
         wake::wake();
         true
     });
-    lock(routes).clear();
+    *lock(routes) = None;
+    let _ = notices.send(Notice::Gone);
     wake::wake();
 }
 
@@ -710,55 +797,39 @@ pub fn listener_from_env() -> Option<UnixListener> {
 enum Happened {
     /// A client said hello, and is of this build.
     Greeted(UnixStream),
-    /// The client of this connection is gone.
+    /// A client asked to end the session (see [`end_session`]).
+    End(UnixStream),
+    /// The client of this connection is gone, or left.
     Ended(u64),
 }
 
 /// Runs a host process: serves the clients that connect to `listener`,
-/// one at a time, a newer one taking over, keeping terminals' screens if
-/// `screens` (see [`crate::term_hub`]). Ends once the one it serves is
-/// gone, unless it keeps a session with terminals running, for another
-/// to attach to; or if the first doesn't come. Then hangs up on its
-/// terminals, and removes the socket.
+/// and to its session's socket while it keeps one, one at a time,
+/// keeping terminals' screens if `screens` (see [`crate::term_hub`]). A
+/// newer client takes over once the one before has left, having heard
+/// [`Notice::Moved`]. Ends once the one it serves is gone, unless it
+/// keeps a session with terminals running, for another to attach to; or
+/// if the first doesn't come; or once its session's ended. Then hangs up
+/// on its terminals, and removes its sockets.
 pub fn serve_listener(listener: UnixListener, screens: bool) {
     let path = listener
         .local_addr()
         .ok()
         .and_then(|addr| addr.as_pathname().map(Path::to_path_buf));
-    let state = Arc::new(State::new(screens));
     let (happen, happened) = mpsc::channel();
-    let greeted = happen.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else {
-                // Out of descriptors, say: a moment may free some.
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            };
-            let greeted = greeted.clone();
-            // Apart, so a client that says nothing holds up no other.
-            std::thread::spawn(move || {
-                if let Some(stream) = greet(stream) {
-                    let _ = greeted.send(Happened::Greeted(stream));
-                }
-            });
-        }
-    });
+    let state = Arc::new(State::new(screens, Some(happen.clone())));
+    take_clients(listener, happen.clone());
     // The connection served, by its number, and its host thread's inbox.
     let mut serving: Option<(u64, Sender<Input>)> = None;
+    // The client to serve next, once the one served leaves, and until when
+    // it waits for that.
+    let mut waiting: Option<(UnixStream, Instant)> = None;
+    // The client that asked to end the session, told once it has.
+    let mut ender = None;
     let mut connections = 0;
     loop {
-        let next = match (&serving, connections) {
-            (Some(_), _) => happened.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            (None, 0) => happened.recv_timeout(FIRST_CLIENT_TIMEOUT),
-            // Looking now and then whether there's still a reason to wait.
-            (None, _) => happened.recv_timeout(DETACHED_POLL),
-        };
-        match next {
-            Ok(Happened::Greeted(stream)) => {
-                if let Some((_, moved)) = serving.take() {
-                    let _ = moved.send(Input::Moved);
-                }
+        if serving.is_none() {
+            if let Some((stream, _)) = waiting.take() {
                 connections += 1;
                 let id = connections;
                 let (to_host, inbox) = mpsc::channel();
@@ -770,12 +841,47 @@ pub fn serve_listener(listener: UnixListener, screens: bool) {
                     let _ = ended.send(Happened::Ended(id));
                 });
             }
+        }
+        let next = match (&serving, &waiting, connections) {
+            (_, Some((_, until)), _) => {
+                happened.recv_timeout(until.saturating_duration_since(Instant::now()))
+            }
+            (Some(_), None, _) => happened.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            (None, None, 0) => happened.recv_timeout(FIRST_CLIENT_TIMEOUT),
+            // Looking now and then whether there's still a reason to wait.
+            (None, None, _) => happened.recv_timeout(DETACHED_POLL),
+        };
+        match next {
+            Ok(Happened::Greeted(stream)) => {
+                // Told once: a third client coming meanwhile replaces the
+                // second, which is hung up on.
+                if let (Some((_, served)), None) = (&serving, &waiting) {
+                    let _ = served.send(Input::Moving);
+                }
+                waiting = Some((stream, Instant::now() + MOVE_TIMEOUT));
+            }
+            Ok(Happened::End(stream)) => {
+                if let Some((_, served)) = serving.take() {
+                    let _ = served.send(Input::Ended);
+                }
+                if let Some(session) = lock(&state.session).take() {
+                    session.end();
+                }
+                ender = Some(stream);
+                break;
+            }
             Ok(Happened::Ended(id)) => {
                 if serving.as_ref().is_some_and(|(serving, _)| *serving == id) {
                     serving = None;
-                    if !state.keeps_going() {
+                    if waiting.is_none() && !state.keeps_going() {
                         break;
                     }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) if waiting.is_some() => {
+                // Taking too long to leave: the next is served regardless.
+                if let Some((_, served)) = serving.take() {
+                    let _ = served.send(Input::Evicted);
                 }
             }
             Err(RecvTimeoutError::Timeout) if connections > 0 && state.keeps_going() => {}
@@ -786,24 +892,81 @@ pub fn serve_listener(listener: UnixListener, screens: bool) {
     if let Some(path) = path {
         let _ = std::fs::remove_file(path);
     }
+    if let Some(socket) = lock(&state.socket).take() {
+        let _ = std::fs::remove_file(socket);
+    }
+    drop(ender);
 }
 
-/// `stream`, once its client said it's of this build; told why not, if
-/// it isn't.
-fn greet(stream: UnixStream) -> Option<UnixStream> {
+/// Takes the clients that connect to `listener`, on a thread of its own,
+/// for the host process's loop.
+fn take_clients(listener: UnixListener, happen: Sender<Happened>) {
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                // Out of descriptors, say: a moment may free some.
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
+            let happen = happen.clone();
+            // Apart, so a client that says nothing holds up no other.
+            std::thread::spawn(move || {
+                if let Some(happened) = greet(stream) {
+                    let _ = happen.send(happened);
+                }
+            });
+        }
+    });
+}
+
+/// What the client on `stream` is there for, once it's said hello: to be
+/// served, if it's of this build and not in one of the host's terminals,
+/// or to end the session. Told why not, if it's neither.
+fn greet(stream: UnixStream) -> Option<Happened> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok()?;
     let hello: Hello = read_frame(&mut &stream).ok()?;
     let build = crate::attach::build();
-    let welcome = match hello.build == build {
-        true => Ok(()),
-        false => Err(format!(
+    let welcome = if hello.end {
+        Ok(())
+    } else if hello.build != build {
+        Err(format!(
             "The host is another build of cue ({build}, not {}).",
             hello.build
-        )),
+        ))
+    } else if hello.inside == Some(std::process::id()) {
+        Err("A session can't be shown in one of its own terminals.".to_string())
+    } else {
+        Ok(())
     };
     write_frame(&mut &stream, &welcome).ok()?;
     stream.set_read_timeout(None).ok()?;
-    welcome.is_ok().then_some(stream)
+    welcome.ok()?;
+    Some(match hello.end {
+        true => Happened::End(stream),
+        false => Happened::Greeted(stream),
+    })
+}
+
+/// A connection to the host process on `path`, once it's taken `hello`.
+fn greeted(path: &Path, hello: &Hello) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    write_frame(&mut &stream, hello)?;
+    let welcome: Result<(), String> = read_frame(&mut &stream)?;
+    welcome.map_err(io::Error::other)?;
+    stream.set_read_timeout(None)?;
+    Ok(stream)
+}
+
+/// Ends the session of the host process on `path`, as `cue --end` does:
+/// the client it serves hears so, its terminals are hung up on, what it
+/// kept is removed, and the host ends. Waits until it's done.
+pub fn end_session(path: &Path) -> io::Result<()> {
+    let stream = greeted(path, &Hello::new(crate::attach::build(), true))?;
+    // It hangs up once it's done.
+    let mut rest = Vec::new();
+    let _ = (&stream).read_to_end(&mut rest);
+    Ok(())
 }
 
 /// Serves the app on the other end of `stream`, until it's gone, or
@@ -820,7 +983,9 @@ fn serve_stream(
     let from_app = to_host.clone();
     std::thread::spawn(move || {
         read_frames(reading, |message: ToHost| {
-            from_app.send(message.into()).is_ok()
+            // What comes after leaving isn't for the host.
+            let more = !matches!(message, ToHost::Leave);
+            from_app.send(message.into()).is_ok() && more
         });
         let _ = from_app.send(Input::Shutdown);
     });
@@ -844,6 +1009,9 @@ fn serve(
     let mut calls: HashMap<CallId, Arc<AtomicBool>> = HashMap::new();
     // The terminal each terminal call hears of, and its token for it.
     let mut terminals: HashMap<CallId, (TermId, Token)> = HashMap::new();
+    // Those let go of, whose calls ended: what the app answered of their
+    // last output still goes to them.
+    let mut let_go: HashMap<CallId, TermId> = HashMap::new();
     loop {
         let input = match watcher.due() {
             Some(due) => inbox.recv_timeout(due.saturating_duration_since(Instant::now())),
@@ -866,6 +1034,21 @@ fn serve(
                 #[cfg(not(test))]
                 let opened = state.hub.open(start, responder);
                 terminals.insert(id, opened);
+            }
+            Ok(Input::Call(id, Request::LetGo)) => {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                calls.insert(id, Arc::clone(&cancelled));
+                let responder = Responder {
+                    id,
+                    output: output.clone(),
+                    inbox: host_inbox.clone(),
+                    cancelled,
+                };
+                for (&call, &(terminal, token)) in &terminals {
+                    state.hub.unwatch(terminal, token);
+                    let_go.insert(call, terminal);
+                }
+                state.hub.after(responder);
             }
             Ok(Input::Call(id, request)) => {
                 let cancelled = Arc::new(AtomicBool::new(false));
@@ -893,7 +1076,8 @@ fn serve(
                 terminals.remove(&id);
             }
             Ok(Input::Tell(Tell::Term { call, control })) => {
-                if let Some(&(terminal, _)) = terminals.get(&call) {
+                let terminal = terminals.get(&call).map(|&(terminal, _)| terminal);
+                if let Some(terminal) = terminal.or_else(|| let_go.get(&call).copied()) {
                     state.hub.control(terminal, control);
                 }
             }
@@ -905,11 +1089,14 @@ fn serve(
             Ok(Input::Settle) => {
                 let _ = output.send(Output::Settled);
             }
-            Ok(Input::Moved) => {
+            Ok(Input::Moving) => {
                 let _ = output.send(Output::Notice(Notice::Moved));
+            }
+            Ok(Input::Ended) => {
+                let _ = output.send(Output::Notice(Notice::Ended));
                 break;
             }
-            Ok(Input::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(Input::Evicted | Input::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
         if let Some(mut changes) = watcher.poll() {
             changes.look();
@@ -932,6 +1119,11 @@ struct State {
     /// The session this host keeps, if it's one.
     session: Mutex<Option<Session>>,
     hub: Hub,
+    /// Where a host process's loop takes clients, connecting to the
+    /// session's socket too while it keeps one.
+    clients: Option<Sender<Happened>>,
+    /// The session's socket, while it's listened on.
+    socket: Mutex<Option<PathBuf>>,
     /// The settings the app said to use, for tests (see
     /// [`Link::set_config`]).
     #[cfg(test)]
@@ -939,12 +1131,15 @@ struct State {
 }
 
 impl State {
-    /// Keeping terminals' screens if `screens` (see [`crate::term_hub`]).
-    fn new(screens: bool) -> State {
+    /// Keeping terminals' screens if `screens` (see [`crate::term_hub`]),
+    /// and in a host process, taking clients to `clients`.
+    fn new(screens: bool, clients: Option<Sender<Happened>>) -> State {
         State {
             symbols: symbols::Cache::default(),
             session: Mutex::default(),
             hub: Hub::new(screens),
+            clients,
+            socket: Mutex::default(),
             #[cfg(test)]
             config: Mutex::default(),
         }
@@ -954,6 +1149,36 @@ impl State {
     /// session with terminals running, for one to attach to.
     fn keeps_going(&self) -> bool {
         lock(&self.session).is_some() && self.hub.count() > 0
+    }
+
+    /// Listens on the socket of `session`, the host's, for clients coming
+    /// back to it, if this is a host process; or stops, with none.
+    fn listen_for(&self, session: Option<&Session>) {
+        let Some(clients) = &self.clients else {
+            return;
+        };
+        let path = session.map(|session| session::socket_path(session.dir()));
+        let mut socket = lock(&self.socket);
+        if *socket == path {
+            return;
+        }
+        if let Some(old) = socket.take() {
+            let _ = std::fs::remove_file(old);
+        }
+        let Some(path) = path else {
+            return;
+        };
+        let listener = crate::attach::listen(&path).and_then(|listener| {
+            listener.set_nonblocking(false)?;
+            Ok(listener)
+        });
+        match listener {
+            Ok(listener) => {
+                take_clients(listener, clients.clone());
+                *socket = Some(path);
+            }
+            Err(err) => eprintln!("cue: can't listen on the session's socket: {err}"),
+        }
     }
 
     /// Puts the settings the app told of in use on this thread, for tests.
@@ -1043,11 +1268,17 @@ fn answer(request: Request, state: &State, responder: Responder) {
                 }
             }
         }
-        // Started apart, in `serve`, with its controls.
-        Request::Terminal(_) => {}
+        // Answered apart, in `serve`, which knows the link's terminals.
+        Request::Terminal(_) | Request::LetGo => {}
         Request::Session(call) => {
-            let answer = session::run(call, &mut lock(&state.session));
+            let mut session = lock(&state.session);
+            let answer = session::run(call, &mut session);
+            state.listen_for(session.as_ref());
+            drop(session);
             responder.reply(Reply::Session(answer));
+        }
+        Request::Terminals => {
+            responder.reply(Reply::Terminals(state.hub.list()));
         }
         Request::Git(call) => {
             responder.reply(Reply::Git(git::run(&call)));
@@ -1117,7 +1348,10 @@ mod tests {
         drop(call);
         // The call ends once it hears it was cancelled.
         let start = Instant::now();
-        while lock(&link.shared.routes).contains_key(&id) {
+        while lock(&link.shared.routes)
+            .as_ref()
+            .is_some_and(|routes| routes.contains_key(&id))
+        {
             assert!(start.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1170,25 +1404,59 @@ mod tests {
         assert!(!path.exists(), "the socket's removed");
     }
 
+    /// Waits for `link` to hear something `wanted`.
+    fn hears(link: &Link, wanted: impl Fn(&Notice) -> bool) {
+        let start = Instant::now();
+        while !link.notices().iter().any(&wanted) {
+            assert!(start.elapsed() < Duration::from_secs(5), "no notice");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
-    fn a_client_that_connects_takes_over_from_the_one_before() {
+    fn a_client_that_connects_takes_over_once_the_one_before_leaves() {
         let (path, host) = host_process("taken", false);
         let first = Link::connect(&path).unwrap();
         let held = first.call(Request::Hold);
         let second = Link::connect(&path).unwrap();
-        // The first hears it moved, and its call ends.
-        assert!(held.wait().is_none());
-        let start = Instant::now();
-        while !first.notices().iter().any(|n| matches!(n, Notice::Moved)) {
-            assert!(start.elapsed() < Duration::from_secs(5), "no notice");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        // The second's served, and the host goes on without the first.
-        drop((held, first));
-        let call = second.call(Request::Look { paths: Vec::new() });
+        let waiting = second.call(Request::Look { paths: Vec::new() });
+        // The first hears it's moving, and is served until it leaves.
+        hears(&first, |n| matches!(n, Notice::Moved));
+        let call = first.call(Request::Look { paths: Vec::new() });
         assert!(matches!(call.wait(), Some(Reply::Looked(_))));
+        assert!(matches!(waiting.try_recv(), Err(TryRecvError::Empty)));
+        first.leave();
+        assert!(held.wait().is_none());
+        // Then the second's served, and the host goes on without the first.
+        assert!(matches!(waiting.wait(), Some(Reply::Looked(_))));
+        drop((call, held, first));
         assert!(!host.is_finished());
-        drop((call, second));
+        drop((waiting, second));
+        ends(host);
+    }
+
+    #[test]
+    fn a_client_that_doesnt_leave_is_let_go_of() {
+        let (path, host) = host_process("evicted", false);
+        let first = Link::connect(&path).unwrap();
+        let held = first.call(Request::Hold);
+        let second = Link::connect(&path).unwrap();
+        let call = second.call(Request::Look { paths: Vec::new() });
+        // Served once the first's had its time.
+        assert!(matches!(call.wait(), Some(Reply::Looked(_))));
+        assert!(held.wait().is_none());
+        drop((call, second, held, first));
+        ends(host);
+    }
+
+    #[test]
+    fn a_client_in_one_of_the_hosts_terminals_is_refused() {
+        let (path, host) = host_process("inside", false);
+        let mut hello = Hello::new(crate::attach::build(), false);
+        hello.inside = Some(std::process::id());
+        let err = greeted(&path, &hello).err().unwrap();
+        assert!(err.to_string().contains("its own terminals"), "{err}");
+        drop(Link::connect(&path).unwrap());
         ends(host);
     }
 
@@ -1227,16 +1495,17 @@ mod tests {
         let first = Link::connect(&path).unwrap();
         // A session, so the host goes on without a client.
         let sessions = root.join("sessions");
-        let opened = first.call(Request::Session(SessionCall::Create(sessions)));
-        assert!(matches!(
-            opened.wait(),
-            Some(Reply::Session(SessionAnswer::Opened(Ok(_))))
-        ));
+        let opened = first.call(Request::Session(SessionCall::Create(sessions.clone())));
+        let session_id = match opened.wait() {
+            Some(Reply::Session(SessionAnswer::Opened(Ok((id, _))))) => id,
+            other => panic!("{other:?}"),
+        };
         let term = first.call(Request::Terminal(pty::Start::Shell {
             cwd: root.clone(),
             or: None,
             cols: 80,
             rows: 24,
+            above: Vec::new(),
         }));
         let id = match term.wait() {
             Some(Reply::Term(pty::Event::Started(id))) => id,
@@ -1252,11 +1521,23 @@ mod tests {
         typed(&first, &term, "echo hi-$((40+2))\r");
         wait_for_output(&term, "hi-42");
 
-        // Another client takes over: the first's call ends, but not the
-        // terminal.
-        let second = Link::connect(&path).unwrap();
+        // Another client takes over, at the session's socket: once the
+        // first leaves, its call ends, but not the terminal.
+        let socket = session::socket_path(&sessions.join(&session_id));
+        let second = Link::connect(&socket).unwrap();
+        hears(&first, |n| matches!(n, Notice::Moved));
+        first.leave();
         while term.wait().is_some() {}
         drop((term, first));
+        let reopened = second.call(Request::Session(SessionCall::Open(
+            sessions.join(&session_id),
+        )));
+        assert!(matches!(
+            reopened.wait(),
+            Some(Reply::Session(SessionAnswer::Opened(Ok(_))))
+        ));
+        let running = second.call(Request::Terminals);
+        assert!(matches!(running.wait(), Some(Reply::Terminals(ids)) if ids == [id]));
         let attached = second.call(Request::Terminal(pty::Start::Attach(id)));
         match attached.wait() {
             Some(Reply::Term(pty::Event::Screen { screen, cols, rows })) => {
@@ -1269,7 +1550,86 @@ mod tests {
         wait_for_output(&attached, "again-2");
 
         // Closing it hangs up; with no terminals left, the host ends.
-        drop((attached, second));
+        drop((attached, reopened, running, second));
+        ends(host);
+        assert!(!socket.exists(), "the session's socket is removed");
+    }
+
+    #[test]
+    fn ending_the_session_hangs_up_and_tells_the_client() {
+        let (path, host) = host_process("end", false);
+        let root = path.parent().unwrap().to_path_buf();
+        let link = Link::connect(&path).unwrap();
+        let sessions = root.join("sessions");
+        let opened = link.call(Request::Session(SessionCall::Create(sessions)));
+        let dir = match opened.wait() {
+            Some(Reply::Session(SessionAnswer::Opened(Ok((_, dir))))) => dir,
+            other => panic!("{other:?}"),
+        };
+        let term = link.call(Request::Terminal(pty::Start::Shell {
+            cwd: root.clone(),
+            or: None,
+            cols: 80,
+            rows: 24,
+            above: Vec::new(),
+        }));
+        assert!(matches!(
+            term.wait(),
+            Some(Reply::Term(pty::Event::Started(_)))
+        ));
+        end_session(&session::socket_path(&dir)).unwrap();
+        hears(&link, |n| matches!(n, Notice::Ended));
+        assert!(!dir.exists(), "what it kept is removed");
+        ends(host);
+    }
+
+    #[test]
+    fn letting_go_stops_a_terminals_output_but_not_the_terminal() {
+        let (path, host) = host_process("let-go", false);
+        let root = path.parent().unwrap().to_path_buf();
+        let link = Link::connect(&path).unwrap();
+        let sessions = root.join("sessions");
+        let opened = link.call(Request::Session(SessionCall::Create(sessions)));
+        let dir = match opened.wait() {
+            Some(Reply::Session(SessionAnswer::Opened(Ok((_, dir))))) => dir,
+            other => panic!("{other:?}"),
+        };
+        let term = link.call(Request::Terminal(pty::Start::Shell {
+            cwd: root.clone(),
+            or: None,
+            cols: 80,
+            rows: 24,
+            above: Vec::new(),
+        }));
+        let typed = |text: &str| {
+            let input = pty::Control::Input(text.as_bytes().to_vec());
+            link.tell(Tell::Term {
+                call: term.id(),
+                control: input,
+            });
+        };
+        typed("echo ready-$((1+1))\r");
+        wait_for_output(&term, "ready-2");
+
+        let let_go = link.call(Request::LetGo);
+        while let_go.wait().is_some() {}
+        while term.try_recv().is_ok() {}
+        // What's typed still runs, but the call hears nothing of it.
+        let mark = root.join("after");
+        typed(&format!("echo after-$((2+2)) > '{}'\r", mark.display()));
+        let start = Instant::now();
+        while !fs::read_to_string(&mark).is_ok_and(|text| text.contains("after-4")) {
+            assert!(start.elapsed() < Duration::from_secs(20), "it didn't run");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !matches!(term.try_recv(), Ok(Reply::Term(pty::Event::Output(_)))),
+            "output after letting go"
+        );
+
+        link.leave();
+        drop((term, let_go, link));
+        end_session(&session::socket_path(&dir)).unwrap();
         ends(host);
     }
 
@@ -1301,7 +1661,7 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "no notice");
             let heard = link.notices().into_iter().any(|notice| match notice {
                 Notice::DiskChanged(changes) => changes.paths.contains(&file),
-                Notice::Moved => false,
+                _ => false,
             });
             if heard {
                 break;

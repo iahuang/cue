@@ -37,11 +37,29 @@ pub struct Args {
 
 /// Opens what `args` say, in a server, and waits on it.
 pub fn run(args: Args) -> ExitCode {
+    match target(&args) {
+        Ok(Some(listing)) if listing.live => {
+            match attach::request_attach(&session::socket_path(&listing.dir)) {
+                Ok(control) => wait(control, None),
+                Err(err) => fail(&format!("can't reach session {}: {err}", listing.id)),
+            }
+        }
+        Ok(Some(listing)) => serve(vec!["--restore".into(), listing.dir.into_os_string()]),
+        Ok(None) => serve(
+            args.paths
+                .into_iter()
+                .map(PathBuf::into_os_string)
+                .collect(),
+        ),
+        Err(code) => code,
+    }
+}
+
+/// The session `args` say to go back to, or `None` for a new cue; or the
+/// code to exit with, if there's nothing to show.
+pub fn target(args: &Args) -> Result<Option<Listing>, ExitCode> {
     let sessions = session::default_dir();
-    let folder = match folder(&args.paths) {
-        Ok(folder) => folder,
-        Err(err) => return fail(&err.to_string()),
-    };
+    let folder = folder(&args.paths).map_err(|err| fail(&err.to_string()))?;
     let names_file = args.paths.iter().any(|path| !path.is_dir());
     // A cue run in a cue terminal is its own, unless asked.
     let nested = std::env::var_os(attach::PID_VARIABLE).is_some();
@@ -52,35 +70,21 @@ pub fn run(args: Args) -> ExitCode {
     let target = if args.resume {
         let all = sessions.as_deref().map(session::list).unwrap_or_default();
         if all.is_empty() {
-            return fail("there are no sessions");
+            return Err(fail("there are no sessions"));
         }
         // With none here, the rest are worth seeing.
         let everywhere = args.all || !all.iter().any(|listing| listing.has(&folder));
         match pick(all, &folder, everywhere) {
             Ok(Some(listing)) => Some(listing),
-            Ok(None) => return ExitCode::SUCCESS,
-            Err(err) => return fail(&format!("can't list sessions: {err}")),
+            Ok(None) => return Err(ExitCode::SUCCESS),
+            Err(err) => return Err(fail(&format!("can't list sessions: {err}"))),
         }
     } else if found.len() == 1 && !nested {
         found.into_iter().next()
     } else {
         None
     };
-    match target {
-        Some(listing) if listing.live => {
-            match attach::request_attach(&session::socket_path(&listing.dir)) {
-                Ok(control) => wait(control, None),
-                Err(err) => fail(&format!("can't reach session {}: {err}", listing.id)),
-            }
-        }
-        Some(listing) => serve(vec!["--restore".into(), listing.dir.into_os_string()]),
-        None => serve(
-            args.paths
-                .into_iter()
-                .map(PathBuf::into_os_string)
-                .collect(),
-        ),
-    }
+    Ok(target)
 }
 
 /// The folder sessions are looked for in: the first named, or the
@@ -137,8 +141,10 @@ pub fn end(id: Option<String>) -> ExitCode {
         }
     };
     let about = listing.describe(SystemTime::now());
+    let socket = session::socket_path(&listing.dir);
     let ended = match listing.live {
-        true => attach::request_end(&session::socket_path(&listing.dir)),
+        true if crate::env_flag(crate::HOST_PROCESS_VARIABLE) => crate::host::end_session(&socket),
+        true => attach::request_end(&socket),
         false => Session::open(&listing.dir).map(Session::end),
     };
     match ended {

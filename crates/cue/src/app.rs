@@ -340,6 +340,11 @@ pub enum AppAction {
     /// Start cue again in this process, from its binary as it is now,
     /// keeping everything (see [`App::hand_over`]).
     Restart,
+    /// Another client is taking the session over, from the host process:
+    /// save it and leave (see [`Notice::Moved`]).
+    Moved,
+    /// The session was ended from elsewhere: exit.
+    Ended,
 }
 
 /// A terminal a process this one replaced left running, to adopt.
@@ -761,16 +766,28 @@ impl QueryInput for FileDialog {
 }
 
 impl App {
-    /// Shows `workspace`, with `file` open, or an empty panel. Focus starts
-    /// in the editor when there is a file or no tree, in the tree otherwise.
+    /// As [`App::with_host`], on a host in this process.
+    #[cfg(test)]
     pub fn new(
         workspace: Workspace,
         file: Option<PathBuf>,
         width: u32,
         height: u32,
     ) -> Result<App, String> {
+        App::with_host(Link::start(), workspace, file, width, height)
+    }
+
+    /// Shows `workspace`, on `host`, with `file` open, or an empty panel.
+    /// Focus starts in the editor when there is a file or no tree, in the
+    /// tree otherwise.
+    pub fn with_host(
+        host: Link,
+        workspace: Workspace,
+        file: Option<PathBuf>,
+        width: u32,
+        height: u32,
+    ) -> Result<App, String> {
         let file = file.map(|file| document::normalize(&file));
-        let host = Link::start();
         let mut tree = FileTree::new(&host, workspace.roots());
         // Before revealing, so the file's folders stay in view above it.
         // The status bar is below it.
@@ -2562,9 +2579,15 @@ impl App {
                     self.watch_folders();
                     changed |= self.follow_settings();
                 }
-                // Only to a client of a host process, which this app
-                // doesn't let another take yet.
-                Notice::Moved => {}
+                Notice::Moved => self.deferred = Some(AppAction::Moved),
+                Notice::Ended => self.deferred = Some(AppAction::Ended),
+                Notice::Gone => {
+                    self.show_message(
+                        "The host stopped: files can't be opened or saved. Copy what you need, then quit.",
+                        true,
+                    );
+                    changed = true;
+                }
             }
         }
         let committed: Vec<_> = self
@@ -5213,6 +5236,19 @@ impl App {
         &self.host
     }
 
+    /// Leaves the host, for another client to come to, its terminals
+    /// running on. First the host stops sending their output, and what
+    /// came before that is taken in, so that no query a program asks is
+    /// left unanswered: the host's emulator answers those that come later.
+    pub fn leave(&mut self) {
+        let call = self.host.call(Request::LetGo);
+        while call.wait().is_some() {}
+        for terminal in &self.terminals {
+            while terminal.borrow_mut().poll() {}
+        }
+        self.host.leave();
+    }
+
     /// The session this cue is, if any.
     pub fn session(&self) -> Option<&SessionLink> {
         self.session.as_ref()
@@ -5462,6 +5498,7 @@ impl App {
                 program: terminal.is_busy().then(|| terminal.program()).flatten(),
                 screen: self.screens.get(&id).map(|(name, _)| name.clone()),
                 size: (cols, rows),
+                host_id: terminal.host_id(),
             });
         }
         let ids: Vec<u32> = terminals.iter().map(|terminal| terminal.id).collect();
@@ -5653,6 +5690,11 @@ impl App {
             .iter()
             .filter_map(|saved| saved.screen.clone());
         let mut screens = session.screens(names.collect()).into_iter();
+        // Those running on the host still, for a client coming back to them.
+        let running = match state.terminals.iter().any(|saved| saved.host_id.is_some()) {
+            true => terminals_on(&self.host),
+            false => Vec::new(),
+        };
         let root = self.current_root();
         for saved in &state.terminals {
             let screen = saved.screen.as_ref().and_then(|_| screens.next().flatten());
@@ -5663,13 +5705,15 @@ impl App {
                 height: rows as u32,
                 ..Rect::default()
             };
-            let terminal = match adopted.iter().position(|a| a.id == saved.id) {
-                Some(index) => {
+            let running = saved.host_id.filter(|id| running.contains(id));
+            let terminal = match (adopted.iter().position(|a| a.id == saved.id), running) {
+                (Some(index), _) => {
                     let a = adopted.remove(index);
                     let pty = (a.fd, a.pid);
                     Terminal::adopt(&self.host, saved.id, cwd, area, pty, &a.screen, a.size)
                 }
-                None => {
+                (None, Some(host_id)) => Terminal::attach(&self.host, saved.id, cwd, area, host_id),
+                (None, None) => {
                     let screen = screen.as_deref();
                     let host = &self.host;
                     Terminal::restore(host, saved.id, cwd, &root, area, screen, cols, state.saved)
@@ -8684,6 +8728,15 @@ fn images_now(host: &Link, paths: &[&Path]) -> Vec<Result<ImageView, String>> {
             _ => Err("The host stopped.".to_string()),
         })
         .collect()
+}
+
+/// The terminals running on `host`, by their ids there, waiting for it
+/// to say.
+fn terminals_on(host: &Link) -> Vec<crate::term_hub::TermId> {
+    match host.call(Request::Terminals).wait() {
+        Some(Reply::Terminals(ids)) => ids,
+        _ => Vec::new(),
+    }
 }
 
 /// The files at `paths`, loaded by `host`, waiting for them all at once:
@@ -14250,6 +14303,66 @@ mod tests {
         });
         assert!(matches!(ctrl(&mut app, 'q'), AppAction::Detach));
         app.end_session_now();
+    }
+
+    #[test]
+    fn a_client_coming_back_to_a_host_process_attaches_to_its_terminals() {
+        let _serial = crate::test_serial();
+        let root = fixture("session-attach", &[("a.txt", "alpha")]);
+        let path = root.join("host.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Without screens: the native core's the apps', on this thread.
+        let host = std::thread::spawn(move || crate::host::serve_listener(listener, false));
+        let workspace = Workspace::new([root.clone()]).unwrap();
+        let link = Link::connect(&path).unwrap();
+        let mut app = App::with_host(link, workspace, Some(root.join("a.txt")), 80, 10).unwrap();
+        app.sessions = Some(sessions_dir("attach"));
+        app.run(Command::KeepSession, false);
+        app.run(Command::NewTerminal, false);
+        type_text(&mut app, "echo mark-$((6*7))");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the shell's output", |app| {
+            snapshot_text(&app.terminals[0]).contains("mark-42")
+        });
+        let dir = app.session().unwrap().dir().to_path_buf();
+
+        // Another client comes, to the session's socket: this one hears
+        // it, saves, and leaves, the shell running on.
+        let link = Link::connect(&session::socket_path(&dir)).unwrap();
+        wait_until(&mut app, "the move", |app| {
+            matches!(app.deferred, Some(AppAction::Moved))
+        });
+        app.set_attached(false);
+        app.leave();
+        let closed = app.host().closed();
+        drop(app);
+        closed.wait(Duration::from_secs(5));
+        let session = SessionLink::open(&link, &dir).unwrap();
+        let state = session::read(&dir).unwrap();
+        assert!(state.terminals[0].host_id.is_some());
+        let workspace = Workspace::new(state.roots.clone()).unwrap();
+        let mut app = App::with_host(link, workspace, None, 80, 10).unwrap();
+        app.restore_session(session, state, Vec::new()).unwrap();
+        assert_eq!(app.terminals.len(), 1);
+        assert!(app.active_terminal().is_some(), "still on screen");
+        type_text(&mut app, "echo again-$((1+1))");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the same shell's output", |app| {
+            snapshot_text(&app.terminals[0]).contains("again-2")
+        });
+        let text = snapshot_text(&app.terminals[0]);
+        assert!(!text.contains("restored session from"), "{text}");
+
+        // Ended and quit: the shell's hung up on, and the host ends.
+        app.end_session_now();
+        let closed = app.host().closed();
+        drop(app);
+        closed.wait(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !host.is_finished() {
+            assert!(Instant::now() < deadline, "the host goes on");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

@@ -57,6 +57,10 @@ enum ToHub {
     /// A terminal's thread ended.
     Ended(TermId),
     HangUpAll,
+    /// Ends the call it answers, once what came before is sent.
+    After(Responder),
+    /// Which terminals are running, said to this.
+    List(Sender<Vec<TermId>>),
     /// The host's done: hang up on every terminal, and end once they have.
     Close,
 }
@@ -112,9 +116,22 @@ impl Hub {
         let _ = self.to_hub.send(ToHub::Unwatch(id, token));
     }
 
+    /// Ends the call `responder` answers once what the hub sent before is
+    /// on its way: after [`Hub::unwatch`], the last of the output.
+    pub fn after(&self, responder: Responder) {
+        let _ = self.to_hub.send(ToHub::After(responder));
+    }
+
     /// Hangs up on every terminal.
     pub fn hang_up_all(&self) {
         let _ = self.to_hub.send(ToHub::HangUpAll);
+    }
+
+    /// Which terminals are running, by id.
+    pub fn list(&self) -> Vec<TermId> {
+        let (answer, listed) = mpsc::channel();
+        let _ = self.to_hub.send(ToHub::List(answer));
+        listed.recv().unwrap_or_default()
     }
 
     /// How many terminals are running.
@@ -209,12 +226,18 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                     _ => (80, 24),
                 };
                 // Not for a pty adopted, whose screen the app has.
-                let vt = (screens && matches!(start, Start::Shell { .. }))
-                    .then(|| {
+                let vt = match &start {
+                    Start::Shell { above, .. } if screens => {
                         let scrollback = crate::config::get().scrollback;
-                        EmbeddedTerminal::new(size.0.max(1), size.1.max(1), scrollback).ok()
-                    })
-                    .flatten();
+                        let vt = EmbeddedTerminal::new(size.0.max(1), size.1.max(1), scrollback);
+                        vt.ok().map(|mut vt| {
+                            let _ = vt.write(above);
+                            vt.drain_responses();
+                            vt
+                        })
+                    }
+                    _ => None,
+                };
                 let mut term = Term {
                     controller,
                     vt,
@@ -261,16 +284,12 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                 let Some(term) = terms.get_mut(&id) else {
                     continue;
                 };
+                let mut answers = Vec::new();
                 match &event {
                     Event::Output(bytes) => {
                         if let Some(vt) = &mut term.vt {
                             let _ = vt.write(bytes);
-                            // The client's emulator answers, while there's
-                            // one.
-                            let answers = vt.drain_responses();
-                            if term.watcher.is_none() && !answers.is_empty() {
-                                term.controller.send(Control::Input(answers));
-                            }
+                            answers = vt.drain_responses();
                         }
                     }
                     Event::Status(status) => term.status = status.clone(),
@@ -278,6 +297,12 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                     _ => {}
                 }
                 term.tell(event);
+                // The client's emulator answers, while there's one: looked
+                // at once it's been told, so one that went meanwhile isn't
+                // counted on.
+                if term.watcher.is_none() && !answers.is_empty() {
+                    term.controller.send(Control::Input(answers));
+                }
             }
             ToHub::Ended(id) => {
                 // Its call ends with it.
@@ -285,10 +310,16 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                     count.fetch_sub(1, Ordering::Relaxed);
                 }
             }
+            ToHub::After(responder) => drop(responder),
             ToHub::HangUpAll => {
                 for term in terms.values() {
                     term.controller.send(Control::HangUp);
                 }
+            }
+            ToHub::List(answer) => {
+                let mut ids: Vec<TermId> = terms.keys().copied().collect();
+                ids.sort_unstable();
+                let _ = answer.send(ids);
             }
             ToHub::Close => {
                 closing = true;

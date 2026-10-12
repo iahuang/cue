@@ -78,6 +78,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use app::{App, AppAction};
 use attach::{Control, Request};
+use host::Link;
 use input::{Event, Parser};
 use keymap::{Command, Keymap};
 use session::SessionLink;
@@ -119,8 +120,19 @@ fn main() -> ExitCode {
     if !matches!(mode, Ok(Mode::Client(_))) {
         relocate::release();
     }
+    // Whether the app's shown in this process, the client's.
+    let here = matches!(mode, Ok(Mode::Client(_))) && env_flag(HOST_PROCESS_VARIABLE);
     let start = match mode {
         Ok(Mode::Serve(start)) => start,
+        Ok(Mode::Client(args)) if here => match client::target(&args) {
+            Ok(Some(listing)) if listing.live => Start::Attach(listing.dir),
+            Ok(Some(listing)) => Start::Restore(listing.dir),
+            Ok(None) => Start::Paths(args.paths),
+            Err(code) => {
+                relocate::release();
+                return code;
+            }
+        },
         Ok(Mode::Client(args)) => {
             let code = client::run(args);
             relocate::release();
@@ -131,7 +143,11 @@ fn main() -> ExitCode {
         Ok(Mode::End(id)) => return client::end(id),
         Err(code) => return code,
     };
-    let result = std::panic::catch_unwind(|| serve(start));
+    let result = std::panic::catch_unwind(|| match here {
+        true => show(start),
+        false => serve(start),
+    });
+    relocate::release();
     if let Some(panic) = crash::take_panic() {
         eprintln!("cue crashed: {}", panic.text);
         // Said, unless stderr is the background's log.
@@ -197,6 +213,11 @@ enum Mode {
     End(Option<String>),
 }
 
+/// Has the app use a host process (see [`host::Link::spawn`]), shown by
+/// the `cue` the shell ran (see [`show`]): experimental, until it's how
+/// cue always runs.
+const HOST_PROCESS_VARIABLE: &str = "CUE_HOST_PROCESS";
+
 /// What a server starts with.
 enum Start {
     /// The folders and file named.
@@ -206,6 +227,9 @@ enum Start {
     /// The session in this folder, from a process this one replaced, and
     /// its running terminals (see [`attach::exec`]).
     Adopt(PathBuf),
+    /// The session in this folder, from the host process running it, its
+    /// terminals included (see [`show`]).
+    Attach(PathBuf),
 }
 
 /// What the command line asks for, or the exit code for `--help`,
@@ -295,17 +319,18 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
     // Load before taking over the terminal so errors print normally.
     let (width, height) = tty::size();
     let mut app = match start {
-        Start::Paths(paths) => open(paths, width, height)?,
-        Start::Restore(dir) => resume(&dir, width, height, Vec::new())?,
+        Start::Paths(paths) => open(Link::start(), paths, width, height)?,
+        Start::Restore(dir) => resume(Link::start(), &dir, width, height, Vec::new())?,
         Start::Adopt(dir) => {
             let (ephemeral, adopted) =
                 attach::read_manifest(&dir).ok_or("No session state found to take over.")?;
-            let mut app = resume(&dir, width, height, adopted)?;
+            let mut app = resume(Link::start(), &dir, width, height, adopted)?;
             if ephemeral {
                 app.forget_session();
             }
             app
         }
+        Start::Attach(_) => return Err("Only a host process's client attaches.".into()),
     };
     app.warn_about_config(&config_warnings);
     if let Some(note) = background_sessions(&app) {
@@ -370,6 +395,16 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
                 app.hang_up();
                 return Ok(());
             }
+            // Only from a host process, as with `CUE_NO_SERVER` too.
+            Outcome::Moved => {
+                app.save_session(true);
+                leave(app);
+                return Ok(());
+            }
+            Outcome::Ended => {
+                leave(app);
+                return Ok(());
+            }
             Outcome::End(requester) => {
                 app.end_session_now();
                 if let Some(control) = &mut control {
@@ -426,9 +461,14 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// An app showing `paths`: the folders named, or the current one, with
-/// the file named open, at the line and column given.
-fn open(paths: Vec<PathBuf>, width: u32, height: u32) -> Result<App, Box<dyn std::error::Error>> {
+/// An app showing `paths`, on `host`: the folders named, or the current
+/// one, with the file named open, at the line and column given.
+fn open(
+    host: Link,
+    paths: Vec<PathBuf>,
+    width: u32,
+    height: u32,
+) -> Result<App, Box<dyn std::error::Error>> {
     let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) =
         paths.into_iter().partition(|path| path.is_dir());
     let mut files = files.into_iter();
@@ -446,21 +486,26 @@ fn open(paths: Vec<PathBuf>, width: u32, height: u32) -> Result<App, Box<dyn std
         true => Workspace::new([std::env::current_dir()?])?,
         false => Workspace::new(folders)?,
     };
-    let mut app = App::new(workspace, file, width, height)?;
+    let mut app = App::with_host(host, workspace, file, width, height)?;
     if let Some(position) = position {
         app.go_to(position);
     }
     Ok(app)
 }
 
-/// An app going back to the session in `dir`, with the terminals
-/// `adopted` from a process this one replaced.
+/// An app going back to the session in `dir`, on `host`, with the
+/// terminals `adopted` from a process this one replaced.
 fn resume(
+    host: Link,
     dir: &Path,
     width: u32,
     height: u32,
     adopted: Vec<app::Adopted>,
 ) -> Result<App, Box<dyn std::error::Error>> {
+    // First: a host process taken over from a client says so once that
+    // one's saved it, and left.
+    let session =
+        SessionLink::open(&host, dir).map_err(|err| format!("can't open the session: {err}"))?;
     let state = session::read(dir).ok_or("the session can't be read")?;
     let roots: Vec<PathBuf> = state
         .roots
@@ -471,9 +516,7 @@ fn resume(
     if roots.is_empty() {
         return Err("The session's folders no longer exist.".into());
     }
-    let mut app = App::new(Workspace::new(roots)?, None, width, height)?;
-    let session = SessionLink::open(app.host(), dir)
-        .map_err(|err| format!("can't open the session: {err}"))?;
+    let mut app = App::with_host(host, Workspace::new(roots)?, None, width, height)?;
     app.restore_session(session, state, adopted)?;
     Ok(app)
 }
@@ -540,6 +583,101 @@ fn host_process() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// How long leaving waits for the host to hear what's left to say.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Shows the app in this process's terminal, as the `cue` the shell ran,
+/// with its host a process of its own (`CUE_HOST_PROCESS`, for now): a
+/// new one, or with [`Start::Attach`], the one running the session,
+/// which another client showing it leaves first. Quitting hangs up on its
+/// terminals; detaching, or the terminal going, leaves them running in the
+/// host, for `cue` to come back to; it exits either way.
+fn show(start: Start) -> Result<(), Box<dyn std::error::Error>> {
+    let (config, config_warnings) = config::load();
+    config::set(config);
+    let (width, height) = tty::size();
+    let spawn = || Link::spawn().map_err(|err| format!("can't start a host process: {err}"));
+    let mut app = match start {
+        Start::Paths(paths) => open(spawn()?, paths, width, height)?,
+        Start::Restore(dir) => resume(spawn()?, &dir, width, height, Vec::new())?,
+        Start::Attach(dir) => {
+            let host = Link::connect(&session::socket_path(&dir))
+                .map_err(|err| format!("can't reach the session: {err}"))?;
+            resume(host, &dir, width, height, Vec::new())?
+        }
+        Start::Adopt(_) => return Err("Only a server takes over.".into()),
+    };
+    // The host's started, from the copy this runs from, if it does.
+    relocate::release();
+    app.warn_about_config(&config_warnings);
+    if let Some(note) = background_sessions(&app) {
+        app.show_message_now(note, false);
+    }
+    if let Some(note) = crashes() {
+        app.show_message_now(note, true);
+    }
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        unsafe {
+            libc::signal(
+                signal,
+                on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            )
+        };
+    }
+    loop {
+        let said = match attached(&mut app, None, &mut None, None)? {
+            Outcome::Quit => {
+                app.discard_recovery();
+                close(app);
+                return Ok(());
+            }
+            Outcome::Restart => {
+                let text = "Restart isn't available with a host process yet.";
+                app.show_message_now(text.into(), true);
+                continue;
+            }
+            Outcome::Detach => {
+                app.set_attached(false);
+                detached(&app)
+            }
+            Outcome::HangUp | Outcome::Terminate => {
+                if !app.hang_up() {
+                    close(app);
+                    return Ok(());
+                }
+                // Nowhere to say it.
+                String::new()
+            }
+            Outcome::Moved => {
+                app.set_attached(false);
+                "the session moved to another terminal.".to_string()
+            }
+            // Not served any more.
+            Outcome::Ended => "the session was ended.".to_string(),
+            Outcome::Attach(..) | Outcome::End(_) => unreachable!("it takes no clients"),
+        };
+        leave(app);
+        if !said.is_empty() {
+            eprintln!("cue: {said}");
+        }
+        return Ok(());
+    }
+}
+
+/// Lets `app` go, hanging up on its terminals, once the host hears.
+fn close(app: App) {
+    let closed = app.host().closed();
+    drop(app);
+    closed.wait(CLOSE_TIMEOUT);
+}
+
+/// Lets `app` go, leaving its terminals running in the host, for a
+/// client to come back to.
+fn leave(mut app: App) {
+    app.leave();
+    close(app);
+}
+
 /// What the client that detached says about how to come back.
 fn detached(app: &App) -> String {
     let running = app.running_programs();
@@ -567,9 +705,9 @@ impl Drop for Listener {
 }
 
 /// Listens for clients on the session's socket, if `app` is a session and
-/// it isn't yet.
+/// it isn't yet, unless its host is a process: then that does.
 fn listen(app: &App, listener: &mut Option<Listener>) -> std::io::Result<()> {
-    let (None, Some(session)) = (&listener, app.session()) else {
+    let (None, Some(session), true) = (&listener, app.session(), app.host().is_local()) else {
         return Ok(());
     };
     let path = session.socket();
@@ -652,7 +790,7 @@ fn restart(
             error
         }
     };
-    let mut app = resume(&dir, width, height, adopted)?;
+    let mut app = resume(Link::start(), &dir, width, height, adopted)?;
     if ephemeral {
         app.forget_session();
     }
@@ -674,6 +812,10 @@ enum Outcome {
     Attach(Control, attach::Attach),
     /// A client asked to end the session.
     End(Control),
+    /// Another client is taking over, from the host process.
+    Moved,
+    /// The session was ended, from the host process.
+    Ended,
 }
 
 /// What woke a detached app.
@@ -863,6 +1005,8 @@ fn attached(
                     Some(AppAction::Quit) => return Ok(Outcome::Quit),
                     Some(AppAction::Detach) => return Ok(Outcome::Detach),
                     Some(AppAction::Restart) => return Ok(Outcome::Restart),
+                    Some(AppAction::Moved) => return Ok(Outcome::Moved),
+                    Some(AppAction::Ended) => return Ok(Outcome::Ended),
                     Some(AppAction::Copy(text)) => {
                         renderer.copy_to_clipboard(&text);
                     }
@@ -906,6 +1050,8 @@ fn attached(
                 AppAction::Quit => return Ok(Outcome::Quit),
                 AppAction::Detach => return Ok(Outcome::Detach),
                 AppAction::Restart => return Ok(Outcome::Restart),
+                AppAction::Moved => return Ok(Outcome::Moved),
+                AppAction::Ended => return Ok(Outcome::Ended),
                 AppAction::Copy(text) => {
                     renderer.copy_to_clipboard(&text);
                 }

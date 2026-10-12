@@ -11,7 +11,8 @@
 - Finish moving file system checks to the host: it resolves paths, startup and session restore load in one round trip, and periodic session saves don't wait (`2f4ab08`)
 - Send the host's messages over a socket, serialized, even to a host in the same process: the first part of moving the host into its own process (`83c7f0f`)
 - Add `cue --host`, a host in a process of its own that serves one client at a time, a newer one taking over; the app uses one with `CUE_HOST_PROCESS=1`, for now (`cf8456d`)
-- Keep terminals running on a host process when its client's gone, for another to attach to and get the screen
+- Keep terminals running on a host process when its client's gone, for another to attach to and get the screen (`c06ab44`)
+- With `CUE_HOST_PROCESS=1`, show the app in the `cue` the shell ran: detaching exits, leaving terminals running on the host, and coming back reattaches to them; sessions' sockets go only in folders of the user's own
 
 ## v0.4.2 — 2026-10-11
 

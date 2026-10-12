@@ -180,6 +180,7 @@ impl Terminal {
                 or: None,
                 cols,
                 rows,
+                above: Vec::new(),
             },
         );
         Ok(Terminal::with(id, vt, pty, &cwd, area))
@@ -204,13 +205,15 @@ impl Terminal {
         let mut vt = EmbeddedTerminal::new(cols.max(1), rows, config::get().scrollback)
             .map_err(|e| io::Error::other(e.to_string()))?;
         restyle(&mut vt);
+        let mut above = Vec::new();
         if let Some(screen) = screen {
-            let _ = vt.write(screen);
+            above.extend_from_slice(screen);
             let note = format!(
                 "\x1b[0;2m── restored session from {} ──\x1b[0m\r\n",
                 local_time(saved)
             );
-            let _ = vt.write(note.as_bytes());
+            above.extend_from_slice(note.as_bytes());
+            let _ = vt.write(&above);
             vt.drain_responses();
         }
         let _ = vt.resize(width, rows);
@@ -219,6 +222,7 @@ impl Terminal {
             or: Some(or.to_path_buf()),
             cols: width,
             rows,
+            above,
         };
         Ok(Terminal::with(id, vt, Shell::start(host, start), cwd, area))
     }
@@ -241,6 +245,26 @@ impl Terminal {
         let mut terminal = Terminal::with(id, vt, pty, cwd, area);
         terminal.show_screen(screen, (cols, rows));
         Ok(terminal)
+    }
+
+    /// A terminal running on the host already, as `host_id` there, which
+    /// a client before this one left running: what it shows comes from
+    /// the host first (see [`Event::Screen`]), then what its program
+    /// writes.
+    pub fn attach(
+        host: &Link,
+        id: u32,
+        cwd: &Path,
+        area: Rect,
+        host_id: TermId,
+    ) -> io::Result<Terminal> {
+        let (cols, rows) = size(area);
+        let mut vt = EmbeddedTerminal::new(cols, rows, config::get().scrollback)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        restyle(&mut vt);
+        let mut pty = Shell::start(host, Start::Attach(host_id));
+        pty.id = Some(host_id);
+        Ok(Terminal::with(id, vt, pty, cwd, area))
     }
 
     /// Shows `screen`, as [`full_snapshot`] took it `cols` by `rows`, in
@@ -372,6 +396,7 @@ impl Terminal {
             or: None,
             cols,
             rows,
+            above: Vec::new(),
         };
         self.pty = Shell::start(&self.pty.host.clone(), start);
         self.closed = false;
@@ -440,6 +465,11 @@ impl Terminal {
     /// system clipboard themselves.
     pub fn take_copied(&mut self) -> Option<String> {
         self.vt.take_clipboard()
+    }
+
+    /// Which it is on the host, once the host's said.
+    pub fn host_id(&self) -> Option<TermId> {
+        self.pty.id
     }
 
     pub fn id(&self) -> u32 {

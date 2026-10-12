@@ -56,8 +56,11 @@ operation (search, indexing, and git stay server-side).
   aarch64); the server never downloads anything. A server of another build
   re-execs into the uploaded one, adopting its state, as sessions do today.
 - **System `ssh`**, not a library: `~/.ssh/config`, ProxyJump,
-  ControlMaster, and agents just work. The server listens only on a unix
-  socket in the user's runtime dir, mode 0700.
+  ControlMaster, and agents just work. The server listens only on unix
+  sockets, in folders checked to be the user's own, as tmux does: theirs,
+  not a link, and no one else's to write to (`/tmp/cue-UID/` is fine on
+  macOS, which has no `XDG_RUNTIME_DIR`, but on a shared Linux machine
+  another user can make that folder first).
 
 ## Protocol shape
 
@@ -81,6 +84,11 @@ Later, for reconnection: session ids, sequence numbers and acks, and replay
 buffers on both sides, so a dropped link resumes instead of starting over.
 State the server pushes (repos, screens) should be idempotent snapshots or
 diffs against an acked version, not a log of commands.
+
+Everything shares one stream, so a big reply (a PDF, the picker's list)
+mustn't hold up terminal output and acks behind it: big replies go in
+chunks, and each side's writer keeps two queues, sending from the bulk one
+only while the interactive one's empty.
 
 ## Steps
 
@@ -251,7 +259,7 @@ Notes from 1.1 and 1.2:
   thread has its own.
 - `Symbol::kind` is a `&'static str`; it's interned as it's read (2.1).
 - Git status is still scheduled by the client (`Git::poll` decides when to
-  call). See open questions.
+  call). See settled questions.
 
 ### 2. Host in the session server
 
@@ -282,6 +290,18 @@ client's connected, or while it's a session with programs running.
 5. Upgrades: a client of another build has the host re-exec into its
    binary, which adopts the ptys, their screens, and the session's lock.
 6. Config: the host loads its own, and reloads when told to.
+7. Edits as operations: the client streams each document's edits to the
+   host as versioned operations, which it acks, and the host's copy is
+   what sessions keep and what saving writes. Whole texts go only on
+   opening and reloading. Step 4's editing while disconnected needs this.
+8. Terminals' queries answered by the host only: with the client's colors
+   pushed to it, the host's emulator answers every query and the client's
+   none, so a query that comes as a client attaches or leaves gets one
+   answer, and the two emulators can't drift (colors, a size the client
+   hasn't sent yet). Until then, a client leaves in two steps
+   (`App::leave`): the host stops sending its terminals' output
+   (`Request::LetGo`, ending once the last is sent), the client answers
+   what came, then leaves; from then on the hub's emulator answers.
 
 Progress:
 
@@ -331,6 +351,29 @@ Progress:
   `Terminal::adopt` now uses too), but doesn't attach yet: that's 2.4,
   which also needs a way to leave without hanging up (dropping the app
   cancels its terminals' calls).
+- [x] 2.4 With `CUE_HOST_PROCESS=1`, the `cue` the shell ran is the app
+  (`main::show`), in its own terminal: it picks a session as before
+  (`client::target`), then starts a host process, or for a live session
+  connects to the one running it, on the session's socket, which a host
+  listens on while it keeps one. A client that connects takes over once
+  the one before has saved and left: that one hears `Notice::Moved`, is
+  served until it leaves (`Link::leave`, after which dropping its calls
+  doesn't hang up), or 5s, and exits saying the session moved; what the
+  new one asks meanwhile waits, so it reads the session as last saved.
+  Restoring asks the host which terminals still run (`Request::Terminals`)
+  and attaches to those (`TerminalState::host_id`, `Terminal::attach`); the
+  rest start over below their screens, which the host's emulator is given
+  too (`Start::Shell`'s `above`). Detaching, or the terminal going with
+  programs running, leaves; quitting hangs up, waiting until the host's
+  heard (`Link::closed`). `cue --end` asks the host (`end_session`), which
+  tells its client `Notice::Ended`, hangs up, removes the session, and
+  ends. A host doesn't take a client in one of its own terminals
+  (`Hello::inside`). Once the host's gone, or the link's left, calls end
+  unanswered, and the app says the host stopped (`Notice::Gone`). Also
+  fixed: a session's unknown keys went over the wire as TOML values, which
+  postcard can't read back; they go as text now. Not yet: Restart, and a
+  client of another build attaching (2.5); without the flag, the old
+  server path is unchanged.
 
 ### 3. ssh
 
@@ -338,9 +381,11 @@ Progress:
 sessions). scp's rule decides what's remote: a `:` before any `/`. Bootstrap
 the server binary over ssh, then run the protocol over the ssh channel.
 
-Large transfers to watch: the file list for the picker (send paths relative
-to roots, maybe compressed, maybe match server-side instead), and search
-results.
+Large transfers to watch: the file list for the picker (paths relative to
+roots, compressed, then kept up to date from disk change notices rather
+than sent again), and search results. Chunked replies and the writers'
+two queues (see Protocol shape) come in here, before anything's slow.
+The host pushes git status (see below).
 
 ### 4. Resumable transport
 
@@ -349,13 +394,24 @@ disconnected UI (buffers editable with edits queued, terminals visibly
 stale, popups saying offline). Later, a UDP transport keyed over ssh, as
 mosh and Eternal Terminal do.
 
+Taking over must still leave one writer. Taking over ends the old
+client's claim to resume: one that comes back after another took over
+hears `Notice::Moved`, doesn't send the edits the host never acked, and
+puts them in its recovery copies instead, which are for exactly that.
+
 ### 5. GUI renderer
 
-## Open questions
+## Settled questions
 
-- Fuzzy file matching client-side (needs the whole list) or server-side
-  (a round trip per keystroke in the picker)?
-- Git status scheduling: today the client decides when to ask; the host
-  could instead refresh on its own watch events and push repos.
-- Syntax highlighting of search excerpts happens server-side now; keep it
-  there (CPU on the server, colors on the wire) or highlight on the client?
+- Fuzzy file matching stays on the client, which has the whole list
+  already: on the host it'd put a round trip in every keystroke in the
+  picker. Step 3 makes the list cheap to send. Matching on the host,
+  debounced, only if a list's too big to send.
+- Git status: the host refreshes it on its own watch events (the
+  worktree's, and `.git/index` and `HEAD`), settled, and pushes repos as
+  snapshots. The client stops scheduling it.
+- Search excerpts stay highlighted on the host. It parses the whole file,
+  so lines in a block comment or a long string come out right, which the
+  client can't do from an excerpt; and what goes on the wire is a capture
+  index per range (`SyntaxColor`, a byte), not colors, so the client's
+  theme still picks them.

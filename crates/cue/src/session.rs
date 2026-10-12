@@ -26,6 +26,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -146,6 +147,9 @@ pub struct TerminalState {
     pub screen: Option<String>,
     /// The size it was, in columns and rows.
     pub size: (u16, u16),
+    /// Which it is on the host, to attach to while it runs there (see
+    /// [`crate::term_hub`]).
+    pub host_id: Option<u64>,
 }
 
 /// Everything a session keeps.
@@ -175,7 +179,24 @@ pub struct State {
     /// How files were chosen to indent, by path.
     pub indents: Vec<(PathBuf, Indent)>,
     /// The keys at the top of the file this cue doesn't know, to write back.
+    #[serde(with = "toml_text")]
     pub unknown: Table,
+}
+
+/// A TOML table, sent as its text: what it holds goes by what it is, which
+/// a compact format such as postcard doesn't say.
+mod toml_text {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(table: &Table, ser: S) -> Result<S::Ok, S::Error> {
+        table.to_string().serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Table, D::Error> {
+        String::deserialize(de)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl State {
@@ -233,7 +254,9 @@ impl Session {
             // one another.
             let id = format!("{:08x}", mix(seed.wrapping_add(attempt)) as u32);
             let dir = sessions.join(&id);
-            match fs::create_dir(&dir) {
+            // Its socket may be in it, which takes a folder others can't
+            // write to (see `attach::listen`).
+            match fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => return Session::open(&dir),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(err) => return Err(err),
@@ -281,7 +304,6 @@ impl Session {
         &self.id
     }
 
-    #[cfg(test)]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -457,6 +479,11 @@ pub fn run(call: SessionCall, session: &mut Option<Session>) -> SessionAnswer {
     };
     match &call {
         SessionCall::Create(sessions) => return opened(Session::create(sessions), session),
+        // The host's already, for a client coming back to it.
+        SessionCall::Open(dir) if session.as_ref().is_some_and(|s| s.dir == *dir) => {
+            let held = session.as_ref().unwrap();
+            return SessionAnswer::Opened(Ok((held.id.clone(), held.dir.clone())));
+        }
         SessionCall::Open(dir) => return opened(Session::open(dir), session),
         _ => {}
     }
@@ -1061,6 +1088,9 @@ pub fn encode(state: &State) -> String {
         if let Some(screen) = &terminal.screen {
             table.insert("screen".into(), Value::String(screen.clone()));
         }
+        if let Some(id) = terminal.host_id {
+            table.insert("host_id".into(), int(id));
+        }
         table.insert("cols".into(), int(terminal.size.0 as u64));
         table.insert("rows".into(), int(terminal.size.1 as u64));
         Value::Table(table)
@@ -1275,6 +1305,10 @@ pub fn decode(text: &str) -> Option<State> {
                 name: get_string(table, "name"),
                 program: get_string(table, "program"),
                 screen: get_string(table, "screen"),
+                host_id: table
+                    .get("host_id")
+                    .and_then(Value::as_integer)
+                    .and_then(|id| u64::try_from(id).ok()),
                 size: (
                     get_u32(table, "cols")
                         .unwrap_or(80)
@@ -1348,6 +1382,16 @@ pub fn decode(text: &str) -> Option<State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_keys_cross_the_wire() {
+        let mut state = State::default();
+        let mut later = Table::new();
+        later.insert("width".into(), Value::Integer(3));
+        state.unknown.insert("later".into(), Value::Table(later));
+        let sent = postcard::to_stdvec(&state).unwrap();
+        assert_eq!(postcard::from_bytes::<State>(&sent).unwrap(), state);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
@@ -1439,6 +1483,7 @@ mod tests {
                 program: Some("cargo".into()),
                 screen: Some("2.vt".into()),
                 size: (100, 30),
+                host_id: Some(7),
             }],
             recent: vec![Shown::Terminal(2), Shown::File("/w/cue/b.rs".into())],
             mark: Some(Mark {
