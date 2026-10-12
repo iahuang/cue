@@ -3,6 +3,7 @@
 ## v0.4.2 — 2026-10-11
 
 - Embedded PDF viewer (`c3deea1`)
+- Build releases with Rust 1.92
 
 ## v0.4.1 — 2026-10-10
 
