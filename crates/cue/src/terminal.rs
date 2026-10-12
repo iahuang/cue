@@ -299,7 +299,8 @@ impl Terminal {
     /// `exec`, and the shell's process id, once the host has, taking in
     /// what the program wrote until then. `None` if it's gone.
     pub fn release(&mut self) -> Option<(RawFd, libc::pid_t)> {
-        if self.closed {
+        // A host process's descriptor means nothing in this one.
+        if self.closed || !self.pty.host.is_local() {
             return None;
         }
         self.pty.control(Control::Release);

@@ -297,6 +297,21 @@ Progress:
   reach the local host's threads directly (`Link::set_config`), not as a
   message. Raw fds (`Start::Adopt`, `Event::Released`) still cross as
   numbers, meaningful only in the same process: 2.3 and 2.5 replace them.
+- [x] 2.2 `cue --host` (`host::serve_listener`) serves the clients that
+  connect to the socket it's handed (`CUE_HOST_FD`), one at a time: each
+  says its build first (`Hello`), and one of another build is refused
+  (2.5 makes that a re-exec). A client that connects takes over: the one
+  before hears `Notice::Moved`, and its calls end. The host keeps its
+  `State` (the symbols cache, the session and its lock) from one client to
+  the next, but a connection's watches and terminals end with it, for now
+  (2.3). It ends when the client it serves is gone, or the first doesn't
+  come within 10s, and removes its socket. `Link::connect` connects;
+  `Link::spawn` starts one on a socket in `/tmp/cue-UID/`, setsid, and
+  connects. The app uses one with `CUE_HOST_PROCESS=1` (experimental),
+  the in-process host otherwise. Under the flag: a restart can't adopt
+  shells (`Terminal::release` gives up, so they start over), and
+  terminals' `CUE_PID` is the host's, so a cue run in one isn't told it's
+  nested; the host loads its settings once, at start.
 
 ### 3. ssh
 

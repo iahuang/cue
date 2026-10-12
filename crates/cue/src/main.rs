@@ -125,6 +125,7 @@ fn main() -> ExitCode {
             relocate::release();
             return code;
         }
+        Ok(Mode::Host) => return host_process(),
         Ok(Mode::List) => return client::list(),
         Ok(Mode::End(id)) => return client::end(id),
         Err(code) => return code,
@@ -188,6 +189,9 @@ enum Mode {
     /// Do the work, in the terminal the client handed over (see
     /// [`attach`]).
     Serve(Start),
+    /// Be a host (see [`host::serve_listener`]), on the socket the app
+    /// that started this process handed it.
+    Host,
     List,
     End(Option<String>),
 }
@@ -207,6 +211,9 @@ enum Start {
 /// `--version`, or bad usage.
 fn parse_args() -> Result<Mode, ExitCode> {
     let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "--host") {
+        return Ok(Mode::Host);
+    }
     if args.peek().is_some_and(|arg| arg == "--serve") {
         args.next();
         let folder = |args: &mut dyn Iterator<Item = std::ffi::OsString>| {
@@ -515,6 +522,21 @@ fn crashes() -> Option<String> {
             client::tilde(&dir)
         )),
     }
+}
+
+/// Runs a host process, until its client's gone.
+fn host_process() -> ExitCode {
+    let Some(listener) = host::listener_from_env() else {
+        eprintln!("cue: --host is for cue to start");
+        return ExitCode::FAILURE;
+    };
+    let (config, _) = config::load();
+    config::set(config);
+    // Where a panic's said: there's no terminal.
+    attach::let_go_of_stdio(crash::open_log());
+    host::serve_listener(listener);
+    crash::close_log();
+    ExitCode::SUCCESS
 }
 
 /// What the client that detached says about how to come back.

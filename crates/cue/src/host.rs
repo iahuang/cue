@@ -4,10 +4,12 @@
 //! elsewhere: in the session server, or over ssh (see
 //! `docs/client-server.md`).
 //!
-//! For now the host runs on a thread of its own in the same process, but
-//! the app talks to it over a socket all the same, as it will to a host in
-//! another process: each message serialized ([`postcard`]), after its
-//! length.
+//! The host runs on a thread of its own in the same process, or in a
+//! process of its own (`cue --host`, see [`serve_listener`]); either way
+//! the app talks to it over a socket: each message serialized
+//! ([`postcard`]), after its length. A host process serves one client at a
+//! time, of its own build: one that connects takes over from the one
+//! before, which hears it [`Notice::Moved`].
 //!
 //! - A [`Request`] is a call: the host answers it with [`Reply`]s, as many
 //!   as it takes, and then ends it. Dropping the [`Call`] cancels it, and
@@ -26,13 +28,16 @@
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -73,6 +78,13 @@ pub fn set_at_once(on: bool) {
 
 /// Tells a call from the others on the same link.
 pub type CallId = u64;
+
+/// Hands a host process the socket it listens on, by descriptor.
+const LISTENER_VARIABLE: &str = "CUE_HOST_FD";
+/// How long either end waits for the other's side of the handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a host process waits for its first client.
+const FIRST_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the app asks the host to do, answered with [`Reply`]s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +274,16 @@ pub enum Tell {
 pub enum Notice {
     /// Files in the watched folders changed, with what they are now.
     DiskChanged(Changes),
+    /// Another client took over: this one's calls end, and it hears
+    /// nothing more.
+    Moved,
+}
+
+/// What a client says first, to a host process.
+#[derive(Serialize, Deserialize)]
+struct Hello {
+    /// Which build of cue it is (see [`crate::attach::build`]).
+    build: String,
 }
 
 /// What the app sends the host.
@@ -288,6 +310,8 @@ enum Input {
     Watched,
     /// The app is gone.
     Shutdown,
+    /// Another client took over.
+    Moved,
     #[cfg(test)]
     Settle,
 }
@@ -329,6 +353,8 @@ struct Shared {
     /// Where each call's replies go, until it ends.
     routes: Arc<Mutex<HashMap<CallId, Sender<Reply>>>>,
     notices: Receiver<Notice>,
+    /// The host is on a thread of this process.
+    local: bool,
     #[cfg(test)]
     settled: Receiver<()>,
     /// The host's, if it's in this process, for tests.
@@ -337,21 +363,89 @@ struct Shared {
 }
 
 impl Link {
+    /// The app's host: in a process of its own, with `CUE_HOST_PROCESS`
+    /// set (experimental, until the app moves into the client), or else
+    /// in this one.
+    pub fn start() -> Link {
+        if cfg!(test) || !crate::env_flag("CUE_HOST_PROCESS") {
+            return Link::local();
+        }
+        Link::spawn().unwrap_or_else(|err| {
+            eprintln!("cue: can't start a host process: {err}");
+            Link::local()
+        })
+    }
+
     /// Starts a host in this process, on threads of its own, which stop
     /// once the link and its calls are dropped.
     pub fn local() -> Link {
         let (ours, theirs) = UnixStream::pair().expect("can't make a socket pair");
         let state = Arc::new(State::default());
-        let link = Link::over(ours);
+        let link = Link::over(ours, true);
         #[cfg(test)]
         let _ = link.shared.state.set(Arc::clone(&state));
-        std::thread::spawn(move || serve_stream(theirs, state));
+        std::thread::spawn(move || serve_stream(theirs, mpsc::channel(), state));
         link
     }
 
+    /// Starts a host process (`cue --host`), listening on a socket of its
+    /// own, and connects to it. It ends once no client is connected.
+    pub fn spawn() -> io::Result<Link> {
+        let uid = unsafe { libc::getuid() };
+        let path = PathBuf::from(format!("/tmp/cue-{uid}/host-{}.sock", std::process::id()));
+        let listener = crate::attach::listen(&path)?;
+        listener.set_nonblocking(false)?;
+        let fd = listener.as_raw_fd();
+        let mut command = Command::new(crate::relocate::exe());
+        command
+            .arg("--host")
+            .env(LISTENER_VARIABLE, fd.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::relocate::pass_on(&mut command);
+        // A session of its own, so that the terminal's signals aren't its;
+        // and the listener, kept across `exec`.
+        unsafe {
+            command.pre_exec(move || {
+                libc::setsid();
+                libc::fcntl(fd, libc::F_SETFD, 0);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        drop(listener);
+        std::thread::spawn(move || child.wait());
+        Link::connect(&path)
+    }
+
+    /// Connects to the host process listening on `path`.
+    pub fn connect(path: &Path) -> io::Result<Link> {
+        Link::connect_as(path, crate::attach::build())
+    }
+
+    /// Connects to the host process on `path` as a client of `build`.
+    fn connect_as(path: &Path, build: &str) -> io::Result<Link> {
+        let stream = UnixStream::connect(path)?;
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let hello = Hello {
+            build: build.to_string(),
+        };
+        write_frame(&mut &stream, &hello)?;
+        let welcome: Result<(), String> = read_frame(&mut &stream)?;
+        welcome.map_err(io::Error::other)?;
+        stream.set_read_timeout(None)?;
+        Ok(Link::over(stream, false))
+    }
+
+    /// Whether the host is on a thread of this process.
+    pub fn is_local(&self) -> bool {
+        self.shared.local
+    }
+
     /// The app's end of a connection to a host on the other end of
-    /// `stream`.
-    fn over(stream: UnixStream) -> Link {
+    /// `stream`, in this process if `local`.
+    fn over(stream: UnixStream, local: bool) -> Link {
         let (to_host, outbox) = mpsc::channel();
         let routes: Arc<Mutex<HashMap<CallId, Sender<Reply>>>> = Arc::default();
         let (notify, notices) = mpsc::channel();
@@ -380,6 +474,7 @@ impl Link {
                 next: Cell::new(1),
                 routes,
                 notices,
+                local,
                 #[cfg(test)]
                 settled,
                 #[cfg(test)]
@@ -497,18 +592,29 @@ fn read(
     wake::wake();
 }
 
+/// Reads a message: its length, then it.
+fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<T> {
+    let mut len = [0; 8];
+    reader.read_exact(&mut len)?;
+    let mut frame = vec![0; u64::from_le_bytes(len) as usize];
+    reader.read_exact(&mut frame)?;
+    postcard::from_bytes(&frame).map_err(io::Error::other)
+}
+
+/// Writes a message: its length, then it.
+fn write_frame<T: Serialize>(writer: &mut impl Write, message: &T) -> io::Result<()> {
+    let frame = postcard::to_stdvec(message).map_err(io::Error::other)?;
+    writer.write_all(&(frame.len() as u64).to_le_bytes())?;
+    writer.write_all(&frame)
+}
+
 /// Takes each message from `stream`, until it ends, or `take` says to stop.
 fn read_frames<T: DeserializeOwned>(stream: UnixStream, mut take: impl FnMut(T) -> bool) {
     let mut reader = BufReader::new(stream);
-    let mut len = [0; 8];
-    let mut frame = Vec::new();
-    while reader.read_exact(&mut len).is_ok() {
-        frame.resize(u64::from_le_bytes(len) as usize, 0);
-        if reader.read_exact(&mut frame).is_err() {
-            break;
-        }
-        let message = match postcard::from_bytes(&frame) {
+    loop {
+        let message = match read_frame(&mut reader) {
             Ok(message) => message,
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(err) => {
                 eprintln!("cue: a message from the other end can't be read: {err}");
                 break;
@@ -521,21 +627,17 @@ fn read_frames<T: DeserializeOwned>(stream: UnixStream, mut take: impl FnMut(T) 
 }
 
 /// Sends what comes from `outbox` over `stream`, until it's all sent, or
-/// the other end's gone. Then the other end hears it's done.
+/// the other end's gone. Then the connection's done with, both ways: on
+/// either end, nothing's left to read once nothing's left to send.
 fn write_frames<T: Serialize>(stream: UnixStream, outbox: Receiver<T>) {
-    fn write<T: Serialize>(writer: &mut impl Write, message: &T) -> io::Result<()> {
-        let frame = postcard::to_stdvec(message).map_err(io::Error::other)?;
-        writer.write_all(&(frame.len() as u64).to_le_bytes())?;
-        writer.write_all(&frame)
-    }
     let mut writer = BufWriter::new(&stream);
     'sending: while let Ok(message) = outbox.recv() {
-        if write(&mut writer, &message).is_err() {
+        if write_frame(&mut writer, &message).is_err() {
             break;
         }
         // What's come meanwhile goes in the same write.
         while let Ok(message) = outbox.try_recv() {
-            if write(&mut writer, &message).is_err() {
+            if write_frame(&mut writer, &message).is_err() {
                 break 'sending;
             }
         }
@@ -544,7 +646,7 @@ fn write_frames<T: Serialize>(stream: UnixStream, outbox: Receiver<T>) {
         }
     }
     drop(writer);
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -583,9 +685,116 @@ impl Drop for Responder {
     }
 }
 
-/// Serves the app on the other end of `stream`, until it's gone.
-fn serve_stream(stream: UnixStream, state: Arc<State>) {
-    let (to_host, inbox) = mpsc::channel();
+/// The listening socket this host process was handed, if it was.
+pub fn listener_from_env() -> Option<UnixListener> {
+    let fd: RawFd = std::env::var(LISTENER_VARIABLE).ok()?.parse().ok()?;
+    // Not for the shells it starts.
+    std::env::remove_var(LISTENER_VARIABLE);
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return None;
+    }
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Some(unsafe { UnixListener::from_raw_fd(fd) })
+}
+
+/// What happens to a host process.
+enum Happened {
+    /// A client said hello, and is of this build.
+    Greeted(UnixStream),
+    /// The client of this connection is gone.
+    Ended(u64),
+}
+
+/// Runs a host process: serves the clients that connect to `listener`,
+/// one at a time, a newer one taking over, until the one it serves is
+/// gone, or the first doesn't come. Then removes the socket.
+pub fn serve_listener(listener: UnixListener) {
+    let path = listener
+        .local_addr()
+        .ok()
+        .and_then(|addr| addr.as_pathname().map(Path::to_path_buf));
+    let state = Arc::new(State::default());
+    let (happen, happened) = mpsc::channel();
+    let greeted = happen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                // Out of descriptors, say: a moment may free some.
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
+            let greeted = greeted.clone();
+            // Apart, so a client that says nothing holds up no other.
+            std::thread::spawn(move || {
+                if let Some(stream) = greet(stream) {
+                    let _ = greeted.send(Happened::Greeted(stream));
+                }
+            });
+        }
+    });
+    // The connection served, by its number, and its host thread's inbox.
+    let mut serving: Option<(u64, Sender<Input>)> = None;
+    let mut connections = 0;
+    loop {
+        let next = match serving {
+            Some(_) => happened.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            None => happened.recv_timeout(FIRST_CLIENT_TIMEOUT),
+        };
+        match next {
+            Ok(Happened::Greeted(stream)) => {
+                if let Some((_, moved)) = serving.take() {
+                    let _ = moved.send(Input::Moved);
+                }
+                connections += 1;
+                let id = connections;
+                let (to_host, inbox) = mpsc::channel();
+                serving = Some((id, to_host.clone()));
+                let state = Arc::clone(&state);
+                let ended = happen.clone();
+                std::thread::spawn(move || {
+                    serve_stream(stream, (to_host, inbox), state);
+                    let _ = ended.send(Happened::Ended(id));
+                });
+            }
+            Ok(Happened::Ended(id)) => {
+                if serving.as_ref().is_some_and(|(serving, _)| *serving == id) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// `stream`, once its client said it's of this build; told why not, if
+/// it isn't.
+fn greet(stream: UnixStream) -> Option<UnixStream> {
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok()?;
+    let hello: Hello = read_frame(&mut &stream).ok()?;
+    let build = crate::attach::build();
+    let welcome = match hello.build == build {
+        true => Ok(()),
+        false => Err(format!(
+            "The host is another build of cue ({build}, not {}).",
+            hello.build
+        )),
+    };
+    write_frame(&mut &stream, &welcome).ok()?;
+    stream.set_read_timeout(None).ok()?;
+    welcome.is_ok().then_some(stream)
+}
+
+/// Serves the app on the other end of `stream`, until it's gone, or
+/// another takes over: the host's thread takes what comes to `inbox`.
+fn serve_stream(
+    stream: UnixStream,
+    (to_host, inbox): (Sender<Input>, Receiver<Input>),
+    state: Arc<State>,
+) {
     let (output, outbox) = mpsc::channel();
     let Ok(reading) = stream.try_clone() else {
         return;
@@ -682,6 +891,10 @@ fn serve(
             #[cfg(test)]
             Ok(Input::Settle) => {
                 let _ = output.send(Output::Settled);
+            }
+            Ok(Input::Moved) => {
+                let _ = output.send(Output::Notice(Notice::Moved));
+                break;
             }
             Ok(Input::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -878,6 +1091,83 @@ mod tests {
         }
     }
 
+    /// A host process's loop, on a thread, listening on a socket in
+    /// `name`'s fixture folder.
+    fn host_process(name: &str) -> (PathBuf, std::thread::JoinHandle<()>) {
+        let path = fixture(name).join("host.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        (path, std::thread::spawn(move || serve_listener(listener)))
+    }
+
+    /// Waits for `host` to end, which it does once its client's gone.
+    fn ends(host: std::thread::JoinHandle<()>) {
+        let start = Instant::now();
+        while !host.is_finished() {
+            assert!(start.elapsed() < Duration::from_secs(5), "the host goes on");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_host_process_serves_its_client_until_it_goes() {
+        let (path, host) = host_process("process");
+        let root = path.parent().unwrap().to_path_buf();
+        let link = Link::connect(&path).unwrap();
+        assert!(!link.is_local());
+        let call = link.call(Request::Look {
+            paths: vec![root.clone()],
+        });
+        match call.wait() {
+            Some(Reply::Looked(looked)) => {
+                assert_eq!(
+                    looked,
+                    [Some(Look {
+                        real: root,
+                        is_dir: true
+                    })]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        drop(call);
+        drop(link);
+        ends(host);
+        assert!(!path.exists(), "the socket's removed");
+    }
+
+    #[test]
+    fn a_client_that_connects_takes_over_from_the_one_before() {
+        let (path, host) = host_process("taken");
+        let first = Link::connect(&path).unwrap();
+        let held = first.call(Request::Hold);
+        let second = Link::connect(&path).unwrap();
+        // The first hears it moved, and its call ends.
+        assert!(held.wait().is_none());
+        let start = Instant::now();
+        while !first.notices().iter().any(|n| matches!(n, Notice::Moved)) {
+            assert!(start.elapsed() < Duration::from_secs(5), "no notice");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The second's served, and the host goes on without the first.
+        drop((held, first));
+        let call = second.call(Request::Look { paths: Vec::new() });
+        assert!(matches!(call.wait(), Some(Reply::Looked(_))));
+        assert!(!host.is_finished());
+        drop((call, second));
+        ends(host);
+    }
+
+    #[test]
+    fn a_client_of_another_build_is_refused() {
+        let (path, host) = host_process("refused");
+        let err = Link::connect_as(&path, "another").err().unwrap();
+        assert!(err.to_string().contains("another build"), "{err}");
+        // It waits on for a client of its own build.
+        let link = Link::connect(&path).unwrap();
+        drop(link);
+        ends(host);
+    }
+
     #[test]
     fn watched_folders_notice_changes() {
         let root = fixture("watched");
@@ -896,6 +1186,7 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "no notice");
             let heard = link.notices().into_iter().any(|notice| match notice {
                 Notice::DiskChanged(changes) => changes.paths.contains(&file),
+                Notice::Moved => false,
             });
             if heard {
                 break;

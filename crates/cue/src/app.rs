@@ -770,7 +770,7 @@ impl App {
         height: u32,
     ) -> Result<App, String> {
         let file = file.map(|file| document::normalize(&file));
-        let host = Link::local();
+        let host = Link::start();
         let mut tree = FileTree::new(&host, workspace.roots());
         // Before revealing, so the file's folders stay in view above it.
         // The status bar is below it.
@@ -2562,6 +2562,9 @@ impl App {
                     self.watch_folders();
                     changed |= self.follow_settings();
                 }
+                // Only to a client of a host process, which this app
+                // doesn't let another take yet.
+                Notice::Moved => {}
             }
         }
         let committed: Vec<_> = self
