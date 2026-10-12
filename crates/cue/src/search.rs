@@ -27,6 +27,7 @@ use crate::file_index;
 use crate::host::{Call, Link, Reply, Request, Responder};
 use crate::keymap::Command;
 use crate::language::{self, Language};
+use crate::replica::DocId;
 use crate::syntax::{ExcerptHighlighter, LineColors, MAX_EXCERPT_BYTES};
 use crate::workspace::Workspace;
 use serde::{Deserialize, Serialize};
@@ -209,14 +210,14 @@ pub struct Search {
 
 impl Search {
     /// Starts searching `workspace` for `query`, on `host`. `open` has the
-    /// text of files open with unsaved changes, by path, to search instead
-    /// of what's on disk. Fails with a message if the query isn't a valid
-    /// regex.
+    /// copies on the host (see [`crate::replica`]) of files open with
+    /// unsaved changes, by path, to search instead of what's on disk. Fails
+    /// with a message if the query isn't a valid regex.
     pub fn start(
         host: &Link,
         workspace: &Workspace,
         query: &Query,
-        open: HashMap<PathBuf, String>,
+        open: HashMap<PathBuf, DocId>,
     ) -> Result<Search, String> {
         query.matcher()?;
         let call = host.call(Request::Search {
@@ -563,6 +564,7 @@ fn floor_char_boundary(text: &str, at: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replica::Replica;
     use crate::theme::SyntaxColor;
     use std::fs;
 
@@ -588,10 +590,20 @@ mod tests {
         }
     }
 
-    /// The files matching `query`, sorted by path.
+    /// The files matching `query`, sorted by path, `open` having their
+    /// text, unsaved, by path, as the host's copies of documents.
     fn search(root: &Path, query: &Query, open: HashMap<PathBuf, String>) -> Vec<FileMatches> {
         let workspace = Workspace::new([root.to_path_buf()]).unwrap();
-        let mut files = Search::start(&Link::local(), &workspace, query, open)
+        let host = Link::local();
+        let replicas: Vec<(PathBuf, Replica)> = open
+            .into_iter()
+            .map(|(path, text)| (path, Replica::open(&host, text, None)))
+            .collect();
+        let open = replicas
+            .iter()
+            .map(|(path, r)| (path.clone(), r.id()))
+            .collect();
+        let mut files = Search::start(&host, &workspace, query, open)
             .unwrap()
             .wait();
         files.sort_by(|a, b| a.display.cmp(&b.display));

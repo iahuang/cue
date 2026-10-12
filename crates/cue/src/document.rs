@@ -26,8 +26,10 @@ use opentui::{EditBuffer, LogicalCursor, WidthMethod};
 use crate::config;
 use crate::git::Tracked;
 use crate::history::{EditKind, History};
+use crate::host::Link;
 use crate::indent::Indent;
 use crate::language::{self, Language};
+use crate::replica::{DocId, Replica};
 use crate::symbols::{self, Symbol};
 use crate::syntax::Highlighter;
 use crate::theme::{self, Theme};
@@ -177,6 +179,8 @@ pub struct Document {
     tracked: RefCell<Option<Rc<Tracked>>>,
     /// What the text defines, as last outlined (see [`Document::outline`]).
     outline: RefCell<Option<Outline>>,
+    /// Its copy on the host, once it has one (see [`crate::replica`]).
+    replica: RefCell<Option<Replica>>,
 }
 
 /// What a document's text defines, as of its content epoch, in the
@@ -355,6 +359,7 @@ impl Document {
             saved: RefCell::new(Saved::of(&text)),
             tracked: RefCell::default(),
             outline: RefCell::default(),
+            replica: RefCell::default(),
         }
     }
 
@@ -552,6 +557,43 @@ impl Document {
         self.buffer.text()
     }
 
+    /// Takes `replica` as its copy on the host, made of the file it was
+    /// loaded from (see [`Replica::loading`]).
+    pub fn set_replica(&self, replica: Replica) {
+        *self.replica.borrow_mut() = Some(replica);
+    }
+
+    /// Brings its copy on `host` up to date with the text, sending what
+    /// changed, or the whole text if it has none yet. Returns the copy's
+    /// id.
+    pub fn sync(&self, host: &Link) -> DocId {
+        let mut replica = self.replica.borrow_mut();
+        let replica = replica.get_or_insert_with(|| {
+            let epoch = self.buffer.content_epoch();
+            Replica::open(host, self.buffer.text(), Some(epoch))
+        });
+        replica.sync(&self.buffer);
+        replica.id()
+    }
+
+    /// Its copy's id, if it has one.
+    pub fn replica_id(&self) -> Option<DocId> {
+        Some(self.replica.borrow().as_ref()?.id())
+    }
+
+    /// Notes that its copy on the host has `version`.
+    pub fn acked(&self, version: u64) {
+        if let Some(replica) = self.replica.borrow_mut().as_mut() {
+            replica.ack(version);
+        }
+    }
+
+    /// The latest version of its copy the host has, for tests.
+    #[cfg(test)]
+    pub fn acked_version(&self) -> Option<u64> {
+        Some(self.replica.borrow().as_ref()?.acked())
+    }
+
     /// What the text defines, in order (see [`symbols::outline`]), outlined
     /// again only once it changed.
     pub fn outline(&self) -> Rc<Vec<Symbol>> {
@@ -586,12 +628,17 @@ impl Document {
         Ok(())
     }
 
-    /// What to write to save it: the text, the buffer's content epoch then,
-    /// and how lines end.
-    pub fn to_write(&self) -> (String, u64, LineEnding) {
-        let text = self.buffer.text();
+    /// What to have `host` write to save it, its copy brought up to date:
+    /// the copy, its version, and its text; the buffer's content epoch
+    /// then; and how lines end.
+    pub fn to_write(&self, host: &Link) -> (DocId, u64, String, u64, LineEnding) {
+        let doc = self.sync(host);
+        let replica = self.replica.borrow();
+        let replica = replica.as_ref().expect("synced");
         (
-            text,
+            doc,
+            replica.version(),
+            replica.sent().to_string(),
             self.buffer.content_epoch(),
             self.file.borrow().line_ending,
         )

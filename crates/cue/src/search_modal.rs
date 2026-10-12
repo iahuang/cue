@@ -20,6 +20,7 @@ use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::{self, Caret, Edit};
 use crate::picker::{self, Area};
+use crate::replica::DocId;
 use crate::search::{FileMatches, Found, Line, Query, Search, Toggle, CONTEXT_LINES};
 use crate::theme;
 use crate::workspace::Workspace;
@@ -79,7 +80,7 @@ pub struct SearchModal {
     host: Link,
     workspace: Workspace,
     /// Unsaved text of open files, searched instead of what's on disk.
-    unsaved: HashMap<PathBuf, String>,
+    unsaved: HashMap<PathBuf, DocId>,
     query: Query,
     /// The cursor and selection in the query. The query filled in on
     /// opening is selected, so typing replaces it.
@@ -123,7 +124,7 @@ impl SearchModal {
         keymap: &Keymap,
         memory: Memory,
         text: Option<String>,
-        unsaved: HashMap<PathBuf, String>,
+        unsaved: HashMap<PathBuf, DocId>,
         width: u32,
         height: u32,
     ) -> SearchModal {

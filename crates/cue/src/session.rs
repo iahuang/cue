@@ -37,6 +37,7 @@ use crate::document::Document;
 use crate::host::{Call, Link, Reply, Request};
 use crate::indent::Indent;
 use crate::layout::{Axis, Layout, PanelId};
+use crate::replica::{DocId, Texts};
 use serde::{Deserialize, Serialize};
 
 /// What `session.toml` starts with; files of later versions are passed
@@ -361,12 +362,14 @@ impl Session {
         Ok(true)
     }
 
-    /// Writes what `snapshot` has: its texts and screens, then its state,
-    /// as [`Session::save`] does, and once that's written, removes the
-    /// texts, and with `prune_screens` the screens, that it no longer
-    /// names. Returns whether the state was written.
-    pub fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<bool> {
-        for (name, text) in &snapshot.texts {
+    /// Writes what `snapshot` has: its texts, the app's `copies` of its
+    /// documents, and screens, then its state, as [`Session::save`] does,
+    /// and once that's written, removes the texts, and with
+    /// `prune_screens` the screens, that it no longer names. Returns
+    /// whether the state was written.
+    pub fn snapshot(&mut self, snapshot: &Snapshot, copies: &Texts) -> io::Result<bool> {
+        for (name, doc) in &snapshot.texts {
+            let text = copies.get(*doc).map_err(io::Error::other)?;
             self.write_text(name, text)?;
         }
         for (id, screen) in &snapshot.screens {
@@ -443,8 +446,9 @@ pub fn screen_name(id: u32) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub state: State,
-    /// Unsaved texts that changed, by name.
-    pub texts: Vec<(String, String)>,
+    /// Unsaved texts that changed, by name: the copies of documents the
+    /// host has (see [`crate::replica`]).
+    pub texts: Vec<(String, DocId)>,
     /// Terminals' screens that changed, by terminal.
     pub screens: Vec<(u32, Vec<u8>)>,
     /// Whether the screens the state doesn't name go.
@@ -484,8 +488,9 @@ pub enum SessionAnswer {
     Done,
 }
 
-/// Does what `call` asks of `session`, the host's, if it has one.
-pub fn run(call: SessionCall, session: &mut Option<Session>) -> SessionAnswer {
+/// Does what `call` asks of `session`, the host's, if it has one, with
+/// the app's `copies` of its documents.
+pub fn run(call: SessionCall, session: &mut Option<Session>, copies: &Texts) -> SessionAnswer {
     let err = |err: io::Error| err.to_string();
     let opened = |opened: io::Result<Session>, session: &mut Option<Session>| {
         SessionAnswer::Opened(opened.map_err(err).map(|opened| {
@@ -526,7 +531,7 @@ pub fn run(call: SessionCall, session: &mut Option<Session>) -> SessionAnswer {
             SessionAnswer::Done
         }
         SessionCall::Save(snapshot) => {
-            SessionAnswer::Saved(current.snapshot(&snapshot).map_err(err))
+            SessionAnswer::Saved(current.snapshot(&snapshot, copies).map_err(err))
         }
         SessionCall::Texts(names) => SessionAnswer::Texts(
             names
@@ -559,8 +564,9 @@ pub struct SessionLink {
     texts: Vec<Text>,
     /// Names the next document's text.
     next_text: u32,
-    /// Texts and screens for the next save.
-    pending_texts: Vec<(String, String)>,
+    /// Texts, by their documents' copies on the host, and screens, for
+    /// the next save.
+    pending_texts: Vec<(String, DocId)>,
     pending_screens: Vec<(u32, Vec<u8>)>,
 }
 
@@ -678,7 +684,11 @@ impl SessionLink {
                 return Some(text.name.clone());
             }
         }
-        let unsaved = doc.unsaved_text()?;
+        if !doc.is_modified() {
+            return None;
+        }
+        // The host writes its copy, which has this.
+        let copy = doc.sync(&self.host);
         let name = match index {
             Some(index) => self.texts[index].name.clone(),
             None => {
@@ -686,7 +696,7 @@ impl SessionLink {
                 format!("{}.txt", self.next_text - 1)
             }
         };
-        self.pending_texts.push((name.clone(), unsaved));
+        self.pending_texts.push((name.clone(), copy));
         let text = Text {
             doc: Rc::downgrade(doc),
             name: name.clone(),

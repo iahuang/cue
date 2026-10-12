@@ -42,6 +42,7 @@ mod quick_look;
 mod reader;
 mod recovery;
 mod relocate;
+mod replica;
 mod resume;
 mod scroller;
 mod search;

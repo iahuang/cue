@@ -404,6 +404,30 @@ Progress:
   ignores it. The host sends the client none of its settings yet: the
   client reads `[editor]` from its own file, which over ssh (step 3)
   won't be the host's.
+- [x] 2.7 Edits as operations (`replica`): each document has a copy on
+  the host, one per connection, under an id the client picks
+  (`Link::next_doc`). Loading a file to open keeps what the host read as
+  the copy (`Request::Load`'s `doc`); a document that wasn't loaded (an
+  untitled one, or unsaved text restored where its file can't be read)
+  sends its whole text once (`Tell::Open`). From then on, each time round
+  the main loop, the client sends what changed in each document since it
+  last sent (`Tell::Edit`: the bytes between what the two texts start and
+  end with in common, as `syntax::changed` finds them) as the next
+  version. The host makes it and acks it (`Notice::Acked`); an edit that
+  doesn't follow drops the copy, so that saving fails rather than write
+  the wrong text. Saving names the copy and its version (`Request::Save`),
+  a session's save the copies of its unsaved texts (`Snapshot::texts`),
+  and workspace search those of files open with unsaved changes. The host
+  takes those texts as each call comes, on the thread that makes edits,
+  so an edit that comes after one doesn't reach it. Dropping a document
+  lets its copy go (`Tell::Close`), even one still loading; its link to
+  the host is weak, so documents left over don't keep the host going.
+  Reverting and reloading send what changed, as editing does. Not yet:
+  the client keeps the text it last sent, to compare with, so a second
+  copy of each document; the host's copies go with the connection, not
+  the session, so a client that's gone loses what it typed since the last
+  periodic save (step 4 keeps them, which is what the acks are for); and
+  big files aren't paged.
 
 ### 3. ssh
 

@@ -55,6 +55,7 @@ use crate::git::{self, GitAnswer, GitCall, Repo};
 use crate::image;
 use crate::pty;
 use crate::quick_look::{self, Peek};
+use crate::replica::{Copies, DocId, Edit, Texts};
 use crate::search::{self, Query};
 use crate::session::{self, Session, SessionAnswer, SessionCall};
 use crate::symbols::{self, FileSymbols};
@@ -111,11 +112,12 @@ pub enum Request {
         progress: bool,
     },
     /// The files in `workspace` matching `query` (see [`crate::search`]),
-    /// searching `unsaved`'s text, by path, instead of what's on disk.
+    /// searching the copies of documents open with unsaved changes,
+    /// `unsaved`, by path, instead of what's on disk.
     Search {
         workspace: Workspace,
         query: Query,
-        unsaved: HashMap<PathBuf, String>,
+        unsaved: HashMap<PathBuf, DocId>,
     },
     /// What git says of the repositories `roots` are in.
     GitStatus { roots: Vec<PathBuf> },
@@ -126,13 +128,15 @@ pub enum Request {
     /// haven't changed since the last indexing aren't read again.
     IndexSymbols { files: Vec<PathBuf>, progress: bool },
     /// The text of the file at `path`, to open, and where it is,
-    /// [`document::resolve`]d (see [`document::load`]).
-    Load { path: PathBuf },
-    /// Writing `text` to `path`, [`document::resolve`]d (see
-    /// [`document::write`]).
+    /// [`document::resolve`]d (see [`document::load`]); kept as the copy
+    /// `doc`, if given (see [`crate::replica`]).
+    Load { path: PathBuf, doc: Option<DocId> },
+    /// Writing the copy `doc`, as of `version`, to `path`,
+    /// [`document::resolve`]d (see [`document::write`]).
     Save {
         path: PathBuf,
-        text: String,
+        doc: DocId,
+        version: u64,
         line_ending: LineEnding,
         /// The file as last loaded or saved, to write over only if it
         /// still is, if given.
@@ -291,6 +295,16 @@ pub enum Tell {
     Watch(BTreeSet<PathBuf>),
     /// Have the terminal of this [`Request::Terminal`] call do something.
     Term { call: CallId, control: pty::Control },
+    /// Keep `text` as the copy `doc` (see [`crate::replica`]).
+    Open { doc: DocId, text: String },
+    /// Make `edit` to the copy `doc`, as `version`.
+    Edit {
+        doc: DocId,
+        version: u64,
+        edit: Edit,
+    },
+    /// Let the copy `doc` go.
+    Close(DocId),
     /// Read the settings again: the client did. A host process reads its
     /// own file, and takes its part of it (see [`crate::config`]); one in
     /// the app's process shares the app's.
@@ -302,6 +316,8 @@ pub enum Tell {
 pub enum Notice {
     /// Files in the watched folders changed, with what they are now.
     DiskChanged(Changes),
+    /// The copy `doc` took the edits up to `version`.
+    Acked { doc: DocId, version: u64 },
     /// Another client is taking over: this one's to save what it has,
     /// and leave (see [`Link::leave`]), within [`MOVE_TIMEOUT`].
     Moved,
@@ -420,6 +436,7 @@ struct Shared {
     /// dropped, the host hears the app's gone.
     to_host: Sender<ToHost>,
     next: Cell<CallId>,
+    next_doc: Cell<DocId>,
     /// Where each call's replies go, until it ends.
     routes: Arc<Mutex<Routes>>,
     notices: Receiver<Notice>,
@@ -553,6 +570,7 @@ impl Link {
             shared: Rc::new(Shared {
                 to_host,
                 next: Cell::new(1),
+                next_doc: Cell::new(1),
                 routes,
                 notices,
                 sent: RefCell::new(Some(sent)),
@@ -585,6 +603,18 @@ impl Link {
 
     pub fn tell(&self, tell: Tell) {
         let _ = self.shared.to_host.send(ToHost::Tell(tell));
+    }
+
+    /// An id for a document's copy on the host (see [`crate::replica`]).
+    pub fn next_doc(&self) -> DocId {
+        let id = self.shared.next_doc.get();
+        self.shared.next_doc.set(id + 1);
+        id
+    }
+
+    /// A link that doesn't keep the host going, as this one does.
+    pub fn weak(&self) -> WeakLink {
+        WeakLink(Rc::downgrade(&self.shared))
     }
 
     /// Leaves the host, for another client to come to: its terminals run
@@ -623,6 +653,18 @@ impl Link {
     /// What the host said since the last call, in order.
     pub fn notices(&self) -> Vec<Notice> {
         self.shared.notices.try_iter().collect()
+    }
+}
+
+/// A [`Link`] that doesn't keep the host going: what it's told once the
+/// link and its calls are gone goes nowhere.
+pub struct WeakLink(std::rc::Weak<Shared>);
+
+impl WeakLink {
+    pub fn tell(&self, tell: Tell) {
+        if let Some(shared) = self.0.upgrade() {
+            let _ = shared.to_host.send(ToHost::Tell(tell));
+        }
     }
 }
 
@@ -1221,6 +1263,8 @@ fn serve(
     // Those let go of, whose calls ended: what the app answered of their
     // last output still goes to them.
     let mut let_go: HashMap<CallId, TermId> = HashMap::new();
+    // The app's documents' copies, which its calls read.
+    let copies = Arc::new(Mutex::new(Copies::default()));
     let mut left = false;
     loop {
         let input = match watcher.due() {
@@ -1270,7 +1314,10 @@ fn serve(
                     cancelled,
                 };
                 let state = Arc::clone(&state);
-                std::thread::spawn(move || answer(request, &state, responder));
+                // As they are now, before the edits that come after.
+                let texts = texts_for(&request, &lock(&copies));
+                let copies = Arc::clone(&copies);
+                std::thread::spawn(move || answer(request, &state, &copies, texts, responder));
             }
             Ok(Input::Cancel(id)) => {
                 if let Some(cancelled) = calls.remove(&id) {
@@ -1293,6 +1340,14 @@ fn serve(
             }
             // Here, before the calls that come after are answered.
             Ok(Input::Tell(Tell::ReloadConfig)) => state.reload_config(),
+            Ok(Input::Tell(Tell::Open { doc, text })) => lock(&copies).open(doc, text),
+            Ok(Input::Tell(Tell::Edit { doc, version, edit })) => {
+                if lock(&copies).edit(doc, version, &edit) {
+                    let acked = Notice::Acked { doc, version };
+                    let _ = output.send(Output::Notice(acked));
+                }
+            }
+            Ok(Input::Tell(Tell::Close(doc))) => lock(&copies).close(doc),
             Ok(Input::Tell(Tell::Watch(folders))) => {
                 watcher.watch(folders.into_iter().filter(|f| f.is_dir()).collect());
             }
@@ -1421,8 +1476,28 @@ impl State {
     }
 }
 
-/// Does what `request` asks, replying as it goes.
-fn answer(request: Request, state: &State, responder: Responder) {
+/// The texts of the app's `copies` of documents that `request` reads.
+fn texts_for(request: &Request, copies: &Copies) -> Texts {
+    match request {
+        Request::Save { doc, version, .. } => copies.take([(*doc, Some(*version))]),
+        Request::Search { unsaved, .. } => copies.take(unsaved.values().map(|&doc| (doc, None))),
+        Request::Session(SessionCall::Save(snapshot)) => {
+            copies.take(snapshot.texts.iter().map(|&(_, doc)| (doc, None)))
+        }
+        _ => Texts::default(),
+    }
+}
+
+/// Does what `request` asks, replying as it goes: with the app's copies of
+/// documents, `copies`, which loading adds to, and the `texts` of them it
+/// reads, taken as it came.
+fn answer(
+    request: Request,
+    state: &State,
+    copies: &Mutex<Copies>,
+    mut texts: Texts,
+    responder: Responder,
+) {
     state.use_config();
     match request {
         Request::ListFiles {
@@ -1433,30 +1508,43 @@ fn answer(request: Request, state: &State, responder: Responder) {
             workspace,
             query,
             unsaved,
-        } => search::run(&workspace, &query, unsaved, &responder),
+        } => {
+            let unsaved = unsaved
+                .into_iter()
+                .filter_map(|(path, doc)| Some((path, texts.remove(doc).ok()?)))
+                .collect();
+            search::run(&workspace, &query, unsaved, &responder)
+        }
         Request::IndexSymbols { files, progress } => {
             symbols::index(&files, &state.symbols, progress, &responder)
         }
-        Request::Load { path } => {
+        Request::Load { path, doc } => {
             let loaded = document::load(&path).map_err(|err| err.to_string());
+            if let Some(doc) = doc {
+                let text = loaded.as_ref().ok().map(|loaded| loaded.text.as_str());
+                lock(copies).loaded(doc, text);
+            }
             responder.reply(Reply::Loaded(loaded));
         }
         Request::Save {
             path,
-            text,
+            doc,
+            version: _,
             line_ending,
             expected,
             make_folder,
         } => {
             let path = document::resolve(&path);
-            let written =
-                document::write(&path, &text, line_ending, expected, make_folder).map(|stamp| {
-                    Written {
-                        real: std::fs::canonicalize(&path).ok(),
-                        path,
-                        stamp,
-                    }
-                });
+            // Taken as of it already.
+            let written = texts
+                .get(doc)
+                .map_err(Unsaved::Failed)
+                .and_then(|text| document::write(&path, text, line_ending, expected, make_folder));
+            let written = written.map(|stamp| Written {
+                real: std::fs::canonicalize(&path).ok(),
+                path,
+                stamp,
+            });
             responder.reply(Reply::Saved(written));
         }
         Request::CheckDisk { files } => {
@@ -1503,7 +1591,7 @@ fn answer(request: Request, state: &State, responder: Responder) {
         Request::Terminal(_) | Request::LetGo => {}
         Request::Session(call) => {
             let mut session = lock(&state.session);
-            let answer = session::run(call, &mut session);
+            let answer = session::run(call, &mut session, &texts);
             state.listen_for(session.as_ref());
             drop(session);
             responder.reply(Reply::Session(answer));

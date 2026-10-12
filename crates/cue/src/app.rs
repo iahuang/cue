@@ -105,6 +105,7 @@ use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::quick_look::QuickLook;
 use crate::recovery::{self, Orphan, Recovery};
+use crate::replica::{DocId, Replica};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::session::{self, SessionLink, Shown};
@@ -522,7 +523,7 @@ pub struct App {
     /// What the host is doing to files, in the background.
     file_ops: Vec<PendingOp>,
     /// Files the host is loading, to show once it has.
-    opening: Vec<(Opening, Call)>,
+    opening: Vec<(Opening, Call, Replica)>,
     /// Images the host is reading.
     reading_images: Vec<(ImageRead, Call)>,
     /// Files the host is writing.
@@ -2460,6 +2461,10 @@ impl App {
     /// whether the screen needs redrawing.
     pub fn poll(&mut self) -> bool {
         let now = Instant::now();
+        // What was typed since, to the host's copies.
+        for doc in &self.documents {
+            doc.sync(&self.host);
+        }
         let mut changed = self.toasts.expire(now);
         // A thread finished something to show, such as a PDF's page.
         changed |= wake::take();
@@ -2578,6 +2583,12 @@ impl App {
                     self.watching = None;
                     self.watch_folders();
                     changed |= self.follow_settings();
+                }
+                Notice::Acked { doc, version } => {
+                    let acked = self.documents.iter().find(|d| d.replica_id() == Some(doc));
+                    if let Some(acked) = acked {
+                        acked.acked(version);
+                    }
                 }
                 Notice::Moved => self.deferred = Some(AppAction::Moved),
                 Notice::Ended => self.deferred = Some(AppAction::Ended),
@@ -2829,7 +2840,8 @@ impl App {
         let Some(path) = doc.path() else {
             return AppAction::Continue;
         };
-        let call = self.host.call(Request::Load { path });
+        // What changed comes back to the host as an edit.
+        let call = self.host.call(Request::Load { path, doc: None });
         self.reverting.push((doc, saving, call));
         #[cfg(test)]
         if crate::host::at_once() {
@@ -3872,7 +3884,7 @@ impl App {
     pub fn go_to(&mut self, position: Position) {
         // A file on its way to the active panel, it's in that one.
         let panel = (self.tab().id, self.tab().active);
-        if let Some((opening, _)) = self.opening.iter_mut().find(|(o, _)| o.panel == panel) {
+        if let Some((opening, ..)) = self.opening.iter_mut().find(|(o, ..)| o.panel == panel) {
             let before = opening.go.take();
             opening.go = Some(Box::new(move |editor: &mut Editor| {
                 if let Some(before) = before {
@@ -3905,12 +3917,13 @@ impl App {
             .editor()
             .and_then(Editor::selected_text)
             .filter(|text| !text.contains('\n'));
-        // Open files are searched as they are, saved or not.
-        let unsaved: HashMap<PathBuf, String> = self
+        // Open files are searched as they are, saved or not: their copies
+        // on the host.
+        let unsaved: HashMap<PathBuf, DocId> = self
             .documents
             .iter()
             .filter(|doc| doc.is_modified())
-            .filter_map(|doc| Some((doc.path()?, doc.text())))
+            .filter_map(|doc| Some((doc.path()?, doc.sync(&self.host))))
             .collect();
         self.search = Some(SearchModal::new(
             &self.host,
@@ -4014,9 +4027,9 @@ impl App {
         }
         // What the panel was to show before, it no longer is.
         self.opening
-            .retain(|(other, _)| other.panel != opening.panel);
-        let call = self.host.call(Request::Load { path });
-        self.opening.push((opening, call));
+            .retain(|(other, ..)| other.panel != opening.panel);
+        let (call, replica) = load(&self.host, path);
+        self.opening.push((opening, call, replica));
         #[cfg(test)]
         if crate::host::at_once() {
             let mut shown = false;
@@ -4042,12 +4055,12 @@ impl App {
                 }
                 Err(TryRecvError::Disconnected) => Err("The host stopped.".to_string()),
             };
-            let (opening, _) = self.opening.remove(index);
-            loaded.push((opening, result));
+            let (opening, _, replica) = self.opening.remove(index);
+            loaded.push((opening, result, replica));
         }
         let mut shown = false;
-        for (opening, result) in loaded {
-            shown |= self.opened(opening, result);
+        for (opening, result, replica) in loaded {
+            shown |= self.opened(opening, result, replica);
         }
         shown
     }
@@ -4055,7 +4068,12 @@ impl App {
     /// Shows the file `opening` asked for, as `result` loaded it, in the
     /// panel it was asked from if it's still in this tab. Returns false,
     /// with a message, if it can't be.
-    fn opened(&mut self, opening: Opening, result: Result<Loaded, String>) -> bool {
+    fn opened(
+        &mut self,
+        opening: Opening,
+        result: Result<Loaded, String>,
+        replica: Replica,
+    ) -> bool {
         // Open already by another name, or opened meanwhile, it's that one.
         let open = result.as_ref().ok().and_then(|loaded| {
             self.documents
@@ -4071,7 +4089,7 @@ impl App {
                 return false;
             }
             (None, result) => {
-                result.and_then(|loaded| Document::loaded(loaded, self.theme.clone()))
+                result.and_then(|loaded| document_of(loaded, replica, self.theme.clone()))
             }
         };
         let (doc, notice) = match opened {
@@ -4173,7 +4191,7 @@ impl App {
         };
         let panel = (self.tab().id, self.tab().active);
         // What the panel was to show before, it no longer is.
-        self.opening.retain(|(other, _)| other.panel != panel);
+        self.opening.retain(|(other, ..)| other.panel != panel);
         self.reading_images.retain(
             |(read, _)| !matches!(read, ImageRead::Open { panel: other, .. } if *other == panel),
         );
@@ -5104,10 +5122,10 @@ impl App {
     /// A document of the file `loaded`, as [`load_all`] loaded it.
     fn loaded_document(
         &self,
-        loaded: Option<Result<Loaded, String>>,
+        loaded: Option<(Result<Loaded, String>, Replica)>,
     ) -> Result<(Rc<Document>, Option<String>), String> {
-        let loaded = loaded.unwrap_or_else(|| Err("Not loaded.".to_string()))?;
-        Document::loaded(loaded, self.theme.clone())
+        let (loaded, replica) = loaded.ok_or("Not loaded.")?;
+        document_of(loaded?, replica, self.theme.clone())
     }
 
     /// Offers back the unsaved changes cues that are gone left in this
@@ -5628,7 +5646,7 @@ impl App {
                 // A file that's gone comes back only with changes to it.
                 Some(_)
                     if text.is_none()
-                        && matches!(&loaded, Some(Ok(loaded)) if loaded.stamp.is_none()) =>
+                        && matches!(&loaded, Some((Ok(loaded), _)) if loaded.stamp.is_none()) =>
                 {
                     None
                 }
@@ -6135,10 +6153,11 @@ impl App {
         let Some(path) = doc.path() else {
             return AppAction::Continue;
         };
-        let (text, epoch, line_ending) = doc.to_write();
+        let (copy, version, text, epoch, line_ending) = doc.to_write(&self.host);
         let call = self.host.call(Request::Save {
             path,
-            text: text.clone(),
+            doc: copy,
+            version,
             line_ending,
             expected: (!overwrite).then(|| doc.stamp()),
             make_folder,
@@ -8750,21 +8769,49 @@ fn terminals_on(host: &Link) -> Vec<crate::term_hub::TermId> {
     }
 }
 
-/// The files at `paths`, loaded by `host`, waiting for them all at once:
-/// `None` for each `None` in `paths`. Only for what can't go on without
-/// them yet: restoring sessions and unsaved changes.
-fn load_all(host: &Link, paths: Vec<Option<PathBuf>>) -> Vec<Option<Result<Loaded, String>>> {
+/// Has `host` load the file at `path`, keeping it as the copy of the
+/// document to be made of it (see [`crate::replica`]).
+fn load(host: &Link, path: PathBuf) -> (Call, Replica) {
+    let replica = Replica::loading(host);
+    let doc = Some(replica.id());
+    (host.call(Request::Load { path, doc }), replica)
+}
+
+/// A document of the file as `loaded`, whose copy on the host is
+/// `replica`, and a notice for the status bar if loading it had anything
+/// to say (see [`Document::loaded`]).
+fn document_of(
+    loaded: Loaded,
+    mut replica: Replica,
+    theme: Rc<Theme>,
+) -> Result<(Rc<Document>, Option<String>), String> {
+    replica.loaded(loaded.text.clone());
+    let (doc, notice) = Document::loaded(loaded, theme)?;
+    doc.set_replica(replica);
+    Ok((doc, notice))
+}
+
+/// The files at `paths`, loaded by `host`, waiting for them all at once,
+/// each with its copy on the host: `None` for each `None` in `paths`. Only
+/// for what can't go on without them yet: restoring sessions and unsaved
+/// changes.
+fn load_all(
+    host: &Link,
+    paths: Vec<Option<PathBuf>>,
+) -> Vec<Option<(Result<Loaded, String>, Replica)>> {
     let calls: Vec<_> = paths
         .into_iter()
-        .map(|path| path.map(|path| host.call(Request::Load { path })))
+        .map(|path| path.map(|path| load(host, path)))
         .collect();
     calls
-        .iter()
+        .into_iter()
         .map(|call| {
-            Some(match call.as_ref()?.wait() {
+            let (call, replica) = call?;
+            let loaded = match call.wait() {
                 Some(Reply::Loaded(loaded)) => loaded,
                 _ => Err("The host stopped.".to_string()),
-            })
+            };
+            Some((loaded, replica))
         })
         .collect()
 }
@@ -9338,6 +9385,29 @@ mod tests {
             app.poll();
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn edits_go_to_the_hosts_copy_which_acks_them_and_saving_writes_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("replicated", &[("a.txt", "alpha\n")]);
+        let mut app = app(&root, Some("a.txt"));
+        let doc = app.documents[0].clone();
+        type_text(&mut app, "x");
+        wait_until(&mut app, "the first edit", |_| {
+            doc.acked_version() == Some(1)
+        });
+        // What's typed between two looks goes as one edit.
+        type_text(&mut app, "yz");
+        key(&mut app, KeyCode::End);
+        type_text(&mut app, "!");
+        wait_until(&mut app, "the second", |_| doc.acked_version() == Some(2));
+        ctrl(&mut app, 's');
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "xyzalpha!\n"
+        );
+        assert!(!doc.is_modified());
     }
 
     #[test]
