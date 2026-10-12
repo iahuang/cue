@@ -59,7 +59,7 @@ use crate::replica::{Copies, DocId, Edit, Texts};
 use crate::search::{self, Query};
 use crate::session::{self, Session, SessionAnswer, SessionCall};
 use crate::symbols::{self, FileSymbols};
-use crate::term_hub::{Hub, TermId, Token};
+use crate::term_hub::{Colors, Hub, TermId, Token};
 use crate::tree::{self, Listed};
 use crate::wake;
 use crate::watch::{Changes, Watcher};
@@ -181,11 +181,6 @@ pub enum Request {
     /// Which terminals are running, by their ids on the host, for a
     /// client attaching to them (see [`crate::term_hub`]).
     Terminals,
-    /// Stop sending the output of this link's terminals, for a client
-    /// that's leaving (see [`App::leave`](crate::app::App::leave)). Ends
-    /// once the last of it is sent: what comes later, the host answers
-    /// the queries in.
-    LetGo,
     /// Nothing, until cancelled, for tests.
     #[cfg(test)]
     Hold,
@@ -305,6 +300,9 @@ pub enum Tell {
     },
     /// Let the copy `doc` go.
     Close(DocId),
+    /// The colors programs in the client's terminals start with, which a
+    /// host process's emulators answer with (see [`crate::term_hub`]).
+    Colors(Colors),
     /// Read the settings again: the client did. A host process reads its
     /// own file, and takes its part of it (see [`crate::config`]); one in
     /// the app's process shares the app's.
@@ -1260,9 +1258,6 @@ fn serve(
     let mut calls: HashMap<CallId, Arc<AtomicBool>> = HashMap::new();
     // The terminal each terminal call hears of, and its token for it.
     let mut terminals: HashMap<CallId, (TermId, Token)> = HashMap::new();
-    // Those let go of, whose calls ended: what the app answered of their
-    // last output still goes to them.
-    let mut let_go: HashMap<CallId, TermId> = HashMap::new();
     // The app's documents' copies, which its calls read.
     let copies = Arc::new(Mutex::new(Copies::default()));
     let mut left = false;
@@ -1288,21 +1283,6 @@ fn serve(
                 #[cfg(not(test))]
                 let opened = state.hub.open(start, responder);
                 terminals.insert(id, opened);
-            }
-            Ok(Input::Call(id, Request::LetGo)) => {
-                let cancelled = Arc::new(AtomicBool::new(false));
-                calls.insert(id, Arc::clone(&cancelled));
-                let responder = Responder {
-                    id,
-                    output: output.clone(),
-                    inbox: host_inbox.clone(),
-                    cancelled,
-                };
-                for (&call, &(terminal, token)) in &terminals {
-                    state.hub.unwatch(terminal, token);
-                    let_go.insert(call, terminal);
-                }
-                state.hub.after(responder);
             }
             Ok(Input::Call(id, request)) => {
                 let cancelled = Arc::new(AtomicBool::new(false));
@@ -1333,13 +1313,14 @@ fn serve(
                 terminals.remove(&id);
             }
             Ok(Input::Tell(Tell::Term { call, control })) => {
-                let terminal = terminals.get(&call).map(|&(terminal, _)| terminal);
-                if let Some(terminal) = terminal.or_else(|| let_go.get(&call).copied()) {
+                if let Some(&(terminal, _)) = terminals.get(&call) {
                     state.hub.control(terminal, control);
                 }
             }
             // Here, before the calls that come after are answered.
             Ok(Input::Tell(Tell::ReloadConfig)) => state.reload_config(),
+            // Here too, before the terminals asked for after.
+            Ok(Input::Tell(Tell::Colors(colors))) => state.hub.set_colors(colors),
             Ok(Input::Tell(Tell::Open { doc, text })) => lock(&copies).open(doc, text),
             Ok(Input::Tell(Tell::Edit { doc, version, edit })) => {
                 if lock(&copies).edit(doc, version, &edit) {
@@ -1588,7 +1569,7 @@ fn answer(
             }
         }
         // Answered apart, in `serve`, which knows the link's terminals.
-        Request::Terminal(_) | Request::LetGo => {}
+        Request::Terminal(_) => {}
         Request::Session(call) => {
             let mut session = lock(&state.session);
             let answer = session::run(call, &mut session, &texts);
@@ -1997,16 +1978,17 @@ mod tests {
     }
 
     #[test]
-    fn letting_go_stops_a_terminals_output_but_not_the_terminal() {
-        let (path, host) = host_process("let-go", false);
+    fn a_host_process_answers_its_terminals_queries_in_the_clients_colors() {
+        let _serial = crate::test_serial();
+        let (path, host) = host_process("answers", true);
         let root = path.parent().unwrap().to_path_buf();
         let link = Link::connect(&path).unwrap();
-        let sessions = root.join("sessions");
-        let opened = link.call(Request::Session(SessionCall::Create(sessions)));
-        let dir = match opened.wait() {
-            Some(Reply::Session(SessionAnswer::Opened(Ok((_, dir))))) => dir,
-            other => panic!("{other:?}"),
+        let palette = crate::theme::TerminalPalette {
+            fg: opentui::Rgba::rgb(0xee, 0xee, 0xee),
+            bg: opentui::Rgba::rgb(0x12, 0x34, 0x56),
+            ansi: None,
         };
+        link.tell(Tell::Colors(Colors::from(&palette)));
         let term = link.call(Request::Terminal(pty::Start::Shell {
             cwd: root.clone(),
             or: None,
@@ -2014,35 +1996,41 @@ mod tests {
             rows: 24,
             above: Vec::new(),
         }));
-        let typed = |text: &str| {
-            let input = pty::Control::Input(text.as_bytes().to_vec());
-            link.tell(Tell::Term {
-                call: term.id(),
-                control: input,
-            });
-        };
-        typed("echo ready-$((1+1))\r");
-        wait_for_output(&term, "ready-2");
-
-        let let_go = link.call(Request::LetGo);
-        while let_go.wait().is_some() {}
-        while term.try_recv().is_ok() {}
-        // What's typed still runs, but the call hears nothing of it.
-        let mark = root.join("after");
-        typed(&format!("echo after-$((2+2)) > '{}'\r", mark.display()));
+        assert!(matches!(
+            term.wait(),
+            Some(Reply::Term(pty::Event::Started(_)))
+        ));
+        assert!(matches!(
+            term.wait(),
+            Some(Reply::Term(pty::Event::Answering))
+        ));
+        // Asked for its background, while a client hears of it, which
+        // doesn't answer: the host does.
+        let asked = "stty -echo; printf '\\033]11;?\\007'; read -rs -t 5 -d $'\\a' reply; \
+                     stty echo; echo \"bg=${reply#*rgb:};end-$((1+1))\"\r";
+        link.tell(Tell::Term {
+            call: term.id(),
+            control: pty::Control::Input(asked.as_bytes().to_vec()),
+        });
         let start = Instant::now();
-        while !fs::read_to_string(&mark).is_ok_and(|text| text.contains("after-4")) {
-            assert!(start.elapsed() < Duration::from_secs(20), "it didn't run");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            !matches!(term.try_recv(), Ok(Reply::Term(pty::Event::Output(_)))),
-            "output after letting go"
-        );
+        let mut output = Vec::new();
+        let said = loop {
+            assert!(start.elapsed() < Duration::from_secs(20), "no answer");
+            match term.try_recv() {
+                Ok(Reply::Term(pty::Event::Output(bytes))) => output.extend(bytes),
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+                Err(TryRecvError::Disconnected) => panic!("the terminal ended"),
+            }
+            let text = String::from_utf8_lossy(&output);
+            if let Some(end) = text.find(";end-2") {
+                let from = text[..end].rfind("bg=").unwrap();
+                break text[from + 3..end].to_string();
+            }
+        };
+        assert!(said == "1212/3434/5656" || said == "12/34/56", "{said:?}");
 
-        link.leave();
-        drop((term, let_go, link));
-        end_session(&session::socket_path(&dir)).unwrap();
+        drop((term, link));
         ends(host);
     }
 

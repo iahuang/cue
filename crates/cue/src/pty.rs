@@ -436,6 +436,9 @@ pub enum Event {
         cols: u16,
         rows: u16,
     },
+    /// The host's emulator answers the program's queries from here on,
+    /// so the client's is to answer none (see [`crate::term_hub`]).
+    Answering,
     /// What the program wrote.
     Output(Vec<u8>),
     Status(Status),

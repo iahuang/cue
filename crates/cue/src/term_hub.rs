@@ -8,10 +8,13 @@
 //! In a host process, the hub keeps each terminal's screen too, as the
 //! app does, in an emulator of its own; the native core allows one thread
 //! per process, so they're all on the hub's. A client that attaches gets
-//! the screen first ([`Event::Screen`]), then what the program writes; and
-//! while no client hears of a terminal, the hub answers the program's
-//! queries. The host in the app's process has none, the core being the
-//! app's: a terminal there can't be attached to again.
+//! the screen first ([`Event::Screen`]), then what the program writes.
+//! The hub's emulator answers the program's queries, whether a client
+//! hears of it or not, in the client's colors ([`Hub::set_colors`]), so
+//! that a query that comes as a client attaches or leaves gets one answer
+//! ([`Event::Answering`] says the client's emulator is to answer none).
+//! The host in the app's process has none, the core being the app's: a
+//! terminal there can't be attached to again, and the app answers.
 //!
 //! A host process replacing itself with another build of cue lets go of
 //! every terminal, with its screen ([`Hub::release_all`]), and the new one
@@ -22,11 +25,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
-use opentui::EmbeddedTerminal;
+use opentui::{EmbeddedTerminal, Rgba};
+use serde::{Deserialize, Serialize};
 
 use crate::app::Adopted;
 use crate::host::{Reply, Responder};
 use crate::pty::{self, Control, Event, Start, Status};
+use crate::theme::TerminalPalette;
 
 /// Tells a terminal from the others on the same host, across clients.
 pub type TermId = u64;
@@ -43,6 +48,35 @@ pub struct Hub {
 /// Which call hears of a terminal, by a token for it unique to the host.
 pub type Token = u64;
 
+/// The colors programs in the client's terminals start with, which the
+/// hub's emulators tell programs that ask (see [`TerminalPalette`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Colors {
+    fg: [u8; 3],
+    bg: [u8; 3],
+    ansi: Option<[[u8; 3]; 16]>,
+}
+
+impl From<&TerminalPalette> for Colors {
+    fn from(palette: &TerminalPalette) -> Colors {
+        let rgb = |color: Rgba| [color.r(), color.g(), color.b()];
+        Colors {
+            fg: rgb(palette.fg),
+            bg: rgb(palette.bg),
+            ansi: palette.ansi.map(|ansi| ansi.map(rgb)),
+        }
+    }
+}
+
+impl Colors {
+    /// Gives `vt` these colors.
+    fn apply(&self, vt: &mut EmbeddedTerminal) {
+        let rgba = |[r, g, b]: [u8; 3]| Rgba::rgb(r, g, b);
+        let ansi = self.ansi.map(|ansi| ansi.map(rgba));
+        vt.set_default_colors(rgba(self.fg), rgba(self.bg), ansi.as_ref());
+    }
+}
+
 enum ToHub {
     /// Start the terminal `id` as `start` says, or attach to it, for the
     /// call `responder` answers.
@@ -57,13 +91,13 @@ enum ToHub {
     Control(TermId, Control),
     /// The call `token` no longer hears of it, if it still does.
     Unwatch(TermId, Token),
+    /// The client's colors, for every emulator.
+    Colors(Colors),
     /// From a terminal's thread.
     Event(TermId, Event),
     /// A terminal's thread ended.
     Ended(TermId),
     HangUpAll,
-    /// Ends the call it answers, once what came before is sent.
-    After(Responder),
     /// Which terminals are running, said to this.
     List(Sender<Vec<TermId>>),
     /// Let go of every terminal without hanging up, saying each, with its
@@ -126,10 +160,10 @@ impl Hub {
         let _ = self.to_hub.send(ToHub::Unwatch(id, token));
     }
 
-    /// Ends the call `responder` answers once what the hub sent before is
-    /// on its way: after [`Hub::unwatch`], the last of the output.
-    pub fn after(&self, responder: Responder) {
-        let _ = self.to_hub.send(ToHub::After(responder));
+    /// Has the emulators answer programs that ask for their colors with
+    /// `colors`, the client's, from now on.
+    pub fn set_colors(&self, colors: Colors) {
+        let _ = self.to_hub.send(ToHub::Colors(colors));
     }
 
     /// Hangs up on every terminal.
@@ -222,6 +256,8 @@ impl Term {
 /// terminal's gone.
 fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens: bool) {
     let mut terms: HashMap<TermId, Term> = HashMap::new();
+    // The client's, once one's said.
+    let mut colors: Option<Colors> = None;
     let mut closing = false;
     // Where to say the terminals let go of, once they all are, and those so
     // far.
@@ -245,6 +281,7 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                 if let Some(screen) = term.screen() {
                     let (cols, rows) = term.size;
                     term.tell(Event::Screen { screen, cols, rows });
+                    term.tell(Event::Answering);
                 }
                 term.tell(Event::Status(term.status.clone()));
                 if let Some(raw) = term.exited {
@@ -269,7 +306,7 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                 };
                 // Not for a pty adopted, whose screen the app has.
                 let vt = match &start {
-                    Start::Shell { above, .. } if screens => emulator(size, above),
+                    Start::Shell { above, .. } if screens => emulator(size, above, colors),
                     _ => None,
                 };
                 let spawned = spawn(
@@ -289,13 +326,16 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                 let mut term = Term::new(controller, vt, size);
                 term.watcher = Some((token, responder));
                 term.tell(Event::Started(id));
+                if term.vt.is_some() {
+                    term.tell(Event::Answering);
+                }
                 terms.insert(id, term);
                 count.fetch_add(1, Ordering::Relaxed);
             }
             ToHub::Adopt(adopted) => {
                 let id = adopted.id as TermId;
                 let vt = match screens {
-                    true => emulator(adopted.size, &adopted.screen),
+                    true => emulator(adopted.size, &adopted.screen, colors),
                     false => None,
                 };
                 let start = Start::Adopt {
@@ -326,6 +366,12 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                     }
                 }
                 term.controller.send(control);
+            }
+            ToHub::Colors(new) => {
+                colors = Some(new);
+                for vt in terms.values_mut().filter_map(|term| term.vt.as_mut()) {
+                    new.apply(vt);
+                }
             }
             ToHub::Unwatch(id, token) => {
                 if let Some(term) = terms.get_mut(&id) {
@@ -369,10 +415,7 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                     _ => {}
                 }
                 term.tell(event);
-                // The client's emulator answers, while there's one: looked
-                // at once it's been told, so one that went meanwhile isn't
-                // counted on.
-                if term.watcher.is_none() && !answers.is_empty() {
+                if !answers.is_empty() {
                     term.controller.send(Control::Input(answers));
                 }
             }
@@ -382,7 +425,6 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                     count.fetch_sub(1, Ordering::Relaxed);
                 }
             }
-            ToHub::After(responder) => drop(responder),
             ToHub::HangUpAll => {
                 for term in terms.values() {
                     term.controller.send(Control::HangUp);
@@ -419,10 +461,17 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
 }
 
 /// An emulator for a terminal's screen, `cols` by `rows`, showing
-/// `screen` (see [`crate::terminal::full_snapshot`]).
-fn emulator((cols, rows): (u16, u16), screen: &[u8]) -> Option<EmbeddedTerminal> {
+/// `screen` (see [`crate::terminal::full_snapshot`]), in `colors`.
+fn emulator(
+    (cols, rows): (u16, u16),
+    screen: &[u8],
+    colors: Option<Colors>,
+) -> Option<EmbeddedTerminal> {
     let scrollback = crate::config::get().scrollback;
     let mut vt = EmbeddedTerminal::new(cols.max(1), rows.max(1), scrollback).ok()?;
+    if let Some(colors) = colors {
+        colors.apply(&mut vt);
+    }
     let _ = vt.write(screen);
     // What it answered isn't for the program.
     vt.drain_responses();

@@ -428,6 +428,17 @@ Progress:
   the session, so a client that's gone loses what it typed since the last
   periodic save (step 4 keeps them, which is what the acks are for); and
   big files aren't paged.
+- [x] 2.8 A host process's emulators answer every query its terminals'
+  programs ask, whether a client hears of them or not, and the client's
+  emulators answer none: the hub says so with each terminal's first
+  replies (`Event::Answering`, after `Started` or the attaching
+  `Screen`). The client tells the host its terminals' colors
+  (`Tell::Colors`, the theme's `TerminalPalette` as RGB) whenever they
+  change, ahead of the terminals it asks for next, and the hub gives
+  them to every emulator, so programs asking for colors get the
+  client's even with no client there. Leaving is one step again
+  (`Request::LetGo` is gone). The host in the app's process has no
+  emulators, so there the app answers, as before.
 
 ### 3. ssh
 

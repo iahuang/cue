@@ -96,6 +96,8 @@ struct Shell {
     status: pty::Status,
     /// Which it is on the host, once it's said.
     id: Option<TermId>,
+    /// The host answers the program's queries, not the app.
+    host_answers: bool,
 }
 
 impl Shell {
@@ -105,6 +107,7 @@ impl Shell {
             call: host.call(Request::Terminal(start)),
             status: pty::Status::default(),
             id: None,
+            host_answers: false,
         }
     }
 
@@ -407,8 +410,8 @@ impl Terminal {
     }
 
     /// Takes what the shell wrote since the last call into the screen, and
-    /// how it's doing, and answers its queries. Returns whether anything
-    /// changed.
+    /// how it's doing, and answers its queries unless the host does.
+    /// Returns whether anything changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         let mut read = 0;
@@ -442,6 +445,7 @@ impl Terminal {
                     output = true;
                 }
                 Event::Started(id) => self.pty.id = Some(id),
+                Event::Answering => self.pty.host_answers = true,
                 Event::Screen { screen, cols, rows } => {
                     self.show_screen(&screen, (cols, rows));
                 }
@@ -456,7 +460,9 @@ impl Terminal {
             self.output_changed();
         }
         let responses = self.vt.drain_responses();
-        self.pty.write(&responses);
+        if !self.pty.host_answers {
+            self.pty.write(&responses);
+        }
         changed
     }
 

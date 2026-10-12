@@ -113,6 +113,7 @@ use crate::status::{self, GitBadge, StatusButton};
 use crate::switcher::{Switcher, SwitcherAction};
 use crate::symbols::{self, Symbol, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
+use crate::term_hub::Colors;
 use crate::terminal::Terminal;
 use crate::theme::{self, TerminalColors, Theme, ThemeId, ThemeSetting};
 use crate::toast::Toasts;
@@ -476,6 +477,8 @@ pub struct App {
     /// again, as the terminal's colors changed.
     theme_shown: Option<ThemeId>,
     theme_stale: bool,
+    /// The colors terminals start with, as the host was last told them.
+    told_colors: Option<Colors>,
     /// Running terminals, and exited ones still shown, in the order they
     /// were started.
     terminals: Vec<Rc<RefCell<Terminal>>>,
@@ -837,6 +840,7 @@ impl App {
             terminal_colors: TerminalColors::default(),
             theme_shown: None,
             theme_stale: true,
+            told_colors: None,
             terminals: Vec::new(),
             next_terminal: 1,
             terminal_cue_keys: true,
@@ -4976,9 +4980,22 @@ impl App {
     }
 
     /// Puts the theme in use, if it isn't already: the one Select Theme
-    /// has selected, or the setting's, for the terminal's colors. Returns
-    /// whether the colors changed.
+    /// has selected, or the setting's, for the terminal's colors, and
+    /// tells the host its terminals' colors, for answering programs that
+    /// ask. Returns whether the colors changed.
     pub fn update_theme(&mut self) -> bool {
+        let changed = self.put_theme();
+        let colors = theme::colors().terminal.as_ref().map(Colors::from);
+        if let Some(colors) = colors.filter(|&colors| self.told_colors != Some(colors)) {
+            self.told_colors = Some(colors);
+            self.host.tell(Tell::Colors(colors));
+        }
+        changed
+    }
+
+    /// Puts the theme in use, if it isn't already (see
+    /// [`App::update_theme`]).
+    fn put_theme(&mut self) -> bool {
         let previewed = self
             .picker
             .as_ref()
@@ -5257,15 +5274,9 @@ impl App {
     }
 
     /// Leaves the host, for another client to come to, its terminals
-    /// running on. First the host stops sending their output, and what
-    /// came before that is taken in, so that no query a program asks is
-    /// left unanswered: the host's emulator answers those that come later.
+    /// running on. Their programs' queries were the host's to answer all
+    /// along (see [`crate::term_hub`]), so none is left unanswered.
     pub fn leave(&mut self) {
-        let call = self.host.call(Request::LetGo);
-        while call.wait().is_some() {}
-        for terminal in &self.terminals {
-            while terminal.borrow_mut().poll() {}
-        }
         self.host.leave();
     }
 
