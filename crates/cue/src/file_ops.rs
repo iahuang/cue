@@ -2,12 +2,13 @@
 //! tree's commands do. The host does them (see [`crate::host`]); the app
 //! catches up once they're done.
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// What to do to the files.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileOp {
     /// An empty file, and the folders it's in if need be. Fails if it's
     /// there already.

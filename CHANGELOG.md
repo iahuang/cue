@@ -8,7 +8,8 @@
 - Read images, PDFs, and Quick Look's previews through the host (`e34e41e`)
 - Run terminals' shells on the host (`bfc16b2`)
 - Keep sessions' files on the host (`a71b305`)
-- Finish moving file system checks to the host: it resolves paths, startup and session restore load in one round trip, and periodic session saves don't wait
+- Finish moving file system checks to the host: it resolves paths, startup and session restore load in one round trip, and periodic session saves don't wait (`2f4ab08`)
+- Send the host's messages over a socket, serialized, even to a host in the same process: the first part of moving the host into its own process
 
 ## v0.4.2 — 2026-10-11
 

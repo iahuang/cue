@@ -31,6 +31,7 @@ use crate::keymap::Command;
 use crate::theme;
 use crate::watch::Changes;
 use crate::workspace::{deepest_root, root_names};
+use serde::{Deserialize, Serialize};
 
 /// Entries never shown, here or in the file picker and workspace search,
 /// with those the `files.exclude` setting names.
@@ -50,7 +51,7 @@ fn is_ignore_file(name: &std::ffi::OsStr) -> bool {
 }
 
 /// An entry of a folder, as the host lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listed {
     pub path: PathBuf,
     pub name: String,

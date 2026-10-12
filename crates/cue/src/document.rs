@@ -31,8 +31,9 @@ use crate::language::{self, Language};
 use crate::symbols::{self, Symbol};
 use crate::syntax::Highlighter;
 use crate::theme::{self, Theme};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LineEnding {
     #[default]
     Lf,
@@ -57,7 +58,7 @@ pub struct File {
 
 /// The file on disk as last read or written, to tell whether it changed
 /// since.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stamp {
     modified: Option<SystemTime>,
     len: u64,
@@ -833,7 +834,7 @@ fn detect_language(buffer: &EditBuffer, path: Option<&Path>) -> Option<&'static 
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Loaded {
     /// Where it is, [`resolve`]d.
     pub path: PathBuf,
@@ -849,7 +850,7 @@ pub struct Loaded {
 }
 
 /// A file as the host wrote it.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Written {
     /// Where it was written, [`resolve`]d.
     pub path: PathBuf,
@@ -900,7 +901,7 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
 
 /// How the host found a file compared with what a document last had of it
 /// (see [`check`]).
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Checked {
     /// It isn't there.
     Missing,
@@ -933,7 +934,7 @@ pub fn check(path: &Path, stamp: Option<Stamp>) -> Checked {
 }
 
 /// Why the host didn't save a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Unsaved {
     /// It changed on disk since it was last loaded or saved.
     Changed,

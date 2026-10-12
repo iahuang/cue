@@ -29,6 +29,7 @@ use crate::picker::{self, Area};
 use crate::status::Status;
 use crate::theme::{self, Theme};
 use crate::tree;
+use serde::{Deserialize, Serialize};
 
 /// The widest it gets, in columns.
 const MAX_WIDTH: u32 = 120;
@@ -262,7 +263,7 @@ fn place(bounds: Rect) -> Area {
 }
 
 /// What the host found at a path, for Quick Look to show (see [`peek`]).
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Peek {
     /// Why there's nothing to show, and how big it is, if known.
     Note(String, Option<u64>),

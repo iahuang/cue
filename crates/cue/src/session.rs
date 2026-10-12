@@ -36,6 +36,7 @@ use crate::document::Document;
 use crate::host::{Call, Link, Reply, Request};
 use crate::indent::Indent;
 use crate::layout::{Axis, Layout, PanelId};
+use serde::{Deserialize, Serialize};
 
 /// What `session.toml` starts with; files of later versions are passed
 /// over. 2 added the name, and keeping unknown keys.
@@ -64,7 +65,7 @@ const SOCKET: &str = "sock";
 const MAX_SOCKET_PATH: usize = 100;
 
 /// Something a panel shows, or showed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Shown {
     File(PathBuf),
     /// An untitled file, by number.
@@ -75,7 +76,7 @@ pub enum Shown {
 }
 
 /// An open file.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Doc {
     /// `None` for an untitled one.
     pub path: Option<PathBuf>,
@@ -88,7 +89,7 @@ pub struct Doc {
 }
 
 /// A panel's place in a file: its cursor and the first row in view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Place {
     pub doc: Shown,
     pub row: u32,
@@ -98,7 +99,7 @@ pub struct Place {
     pub reading: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PanelState {
     pub id: PanelId,
     pub shows: Option<Shown>,
@@ -110,7 +111,7 @@ pub struct PanelState {
 }
 
 /// Something a panel showed, in its history.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Visited {
     pub shown: Shown,
     /// The cursor's row and column, in a file.
@@ -118,13 +119,13 @@ pub struct Visited {
 }
 
 /// The place in a file to jump back to, and the panel it was marked in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mark {
     pub panel: PanelId,
     pub visited: Visited,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TabState {
     pub name: Option<String>,
     pub layout: Layout,
@@ -132,7 +133,7 @@ pub struct TabState {
     pub panels: Vec<PanelState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TerminalState {
     pub id: u32,
     /// The name it was given, if renamed.
@@ -148,7 +149,7 @@ pub struct TerminalState {
 }
 
 /// Everything a session keeps.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct State {
     /// The name it was given, if any.
     pub name: Option<String>,
@@ -400,7 +401,7 @@ pub fn screen_name(id: u32) -> String {
 }
 
 /// Everything a session saves at once (see [`Session::snapshot`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub state: State,
     /// Unsaved texts that changed, by name.
@@ -413,7 +414,7 @@ pub struct Snapshot {
 
 /// What the app asks of its session's files, which the host keeps (see
 /// [`run`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionCall {
     /// Makes a new session in this folder of them.
     Create(PathBuf),
@@ -433,7 +434,7 @@ pub enum SessionCall {
 }
 
 /// What the host answered a [`SessionCall`].
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum SessionAnswer {
     /// The session's id and folder.
     Opened(Result<(String, PathBuf), String>),

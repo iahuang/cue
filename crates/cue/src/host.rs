@@ -4,8 +4,10 @@
 //! elsewhere: in the session server, or over ssh (see
 //! `docs/client-server.md`).
 //!
-//! For now the host runs on a thread of its own in the same process. The
-//! messages are plain data all the same, as they'd be on a wire:
+//! For now the host runs on a thread of its own in the same process, but
+//! the app talks to it over a socket all the same, as it will to a host in
+//! another process: each message serialized ([`postcard`]), after its
+//! length.
 //!
 //! - A [`Request`] is a call: the host answers it with [`Reply`]s, as many
 //!   as it takes, and then ends it. Dropping the [`Call`] cancels it, and
@@ -23,13 +25,17 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
-use std::io;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::document::{self, Checked, LineEnding, Loaded, Stamp, Unsaved, Written};
 use crate::file_dialog;
@@ -69,7 +75,7 @@ pub fn set_at_once(on: bool) {
 pub type CallId = u64;
 
 /// What the app asks the host to do, answered with [`Reply`]s.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     /// Every file in `workspace` (see [`crate::file_index`]): the files
     /// found so far as it goes, if `progress`, and then the whole list.
@@ -147,7 +153,7 @@ pub enum Request {
 }
 
 /// The host's answers to [`Request`]s.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
     /// Files found so far, during a [`Request::ListFiles`] with progress.
     FilesFound(Vec<PathBuf>),
@@ -170,6 +176,7 @@ pub enum Reply {
     /// What's in a folder, for the file dialog, or why it couldn't be read.
     Dir {
         dir: PathBuf,
+        #[serde(with = "error_kind")]
         entries: Result<Vec<file_dialog::Entry>, io::ErrorKind>,
     },
     /// A folder's entries, folders first. Empty if it can't be read.
@@ -203,8 +210,37 @@ pub enum Reply {
     Committed(Result<String, String>),
 }
 
+/// An [`io::ErrorKind`] in a result, as sent: those the app tells apart,
+/// and the rest as [`io::ErrorKind::Other`].
+mod error_kind {
+    use super::*;
+
+    const KINDS: &[io::ErrorKind] = &[
+        io::ErrorKind::NotFound,
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::NotADirectory,
+        io::ErrorKind::IsADirectory,
+        io::ErrorKind::AlreadyExists,
+    ];
+
+    pub fn serialize<T: Serialize, S: serde::Serializer>(
+        result: &Result<T, io::ErrorKind>,
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        let index = |kind| KINDS.iter().position(|&k| k == kind).unwrap_or(KINDS.len());
+        result.as_ref().map_err(|&kind| index(kind)).serialize(ser)
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+        de: D,
+    ) -> Result<Result<T, io::ErrorKind>, D::Error> {
+        let result = Result::<T, usize>::deserialize(de)?;
+        Ok(result.map_err(|i| KINDS.get(i).copied().unwrap_or(io::ErrorKind::Other)))
+    }
+}
+
 /// What a path is, as the host found it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Look {
     /// Where it really is: absolute, with symlinks followed.
     pub real: PathBuf,
@@ -212,24 +248,32 @@ pub struct Look {
 }
 
 /// What the app asks of the host with no answer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Tell {
     /// Watch these folders for changes (see [`crate::watch`]), and no
     /// others. Those that don't exist are left out.
     Watch(BTreeSet<PathBuf>),
     /// Have the terminal of this [`Request::Terminal`] call do something.
     Term { call: CallId, control: pty::Control },
-    /// Use these settings, for tests, where each thread has its own: the
-    /// host's threads would have the defaults.
-    #[cfg(test)]
-    Config(Arc<crate::config::Config>),
 }
 
 /// What the host says unasked.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Notice {
     /// Files in the watched folders changed, with what they are now.
     DiskChanged(Changes),
+}
+
+/// What the app sends the host.
+#[derive(Serialize, Deserialize)]
+enum ToHost {
+    Call(CallId, Request),
+    Cancel(CallId),
+    Tell(Tell),
+    /// Answered with [`Output::Settled`] once what came before is done
+    /// with, for tests.
+    #[cfg(test)]
+    Settle,
 }
 
 /// What reaches the host's thread: from the app, and from the host's own
@@ -244,17 +288,31 @@ enum Input {
     Watched,
     /// The app is gone.
     Shutdown,
-    /// Answered once what came before is done with, for tests.
     #[cfg(test)]
-    Settle(Sender<()>),
+    Settle,
+}
+
+impl From<ToHost> for Input {
+    fn from(message: ToHost) -> Input {
+        match message {
+            ToHost::Call(id, request) => Input::Call(id, request),
+            ToHost::Cancel(id) => Input::Cancel(id),
+            ToHost::Tell(tell) => Input::Tell(tell),
+            #[cfg(test)]
+            ToHost::Settle => Input::Settle,
+        }
+    }
 }
 
 /// What the host sends the app.
+#[derive(Serialize, Deserialize)]
 enum Output {
     Reply(CallId, Reply),
     /// The call has no more replies.
     End(CallId),
     Notice(Notice),
+    #[cfg(test)]
+    Settled,
 }
 
 /// The app's end of its connection to a host.
@@ -264,37 +322,68 @@ pub struct Link {
 }
 
 struct Shared {
-    to_host: Sender<Input>,
+    /// To the thread that sends what's here to the host. Once it's
+    /// dropped, the host hears the app's gone.
+    to_host: Sender<ToHost>,
     next: Cell<CallId>,
     /// Where each call's replies go, until it ends.
     routes: Arc<Mutex<HashMap<CallId, Sender<Reply>>>>,
     notices: Receiver<Notice>,
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        let _ = self.to_host.send(Input::Shutdown);
-    }
+    #[cfg(test)]
+    settled: Receiver<()>,
+    /// The host's, if it's in this process, for tests.
+    #[cfg(test)]
+    state: std::cell::OnceCell<Arc<State>>,
 }
 
 impl Link {
     /// Starts a host in this process, on threads of its own, which stop
     /// once the link and its calls are dropped.
     pub fn local() -> Link {
-        let (to_host, inbox) = mpsc::channel();
-        let (output, from_host) = mpsc::channel();
-        let host_inbox = to_host.clone();
-        std::thread::spawn(move || serve(inbox, host_inbox, output));
+        let (ours, theirs) = UnixStream::pair().expect("can't make a socket pair");
+        let state = Arc::new(State::default());
+        let link = Link::over(ours);
+        #[cfg(test)]
+        let _ = link.shared.state.set(Arc::clone(&state));
+        std::thread::spawn(move || serve_stream(theirs, state));
+        link
+    }
+
+    /// The app's end of a connection to a host on the other end of
+    /// `stream`.
+    fn over(stream: UnixStream) -> Link {
+        let (to_host, outbox) = mpsc::channel();
         let routes: Arc<Mutex<HashMap<CallId, Sender<Reply>>>> = Arc::default();
         let (notify, notices) = mpsc::channel();
+        #[cfg(test)]
+        let (settle, settled) = mpsc::channel();
         let reader_routes = Arc::clone(&routes);
-        std::thread::spawn(move || read(from_host, &reader_routes, notify));
+        match stream.try_clone() {
+            Ok(reading) => {
+                std::thread::spawn(move || {
+                    read(
+                        reading,
+                        &reader_routes,
+                        notify,
+                        #[cfg(test)]
+                        settle,
+                    )
+                });
+                std::thread::spawn(move || write_frames(stream, outbox));
+            }
+            // As if the host were gone: calls end unanswered.
+            Err(_) => drop(outbox),
+        }
         Link {
             shared: Rc::new(Shared {
                 to_host,
                 next: Cell::new(1),
                 routes,
                 notices,
+                #[cfg(test)]
+                settled,
+                #[cfg(test)]
+                state: Default::default(),
             }),
         }
     }
@@ -306,7 +395,7 @@ impl Link {
         shared.next.set(id + 1);
         let (sender, replies) = mpsc::channel();
         lock(&shared.routes).insert(id, sender);
-        let _ = shared.to_host.send(Input::Call(id, request));
+        let _ = shared.to_host.send(ToHost::Call(id, request));
         Call {
             id,
             replies,
@@ -315,16 +404,24 @@ impl Link {
     }
 
     pub fn tell(&self, tell: Tell) {
-        let _ = self.shared.to_host.send(Input::Tell(tell));
+        let _ = self.shared.to_host.send(ToHost::Tell(tell));
     }
 
     /// Waits for the host to take in what was asked of it so far, for
     /// tests: watching starts, for one.
     #[cfg(test)]
     pub fn settle(&self) {
-        let (sender, settled) = mpsc::channel();
-        let _ = self.shared.to_host.send(Input::Settle(sender));
-        let _ = settled.recv();
+        let _ = self.shared.to_host.send(ToHost::Settle);
+        let _ = self.shared.settled.recv();
+    }
+
+    /// Has the host's threads use `config`, for tests, where each thread
+    /// has its own settings: they'd have the defaults.
+    #[cfg(test)]
+    pub fn set_config(&self, config: Arc<crate::config::Config>) {
+        if let Some(state) = self.shared.state.get() {
+            *lock(&state.config) = Some(config);
+        }
     }
 
     /// What the host said since the last call, in order.
@@ -362,18 +459,19 @@ impl Call {
 impl Drop for Call {
     fn drop(&mut self) {
         // Harmless if it ended already.
-        let _ = self.shared.to_host.send(Input::Cancel(self.id));
+        let _ = self.shared.to_host.send(ToHost::Cancel(self.id));
     }
 }
 
 /// Hands what the host sends to the calls it's for and to the notices,
-/// waking the main loop, until the host and its calls are all gone.
+/// waking the main loop, until the host's gone. Then the calls left end.
 fn read(
-    from_host: Receiver<Output>,
+    from_host: UnixStream,
     routes: &Mutex<HashMap<CallId, Sender<Reply>>>,
     notices: Sender<Notice>,
+    #[cfg(test)] settled: Sender<()>,
 ) {
-    for output in from_host {
+    read_frames(from_host, |output| {
         match output {
             Output::Reply(id, reply) => {
                 if let Some(route) = lock(routes).get(&id) {
@@ -387,9 +485,66 @@ fn read(
             Output::Notice(notice) => {
                 let _ = notices.send(notice);
             }
+            #[cfg(test)]
+            Output::Settled => {
+                let _ = settled.send(());
+            }
         }
         wake::wake();
+        true
+    });
+    lock(routes).clear();
+    wake::wake();
+}
+
+/// Takes each message from `stream`, until it ends, or `take` says to stop.
+fn read_frames<T: DeserializeOwned>(stream: UnixStream, mut take: impl FnMut(T) -> bool) {
+    let mut reader = BufReader::new(stream);
+    let mut len = [0; 8];
+    let mut frame = Vec::new();
+    while reader.read_exact(&mut len).is_ok() {
+        frame.resize(u64::from_le_bytes(len) as usize, 0);
+        if reader.read_exact(&mut frame).is_err() {
+            break;
+        }
+        let message = match postcard::from_bytes(&frame) {
+            Ok(message) => message,
+            Err(err) => {
+                eprintln!("cue: a message from the other end can't be read: {err}");
+                break;
+            }
+        };
+        if !take(message) {
+            break;
+        }
     }
+}
+
+/// Sends what comes from `outbox` over `stream`, until it's all sent, or
+/// the other end's gone. Then the other end hears it's done.
+fn write_frames<T: Serialize>(stream: UnixStream, outbox: Receiver<T>) {
+    fn write<T: Serialize>(writer: &mut impl Write, message: &T) -> io::Result<()> {
+        let frame = postcard::to_stdvec(message).map_err(io::Error::other)?;
+        writer.write_all(&(frame.len() as u64).to_le_bytes())?;
+        writer.write_all(&frame)
+    }
+    let mut writer = BufWriter::new(&stream);
+    'sending: while let Ok(message) = outbox.recv() {
+        if write(&mut writer, &message).is_err() {
+            break;
+        }
+        // What's come meanwhile goes in the same write.
+        while let Ok(message) = outbox.try_recv() {
+            if write(&mut writer, &message).is_err() {
+                break 'sending;
+            }
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+    }
+    drop(writer);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -428,16 +583,38 @@ impl Drop for Responder {
     }
 }
 
+/// Serves the app on the other end of `stream`, until it's gone.
+fn serve_stream(stream: UnixStream, state: Arc<State>) {
+    let (to_host, inbox) = mpsc::channel();
+    let (output, outbox) = mpsc::channel();
+    let Ok(reading) = stream.try_clone() else {
+        return;
+    };
+    let from_app = to_host.clone();
+    std::thread::spawn(move || {
+        read_frames(reading, |message: ToHost| {
+            from_app.send(message.into()).is_ok()
+        });
+        let _ = from_app.send(Input::Shutdown);
+    });
+    std::thread::spawn(move || write_frames(stream, outbox));
+    serve(inbox, to_host, output, state);
+}
+
 /// The host's thread: takes calls, tells, and the watcher's changes, until
 /// the app's gone.
-fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Output>) {
+fn serve(
+    inbox: Receiver<Input>,
+    host_inbox: Sender<Input>,
+    output: Sender<Output>,
+    state: Arc<State>,
+) {
     let nudge = host_inbox.clone();
     let mut watcher = Watcher::new(move || {
         let _ = nudge.send(Input::Watched);
     });
     // Each call in progress, by whether it was cancelled.
     let mut calls: HashMap<CallId, Arc<AtomicBool>> = HashMap::new();
-    let state = Arc::new(State::default());
     // Each terminal's controls, by the call it is.
     let mut terminals: HashMap<CallId, pty::Controller> = HashMap::new();
     loop {
@@ -498,17 +675,13 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
                     terminal.send(control);
                 }
             }
-            #[cfg(test)]
-            Ok(Input::Tell(Tell::Config(config))) => {
-                *state.config.lock().unwrap_or_else(|e| e.into_inner()) = Some(config);
-            }
             Ok(Input::Tell(Tell::Watch(folders))) => {
                 watcher.watch(folders.into_iter().filter(|f| f.is_dir()).collect());
             }
             Ok(Input::Watched) | Err(RecvTimeoutError::Timeout) => {}
             #[cfg(test)]
-            Ok(Input::Settle(settled)) => {
-                let _ = settled.send(());
+            Ok(Input::Settle) => {
+                let _ = output.send(Output::Settled);
             }
             Ok(Input::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -531,7 +704,8 @@ struct State {
     symbols: symbols::Cache,
     /// The session this host keeps, if it's one.
     session: Mutex<Option<Session>>,
-    /// The settings the app told of, for tests.
+    /// The settings the app said to use, for tests (see
+    /// [`Link::set_config`]).
     #[cfg(test)]
     config: Mutex<Option<Arc<crate::config::Config>>>,
 }
@@ -540,12 +714,7 @@ impl State {
     /// Puts the settings the app told of in use on this thread, for tests.
     fn use_config(&self) {
         #[cfg(test)]
-        if let Some(config) = self
-            .config
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
+        if let Some(config) = lock(&self.config).clone() {
             crate::config::set((*config).clone());
         }
     }

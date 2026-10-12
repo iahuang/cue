@@ -4878,7 +4878,7 @@ impl App {
         // The host's threads share these settings, but for tests, where
         // each thread has its own.
         #[cfg(test)]
-        self.host.tell(Tell::Config(new.clone()));
+        self.host.set_config(new.clone());
         self.keymap = Keymap::new(&new.keys);
         if new.tree != old.tree {
             self.tree_visible = new.tree;
@@ -14066,7 +14066,8 @@ mod tests {
             2
         );
         drop(app);
-        assert!(!session::is_live(&dir));
+        // The host lets go of it once it hears the app's gone.
+        assert!(crate::let_go(|| session::is_live(&dir)));
     }
 
     #[test]

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::host::{Call, Link, Reply, Request};
 use crate::theme::Hue;
+use serde::{Deserialize, Serialize};
 
 /// Changes past this many in a repository aren't listed.
 const MAX_CHANGES: usize = 10_000;
@@ -48,7 +49,7 @@ const SLOWDOWN: u32 = 10;
 const MIN_GAP: Duration = Duration::from_millis(500);
 
 /// How a file changed since the last commit, staged or not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     Modified,
     /// New to git, and staged.
@@ -85,7 +86,7 @@ impl Kind {
 }
 
 /// How much of a file's change is staged, to go in the next commit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Staged {
     #[default]
     No,
@@ -95,7 +96,7 @@ pub enum Staged {
 }
 
 /// A file changed since the last commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     /// Where it is, or was, if it's gone.
     pub path: PathBuf,
@@ -107,7 +108,7 @@ pub struct Change {
 }
 
 /// What a repository has checked out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Head {
     /// A branch, which may not have any commits yet.
     Branch(String),
@@ -125,7 +126,7 @@ impl Head {
 }
 
 /// A repository a workspace folder is in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repo {
     /// Its working tree's top folder.
     pub root: PathBuf,
@@ -152,7 +153,7 @@ pub struct Repo {
 }
 
 /// The branch, on a remote, that the one checked out tracks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upstream {
     /// Its name: `origin/main`.
     pub name: String,
@@ -164,7 +165,7 @@ pub struct Upstream {
 
 /// What a repository's branch needs to catch up with the branch it tracks,
 /// as its sync button does it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sync {
     /// Nothing, as far as is known: asks the remote what's new.
     Fetch,
@@ -215,7 +216,7 @@ pub struct Tracked {
 }
 
 /// What a file was in the last commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Base {
     /// Its text, with `\n` line breaks.
     Text(String),
@@ -278,7 +279,7 @@ impl Tracked {
 }
 
 /// A commit, as the log lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
     pub hash: String,
     /// The hash as git abbreviates it.
@@ -511,7 +512,7 @@ pub fn revert(root: &Path, commit: &str) -> Result<(), String> {
 
 /// Changes put away, as `git stash` keeps them: a commit of the files as
 /// they were, whose first parent is the commit checked out then.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stash {
     /// Its subject is what it was stashed as, without the branch it was
     /// stashed on.
@@ -648,7 +649,7 @@ fn stash_name(root: &Path, hash: &str) -> Result<String, String> {
 }
 
 /// A branch to switch to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Branch {
     /// Its name: `main`, or a remote's, `origin/main`.
     pub name: String,
@@ -770,7 +771,7 @@ fn remote_of(name: &str, remotes: &[String]) -> Option<String> {
 }
 
 /// Where to switch a repository to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwitchTo {
     Branch(String),
     /// A new branch, by this name, at the commit checked out.
@@ -807,7 +808,7 @@ impl SwitchTo {
 }
 
 /// How the changes not committed came along when switching branches.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Carried {
     /// As they were, since the branch didn't change the files they did.
     Along,
@@ -980,7 +981,7 @@ pub fn sides(root: &Path, commit: &Commit, change: &Change) -> (Base, Base) {
 
 /// What the app asks git, through the host (see [`run`]), but for status,
 /// syncing, and committing, which have requests of their own.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GitCall {
     Log {
         root: PathBuf,
@@ -1051,7 +1052,7 @@ pub enum GitCall {
 
 /// What git answered a [`GitCall`], as the function of the same name
 /// returns it.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum GitAnswer {
     Log(Vec<Commit>),
     Changes(Vec<Change>),

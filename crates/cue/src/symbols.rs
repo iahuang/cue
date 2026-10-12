@@ -26,6 +26,7 @@ use crate::language::{self, Language};
 use crate::picker::Item;
 use crate::theme::SyntaxColor;
 use crate::workspace::Workspace;
+use serde::{Deserialize, Serialize};
 
 /// Larger files aren't outlined, or indexed for the workspace.
 const MAX_BYTES: usize = 4 << 20;
@@ -38,7 +39,7 @@ const MAX_SYMBOLS: usize = 500_000;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Something a file defines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Symbol {
     pub name: String,
     /// What it is: `function`, `struct`, `heading`, and so on.
@@ -73,6 +74,31 @@ const NODE_KINDS: &[&str] = &[
     "type",
     "union",
 ];
+
+/// A [`Symbol`] as sent, its kind one of [`kind_name`]'s or
+/// [`NODE_KINDS`].
+#[derive(Deserialize)]
+struct Sent {
+    name: String,
+    kind: String,
+    line: u32,
+    bytes: Range<usize>,
+    container: String,
+}
+
+impl<'de> Deserialize<'de> for Symbol {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Symbol, D::Error> {
+        let sent = Sent::deserialize(de)?;
+        let known = NODE_KINDS.iter().find(|&&known| known == sent.kind);
+        Ok(Symbol {
+            name: sent.name,
+            kind: known.copied().unwrap_or_else(|| kind_name(&sent.kind)),
+            line: sent.line,
+            bytes: sent.bytes,
+            container: sent.container,
+        })
+    }
+}
 
 /// A language's compiled tags query.
 struct Tags {

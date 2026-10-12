@@ -4,10 +4,11 @@
 //! Roots may nest, as when a package of a monorepo is added beside the
 //! repository: a file belongs to the deepest root it's in.
 
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     /// Absolute, symlink-free paths, in the order they were added.
     roots: Vec<PathBuf>,

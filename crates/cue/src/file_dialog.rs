@@ -44,6 +44,7 @@ use crate::line_edit::{self, Caret, Edit};
 use crate::picker::{self, Area};
 use crate::theme;
 use crate::tree;
+use serde::{Deserialize, Serialize};
 
 /// The widest the popup gets, in columns.
 const MAX_WIDTH: u32 = 90;
@@ -98,7 +99,7 @@ pub enum DialogAction {
 }
 
 /// Something in the folder listed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     name: String,
     is_dir: bool,

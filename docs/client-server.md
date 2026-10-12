@@ -249,8 +249,7 @@ Notes from 1.1 and 1.2:
   turn it off to see what shows meanwhile. The host's threads also get
   the test's settings (`Tell::Config`, test-only), since in tests each
   thread has its own.
-- `Symbol::kind` is a `&'static str`; it needs to become owned or an enum
-  to be serialized (step 2).
+- `Symbol::kind` is a `&'static str`; it's interned as it's read (2.1).
 - Git status is still scheduled by the client (`Git::poll` decides when to
   call). See open questions.
 
@@ -260,6 +259,44 @@ Move the host into the existing session server process, and the app into
 the client. The client stops borrowing the tty's fds; the two talk over the
 unix socket with a serialized protocol (serde + a compact format, versioned
 by build id).
+
+One host process per cue, as one server per cue today: it lives while a
+client's connected, or while it's a session with programs running.
+
+1. Wire format: every message serde, framed and written with postcard.
+   `Link::local` talks to its host thread over a socketpair, so every
+   test goes through serialization ("same path locally").
+2. The host as a process of its own (`cue --host`), listening on the
+   session's socket; `Link::connect`. One client at a time: a new one
+   takes over, and the old one hears it moved.
+3. Terminals' screens on the host: the native core allows one thread per
+   process, so the host keeps a VT per terminal on a thread of its own,
+   fed what the program writes, answering its queries while no client's
+   there. A client that attaches gets each screen as a snapshot, then
+   output as bytes (as `Terminal::adopt` takes them now). Not in the
+   in-process host, whose process has the client's VTs.
+4. The app in the client: the `cue` the shell ran shows the app in its own
+   terminal, and connects to (or starts) the host. Detaching saves the
+   session and exits; attaching restores it from the host, terminals
+   included. No more handing stdio over, and no headless app.
+5. Upgrades: a client of another build has the host re-exec into its
+   binary, which adopts the ptys, their screens, and the session's lock.
+6. Config: the host loads its own, and reloads when told to.
+
+Progress:
+
+- [x] 2.1 Every message is serde (`Request`, `Reply`, `Tell`, `Notice`,
+  and what they carry), framed by its length (a `u64`) and written with
+  postcard. `Link::over` is the app's end of a stream: a thread writes
+  what it's asked, another reads and routes replies; once the host's
+  gone, the calls left end. `serve_stream` is the host's end. The local
+  host is on the other end of a socketpair, so every test goes through
+  the wire. Two types needed help: `io::ErrorKind` goes as one of the
+  kinds the app tells apart (`error_kind`), and `Symbol` is read through
+  an owned twin, its kind interned among the known ones. Tests' settings
+  reach the local host's threads directly (`Link::set_config`), not as a
+  message. Raw fds (`Start::Adopt`, `Event::Released`) still cross as
+  numbers, meaningful only in the same process: 2.3 and 2.5 replace them.
 
 ### 3. ssh
 

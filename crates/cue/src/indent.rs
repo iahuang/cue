@@ -9,6 +9,7 @@
 
 use crate::config;
 use crate::language::Language;
+use serde::{Deserialize, Serialize};
 
 /// Lines past this many aren't looked at.
 const MAX_LINES: usize = 10_000;
@@ -16,7 +17,7 @@ const MAX_LINES: usize = 10_000;
 /// for breaking ties.
 const WIDTHS: [u32; 4] = [4, 2, 8, 3];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Indent {
     Tabs,
     Spaces(u32),

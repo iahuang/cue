@@ -7,6 +7,7 @@
 //! closes. cue holds the other end, non-blocking, and reads it when
 //! `poll` says it's ready.
 
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -388,7 +389,7 @@ fn winsize(cols: u16, rows: u16) -> libc::winsize {
 // --- on the host ------------------------------------------------------------
 
 /// How a terminal starts on the host.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Start {
     /// The user's shell (see [`Pty::shell`]), in `cwd`, or in `or` if
     /// that isn't a folder (any more).
@@ -403,7 +404,7 @@ pub enum Start {
 }
 
 /// What a terminal's program is doing, as the host last looked.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     /// A program other than the shell has the terminal.
     pub busy: bool,
@@ -417,7 +418,7 @@ pub struct Status {
 }
 
 /// What the host says of a terminal.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Event {
     /// What the program wrote.
     Output(Vec<u8>),
@@ -432,7 +433,7 @@ pub enum Event {
 }
 
 /// What the app has a terminal's host thread do.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Control {
     /// Send the program this, as typed.
     Input(Vec<u8>),

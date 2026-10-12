@@ -44,6 +44,7 @@ use crate::layout::Rect;
 use crate::pdf::{Job, Pdf, Renderer};
 use crate::status::Status;
 use crate::tty;
+use serde::{Deserialize, Serialize};
 
 /// File extensions opened as images rather than as text.
 const EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "pdf"];
@@ -201,7 +202,7 @@ struct Drag {
 
 /// A file as it was on disk: if it has the same time and size, it's
 /// surely not changed.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Stamp {
     modified: SystemTime,
     len: u64,

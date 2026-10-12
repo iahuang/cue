@@ -29,6 +29,7 @@ use crate::keymap::Command;
 use crate::language::{self, Language};
 use crate::syntax::{ExcerptHighlighter, LineColors, MAX_EXCERPT_BYTES};
 use crate::workspace::Workspace;
+use serde::{Deserialize, Serialize};
 
 /// Lines shown before and after each matching line.
 pub const CONTEXT_LINES: usize = 2;
@@ -40,7 +41,7 @@ const MAX_LINE_BYTES: usize = 400;
 const LEAD_BYTES: usize = 40;
 
 /// What to search for.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Query {
     pub text: String,
     pub case_sensitive: bool,
@@ -130,7 +131,7 @@ impl Query {
 }
 
 /// One file's matches, with the lines around them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMatches {
     pub path: PathBuf,
     /// The path as shown, relative to the workspace.
@@ -143,7 +144,7 @@ pub struct FileMatches {
 }
 
 /// A line of a file, matching or around a match.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Line {
     /// 0-based.
     pub number: u32,
@@ -183,7 +184,7 @@ impl FileMatches {
 }
 
 /// What a search found.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Found {
     /// A file with matches, not colored yet.
     File(FileMatches),

@@ -13,6 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use serde::{Deserialize, Serialize};
 
 /// How long changes have to stop for before they're handed over.
 const SETTLE: Duration = Duration::from_millis(50);
@@ -20,7 +21,7 @@ const SETTLE: Duration = Duration::from_millis(50);
 const MAX_WAIT: Duration = Duration::from_millis(300);
 
 /// What changed in the watched folders.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Changes {
     /// The files and folders that came, went, or changed. Which of those
     /// isn't told: on macOS, a file created lately is told as created again
