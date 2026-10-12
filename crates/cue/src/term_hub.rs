@@ -12,6 +12,10 @@
 //! while no client hears of a terminal, the hub answers the program's
 //! queries. The host in the app's process has none, the core being the
 //! app's: a terminal there can't be attached to again.
+//!
+//! A host process replacing itself with another build of cue lets go of
+//! every terminal, with its screen ([`Hub::release_all`]), and the new one
+//! takes them up again, under the same ids ([`Hub::adopt`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -20,6 +24,7 @@ use std::sync::Arc;
 
 use opentui::EmbeddedTerminal;
 
+use crate::app::Adopted;
 use crate::host::{Reply, Responder};
 use crate::pty::{self, Control, Event, Start, Status};
 
@@ -61,6 +66,11 @@ enum ToHub {
     After(Responder),
     /// Which terminals are running, said to this.
     List(Sender<Vec<TermId>>),
+    /// Let go of every terminal without hanging up, saying each, with its
+    /// screen, to this once they all are.
+    Release(Sender<Vec<Adopted>>),
+    /// Take up a terminal a host process this one replaced let go of.
+    Adopt(Adopted),
     /// The host's done: hang up on every terminal, and end once they have.
     Close,
 }
@@ -138,6 +148,27 @@ impl Hub {
     pub fn count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
     }
+
+    /// Lets go of every terminal, their programs running on, for a process
+    /// that replaces this one: each pty's master, kept open across `exec`,
+    /// with its program and its screen (empty unless the hub keeps them).
+    /// Waits until they all are.
+    pub fn release_all(&self) -> Vec<Adopted> {
+        let (answer, released) = mpsc::channel();
+        let _ = self.to_hub.send(ToHub::Release(answer));
+        released.recv().unwrap_or_default()
+    }
+
+    /// Takes up `terminals`, which a host process this one replaced let go
+    /// of (see [`Hub::release_all`]), under their ids there, for clients to
+    /// attach to.
+    pub fn adopt(&self, terminals: Vec<Adopted>) {
+        for terminal in terminals {
+            self.next_id
+                .fetch_max(terminal.id as TermId + 1, Ordering::Relaxed);
+            let _ = self.to_hub.send(ToHub::Adopt(terminal));
+        }
+    }
 }
 
 impl Drop for Hub {
@@ -160,6 +191,23 @@ struct Term {
 }
 
 impl Term {
+    fn new(controller: pty::Controller, vt: Option<EmbeddedTerminal>, size: (u16, u16)) -> Term {
+        Term {
+            controller,
+            vt,
+            size,
+            watcher: None,
+            status: Status::default(),
+            exited: None,
+        }
+    }
+
+    /// Its screen, in full, as [`crate::terminal::full_snapshot`] takes
+    /// it, if the hub keeps it.
+    fn screen(&mut self) -> Option<Vec<u8>> {
+        crate::terminal::full_snapshot(self.vt.as_mut()?)
+    }
+
     /// Tells the call that hears of it, if one does and still listens.
     fn tell(&mut self, event: Event) {
         if let Some((_, responder)) = &self.watcher {
@@ -175,6 +223,9 @@ impl Term {
 fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens: bool) {
     let mut terms: HashMap<TermId, Term> = HashMap::new();
     let mut closing = false;
+    // Where to say the terminals let go of, once they all are, and those so
+    // far.
+    let mut releasing: Option<(Sender<Vec<Adopted>>, Vec<Adopted>)> = None;
     for message in inbox {
         match message {
             ToHub::Open {
@@ -191,11 +242,9 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                 };
                 // The call that heard of it before ends.
                 term.watcher = Some((token, responder));
-                if let Some(vt) = &mut term.vt {
-                    if let Some(screen) = crate::terminal::full_snapshot(vt) {
-                        let (cols, rows) = term.size;
-                        term.tell(Event::Screen { screen, cols, rows });
-                    }
+                if let Some(screen) = term.screen() {
+                    let (cols, rows) = term.size;
+                    term.tell(Event::Screen { screen, cols, rows });
                 }
                 term.tell(Event::Status(term.status.clone()));
                 if let Some(raw) = term.exited {
@@ -214,52 +263,57 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                 if let Some(config) = &config {
                     crate::config::set((**config).clone());
                 }
-                let (controller, controls) = match pty::controls() {
-                    Ok(controls) => controls,
-                    Err(err) => {
-                        responder.reply(Reply::Term(Event::Failed(err.to_string())));
-                        continue;
-                    }
-                };
                 let size = match &start {
                     Start::Shell { cols, rows, .. } => (*cols, *rows),
                     _ => (80, 24),
                 };
                 // Not for a pty adopted, whose screen the app has.
                 let vt = match &start {
-                    Start::Shell { above, .. } if screens => {
-                        let scrollback = crate::config::get().scrollback;
-                        let vt = EmbeddedTerminal::new(size.0.max(1), size.1.max(1), scrollback);
-                        vt.ok().map(|mut vt| {
-                            let _ = vt.write(above);
-                            vt.drain_responses();
-                            vt
-                        })
-                    }
+                    Start::Shell { above, .. } if screens => emulator(size, above),
                     _ => None,
                 };
-                let mut term = Term {
-                    controller,
-                    vt,
-                    size,
-                    watcher: Some((token, responder)),
-                    status: Status::default(),
-                    exited: None,
+                let spawned = spawn(
+                    &hub,
+                    id,
+                    start,
+                    #[cfg(test)]
+                    config,
+                );
+                let controller = match spawned {
+                    Ok(controller) => controller,
+                    Err(err) => {
+                        responder.reply(Reply::Term(Event::Failed(err.to_string())));
+                        continue;
+                    }
                 };
+                let mut term = Term::new(controller, vt, size);
+                term.watcher = Some((token, responder));
                 term.tell(Event::Started(id));
                 terms.insert(id, term);
                 count.fetch_add(1, Ordering::Relaxed);
-                let hub = hub.clone();
-                std::thread::spawn(move || {
+            }
+            ToHub::Adopt(adopted) => {
+                let id = adopted.id as TermId;
+                let vt = match screens {
+                    true => emulator(adopted.size, &adopted.screen),
+                    false => None,
+                };
+                let start = Start::Adopt {
+                    fd: adopted.fd,
+                    pid: adopted.pid,
+                };
+                let spawned = spawn(
+                    &hub,
+                    id,
+                    start,
                     #[cfg(test)]
-                    if let Some(config) = config {
-                        crate::config::set((*config).clone());
-                    }
-                    pty::serve(start, controls, |event| {
-                        hub.send(ToHub::Event(id, event)).is_ok()
-                    });
-                    let _ = hub.send(ToHub::Ended(id));
-                });
+                    None,
+                );
+                // Its program's hung up on, its pty closed, if it can't be.
+                if let Ok(controller) = spawned {
+                    terms.insert(id, Term::new(controller, vt, adopted.size));
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
             }
             ToHub::Control(id, control) => {
                 let Some(term) = terms.get_mut(&id) else {
@@ -278,6 +332,24 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                     if term.watcher.as_ref().is_some_and(|(t, _)| *t == token) {
                         term.watcher = None;
                     }
+                }
+            }
+            ToHub::Event(id, Event::Released(fd, pid)) if releasing.is_some() => {
+                let Some(mut term) = terms.remove(&id) else {
+                    continue;
+                };
+                count.fetch_sub(1, Ordering::Relaxed);
+                let screen = term.screen().unwrap_or_default();
+                let size = term.size;
+                if let Some((_, released)) = &mut releasing {
+                    let id = id as u32;
+                    released.push(Adopted {
+                        id,
+                        fd,
+                        pid,
+                        screen,
+                        size,
+                    });
                 }
             }
             ToHub::Event(id, event) => {
@@ -321,6 +393,12 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                 ids.sort_unstable();
                 let _ = answer.send(ids);
             }
+            ToHub::Release(answer) => {
+                for term in terms.values() {
+                    term.controller.send(Control::Release);
+                }
+                releasing = Some((answer, Vec::new()));
+            }
             ToHub::Close => {
                 closing = true;
                 for term in terms.values() {
@@ -328,8 +406,48 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                 }
             }
         }
+        // Those that ended meanwhile aren't waited for.
+        if terms.is_empty() {
+            if let Some((answer, released)) = releasing.take() {
+                let _ = answer.send(released);
+            }
+        }
         if closing && terms.is_empty() {
             break;
         }
     }
+}
+
+/// An emulator for a terminal's screen, `cols` by `rows`, showing
+/// `screen` (see [`crate::terminal::full_snapshot`]).
+fn emulator((cols, rows): (u16, u16), screen: &[u8]) -> Option<EmbeddedTerminal> {
+    let scrollback = crate::config::get().scrollback;
+    let mut vt = EmbeddedTerminal::new(cols.max(1), rows.max(1), scrollback).ok()?;
+    let _ = vt.write(screen);
+    // What it answered isn't for the program.
+    vt.drain_responses();
+    Some(vt)
+}
+
+/// Starts the thread of the terminal `id`, which runs its program as
+/// `start` says, its events coming to the hub.
+fn spawn(
+    hub: &Sender<ToHub>,
+    id: TermId,
+    start: Start,
+    #[cfg(test)] config: Option<Arc<crate::config::Config>>,
+) -> std::io::Result<pty::Controller> {
+    let (controller, controls) = pty::controls()?;
+    let hub = hub.clone();
+    std::thread::spawn(move || {
+        #[cfg(test)]
+        if let Some(config) = config {
+            crate::config::set((*config).clone());
+        }
+        pty::serve(start, controls, |event| {
+            hub.send(ToHub::Event(id, event)).is_ok()
+        });
+        let _ = hub.send(ToHub::Ended(id));
+    });
+    Ok(controller)
 }

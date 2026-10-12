@@ -223,7 +223,7 @@ pub fn default_dir() -> Option<PathBuf> {
 pub struct Session {
     id: String,
     dir: PathBuf,
-    _lock: fs::File,
+    lock: fs::File,
     /// The name it was given, if any.
     name: Option<String>,
     /// The keys of its file this cue doesn't know, to write back.
@@ -282,6 +282,16 @@ impl Session {
                 _ => err,
             });
         }
+        Ok(Session::with_lock(dir, lock))
+    }
+
+    /// The session in `dir`, whose lock a process this one replaced held,
+    /// and handed over as `lock` (see [`Session::into_lock`]).
+    pub fn adopt(dir: &Path, lock: fs::File) -> Session {
+        Session::with_lock(dir, lock)
+    }
+
+    fn with_lock(dir: &Path, lock: fs::File) -> Session {
         // Not to programs cue starts: a shell holding it would keep the
         // session looking live.
         unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
@@ -289,14 +299,21 @@ impl Session {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Ok(Session {
+        Session {
             id,
             name: None,
             unknown: Table::new(),
             dir: dir.to_path_buf(),
-            _lock: lock,
+            lock,
             written: None,
-        })
+        }
+    }
+
+    /// Lets go of the session but not its lock, for a process that
+    /// replaces this one to take up (see [`Session::adopt`]): its folder,
+    /// and the lock, held while any copy of it is open.
+    pub fn into_lock(self) -> (PathBuf, fs::File) {
+        (self.dir, self.lock)
     }
 
     #[cfg(test)]

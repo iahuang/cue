@@ -5881,20 +5881,29 @@ impl App {
         Ok(())
     }
 
+    /// Saves the session, for a cue that's to go on from it in this one's
+    /// place, made one for the while if this isn't one (`true` then), with
+    /// terminals' screens if `screens`: its folder. `None`, with a message,
+    /// if there's nowhere to keep it.
+    pub fn keep_to_restart(&mut self, screens: bool) -> Option<(PathBuf, bool)> {
+        let ephemeral = self.session.is_none();
+        if ephemeral && !self.keep_session(false) {
+            return None;
+        }
+        if !self.save_session(screens) {
+            return None;
+        }
+        Some((self.session.as_ref()?.dir().to_path_buf(), ephemeral))
+    }
+
     /// Lets go of everything, for a process that replaces this one to go
     /// on with (see [`App::restore_session`]): the session saved, made one
     /// for the while if this isn't one (`true` then), and the terminals,
     /// their shells still running, each with its screen in full. `None`,
     /// with a message, if there's nowhere to keep it.
     pub fn hand_over(&mut self) -> Option<(PathBuf, bool, Vec<Adopted>)> {
-        let ephemeral = self.session.is_none();
-        if ephemeral && !self.keep_session(false) {
-            return None;
-        }
-        if !self.save_session(false) {
-            return None;
-        }
-        let dir = self.session.take()?.dir().to_path_buf();
+        let (dir, ephemeral) = self.keep_to_restart(false)?;
+        self.session = None;
         // Nothing else holds the terminals then.
         self.close_popups();
         self.focused_terminal = None;
@@ -14312,7 +14321,7 @@ mod tests {
         let path = root.join("host.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         // Without screens: the native core's the apps', on this thread.
-        let host = std::thread::spawn(move || crate::host::serve_listener(listener, false));
+        let host = std::thread::spawn(move || crate::host::serve_listener(listener, false, None));
         let workspace = Workspace::new([root.clone()]).unwrap();
         let link = Link::connect(&path).unwrap();
         let mut app = App::with_host(link, workspace, Some(root.join("a.txt")), 80, 10).unwrap();

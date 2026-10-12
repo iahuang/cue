@@ -117,13 +117,27 @@ fn main() -> ExitCode {
     let mode = parse_args();
     // Only a client needs the copy it runs from, if it does: to start a
     // server.
-    if !matches!(mode, Ok(Mode::Client(_))) {
+    if !matches!(mode, Ok(Mode::Client(_) | Mode::Restarted(..))) {
         relocate::release();
     }
     // Whether the app's shown in this process, the client's.
-    let here = matches!(mode, Ok(Mode::Client(_))) && env_flag(HOST_PROCESS_VARIABLE);
+    let here = match &mode {
+        Ok(Mode::Client(_)) => env_flag(HOST_PROCESS_VARIABLE),
+        Ok(Mode::Restarted(..)) => true,
+        _ => false,
+    };
+    // The session's only for restarting, to forget once it's back.
+    let mut ephemeral = false;
     let start = match mode {
         Ok(Mode::Serve(start)) => start,
+        Ok(Mode::Restarted(dir, only_for_restart)) => {
+            ephemeral = only_for_restart;
+            // Its host may have had nothing left to wait for.
+            match session::is_live(&dir) {
+                true => Start::Attach(dir),
+                false => Start::Restore(dir),
+            }
+        }
         Ok(Mode::Client(args)) if here => match client::target(&args) {
             Ok(Some(listing)) if listing.live => Start::Attach(listing.dir),
             Ok(Some(listing)) => Start::Restore(listing.dir),
@@ -138,13 +152,13 @@ fn main() -> ExitCode {
             relocate::release();
             return code;
         }
-        Ok(Mode::Host) => return host_process(),
+        Ok(Mode::Host(adopt)) => return host_process(adopt),
         Ok(Mode::List) => return client::list(),
         Ok(Mode::End(id)) => return client::end(id),
         Err(code) => return code,
     };
     let result = std::panic::catch_unwind(|| match here {
-        true => show(start),
+        true => show(start, ephemeral),
         false => serve(start),
     });
     relocate::release();
@@ -206,9 +220,14 @@ enum Mode {
     /// Do the work, in the terminal the client handed over (see
     /// [`attach`]).
     Serve(Start),
+    /// Show the session in this folder, as a client that restarted (see
+    /// [`restart_client`]), forgetting it once it's back if it was only
+    /// for that.
+    Restarted(PathBuf, bool),
     /// Be a host (see [`host::serve_listener`]), on the socket the app
-    /// that started this process handed it.
-    Host,
+    /// that started this process handed it, or with a folder, the host
+    /// process this one replaced (see [`host::Handover`]).
+    Host(Option<PathBuf>),
     List,
     End(Option<String>),
 }
@@ -237,7 +256,20 @@ enum Start {
 fn parse_args() -> Result<Mode, ExitCode> {
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().is_some_and(|arg| arg == "--host") {
-        return Ok(Mode::Host);
+        args.next();
+        let adopt = match args.next() {
+            Some(arg) if arg == "--adopt" => {
+                Some(args.next().map(PathBuf::from).ok_or(ExitCode::FAILURE)?)
+            }
+            _ => None,
+        };
+        return Ok(Mode::Host(adopt));
+    }
+    if args.peek().is_some_and(|arg| arg == RESTARTED) {
+        args.next();
+        let dir = args.next().map(PathBuf::from).ok_or(ExitCode::FAILURE)?;
+        let ephemeral = args.next().is_some_and(|arg| arg == EPHEMERAL);
+        return Ok(Mode::Restarted(dir, ephemeral));
     }
     if args.peek().is_some_and(|arg| arg == "--serve") {
         args.next();
@@ -568,8 +600,10 @@ fn crashes() -> Option<String> {
     }
 }
 
-/// Runs a host process, until its client's gone.
-fn host_process() -> ExitCode {
+/// Runs a host process, until its client's gone; with `adopt`, in place
+/// of one of another build, for the session in that folder (see
+/// [`host::Handover`]).
+fn host_process(adopt: Option<PathBuf>) -> ExitCode {
     let Some(listener) = host::listener_from_env() else {
         eprintln!("cue: --host is for cue to start");
         return ExitCode::FAILURE;
@@ -578,7 +612,16 @@ fn host_process() -> ExitCode {
     config::set(config);
     // Where a panic's said: there's no terminal.
     attach::let_go_of_stdio(crash::open_log());
-    host::serve_listener(listener, true);
+    let handover = match adopt.as_deref().map(host::Handover::from_env) {
+        Some(Ok(handover)) => Some(handover),
+        Some(Err(err)) => {
+            eprintln!("cue: can't take over the session: {err}");
+            crash::close_log();
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+    host::serve_listener(listener, true, handover);
     crash::close_log();
     ExitCode::SUCCESS
 }
@@ -591,8 +634,10 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// new one, or with [`Start::Attach`], the one running the session,
 /// which another client showing it leaves first. Quitting hangs up on its
 /// terminals; detaching, or the terminal going, leaves them running in the
-/// host, for `cue` to come back to; it exits either way.
-fn show(start: Start) -> Result<(), Box<dyn std::error::Error>> {
+/// host, for `cue` to come back to; it exits either way, unless it
+/// restarts (see [`restart_client`]). The session's forgotten once it's
+/// back if it's `ephemeral`.
+fn show(start: Start, ephemeral: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (config, config_warnings) = config::load();
     config::set(config);
     let (width, height) = tty::size();
@@ -607,6 +652,9 @@ fn show(start: Start) -> Result<(), Box<dyn std::error::Error>> {
         }
         Start::Adopt(_) => return Err("Only a server takes over.".into()),
     };
+    if ephemeral {
+        app.forget_session();
+    }
     // The host's started, from the copy this runs from, if it does.
     relocate::release();
     app.warn_about_config(&config_warnings);
@@ -632,9 +680,17 @@ fn show(start: Start) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Outcome::Restart => {
-                let text = "Restart isn't available with a host process yet.";
-                app.show_message_now(text.into(), true);
-                continue;
+                let Some((dir, ephemeral)) = app.keep_to_restart(true) else {
+                    continue;
+                };
+                app.set_attached(false);
+                leave(app);
+                let err = restart_client(&dir, ephemeral);
+                let resume = match ephemeral {
+                    true => "",
+                    false => " Run `cue --resume` to resume.",
+                };
+                return Err(format!("can't restart: {err}.{resume}").into());
             }
             Outcome::Detach => {
                 app.set_attached(false);
@@ -662,6 +718,26 @@ fn show(start: Start) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+}
+
+/// Says a client restarted, with the session's folder: `cue --restarted
+/// DIR [--ephemeral]`.
+const RESTARTED: &str = "--restarted";
+const EPHEMERAL: &str = "--ephemeral";
+
+/// Starts the cue that's on disk now, as a client, in this one's place,
+/// to come back to the session in `dir`, which this one left; and to
+/// forget it once it's back, if it's `ephemeral`. Its host takes up that
+/// build too, if it's another (see [`host::serve_listener`]). Returns only
+/// if it can't.
+fn restart_client(dir: &Path, ephemeral: bool) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(relocate::origin());
+    command.arg(RESTARTED).arg(dir);
+    if ephemeral {
+        command.arg(EPHEMERAL);
+    }
+    command.exec()
 }
 
 /// Lets `app` go, hanging up on its terminals, once the host hears.

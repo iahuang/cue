@@ -206,7 +206,7 @@ Progress:
   snapshots and diffs rather than bytes (needs the host to keep the VT for
   detached sessions anyway, and spares the wire a `cat` of a big log).
   `Event::Released` hands over a raw fd, which only means anything in
-  the same process: re-exec becomes the server's own business in step 2.
+  the same process: re-exec became the host's own business in 2.5.
 - [x] 1.9 Sessions are the host's: it holds the session's lock and files
   (`Request::Session` with a `SessionCall`, answered by `session::run`),
   and the app keeps a `SessionLink`: the session's id, folder, and name,
@@ -374,6 +374,26 @@ Progress:
   postcard can't read back; they go as text now. Not yet: Restart, and a
   client of another build attaching (2.5); without the flag, the old
   server path is unchanged.
+- [x] 2.5 A client of another build has the host process start its
+  binary in its place (`host::upgrade`): the client says where its binary
+  is (`Hello::exe`), and once the client before has left, the host lets go
+  of its terminals, their programs running, with their screens
+  (`Hub::release_all`), writes them in the session's folder (as
+  `attach::write_manifest` does), and execs `cue --host --adopt DIR`,
+  handing over the session's socket and the client, greeted already. The
+  new host takes the session's lock again, adopts the terminals under the
+  same ids (`Hub::adopt`), and serves that client first (`Handover`).
+  `Hello` and its answer are the messages builds share: fields are only
+  ever added at the end, which postcard lets an earlier build ignore. Only
+  a host that keeps a session upgrades, which is the only way a client of
+  another build reaches one. Restart, with the flag: the client keeps the
+  session (one for the while, if it isn't one), leaves, and execs the
+  binary on disk as `cue --restarted DIR`, which attaches to the session,
+  the host upgrading if that's another build. A host whose client left
+  waits for the next as long as for its first (10s), so a restart finds
+  it. Raw fds still cross the wire only on the old server path
+  (`Start::Adopt`, `Event::Released`), which goes once the flag's the
+  default.
 
 ### 3. ssh
 

@@ -11,7 +11,9 @@
 //! time, of its own build: one that connects takes over once the one
 //! before, told [`Notice::Moved`], has saved and left (see
 //! [`Link::leave`]). While it keeps a session, it takes clients on the
-//! session's socket too, which is how `cue` finds it again.
+//! session's socket too, which is how `cue` finds it again. A client of
+//! another build has it start that build in its place, which takes up the
+//! session and its terminals (see [`Handover`]).
 //!
 //! - A [`Request`] is a call: the host answers it with [`Reply`]s, as many
 //!   as it takes, and then ends it. Dropping the [`Call`] cancels it, and
@@ -44,6 +46,7 @@ use std::time::{Duration, Instant};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::app::Adopted;
 use crate::document::{self, Checked, LineEnding, Loaded, Stamp, Unsaved, Written};
 use crate::file_dialog;
 use crate::file_index;
@@ -84,6 +87,10 @@ pub type CallId = u64;
 
 /// Hands a host process the socket it listens on, by descriptor.
 const LISTENER_VARIABLE: &str = "CUE_HOST_FD";
+/// Hands a host process that replaced another the client it's for, and
+/// the session's lock, by descriptor (see [`Handover`]).
+const CLIENT_VARIABLE: &str = "CUE_HOST_CLIENT_FD";
+const LOCK_VARIABLE: &str = "CUE_HOST_LOCK_FD";
 /// How long either end waits for the other's side of the handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a host process waits for its first client.
@@ -301,7 +308,9 @@ pub enum Notice {
     Gone,
 }
 
-/// What a client says first, to a host process.
+/// What a client says first, to a host process: the one message, with
+/// the answer to it, that builds share. Fields are only ever added, at the
+/// end, which a host of an earlier build doesn't read.
 #[derive(Serialize, Deserialize)]
 struct Hello {
     /// Which build of cue it is (see [`crate::attach::build`]).
@@ -312,6 +321,8 @@ struct Hello {
     inside: Option<u32>,
     /// To end the host's session, not to be served.
     end: bool,
+    /// Its binary, for a host of another build to start in its place.
+    exe: PathBuf,
 }
 
 impl Hello {
@@ -321,6 +332,7 @@ impl Hello {
             build: build.to_string(),
             inside: inside.and_then(|pid| pid.parse().ok()),
             end,
+            exe: crate::relocate::origin().to_path_buf(),
         }
     }
 }
@@ -350,7 +362,9 @@ enum Input {
     Finished(CallId),
     /// The watcher heard something.
     Watched,
-    /// The app is gone, or left.
+    /// The app left, for another client to come.
+    Left,
+    /// The app is gone.
     Shutdown,
     /// Another client is taking over: the app's told so, and served on
     /// until it leaves.
@@ -369,7 +383,7 @@ impl From<ToHost> for Input {
             ToHost::Call(id, request) => Input::Call(id, request),
             ToHost::Cancel(id) => Input::Cancel(id),
             ToHost::Tell(tell) => Input::Tell(tell),
-            ToHost::Leave => Input::Shutdown,
+            ToHost::Leave => Input::Left,
             #[cfg(test)]
             ToHost::Settle => Input::Settle,
         }
@@ -441,7 +455,7 @@ impl Link {
         #[cfg(test)]
         let _ = link.shared.state.set(Arc::clone(&state));
         std::thread::spawn(move || {
-            serve_stream(theirs, mpsc::channel(), &state);
+            let _ = serve_stream(theirs, mpsc::channel(), &state);
             // No other client can come for its terminals.
             state.hub.hang_up_all();
         });
@@ -487,10 +501,13 @@ impl Link {
         Ok(Link::over(stream, false))
     }
 
-    /// Connects to the host process on `path` as a client of `build`.
+    /// Connects to the host process on `path` as a client of `build`,
+    /// whose binary is `exe`.
     #[cfg(test)]
-    fn connect_as(path: &Path, build: &str) -> io::Result<Link> {
-        let stream = greeted(path, &Hello::new(build, false))?;
+    fn connect_as(path: &Path, build: &str, exe: &Path) -> io::Result<Link> {
+        let mut hello = Hello::new(build, false);
+        hello.exe = exe.to_path_buf();
+        let stream = greeted(path, &hello)?;
         Ok(Link::over(stream, false))
     }
 
@@ -782,83 +799,164 @@ impl Drop for Responder {
 
 /// The listening socket this host process was handed, if it was.
 pub fn listener_from_env() -> Option<UnixListener> {
-    let fd: RawFd = std::env::var(LISTENER_VARIABLE).ok()?.parse().ok()?;
+    let fd = socket_from_env(LISTENER_VARIABLE)?;
+    Some(unsafe { UnixListener::from_raw_fd(fd) })
+}
+
+/// The socket handed to this process by descriptor, as the environment
+/// variable `name` says, if it was. It's closed on `exec` from then on.
+fn socket_from_env(name: &str) -> Option<RawFd> {
+    fd_from_env(name, libc::S_IFSOCK)
+}
+
+/// The descriptor of a file of type `kind` handed to this process, as the
+/// environment variable `name` says, if it was. It's closed on `exec`
+/// from then on.
+fn fd_from_env(name: &str, kind: libc::mode_t) -> Option<RawFd> {
+    let fd: RawFd = std::env::var(name).ok()?.parse().ok()?;
     // Not for the shells it starts.
-    std::env::remove_var(LISTENER_VARIABLE);
+    std::env::remove_var(name);
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_mode & libc::S_IFMT != kind {
         return None;
     }
     unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    Some(unsafe { UnixListener::from_raw_fd(fd) })
+    Some(fd)
+}
+
+/// What a host process that replaced another, of another build, goes on
+/// with (see [`upgrade`]): the session the other kept, its terminals, their
+/// programs running, and the client that asked for it, greeted already.
+pub struct Handover {
+    session: Session,
+    terminals: Vec<Adopted>,
+    client: UnixStream,
+}
+
+impl Handover {
+    /// What the host process this one replaced handed it, for the session
+    /// in `dir`.
+    pub fn from_env(dir: &Path) -> io::Result<Handover> {
+        let client = socket_from_env(CLIENT_VARIABLE)
+            .ok_or_else(|| io::Error::other("No client was handed over."))?;
+        let client = unsafe { UnixStream::from_raw_fd(client) };
+        let (_, terminals) = crate::attach::read_manifest(dir)
+            .ok_or_else(|| io::Error::other("No terminals were handed over."))?;
+        let Some(lock) = fd_from_env(LOCK_VARIABLE, libc::S_IFREG) else {
+            // Not this one's, after all: they're hung up on.
+            for left in &terminals {
+                unsafe { libc::close(left.fd) };
+            }
+            return Err(io::Error::other("The session's lock wasn't handed over."));
+        };
+        let session = Session::adopt(dir, unsafe { std::fs::File::from_raw_fd(lock) });
+        Ok(Handover {
+            session,
+            terminals,
+            client,
+        })
+    }
 }
 
 /// What happens to a host process.
 enum Happened {
     /// A client said hello, and is of this build.
     Greeted(UnixStream),
+    /// A client of another build said hello, for its binary to take over
+    /// from this one, once the client before has left.
+    Upgrade(UnixStream, PathBuf),
     /// A client asked to end the session (see [`end_session`]).
     End(UnixStream),
-    /// The client of this connection is gone, or left.
-    Ended(u64),
+    /// The client of this connection is gone, or left (`true`).
+    Ended(u64, bool),
 }
 
 /// Runs a host process: serves the clients that connect to `listener`,
 /// and to its session's socket while it keeps one, one at a time,
 /// keeping terminals' screens if `screens` (see [`crate::term_hub`]). A
 /// newer client takes over once the one before has left, having heard
-/// [`Notice::Moved`]. Ends once the one it serves is gone, unless it
-/// keeps a session with terminals running, for another to attach to; or
-/// if the first doesn't come; or once its session's ended. Then hangs up
-/// on its terminals, and removes its sockets.
-pub fn serve_listener(listener: UnixListener, screens: bool) {
+/// [`Notice::Moved`]; one of another build, by having its binary take this
+/// process's place (see [`upgrade`]). With `handover`, it goes on from the
+/// host process it replaced, `listener` being the session's socket. Ends
+/// once the one it serves is gone, unless it keeps a session with
+/// terminals running, for another to attach to; or if no client comes
+/// within [`FIRST_CLIENT_TIMEOUT`] of starting, or of the last one
+/// leaving; or once its session's ended. Then hangs up on its terminals,
+/// and removes its sockets.
+pub fn serve_listener(listener: UnixListener, screens: bool, handover: Option<Handover>) {
     let path = listener
         .local_addr()
         .ok()
         .and_then(|addr| addr.as_pathname().map(Path::to_path_buf));
     let (happen, happened) = mpsc::channel();
     let state = Arc::new(State::new(screens, Some(happen.clone())));
+    // The client to serve next, once the one served leaves, until when it
+    // waits for that, and the binary to start for it, if it's of another
+    // build.
+    let mut waiting: Option<(UnixStream, Instant, Option<PathBuf>)> = None;
+    if let Some(handover) = handover {
+        // Listened on already.
+        *lock(&state.socket) = path.clone().map(|path| (path, listener.as_raw_fd()));
+        *lock(&state.session) = Some(handover.session);
+        state.hub.adopt(handover.terminals);
+        waiting = Some((handover.client, Instant::now(), None));
+    }
     take_clients(listener, happen.clone());
     // The connection served, by its number, and its host thread's inbox.
     let mut serving: Option<(u64, Sender<Input>)> = None;
-    // The client to serve next, once the one served leaves, and until when
-    // it waits for that.
-    let mut waiting: Option<(UnixStream, Instant)> = None;
     // The client that asked to end the session, told once it has.
     let mut ender = None;
     let mut connections = 0;
+    // Until when it waits for a client with no other reason to go on.
+    let mut alone_until = Instant::now() + FIRST_CLIENT_TIMEOUT;
     loop {
         if serving.is_none() {
-            if let Some((stream, _)) = waiting.take() {
+            if let Some((stream, _, exe)) = waiting.take() {
+                if let Some(exe) = exe {
+                    match upgrade(&state, &exe, stream, path.as_deref()) {
+                        #[cfg(test)]
+                        Ok((listener, handover)) => {
+                            return serve_listener(listener, screens, Some(handover))
+                        }
+                        Err(err) => eprintln!("cue: can't start {}: {err}", exe.display()),
+                    }
+                    continue;
+                }
                 connections += 1;
                 let id = connections;
+                // Not waiting for one any more.
+                alone_until = Instant::now();
                 let (to_host, inbox) = mpsc::channel();
                 serving = Some((id, to_host.clone()));
                 let state = Arc::clone(&state);
                 let ended = happen.clone();
                 std::thread::spawn(move || {
-                    serve_stream(stream, (to_host, inbox), &state);
-                    let _ = ended.send(Happened::Ended(id));
+                    let left = serve_stream(stream, (to_host, inbox), &state);
+                    let _ = ended.send(Happened::Ended(id, left));
                 });
             }
         }
-        let next = match (&serving, &waiting, connections) {
-            (_, Some((_, until)), _) => {
+        let next = match (&serving, &waiting) {
+            (_, Some((_, until, _))) => {
                 happened.recv_timeout(until.saturating_duration_since(Instant::now()))
             }
-            (Some(_), None, _) => happened.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            (None, None, 0) => happened.recv_timeout(FIRST_CLIENT_TIMEOUT),
+            (Some(_), None) => happened.recv().map_err(|_| RecvTimeoutError::Disconnected),
             // Looking now and then whether there's still a reason to wait.
-            (None, None, _) => happened.recv_timeout(DETACHED_POLL),
+            (None, None) => happened.recv_timeout(DETACHED_POLL),
         };
         match next {
-            Ok(Happened::Greeted(stream)) => {
+            Ok(happened @ (Happened::Greeted(_) | Happened::Upgrade(..))) => {
+                let (stream, exe) = match happened {
+                    Happened::Upgrade(stream, exe) => (stream, Some(exe)),
+                    Happened::Greeted(stream) => (stream, None),
+                    _ => unreachable!(),
+                };
                 // Told once: a third client coming meanwhile replaces the
                 // second, which is hung up on.
                 if let (Some((_, served)), None) = (&serving, &waiting) {
                     let _ = served.send(Input::Moving);
                 }
-                waiting = Some((stream, Instant::now() + MOVE_TIMEOUT));
+                waiting = Some((stream, Instant::now() + MOVE_TIMEOUT, exe));
             }
             Ok(Happened::End(stream)) => {
                 if let Some((_, served)) = serving.take() {
@@ -870,10 +968,13 @@ pub fn serve_listener(listener: UnixListener, screens: bool) {
                 ender = Some(stream);
                 break;
             }
-            Ok(Happened::Ended(id)) => {
+            Ok(Happened::Ended(id, left)) => {
                 if serving.as_ref().is_some_and(|(serving, _)| *serving == id) {
                     serving = None;
-                    if waiting.is_none() && !state.keeps_going() {
+                    if left {
+                        // As for a restart: one may be on its way.
+                        alone_until = Instant::now() + FIRST_CLIENT_TIMEOUT;
+                    } else if waiting.is_none() && !state.keeps_going() {
                         break;
                     }
                 }
@@ -884,7 +985,8 @@ pub fn serve_listener(listener: UnixListener, screens: bool) {
                     let _ = served.send(Input::Evicted);
                 }
             }
-            Err(RecvTimeoutError::Timeout) if connections > 0 && state.keeps_going() => {}
+            Err(RecvTimeoutError::Timeout)
+                if state.keeps_going() || Instant::now() < alone_until => {}
             Err(_) => break,
         }
     }
@@ -892,10 +994,109 @@ pub fn serve_listener(listener: UnixListener, screens: bool) {
     if let Some(path) = path {
         let _ = std::fs::remove_file(path);
     }
-    if let Some(socket) = lock(&state.socket).take() {
+    if let Some((socket, _)) = lock(&state.socket).take() {
         let _ = std::fs::remove_file(socket);
     }
     drop(ender);
+}
+
+/// Starts the cue at `exe` in this host process's place, for `client`, of
+/// its build: it takes up the session, its terminals, their programs
+/// running, and the session's socket, and serves `client` first (see
+/// [`Handover`]). The socket the process was started on, `own`, goes.
+/// Only for a host that keeps a session, whose folder the terminals are
+/// handed over in. Returns only if it can't; in tests, with what the new
+/// host's to go on with instead, in this same process.
+fn upgrade(
+    state: &State,
+    exe: &Path,
+    client: UnixStream,
+    own: Option<&Path>,
+) -> io::Result<Replaced> {
+    let Some((socket, listener)) = lock(&state.socket).clone() else {
+        return Err(io::Error::other("Not a session."));
+    };
+    let Some(session) = lock(&state.session).take() else {
+        return Err(io::Error::other("Not a session."));
+    };
+    // Held on to across `exec`, so that no other cue takes it meanwhile.
+    let (dir, session_lock) = session.into_lock();
+    let terminals = state.hub.release_all();
+    let replaced = crate::attach::write_manifest(&dir, false, &terminals).and_then(|()| {
+        if own.is_some_and(|own| own != socket) {
+            // No client's to come to it from now on.
+            let _ = std::fs::remove_file(own.unwrap());
+        }
+        replace(exe, &dir, listener, &session_lock, client)
+    });
+    // Going on as before: the terminals are taken back.
+    let err = match replaced {
+        Ok(replaced) => return Ok(replaced),
+        Err(err) => err,
+    };
+    let (_, terminals) = crate::attach::read_manifest(&dir).unwrap_or((false, terminals));
+    state.hub.adopt(terminals);
+    *lock(&state.session) = Some(Session::adopt(&dir, session_lock));
+    Err(err)
+}
+
+/// What a host goes on with once another build's taken its place: nothing,
+/// `exec` having replaced it; in tests, the new host's socket and what it
+/// was handed, for this same process to go on with.
+#[cfg(not(test))]
+type Replaced = std::convert::Infallible;
+#[cfg(test)]
+type Replaced = (UnixListener, Handover);
+
+/// Replaces this process with the host at `exe`, for the session in
+/// `dir`, handing it the session's socket, `listener`, its lock, and
+/// `client`. Returns only if it can't.
+#[cfg(not(test))]
+fn replace(
+    exe: &Path,
+    dir: &Path,
+    listener: RawFd,
+    session_lock: &std::fs::File,
+    client: UnixStream,
+) -> io::Result<Replaced> {
+    let kept = [listener, session_lock.as_raw_fd(), client.as_raw_fd()];
+    for fd in kept {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+    }
+    let err = Command::new(exe)
+        .arg("--host")
+        .arg("--adopt")
+        .arg(dir)
+        .env(LISTENER_VARIABLE, listener.to_string())
+        .env(LOCK_VARIABLE, session_lock.as_raw_fd().to_string())
+        .env(CLIENT_VARIABLE, client.as_raw_fd().to_string())
+        .exec();
+    for fd in kept {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    Err(err)
+}
+
+/// In tests, the new host is the same process's: what it's handed is
+/// what `exec` would keep.
+#[cfg(test)]
+fn replace(
+    _exe: &Path,
+    dir: &Path,
+    listener: RawFd,
+    session_lock: &std::fs::File,
+    client: UnixStream,
+) -> io::Result<Replaced> {
+    let listener = unsafe { libc::fcntl(listener, libc::F_DUPFD_CLOEXEC, 0) };
+    let listener = unsafe { UnixListener::from_raw_fd(listener) };
+    let (_, terminals) = crate::attach::read_manifest(dir).unwrap_or_default();
+    let session = Session::adopt(dir, session_lock.try_clone()?);
+    let handover = Handover {
+        session,
+        terminals,
+        client,
+    };
+    Ok((listener, handover))
 }
 
 /// Takes the clients that connect to `listener`, on a thread of its own,
@@ -920,21 +1121,23 @@ fn take_clients(listener: UnixListener, happen: Sender<Happened>) {
 }
 
 /// What the client on `stream` is there for, once it's said hello: to be
-/// served, if it's of this build and not in one of the host's terminals,
-/// or to end the session. Told why not, if it's neither.
+/// served, unless it's in one of the host's terminals, by this process, or
+/// if it's of another build, by its binary in this one's place; or to end
+/// the session. Told why not, if it's none of those.
 fn greet(stream: UnixStream) -> Option<Happened> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok()?;
     let hello: Hello = read_frame(&mut &stream).ok()?;
     let build = crate::attach::build();
     let welcome = if hello.end {
         Ok(())
-    } else if hello.build != build {
-        Err(format!(
-            "The host is another build of cue ({build}, not {}).",
-            hello.build
-        ))
     } else if hello.inside == Some(std::process::id()) {
         Err("A session can't be shown in one of its own terminals.".to_string())
+    } else if hello.build != build && !hello.exe.is_file() {
+        Err(format!(
+            "The host is another build of cue ({build}, not {}), and {} isn't there to start.",
+            hello.build,
+            hello.exe.display()
+        ))
     } else {
         Ok(())
     };
@@ -943,6 +1146,7 @@ fn greet(stream: UnixStream) -> Option<Happened> {
     welcome.ok()?;
     Some(match hello.end {
         true => Happened::End(stream),
+        false if hello.build != build => Happened::Upgrade(stream, hello.exe),
         false => Happened::Greeted(stream),
     })
 }
@@ -971,14 +1175,15 @@ pub fn end_session(path: &Path) -> io::Result<()> {
 
 /// Serves the app on the other end of `stream`, until it's gone, or
 /// another takes over: the host's thread takes what comes to `inbox`.
+/// Returns whether it left, rather than went.
 fn serve_stream(
     stream: UnixStream,
     (to_host, inbox): (Sender<Input>, Receiver<Input>),
     state: &Arc<State>,
-) {
+) -> bool {
     let (output, outbox) = mpsc::channel();
     let Ok(reading) = stream.try_clone() else {
-        return;
+        return false;
     };
     let from_app = to_host.clone();
     std::thread::spawn(move || {
@@ -990,17 +1195,17 @@ fn serve_stream(
         let _ = from_app.send(Input::Shutdown);
     });
     std::thread::spawn(move || write_frames(stream, outbox));
-    serve(inbox, to_host, output, Arc::clone(state));
+    serve(inbox, to_host, output, Arc::clone(state))
 }
 
 /// The host's thread: takes calls, tells, and the watcher's changes, until
-/// the app's gone.
+/// the app's gone. Returns whether it left, rather than went.
 fn serve(
     inbox: Receiver<Input>,
     host_inbox: Sender<Input>,
     output: Sender<Output>,
     state: Arc<State>,
-) {
+) -> bool {
     let nudge = host_inbox.clone();
     let mut watcher = Watcher::new(move || {
         let _ = nudge.send(Input::Watched);
@@ -1012,6 +1217,7 @@ fn serve(
     // Those let go of, whose calls ended: what the app answered of their
     // last output still goes to them.
     let mut let_go: HashMap<CallId, TermId> = HashMap::new();
+    let mut left = false;
     loop {
         let input = match watcher.due() {
             Some(due) => inbox.recv_timeout(due.saturating_duration_since(Instant::now())),
@@ -1096,6 +1302,10 @@ fn serve(
                 let _ = output.send(Output::Notice(Notice::Ended));
                 break;
             }
+            Ok(Input::Left) => {
+                left = true;
+                break;
+            }
             Ok(Input::Evicted | Input::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
         if let Some(mut changes) = watcher.poll() {
@@ -1110,6 +1320,7 @@ fn serve(
     for &(terminal, token) in terminals.values() {
         state.hub.unwatch(terminal, token);
     }
+    left
 }
 
 /// What the host keeps from one call to the next, and one client to the
@@ -1122,8 +1333,8 @@ struct State {
     /// Where a host process's loop takes clients, connecting to the
     /// session's socket too while it keeps one.
     clients: Option<Sender<Happened>>,
-    /// The session's socket, while it's listened on.
-    socket: Mutex<Option<PathBuf>>,
+    /// The session's socket, while it's listened on, and its descriptor.
+    socket: Mutex<Option<(PathBuf, RawFd)>>,
     /// The settings the app said to use, for tests (see
     /// [`Link::set_config`]).
     #[cfg(test)]
@@ -1159,10 +1370,10 @@ impl State {
         };
         let path = session.map(|session| session::socket_path(session.dir()));
         let mut socket = lock(&self.socket);
-        if *socket == path {
+        if socket.as_ref().map(|(socket, _)| socket) == path.as_ref() {
             return;
         }
-        if let Some(old) = socket.take() {
+        if let Some((old, _)) = socket.take() {
             let _ = std::fs::remove_file(old);
         }
         let Some(path) = path else {
@@ -1174,8 +1385,8 @@ impl State {
         });
         match listener {
             Ok(listener) => {
+                *socket = Some((path, listener.as_raw_fd()));
                 take_clients(listener, clients.clone());
-                *socket = Some(path);
             }
             Err(err) => eprintln!("cue: can't listen on the session's socket: {err}"),
         }
@@ -1364,7 +1575,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         (
             path,
-            std::thread::spawn(move || serve_listener(listener, screens)),
+            std::thread::spawn(move || serve_listener(listener, screens, None)),
         )
     }
 
@@ -1461,9 +1672,10 @@ mod tests {
     }
 
     #[test]
-    fn a_client_of_another_build_is_refused() {
+    fn a_client_of_another_build_without_its_binary_is_refused() {
         let (path, host) = host_process("refused", false);
-        let err = Link::connect_as(&path, "another").err().unwrap();
+        let gone = path.parent().unwrap().join("gone");
+        let err = Link::connect_as(&path, "another", &gone).err().unwrap();
         assert!(err.to_string().contains("another build"), "{err}");
         // It waits on for a client of its own build.
         let link = Link::connect(&path).unwrap();
@@ -1553,6 +1765,99 @@ mod tests {
         drop((attached, reopened, running, second));
         ends(host);
         assert!(!socket.exists(), "the session's socket is removed");
+    }
+
+    #[test]
+    fn a_client_of_another_build_has_its_binary_take_over_the_terminals() {
+        let _serial = crate::test_serial();
+        let (path, host) = host_process("upgrade", true);
+        let root = path.parent().unwrap().to_path_buf();
+        let first = Link::connect(&path).unwrap();
+        let sessions = root.join("sessions");
+        let opened = first.call(Request::Session(SessionCall::Create(sessions.clone())));
+        let dir = match opened.wait() {
+            Some(Reply::Session(SessionAnswer::Opened(Ok((_, dir))))) => dir,
+            other => panic!("{other:?}"),
+        };
+        let term = first.call(Request::Terminal(pty::Start::Shell {
+            cwd: root.clone(),
+            or: None,
+            cols: 80,
+            rows: 24,
+            above: Vec::new(),
+        }));
+        let id = match term.wait() {
+            Some(Reply::Term(pty::Event::Started(id))) => id,
+            other => panic!("{other:?}"),
+        };
+        let typed = |link: &Link, call: &Call, text: &str| {
+            let input = pty::Control::Input(text.as_bytes().to_vec());
+            link.tell(Tell::Term {
+                call: call.id(),
+                control: input,
+            });
+        };
+        typed(&first, &term, "echo hi-$((40+2))\r");
+        wait_for_output(&term, "hi-42");
+
+        // Once the first leaves, the host's replaced: in tests, by a host
+        // in the same thread, with what `exec` would keep.
+        let socket = session::socket_path(&dir);
+        let exe = std::env::current_exe().unwrap();
+        let second = Link::connect_as(&socket, "another", &exe).unwrap();
+        hears(&first, |n| matches!(n, Notice::Moved));
+        first.leave();
+        while term.wait().is_some() {}
+        drop((term, first));
+        let reopened = second.call(Request::Session(SessionCall::Open(dir.clone())));
+        assert!(matches!(
+            reopened.wait(),
+            Some(Reply::Session(SessionAnswer::Opened(Ok(_))))
+        ));
+        assert!(!path.exists(), "the socket it was started on goes");
+        let running = second.call(Request::Terminals);
+        assert!(matches!(running.wait(), Some(Reply::Terminals(ids)) if ids == [id]));
+        let attached = second.call(Request::Terminal(pty::Start::Attach(id)));
+        match attached.wait() {
+            Some(Reply::Term(pty::Event::Screen { screen, cols, rows })) => {
+                assert!(String::from_utf8_lossy(&screen).contains("hi-42"));
+                assert_eq!((cols, rows), (80, 24));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Its shell's the same one, still running.
+        typed(&second, &attached, "echo again-$((1+1))\r");
+        wait_for_output(&attached, "again-2");
+        let started = second.call(Request::Terminal(pty::Start::Shell {
+            cwd: root.clone(),
+            or: None,
+            cols: 80,
+            rows: 24,
+            above: Vec::new(),
+        }));
+        match started.wait() {
+            Some(Reply::Term(pty::Event::Started(new))) => assert!(new > id, "ids go on"),
+            other => panic!("{other:?}"),
+        }
+
+        drop((started, attached, reopened, running, second));
+        ends(host);
+        assert!(!socket.exists(), "the session's socket is removed");
+    }
+
+    #[test]
+    fn a_host_waits_a_while_for_a_client_after_one_leaves() {
+        let (path, host) = host_process("linger", false);
+        let first = Link::connect(&path).unwrap();
+        first.leave();
+        drop(first);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!host.is_finished(), "it waits, as for a restart");
+        let second = Link::connect(&path).unwrap();
+        let call = second.call(Request::Look { paths: Vec::new() });
+        assert!(matches!(call.wait(), Some(Reply::Looked(_))));
+        drop((call, second));
+        ends(host);
     }
 
     #[test]
