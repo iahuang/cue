@@ -28,8 +28,10 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
 
 use opentui::{
@@ -40,14 +42,16 @@ use opentui::{
 use crate::config;
 use crate::editor::current_match;
 use crate::find::{self, Field, FindBar, Match};
+use crate::host::{Call, Link, Reply, Request, Tell};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::keymap::Keymap;
 use crate::layout::Rect;
 use crate::line_edit::Edit;
 use crate::location::{self, Target};
-use crate::pty::Pty;
+use crate::pty::{self, Control, Event, Start};
 use crate::search::Toggle;
 use crate::status::Status;
+use crate::term_hub::TermId;
 use crate::theme;
 
 /// At most this much output is read per poll, so a flood of it can't keep
@@ -63,7 +67,7 @@ pub struct Terminal {
     /// The name it was given, if it was renamed.
     name: Option<String>,
     vt: EmbeddedTerminal,
-    pty: Pty,
+    pty: Shell,
     cwd: PathBuf,
     /// The screen's size and place; the pty's size too.
     area: Rect,
@@ -80,6 +84,44 @@ pub struct Terminal {
     /// Counts changes to the output, so the find bar knows when to find
     /// its matches again.
     epoch: u64,
+}
+
+/// The shell, which the host runs in a pty (see [`crate::pty::serve`]).
+struct Shell {
+    host: Link,
+    /// What the program writes, and how it's doing, come to this; dropping
+    /// it hangs up.
+    call: Call,
+    /// How it's doing, as the host last said.
+    status: pty::Status,
+    /// Which it is on the host, once it's said.
+    id: Option<TermId>,
+    /// The host answers the program's queries, not the app.
+    host_answers: bool,
+}
+
+impl Shell {
+    fn start(host: &Link, start: Start) -> Shell {
+        Shell {
+            host: host.clone(),
+            call: host.call(Request::Terminal(start)),
+            status: pty::Status::default(),
+            id: None,
+            host_answers: false,
+        }
+    }
+
+    fn control(&self, control: Control) {
+        let call = self.call.id();
+        self.host.tell(Tell::Term { call, control });
+    }
+
+    /// Sends `bytes` to the program, as typed.
+    fn write(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.control(Control::Input(bytes.to_vec()));
+        }
+    }
 }
 
 /// The find bar, and where its matches are.
@@ -127,22 +169,36 @@ impl Terminal {
         restyle(&mut self.vt);
     }
 
-    /// Starts a shell in `cwd`, on a screen the size of `area`.
-    pub fn new(id: u32, cwd: &Path, area: Rect) -> io::Result<Terminal> {
+    /// Starts a shell in `cwd`, on `host`, on a screen the size of `area`.
+    pub fn new(host: &Link, id: u32, cwd: &Path, area: Rect) -> io::Result<Terminal> {
         let (cols, rows) = size(area);
         let mut vt = EmbeddedTerminal::new(cols, rows, config::get().scrollback)
             .map_err(|e| io::Error::other(e.to_string()))?;
         restyle(&mut vt);
-        let pty = Pty::shell(cwd, cols, rows)?;
-        Ok(Terminal::with(id, vt, pty, cwd, area))
+        let cwd = cwd.to_path_buf();
+        let pty = Shell::start(
+            host,
+            Start::Shell {
+                cwd: cwd.clone(),
+                or: None,
+                cols,
+                rows,
+                above: Vec::new(),
+            },
+        );
+        Ok(Terminal::with(id, vt, pty, &cwd, area))
     }
 
     /// A terminal of a session saved before: `screen`, the text it showed
     /// `cols` wide (see [`Terminal::screen`]), then below a line saying it
-    /// was saved at `saved` (seconds since the epoch), a new shell in `cwd`.
+    /// was saved at `saved` (seconds since the epoch), a new shell in `cwd`,
+    /// or `or` if it's gone.
+    #[allow(clippy::too_many_arguments)]
     pub fn restore(
+        host: &Link,
         id: u32,
         cwd: &Path,
+        or: &Path,
         area: Rect,
         screen: Option<&[u8]>,
         cols: u16,
@@ -152,24 +208,33 @@ impl Terminal {
         let mut vt = EmbeddedTerminal::new(cols.max(1), rows, config::get().scrollback)
             .map_err(|e| io::Error::other(e.to_string()))?;
         restyle(&mut vt);
+        let mut above = Vec::new();
         if let Some(screen) = screen {
-            let _ = vt.write(screen);
+            above.extend_from_slice(screen);
             let note = format!(
                 "\x1b[0;2m── restored session from {} ──\x1b[0m\r\n",
                 local_time(saved)
             );
-            let _ = vt.write(note.as_bytes());
+            above.extend_from_slice(note.as_bytes());
+            let _ = vt.write(&above);
             vt.drain_responses();
         }
         let _ = vt.resize(width, rows);
-        let pty = Pty::shell(cwd, width, rows)?;
-        Ok(Terminal::with(id, vt, pty, cwd, area))
+        let start = Start::Shell {
+            cwd: cwd.to_path_buf(),
+            or: Some(or.to_path_buf()),
+            cols: width,
+            rows,
+            above,
+        };
+        Ok(Terminal::with(id, vt, Shell::start(host, start), cwd, area))
     }
 
     /// A terminal whose shell a process this one replaced left running:
     /// on the pty whose master is `fd`, as process `pid`, showing what
     /// [`Terminal::screen`] took in full `cols` by `rows`.
     pub fn adopt(
+        host: &Link,
         id: u32,
         cwd: &Path,
         area: Rect,
@@ -177,29 +242,62 @@ impl Terminal {
         screen: &[u8],
         (cols, rows): (u16, u16),
     ) -> io::Result<Terminal> {
-        let mut vt = EmbeddedTerminal::new(cols.max(1), rows.max(1), config::get().scrollback)
+        let vt = EmbeddedTerminal::new(1, 1, config::get().scrollback)
             .map_err(|e| io::Error::other(e.to_string()))?;
+        let pty = Shell::start(host, Start::Adopt { fd, pid });
+        let mut terminal = Terminal::with(id, vt, pty, cwd, area);
+        terminal.show_screen(screen, (cols, rows));
+        Ok(terminal)
+    }
+
+    /// A terminal running on the host already, as `host_id` there, which
+    /// a client before this one left running: what it shows comes from
+    /// the host first (see [`Event::Screen`]), then what its program
+    /// writes.
+    pub fn attach(
+        host: &Link,
+        id: u32,
+        cwd: &Path,
+        area: Rect,
+        host_id: TermId,
+    ) -> io::Result<Terminal> {
+        let (cols, rows) = size(area);
+        let mut vt = EmbeddedTerminal::new(cols, rows, config::get().scrollback)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        restyle(&mut vt);
+        let mut pty = Shell::start(host, Start::Attach(host_id));
+        pty.id = Some(host_id);
+        Ok(Terminal::with(id, vt, pty, cwd, area))
+    }
+
+    /// Shows `screen`, as [`full_snapshot`] took it `cols` by `rows`, in
+    /// place of what it showed, at its own size.
+    fn show_screen(&mut self, screen: &[u8], (cols, rows): (u16, u16)) {
+        let scrollback = config::get().scrollback;
+        let Ok(mut vt) = EmbeddedTerminal::new(cols.max(1), rows.max(1), scrollback) else {
+            return;
+        };
         restyle(&mut vt);
         let _ = vt.write(screen);
         // What it answered for the snapshot's queries isn't the program's.
         vt.drain_responses();
-        let pty = Pty::adopt(fd, pid)?;
         let full_screen = vt.is_alternate_screen();
-        let mut terminal = Terminal::with(id, vt, pty, cwd, Rect::default());
-        terminal.area = Rect {
+        self.vt = vt;
+        let area = self.area;
+        self.area = Rect {
             width: cols as u32,
             height: rows as u32,
             ..area
         };
-        terminal.set_area(area);
+        self.set_area(area);
         if full_screen {
             // Bytes it was in the middle of may have been lost.
-            terminal.pty.ask_to_redraw();
+            self.pty.control(Control::Redraw);
         }
-        Ok(terminal)
+        self.output_changed();
     }
 
-    fn with(id: u32, vt: EmbeddedTerminal, pty: Pty, cwd: &Path, area: Rect) -> Terminal {
+    fn with(id: u32, vt: EmbeddedTerminal, pty: Shell, cwd: &Path, area: Rect) -> Terminal {
         Terminal {
             id,
             name: None,
@@ -221,30 +319,38 @@ impl Terminal {
     /// needs to look like it (for [`Terminal::adopt`]), or else its text
     /// (for [`Terminal::restore`]), with the size it's at.
     pub fn screen(&mut self, full: bool) -> Option<(Vec<u8>, (u16, u16))> {
-        let mut screen = self.vt.snapshot(full).ok()?;
-        if !full && screen.len() > MAX_SAVED_TEXT {
-            // From the first line in the last of it.
-            let start = screen.len() - MAX_SAVED_TEXT;
-            let cut = screen[start..]
-                .windows(2)
-                .position(|pair| pair == b"\r\n")
-                .map_or(start, |at| start + at + 2);
-            screen.drain(..cut);
-        }
         if full {
-            let title = self.vt.title();
-            if !title.is_empty() && !title.contains(['\x1b', '\x07']) {
-                screen.extend_from_slice(format!("\x1b]2;{title}\x1b\\").as_bytes());
-            }
+            return Some((full_snapshot(&mut self.vt)?, size(self.area)));
         }
-        Some((screen, size(self.area)))
+        Some((saved_text(&mut self.vt)?, size(self.area)))
+    }
+
+    /// Whether the host keeps its screen too, as a host process does (see
+    /// [`crate::term_hub`]), for a session to save from there.
+    pub fn host_keeps_screen(&self) -> bool {
+        self.pty.host_answers && self.pty.id.is_some()
     }
 
     /// Lets go of the shell without hanging up on it, for a process that
     /// replaces this one to adopt: the pty's master, kept open across
-    /// `exec`, and the shell's process id.
-    pub fn release(self) -> (RawFd, libc::pid_t) {
-        self.pty.release()
+    /// `exec`, and the shell's process id, once the host has, taking in
+    /// what the program wrote until then. `None` if it's gone.
+    pub fn release(&mut self) -> Option<(RawFd, libc::pid_t)> {
+        // A host process's descriptor means nothing in this one.
+        if self.closed || !self.pty.host.is_local() {
+            return None;
+        }
+        self.pty.control(Control::Release);
+        while let Some(reply) = self.pty.call.wait() {
+            match reply {
+                Reply::Term(Event::Output(bytes)) => {
+                    let _ = self.vt.write(&bytes);
+                }
+                Reply::Term(Event::Released(fd, pid)) => return Some((fd, pid)),
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Gives it a name, or none.
@@ -274,12 +380,9 @@ impl Terminal {
 
     /// The folder its shell is in now, or else the one it started in.
     pub fn current_folder(&self) -> PathBuf {
-        match self.exit {
-            None => self
-                .pty
-                .working_folder()
-                .unwrap_or_else(|| self.cwd.clone()),
-            Some(_) => self.cwd.clone(),
+        match (self.exit, &self.pty.status.shell_folder) {
+            (None, Some(folder)) => folder.clone(),
+            _ => self.cwd.clone(),
         }
     }
 
@@ -287,7 +390,14 @@ impl Terminal {
     /// with none of the modes the last one left on.
     pub fn restart(&mut self) -> io::Result<()> {
         let (cols, rows) = size(self.area);
-        self.pty = Pty::shell(&self.cwd, cols, rows)?;
+        let start = Start::Shell {
+            cwd: self.cwd.clone(),
+            or: None,
+            cols,
+            rows,
+            above: Vec::new(),
+        };
+        self.pty = Shell::start(&self.pty.host.clone(), start);
         self.closed = false;
         self.exit = None;
         let _ = self.vt.write(b"\x1bc");
@@ -295,47 +405,59 @@ impl Terminal {
         Ok(())
     }
 
-    /// What to poll for this terminal, if anything: its pty, and whether
-    /// input is waiting to be taken.
-    pub fn watch(&self) -> Option<(i32, bool)> {
-        (!self.closed).then(|| (self.pty.fd(), self.pty.has_unsent()))
-    }
-
-    /// Reads the shell's output into the screen and answers its queries.
+    /// Takes what the shell wrote since the last call into the screen, and
+    /// how it's doing, and answers its queries unless the host does.
     /// Returns whether anything changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        self.pty.flush();
-        let mut buf = [0u8; 64 * 1024];
         let mut read = 0;
         let mut output = false;
-        while !self.closed && read < READ_BUDGET {
-            match self.pty.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    read += n;
+        while read < READ_BUDGET {
+            let event = match self.pty.call.try_recv() {
+                Ok(Reply::Term(event)) => event,
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    changed |= !self.closed;
+                    self.closed = true;
+                    break;
+                }
+            };
+            changed = true;
+            match event {
+                Event::Output(bytes) => {
+                    read += bytes.len();
                     // Anything it can't make sense of is dropped, as
                     // terminals do.
-                    let _ = self.vt.write(&buf[..n]);
-                    changed = true;
+                    let _ = self.vt.write(&bytes);
                     output = true;
                 }
-                Err(_) => self.closed = true,
+                Event::Status(status) => self.pty.status = status,
+                Event::Exited(raw) => self.exit = Some(ExitStatus::from_raw(raw)),
+                Event::Failed(reason) => {
+                    let note = format!("\x1b[0;2mcue: can't start the shell: {reason}\x1b[0m\r\n");
+                    let _ = self.vt.write(note.as_bytes());
+                    self.exit = Some(ExitStatus::from_raw(1 << 8));
+                    output = true;
+                }
+                Event::Started(id) => self.pty.id = Some(id),
+                Event::Answering => self.pty.host_answers = true,
+                Event::Screen { screen, cols, rows } => {
+                    self.show_screen(&screen, (cols, rows));
+                }
+                Event::Released(..) => {}
             }
+        }
+        if read >= READ_BUDGET {
+            // The rest comes next time round, which this asks for.
+            crate::wake::wake();
         }
         if output {
             self.output_changed();
         }
         let responses = self.vt.drain_responses();
-        if !responses.is_empty() {
+        if !self.pty.host_answers {
             self.pty.write(&responses);
-        }
-        if self.exit.is_none() {
-            // A shell can exit leaving jobs that hold the pty open.
-            if let Some(status) = self.pty.exit_status() {
-                self.exit = Some(status);
-                changed = true;
-            }
         }
         changed
     }
@@ -345,6 +467,11 @@ impl Terminal {
     /// system clipboard themselves.
     pub fn take_copied(&mut self) -> Option<String> {
         self.vt.take_clipboard()
+    }
+
+    /// Which it is on the host, once the host's said.
+    pub fn host_id(&self) -> Option<TermId> {
+        self.pty.id
     }
 
     pub fn id(&self) -> u32 {
@@ -384,7 +511,7 @@ impl Terminal {
 
     /// Whether a program the shell started is running in it.
     pub fn is_busy(&self) -> bool {
-        self.exit.is_none() && self.pty.is_busy()
+        self.exit.is_none() && self.pty.status.busy
     }
 
     /// The program the shell is running, or the shell, such as `vim`.
@@ -392,7 +519,7 @@ impl Terminal {
         if self.exit.is_some() {
             return None;
         }
-        self.pty.foreground_name()
+        self.pty.status.program.clone()
     }
 
     /// The title the program set, if any.
@@ -465,7 +592,7 @@ impl Terminal {
         self.area = area;
         let (cols, rows) = size(area);
         if (cols, rows) != old && self.vt.resize(cols, rows).is_ok() {
-            self.pty.resize(cols, rows);
+            self.pty.control(Control::Resize(cols, rows));
             self.selecting_from = None;
             // Lines rewrap.
             self.output_changed();
@@ -510,7 +637,7 @@ impl Terminal {
         // kept in it.
         let _ = self.vt.write(b"\x1b[H\x1b[2J\x1b[3J");
         self.output_changed();
-        if self.exit.is_none() && !self.pty.is_busy() {
+        if self.exit.is_none() && !self.pty.status.busy {
             // Ctrl+L: the shell clears the screen and redraws its prompt.
             self.pty.write(b"\x0c");
         }
@@ -646,7 +773,7 @@ impl Terminal {
             .vt
             .line_at((x - self.area.x) as u16, (y - self.area.y) as u16)?;
         let mut folders = match self.exit {
-            None => self.pty.working_folders(),
+            None => self.pty.status.folders.clone(),
             Some(_) => Vec::new(),
         };
         for folder in std::iter::once(&self.cwd).chain(roots) {
@@ -1013,6 +1140,33 @@ fn find_bar(memory: find::Memory, origin: u32) -> FindBar {
     bar
 }
 
+/// Everything a new emulator needs to look like `vt`, written to it:
+/// its screen, history, and modes, and its title.
+/// What a session keeps of `vt`'s screen, for [`Terminal::restore`]: its
+/// text, the last of it if there's much.
+pub fn saved_text(vt: &mut EmbeddedTerminal) -> Option<Vec<u8>> {
+    let mut screen = vt.snapshot(false).ok()?;
+    if screen.len() > MAX_SAVED_TEXT {
+        // From the first line in the last of it.
+        let start = screen.len() - MAX_SAVED_TEXT;
+        let cut = screen[start..]
+            .windows(2)
+            .position(|pair| pair == b"\r\n")
+            .map_or(start, |at| start + at + 2);
+        screen.drain(..cut);
+    }
+    Some(screen)
+}
+
+pub fn full_snapshot(vt: &mut EmbeddedTerminal) -> Option<Vec<u8>> {
+    let mut screen = vt.snapshot(true).ok()?;
+    let title = vt.title();
+    if !title.is_empty() && !title.contains(['\x1b', '\x07']) {
+        screen.extend_from_slice(format!("\x1b]2;{title}\x1b\\").as_bytes());
+    }
+    Some(screen)
+}
+
 /// "The shell exited", with its code or signal if it failed.
 pub fn describe_exit(status: ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt;
@@ -1175,7 +1329,7 @@ mod tests {
             width: 30,
             height: 5,
         };
-        let mut term = Terminal::new(1, &std::env::temp_dir(), area).unwrap();
+        let mut term = Terminal::new(&Link::local(), 1, &std::env::temp_dir(), area).unwrap();
         term.vt.write(b"\x1b[2J\x1b[Halpha beta gamma").unwrap();
         let press = Mouse {
             kind: MouseKind::Press(MouseButton::Left),
@@ -1201,6 +1355,7 @@ mod tests {
     fn preview_clips_recent_output_without_changing_the_terminal() {
         let _serial = crate::test_serial();
         let mut term = Terminal::new(
+            &Link::local(),
             1,
             &std::env::temp_dir(),
             Rect {
@@ -1262,7 +1417,7 @@ mod tests {
             width: 20,
             height: 5,
         };
-        let term = Terminal::new(1, &root, area).unwrap();
+        let term = Terminal::new(&Link::local(), 1, &root, area).unwrap();
         let ctrl_shift = Mods {
             shift: true,
             ..Mods::CTRL
@@ -1339,7 +1494,7 @@ mod tests {
             width: 40,
             height: 6,
         };
-        let mut term = Terminal::new(1, &root, area).unwrap();
+        let mut term = Terminal::new(&Link::local(), 1, &root, area).unwrap();
         // Whatever the login shell prints, it's at a prompt eventually.
         for c in "echo $((6*7)) $TERM $(stty size); pwd".chars() {
             term.send_key(key(KeyCode::Char(c), Mods::NONE));
@@ -1393,7 +1548,7 @@ mod tests {
             width: 40,
             height: 6,
         };
-        let mut term = Terminal::new(1, &root, area).unwrap();
+        let mut term = Terminal::new(&Link::local(), 1, &root, area).unwrap();
         // More than a screenful, so some goes into the history.
         term.paste("seq 1 20; echo do''ne");
         term.send_key(key(KeyCode::Enter, Mods::NONE));
@@ -1422,7 +1577,7 @@ mod tests {
             width: 70,
             height: 6,
         };
-        let mut term = Terminal::new(1, &root, area).unwrap();
+        let mut term = Terminal::new(&Link::local(), 1, &root, area).unwrap();
         term.paste("for i in $(seq 1 30); do echo line$i; done; echo do''ne");
         term.send_key(key(KeyCode::Enter, Mods::NONE));
         wait_for(&mut term, "done");

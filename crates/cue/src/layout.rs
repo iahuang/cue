@@ -9,6 +9,8 @@
 //! panel, it splits that panel's room on that side; dropped in the middle,
 //! the two swap places.
 
+use serde::{Deserialize, Serialize};
+
 /// Names a panel for as long as it's open.
 pub type PanelId = u32;
 
@@ -21,7 +23,7 @@ pub const MIN_HEIGHT: u32 = 3;
 /// it goes beside it rather than in its place.
 const EDGE: f32 = 1.0 / 3.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Axis {
     /// Side by side.
     Horizontal,
@@ -82,7 +84,7 @@ pub struct Handle {
     pub rect: Rect,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Layout {
     Panel(PanelId),
     Split {

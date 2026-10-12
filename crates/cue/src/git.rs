@@ -22,10 +22,12 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::host::{Call, Link, Reply, Request, Responder, Tell};
 use crate::theme::Hue;
+use serde::{Deserialize, Serialize};
 
 /// Changes past this many in a repository aren't listed.
 const MAX_CHANGES: usize = 10_000;
@@ -47,7 +49,7 @@ const SLOWDOWN: u32 = 10;
 const MIN_GAP: Duration = Duration::from_millis(500);
 
 /// How a file changed since the last commit, staged or not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     Modified,
     /// New to git, and staged.
@@ -84,7 +86,7 @@ impl Kind {
 }
 
 /// How much of a file's change is staged, to go in the next commit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Staged {
     #[default]
     No,
@@ -94,7 +96,7 @@ pub enum Staged {
 }
 
 /// A file changed since the last commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     /// Where it is, or was, if it's gone.
     pub path: PathBuf,
@@ -106,7 +108,7 @@ pub struct Change {
 }
 
 /// What a repository has checked out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Head {
     /// A branch, which may not have any commits yet.
     Branch(String),
@@ -124,7 +126,7 @@ impl Head {
 }
 
 /// A repository a workspace folder is in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repo {
     /// Its working tree's top folder.
     pub root: PathBuf,
@@ -151,7 +153,7 @@ pub struct Repo {
 }
 
 /// The branch, on a remote, that the one checked out tracks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upstream {
     /// Its name: `origin/main`.
     pub name: String,
@@ -163,7 +165,7 @@ pub struct Upstream {
 
 /// What a repository's branch needs to catch up with the branch it tracks,
 /// as its sync button does it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sync {
     /// Nothing, as far as is known: asks the remote what's new.
     Fetch,
@@ -209,10 +211,12 @@ pub struct Tracked {
     /// How it changed, if git says it did.
     pub kind: Cell<Option<Kind>>,
     base: OnceCell<Base>,
+    /// Something asked what it was in the last commit, before git said.
+    wanted: Cell<bool>,
 }
 
 /// What a file was in the last commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Base {
     /// Its text, with `\n` line breaks.
     Text(String),
@@ -228,24 +232,54 @@ impl Tracked {
         (&self.root, &self.commit, &self.old_path) == (&other.root, &other.commit, &other.old_path)
     }
 
-    /// What the file was in the last commit, asking git the first time.
-    pub fn base(&self) -> &Base {
-        self.base.get_or_init(|| {
-            let Some(commit) = &self.commit else {
-                return Base::Missing;
-            };
-            file_at(&self.root, commit, &self.old_path)
-        })
+    /// What the file was in the last commit, once git has said. Until
+    /// then, `None`, and the app hears that it's wanted (see
+    /// [`Tracked::wants_base`]), and is woken to ask git.
+    pub fn base(&self) -> Option<&Base> {
+        if self.commit.is_none() {
+            return Some(self.base.get_or_init(|| Base::Missing));
+        }
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let commit = self.commit.as_deref().unwrap_or_default();
+            return Some(
+                self.base
+                    .get_or_init(|| file_at(&self.root, commit, &self.old_path)),
+            );
+        }
+        let base = self.base.get();
+        if base.is_none() && !self.wanted.replace(true) {
+            crate::wake::wake();
+        }
+        base
     }
 
     /// What the file was in the last commit, if git was asked already.
     pub fn base_if_read(&self) -> Option<&Base> {
         self.base.get()
     }
+
+    /// What to ask git, if what the file was in the last commit is wanted
+    /// and not known yet. Asking once is enough: it's not wanted again.
+    pub fn wants_base(&self) -> Option<GitCall> {
+        if self.base.get().is_some() || !self.wanted.replace(false) {
+            return None;
+        }
+        Some(GitCall::FileAt {
+            root: self.root.clone(),
+            commit: self.commit.clone()?,
+            path: self.old_path.clone(),
+        })
+    }
+
+    /// Takes what git said the file was in the last commit.
+    pub fn set_base(&self, base: Base) {
+        let _ = self.base.set(base);
+    }
 }
 
 /// A commit, as the log lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
     pub hash: String,
     /// The hash as git abbreviates it.
@@ -478,7 +512,7 @@ pub fn revert(root: &Path, commit: &str) -> Result<(), String> {
 
 /// Changes put away, as `git stash` keeps them: a commit of the files as
 /// they were, whose first parent is the commit checked out then.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stash {
     /// Its subject is what it was stashed as, without the branch it was
     /// stashed on.
@@ -615,7 +649,7 @@ fn stash_name(root: &Path, hash: &str) -> Result<String, String> {
 }
 
 /// A branch to switch to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Branch {
     /// Its name: `main`, or a remote's, `origin/main`.
     pub name: String,
@@ -737,7 +771,7 @@ fn remote_of(name: &str, remotes: &[String]) -> Option<String> {
 }
 
 /// Where to switch a repository to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwitchTo {
     Branch(String),
     /// A new branch, by this name, at the commit checked out.
@@ -774,7 +808,7 @@ impl SwitchTo {
 }
 
 /// How the changes not committed came along when switching branches.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Carried {
     /// As they were, since the branch didn't change the files they did.
     Along,
@@ -929,28 +963,176 @@ fn run_with_input(mut command: Command, input: &[u8]) -> Result<String, String> 
     })
 }
 
+/// What the file was in `commit`'s first parent, and in `commit`, as it
+/// made `change`, in the repository at `root`.
+pub fn sides(root: &Path, commit: &Commit, change: &Change) -> (Base, Base) {
+    let relative = |path: &Path| path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    let old_path = relative(change.from.as_deref().unwrap_or(&change.path));
+    let old = match (&commit.parent, change.kind) {
+        (Some(parent), kind) if kind != Kind::Added => file_at(root, parent, &old_path),
+        _ => Base::Missing,
+    };
+    let new = match change.kind {
+        Kind::Deleted => Base::Missing,
+        _ => file_at(root, &commit.hash, &relative(&change.path)),
+    };
+    (old, new)
+}
+
+/// What the app asks git, through the host (see [`run`]), but for status,
+/// syncing, and committing, which have requests of their own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GitCall {
+    Log {
+        root: PathBuf,
+        skip: usize,
+        count: usize,
+    },
+    CommitChanges {
+        root: PathBuf,
+        commit: Commit,
+    },
+    FileAt {
+        root: PathBuf,
+        commit: String,
+        path: PathBuf,
+    },
+    /// What a file was before and after `commit` made `change`.
+    Sides {
+        root: PathBuf,
+        commit: Commit,
+        change: Change,
+    },
+    Stage {
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+    },
+    Unstage {
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        initial: bool,
+    },
+    LastMessage {
+        root: PathBuf,
+    },
+    Message {
+        root: PathBuf,
+        commit: String,
+    },
+    Revert {
+        root: PathBuf,
+        commit: String,
+    },
+    StashChanges {
+        root: PathBuf,
+        stash: Stash,
+    },
+    Stash {
+        root: PathBuf,
+        message: String,
+        staged: bool,
+    },
+    ApplyStash {
+        root: PathBuf,
+        hash: String,
+        pop: bool,
+    },
+    DropStash {
+        root: PathBuf,
+        hash: String,
+    },
+    Branches {
+        root: PathBuf,
+    },
+    Switch {
+        root: PathBuf,
+        to: SwitchTo,
+    },
+}
+
+/// What git answered a [`GitCall`], as the function of the same name
+/// returns it.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum GitAnswer {
+    Log(Vec<Commit>),
+    Changes(Vec<Change>),
+    File(Base),
+    /// Before and after.
+    Sides(Base, Base),
+    /// From staging, unstaging, reverting, and stashing.
+    Done(Result<(), String>),
+    Message(Option<String>),
+    StashChanges(Vec<(Commit, Change)>),
+    Branches(Vec<Branch>),
+    Switched(Result<Carried, String>),
+}
+
+/// Does what `call` asks, for the host.
+pub fn run(call: &GitCall) -> GitAnswer {
+    match call {
+        GitCall::Log { root, skip, count } => GitAnswer::Log(log(root, *skip, *count)),
+        GitCall::CommitChanges { root, commit } => GitAnswer::Changes(commit_changes(root, commit)),
+        GitCall::FileAt { root, commit, path } => GitAnswer::File(file_at(root, commit, path)),
+        GitCall::Sides {
+            root,
+            commit,
+            change,
+        } => {
+            let (old, new) = sides(root, commit, change);
+            GitAnswer::Sides(old, new)
+        }
+        GitCall::Stage { root, paths } => GitAnswer::Done(stage(root, paths)),
+        GitCall::Unstage {
+            root,
+            paths,
+            initial,
+        } => GitAnswer::Done(unstage(root, paths, *initial)),
+        GitCall::LastMessage { root } => GitAnswer::Message(last_message(root)),
+        GitCall::Message { root, commit } => GitAnswer::Message(message(root, commit)),
+        GitCall::Revert { root, commit } => GitAnswer::Done(revert(root, commit)),
+        GitCall::StashChanges { root, stash } => {
+            GitAnswer::StashChanges(stash_changes(root, stash))
+        }
+        GitCall::Stash {
+            root,
+            message,
+            staged,
+        } => GitAnswer::Done(stash(root, message, *staged)),
+        GitCall::ApplyStash { root, hash, pop } => GitAnswer::Done(apply_stash(root, hash, *pop)),
+        GitCall::DropStash { root, hash } => GitAnswer::Done(drop_stash(root, hash)),
+        GitCall::Branches { root } => GitAnswer::Branches(branches(root)),
+        GitCall::Switch { root, to } => GitAnswer::Switched(switch(root, to)),
+    }
+}
+
+/// What git says of the workspace's repositories, as the host pushes it:
+/// it asks git on its own, when files change and every few seconds, and
+/// says what it found only when that changed, or when this asked (see
+/// [`follow`]).
 pub struct Git {
+    host: Link,
     roots: Vec<PathBuf>,
     /// As of the last run, in the order of the roots they hold.
     repos: Vec<Repo>,
-    /// The run in progress, if any, and when it started.
-    running: Option<(Receiver<Vec<Repo>>, Instant)>,
-    /// Something asked for a run while one was in progress, or too soon
-    /// after the last started.
-    again: bool,
-    /// When the last run started and how long it took, once it ended.
-    last: Option<(Instant, Duration)>,
+    /// The host's runs, as they're told.
+    call: Option<Call>,
+    /// How many runs this asked for, counting the first, and how many of
+    /// those the host has answered.
+    asked: u64,
+    answered: u64,
 }
 
 impl Git {
-    /// Starts finding out about the repositories `roots` are in.
-    pub fn new(roots: &[PathBuf]) -> Git {
+    /// Starts finding out about the repositories `roots` are in, on
+    /// `host`.
+    pub fn new(host: &Link, roots: &[PathBuf]) -> Git {
         let mut git = Git {
+            host: host.clone(),
             roots: roots.to_vec(),
             repos: Vec::new(),
-            running: None,
-            again: false,
-            last: None,
+            call: None,
+            asked: 0,
+            answered: 0,
         };
         git.start();
         git
@@ -960,7 +1142,7 @@ impl Git {
     pub fn set_roots(&mut self, roots: &[PathBuf]) {
         if self.roots != roots {
             self.roots = roots.to_vec();
-            self.refresh();
+            self.start();
         }
     }
 
@@ -994,85 +1176,160 @@ impl Git {
             old_path: old.strip_prefix(&repo.root).ok()?.to_path_buf(),
             kind: Cell::new(change.map(|change| change.kind)),
             base: OnceCell::new(),
+            wanted: Cell::new(false),
         })
     }
 
-    /// Asks git again: now, unless a run is in progress or one started
-    /// moments ago, and otherwise once [`Git::poll`] finds it can.
+    /// Has the host ask git again: now, unless a run is in progress or one
+    /// started moments ago.
     pub fn refresh(&mut self) {
-        self.again = true;
-        let soon = self
-            .last
-            .is_some_and(|(started, _)| started.elapsed() < MIN_GAP);
-        if self.running.is_none() && !soon {
-            self.start();
-        }
+        self.ask(false);
     }
 
-    /// Asks git again now, dropping a run in progress, which may have
-    /// read the repositories before this app changed them.
+    /// Has the host ask git again now, dropping a run in progress, which
+    /// may have read the repositories before this app changed them.
     pub fn restart(&mut self) {
-        self.running = None;
-        self.start();
+        self.ask(true);
     }
 
-    /// Takes the result of a run that ended, and starts another if one was
-    /// asked for or it's time. Returns whether the repositories changed.
+    fn ask(&mut self, restart: bool) {
+        let Some(call) = &self.call else {
+            return;
+        };
+        self.asked += 1;
+        self.host.tell(Tell::GitAgain {
+            call: call.id(),
+            asked: self.asked,
+            restart,
+        });
+    }
+
+    /// Takes what the host said since. Returns whether the repositories
+    /// changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        if let Some((receiver, started)) = &self.running {
-            match receiver.try_recv() {
-                Ok(repos) => {
-                    self.last = Some((*started, started.elapsed()));
-                    self.running = None;
-                    changed = repos != self.repos;
-                    self.repos = repos;
-                }
-                Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => {
-                    self.last = Some((*started, started.elapsed()));
-                    self.running = None;
-                }
-            }
-        }
-        let due = match self.last {
-            None => true,
-            Some((started, took)) => {
-                let since = started.elapsed();
-                let ended = since.saturating_sub(took);
-                (self.again && since >= MIN_GAP) || ended >= INTERVAL.max(took * SLOWDOWN)
-            }
-        };
-        if due {
-            self.start();
+        while let Some(reply) = self.call.as_ref().and_then(|call| call.try_recv().ok()) {
+            changed |= self.take(reply);
         }
         changed
     }
 
-    /// Waits for the run in progress, for tests.
+    /// Takes in the host's `reply`. Returns whether the repositories
+    /// changed.
+    fn take(&mut self, reply: Reply) -> bool {
+        let Reply::Repos { repos, asked } = reply else {
+            return false;
+        };
+        self.answered = self.answered.max(asked);
+        match repos {
+            Some(repos) if repos != self.repos => {
+                self.repos = repos;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Waits for the host to answer every run asked for, for tests.
     #[cfg(test)]
     pub fn wait(&mut self) {
-        while let Some((receiver, started)) = self.running.take() {
-            if let Ok(repos) = receiver.recv() {
-                self.repos = repos;
-            }
-            self.last = Some((started, started.elapsed()));
+        while self.answered < self.asked {
+            let Some(reply) = self.call.as_ref().and_then(Call::wait) else {
+                return;
+            };
+            self.take(reply);
         }
     }
 
     fn start(&mut self) {
-        let (sender, receiver) = mpsc::channel();
-        let roots = self.roots.clone();
-        std::thread::spawn(move || {
-            let _ = sender.send(read_repos(&roots));
-        });
-        self.running = Some((receiver, Instant::now()));
-        self.again = false;
+        // The first run counts as asked for.
+        self.asked = 1;
+        self.answered = 0;
+        self.call = Some(self.host.call(Request::GitStatus {
+            roots: self.roots.clone(),
+        }));
+    }
+}
+
+/// What a host's [`follow`] call hears as it goes.
+pub enum Nudge {
+    /// Files changed in the watched folders.
+    Changed,
+    /// The app asked for a run, the `asked`th, dropping one in progress if
+    /// `restart`.
+    Asked { asked: u64, restart: bool },
+}
+
+/// Asks git what the repositories `roots` are in are like, for the host,
+/// as long as the call lasts: at once, then as `nudges` say things
+/// changed or the app asks, and every few seconds otherwise, slower for a
+/// slow repository. Replies only with what changed since the last reply,
+/// unless the app asked for a run, which it's always answered: with the
+/// number of the last run asked for before this one started.
+pub fn follow(roots: &[PathBuf], nudges: Receiver<Nudge>, responder: &Responder) {
+    // The repositories as last sent, if they were.
+    let mut sent: Option<Vec<Repo>> = None;
+    let mut asked = 1;
+    let mut answered = 0;
+    loop {
+        let started = Instant::now();
+        let covered = asked;
+        let repos = read_repos(roots);
+        let took = started.elapsed();
+        // A run's wanted once it's been long enough since this one started.
+        let mut again = false;
+        let mut restart = false;
+        let mut take = |nudge: Nudge, again: &mut bool, restart: &mut bool| {
+            *again = true;
+            if let Nudge::Asked {
+                asked: number,
+                restart: now,
+            } = nudge
+            {
+                asked = asked.max(number);
+                *restart |= now;
+            }
+        };
+        loop {
+            match nudges.try_recv() {
+                Ok(nudge) => take(nudge, &mut again, &mut restart),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        if !restart {
+            let changed = sent.as_ref() != Some(&repos);
+            if changed || covered > answered {
+                let reply = Reply::Repos {
+                    repos: changed.then(|| repos.clone()),
+                    asked: covered,
+                };
+                if !responder.reply(reply) {
+                    return;
+                }
+                answered = covered;
+                sent = Some(repos);
+            }
+        }
+        while !restart {
+            let due = match again {
+                true => started + MIN_GAP,
+                false => started + took + INTERVAL.max(took * SLOWDOWN),
+            };
+            let Some(wait) = due.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match nudges.recv_timeout(wait) {
+                Ok(nudge) => take(nudge, &mut again, &mut restart),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
     }
 }
 
 /// The repositories `roots` are in, each once, in the order of the roots.
-fn read_repos(roots: &[PathBuf]) -> Vec<Repo> {
+pub fn read_repos(roots: &[PathBuf]) -> Vec<Repo> {
     let mut repos: Vec<Repo> = Vec::new();
     for root in roots {
         let Some((top, git_dir)) = locate(root) else {
@@ -1486,7 +1743,7 @@ pub(crate) mod tests {
         run(&dir, &["add", "."]);
         fs::write(dir.join("new.txt"), "1\n2\n3").unwrap();
         fs::write(dir.join("binary"), b"\0\n\n").unwrap();
-        let mut git = Git::new(std::slice::from_ref(&dir));
+        let mut git = Git::new(&Link::local(), std::slice::from_ref(&dir));
         git.wait();
         let repo = &git.repos()[0];
         assert_eq!(repo.head, Head::Branch("main".into()));
@@ -1500,7 +1757,7 @@ pub(crate) mod tests {
         fs::remove_file(dir.join("b.txt")).unwrap();
         fs::create_dir(dir.join("new")).unwrap();
         fs::write(dir.join("new/c.txt"), "c\n").unwrap();
-        let mut git = Git::new(std::slice::from_ref(&dir));
+        let mut git = Git::new(&Link::local(), std::slice::from_ref(&dir));
         git.wait();
         let [repo] = git.repos() else {
             panic!("one repository: {:?}", git.repos());
@@ -1533,9 +1790,9 @@ pub(crate) mod tests {
         fs::write(dir.join("a.txt"), "changed\n").unwrap();
         run(&dir, &["mv", "b.txt", "c.txt"]);
         fs::write(dir.join("new.txt"), "new\n").unwrap();
-        let mut git = Git::new(std::slice::from_ref(&dir));
+        let mut git = Git::new(&Link::local(), std::slice::from_ref(&dir));
         git.wait();
-        let base = |name: &str| git.tracked(&dir.join(name)).map(|t| t.base().clone());
+        let base = |name: &str| git.tracked(&dir.join(name)).and_then(|t| t.base().cloned());
         assert_eq!(base("a.txt"), Some(Base::Text("a\n".into())));
         assert_eq!(base("c.txt"), Some(Base::Text("b\n".into())), "renamed");
         assert_eq!(base("new.txt"), Some(Base::Missing));
@@ -1548,7 +1805,7 @@ pub(crate) mod tests {
     fn folders_in_one_repository_list_it_once() {
         let dir = repo("nested");
         fs::create_dir(dir.join("sub")).unwrap();
-        let mut git = Git::new(&[dir.join("sub"), dir.clone()]);
+        let mut git = Git::new(&Link::local(), &[dir.join("sub"), dir.clone()]);
         git.wait();
         assert_eq!(git.repos().len(), 1);
         assert_eq!(git.repos()[0].root, dir);
@@ -1557,7 +1814,7 @@ pub(crate) mod tests {
     #[test]
     fn a_folder_outside_any_repository_has_none() {
         let dir = fixture("none");
-        let mut git = Git::new(&[dir]);
+        let mut git = Git::new(&Link::local(), &[dir]);
         git.wait();
         assert!(git.repos().is_empty());
     }
@@ -1621,7 +1878,7 @@ pub(crate) mod tests {
     /// What git says of each file changed in the repository at `dir`, by
     /// name: how much of it is staged.
     fn staged(dir: &Path) -> Vec<(String, Staged)> {
-        let mut git = Git::new(&[dir.to_path_buf()]);
+        let mut git = Git::new(&Link::local(), &[dir.to_path_buf()]);
         git.wait();
         git.repos()[0]
             .changes
@@ -1752,7 +2009,7 @@ pub(crate) mod tests {
         );
 
         run(&dir, &["reset", "-q", "--hard"]);
-        let mut git = Git::new(std::slice::from_ref(&dir));
+        let mut git = Git::new(&Link::local(), std::slice::from_ref(&dir));
         git.wait();
         assert!(git.repos()[0].stashes.is_empty());
         stash(&dir, "again", false).unwrap();
@@ -1992,7 +2249,7 @@ pub(crate) mod tests {
     #[test]
     fn syncs_with_the_branch_it_tracks() {
         let status = |dir: &Path| {
-            let mut git = Git::new(&[dir.to_path_buf()]);
+            let mut git = Git::new(&Link::local(), &[dir.to_path_buf()]);
             git.wait();
             git.repos()[0].clone()
         };

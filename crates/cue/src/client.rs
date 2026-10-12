@@ -33,15 +33,36 @@ pub struct Args {
     pub all: bool,
     /// Start a new cue even if the folder has a session.
     pub fresh: bool,
+    /// The machine the files are on, if it's another (see
+    /// [`crate::remote`]).
+    pub remote: Option<crate::remote::Destination>,
 }
 
 /// Opens what `args` say, in a server, and waits on it.
 pub fn run(args: Args) -> ExitCode {
+    match target(&args) {
+        Ok(Some(listing)) if listing.live => {
+            match attach::request_attach(&session::socket_path(&listing.dir)) {
+                Ok(control) => wait(control, None),
+                Err(err) => fail(&format!("can't reach session {}: {err}", listing.id)),
+            }
+        }
+        Ok(Some(listing)) => serve(vec!["--restore".into(), listing.dir.into_os_string()]),
+        Ok(None) => serve(
+            args.paths
+                .into_iter()
+                .map(PathBuf::into_os_string)
+                .collect(),
+        ),
+        Err(code) => code,
+    }
+}
+
+/// The session `args` say to go back to, or `None` for a new cue; or the
+/// code to exit with, if there's nothing to show.
+pub fn target(args: &Args) -> Result<Option<Listing>, ExitCode> {
     let sessions = session::default_dir();
-    let folder = match folder(&args.paths) {
-        Ok(folder) => folder,
-        Err(err) => return fail(&err.to_string()),
-    };
+    let folder = folder(&args.paths).map_err(|err| fail(&err.to_string()))?;
     let names_file = args.paths.iter().any(|path| !path.is_dir());
     // A cue run in a cue terminal is its own, unless asked.
     let nested = std::env::var_os(attach::PID_VARIABLE).is_some();
@@ -52,35 +73,21 @@ pub fn run(args: Args) -> ExitCode {
     let target = if args.resume {
         let all = sessions.as_deref().map(session::list).unwrap_or_default();
         if all.is_empty() {
-            return fail("there are no sessions");
+            return Err(fail("there are no sessions"));
         }
         // With none here, the rest are worth seeing.
         let everywhere = args.all || !all.iter().any(|listing| listing.has(&folder));
         match pick(all, &folder, everywhere) {
             Ok(Some(listing)) => Some(listing),
-            Ok(None) => return ExitCode::SUCCESS,
-            Err(err) => return fail(&format!("can't list sessions: {err}")),
+            Ok(None) => return Err(ExitCode::SUCCESS),
+            Err(err) => return Err(fail(&format!("can't list sessions: {err}"))),
         }
     } else if found.len() == 1 && !nested {
         found.into_iter().next()
     } else {
         None
     };
-    match target {
-        Some(listing) if listing.live => {
-            match attach::request_attach(&session::socket_path(&listing.dir)) {
-                Ok(control) => wait(control, None),
-                Err(err) => fail(&format!("can't reach session {}: {err}", listing.id)),
-            }
-        }
-        Some(listing) => serve(vec!["--restore".into(), listing.dir.into_os_string()]),
-        None => serve(
-            args.paths
-                .into_iter()
-                .map(PathBuf::into_os_string)
-                .collect(),
-        ),
-    }
+    Ok(target)
 }
 
 /// The folder sessions are looked for in: the first named, or the
@@ -137,8 +144,10 @@ pub fn end(id: Option<String>) -> ExitCode {
         }
     };
     let about = listing.describe(SystemTime::now());
+    let socket = session::socket_path(&listing.dir);
     let ended = match listing.live {
-        true => attach::request_end(&session::socket_path(&listing.dir)),
+        true if crate::env_flag(crate::HOST_PROCESS_VARIABLE) => crate::host::end_session(&socket),
+        true => attach::request_end(&socket),
         false => Session::open(&listing.dir).map(Session::end),
     };
     match ended {
@@ -264,13 +273,32 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// `path` with `~` for the home folder.
+/// The home folder on the machine the files are on, if it isn't this
+/// one's (see [`set_home`]).
+static HOME: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Has [`tilde`] go by `home`, the home folder of the machine the files are
+/// on, once it's another (see [`crate::remote`]).
+pub fn set_home(home: Option<PathBuf>) {
+    let _ = HOME.set(home);
+}
+
+/// `path` with `~` for the home folder, on the machine the files are on.
 pub fn tilde(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    match home
-        .as_deref()
-        .and_then(|home| path.strip_prefix(home).ok())
-    {
+    let home = match HOME.get() {
+        Some(home) => home.clone(),
+        None => std::env::var_os("HOME").map(PathBuf::from),
+    };
+    tilde_in(path, home.as_deref())
+}
+
+/// `path` with `~` for the home folder on this machine.
+pub fn tilde_here(path: &Path) -> String {
+    tilde_in(path, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+}
+
+fn tilde_in(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
@@ -287,6 +315,13 @@ fn pick(listings: Vec<Listing>, folder: &Path, all: bool) -> io::Result<Option<L
     if interactive {
         return crate::resume::choose(listings, folder, all);
     }
+    print_sessions(&listings, folder, all);
+    Ok(None)
+}
+
+/// Prints `listings`, those in `folder` unless `all`, for a `--resume`
+/// without a terminal to choose in.
+pub fn print_sessions(listings: &[Listing], folder: &Path, all: bool) {
     let now = SystemTime::now();
     match all {
         true => eprintln!("Sessions:"),
@@ -295,5 +330,4 @@ fn pick(listings: Vec<Listing>, folder: &Path, all: bool) -> io::Result<Option<L
     for listing in listings.iter().filter(|listing| all || listing.has(folder)) {
         eprintln!("  {}  {}", listing.id, listing.describe(now));
     }
-    Ok(None)
 }

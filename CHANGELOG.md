@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Move file watching, file listing, workspace search, and git status, sync, and commits behind a message-based host, the first step toward a client/server split (`56a2a65`)
+- Move symbol indexing, the file tree, the file dialog, file operations, and opening, saving, and reloading files to the host (`1322aae`)
+- Move the rest of git (staging, stashing, branches, the log, commit diffs, and diff bases) to the host (`a4ba4bf`)
+- Read images, PDFs, and Quick Look's previews through the host (`e34e41e`)
+- Run terminals' shells on the host (`bfc16b2`)
+- Keep sessions' files on the host (`a71b305`)
+- Finish moving file system checks to the host: it resolves paths, startup and session restore load in one round trip, and periodic session saves don't wait (`2f4ab08`)
+- Send the host's messages over a socket, serialized, even to a host in the same process: the first part of moving the host into its own process (`83c7f0f`)
+- Add `cue --host`, a host in a process of its own that serves one client at a time, a newer one taking over; the app uses one with `CUE_HOST_PROCESS=1`, for now (`cf8456d`)
+- Keep terminals running on a host process when its client's gone, for another to attach to and get the screen (`c06ab44`)
+- With `CUE_HOST_PROCESS=1`, show the app in the `cue` the shell ran: detaching exits, leaving terminals running on the host, and coming back reattaches to them; sessions' sockets go only in folders of the user's own (`78adb77`)
+- With `CUE_HOST_PROCESS=1`, a `cue` of another build has a session's host start that build in its place, terminals still running, and Restart works there too (`aadc9dd`)
+- A host process reads its settings again when the app does, so Reload Settings reaches new terminals' shells and excluded files (`141008f`)
+- Stream edits to the host as they're made, which keeps a copy of each open file; saving, sessions, and workspace search use its copy instead of sending whole texts (`facfea4`)
+- A host process answers its terminals' queries itself, in the app's colors, even while a client's attached, so a query asked as a client comes or goes gets one answer (`f6e3b76`)
+- Add `cue user@host:path` and `cue user@host`, which open a folder or a host's sessions over the system's `ssh`, sending cue to the host if it hasn't this build; `install.sh` also installs the linux-x64 build on Macs to send (`2cfa24c`)
+
 ## v0.4.2 — 2026-10-11
 
 - Embedded PDF viewer (`c3deea1`)

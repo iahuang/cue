@@ -5,15 +5,20 @@
 //!
 //! It runs in the `cue` the shell ran (see [`crate::client`]), which then
 //! attaches to the session chosen, or starts a cue for it.
+//!
+//! For another machine named without a path, `cue host:` (see
+//! [`crate::remote`]), it lists that machine's sessions, and with Tab, its
+//! folders, from its home folder, to open one, or a file in one, instead.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use opentui::{Attributes, Buffer, Output, Renderer, Rgba};
 
 use crate::client::tilde;
 use crate::config;
+use crate::file_dialog::Entry;
 use crate::input::{Event, Key, KeyCode, Mouse, MouseButton, MouseKind, Parser, MULTI_CLICK};
 use crate::keymap::{Command, Context, Keymap};
 use crate::line_edit::{Caret, Edit};
@@ -37,7 +42,44 @@ pub enum Action {
     Continue,
     /// Open the session at this index of those given.
     Open(usize),
+    /// List this folder, to browse it (see [`Chooser::listed`]).
+    List(PathBuf),
+    /// Open this folder, or file.
+    OpenPath(PathBuf),
     Cancel,
+}
+
+/// What was chosen.
+#[derive(Debug)]
+pub enum Chosen {
+    Session(Box<Listing>),
+    /// A folder or file, from browsing.
+    Path(PathBuf),
+}
+
+/// A machine's folders, browsed to open one.
+struct Browser {
+    /// The home folder there, for paths typed from `~`.
+    home: PathBuf,
+    dir: PathBuf,
+    /// What's in it, folders first, or why it can't be read; `None` until
+    /// it's listed.
+    entries: Option<Result<Vec<Entry>, String>>,
+    /// The rows shown, as narrowed by what's typed.
+    shown: Vec<Row>,
+    selected: usize,
+    scroll: usize,
+}
+
+/// A row of a folder browsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    /// Opening the folder.
+    Here,
+    /// The folder above.
+    Up,
+    /// An entry, by position.
+    Entry(usize),
 }
 
 /// The list, and what's typed to narrow it.
@@ -65,6 +107,13 @@ pub struct Chooser {
     now: SystemTime,
     /// The last left press on a session, to tell a double click.
     last_click: Option<(Instant, usize)>,
+    /// What the header says this is.
+    title: String,
+    /// The folders, to browse, beside the sessions, if they're offered;
+    /// then the scopes are the sessions, all of them, and the folders.
+    browser: Option<Browser>,
+    /// The folders show, rather than the sessions.
+    browsing: bool,
 }
 
 impl Chooser {
@@ -96,9 +145,53 @@ impl Chooser {
             keymap,
             now: SystemTime::now(),
             last_click: None,
+            title: " Resume Session".to_string(),
+            browser: None,
+            browsing: false,
         };
         chooser.refilter();
         chooser
+    }
+
+    /// Lists `listings`, every one, and the folders from `home`, to
+    /// browse, on a screen `width` x `height`, under `title`: the folders
+    /// first if there are no sessions. The folder's listed once it's said
+    /// what's in it (see [`Chooser::listed`]).
+    pub fn browsing(
+        listings: Vec<Listing>,
+        home: &Path,
+        title: &str,
+        keymap: Keymap,
+        width: u32,
+        height: u32,
+    ) -> Chooser {
+        let browsing = listings.is_empty();
+        let mut chooser = Chooser::new(listings, home, true, keymap, width, height);
+        chooser.title = format!(" {title}");
+        chooser.browser = Some(Browser {
+            home: home.to_path_buf(),
+            dir: home.to_path_buf(),
+            entries: None,
+            shown: Vec::new(),
+            selected: 0,
+            scroll: 0,
+        });
+        chooser.browsing = browsing;
+        chooser
+    }
+
+    /// Takes in what's in `dir`, or why it can't be read, browsing it.
+    pub fn listed(&mut self, dir: PathBuf, entries: Result<Vec<Entry>, String>) {
+        let Some(browser) = &mut self.browser else {
+            return;
+        };
+        browser.dir = dir;
+        browser.entries = Some(entries);
+        browser.selected = 0;
+        browser.scroll = 0;
+        self.query.clear();
+        self.caret.move_to_end();
+        self.refilter();
     }
 
     pub fn set_size(&mut self, width: u32, height: u32) {
@@ -129,7 +222,16 @@ impl Chooser {
         if key.code == KeyCode::Char('c') && key.mods.ctrl {
             return Action::Cancel;
         }
-        match self.keymap.lookup(key, Context::Picker).map(|(c, _)| c) {
+        let command = self.keymap.lookup(key, Context::Picker).map(|(c, _)| c);
+        // Backspace with nothing typed goes up a folder.
+        let up = self.browsing
+            && self.query.is_empty()
+            && self.keymap.lookup(key, Context::Editor).map(|(c, _)| c)
+                == Some(Command::DeleteBackward);
+        if up {
+            return self.go_up();
+        }
+        match command {
             Some(Command::PickerUp) => self.step(-1),
             Some(Command::PickerDown) => self.step(1),
             Some(Command::PickerPageUp) => self.step(-(self.rows_in_view() as isize)),
@@ -184,7 +286,11 @@ impl Chooser {
             MouseKind::Press(MouseButton::Left) => {
                 if mouse.y == 0 {
                     let (here, all) = self.scope_tabs();
-                    if here.contains(&mouse.x) && self.all || all.contains(&mouse.x) && !self.all {
+                    let on_all = match self.browser {
+                        Some(_) => self.browsing,
+                        None => self.all,
+                    };
+                    if here.contains(&mouse.x) && on_all || all.contains(&mouse.x) && !on_all {
                         self.toggle_all();
                     }
                     return Action::Continue;
@@ -196,7 +302,10 @@ impl Chooser {
                 let double = self.last_click.is_some_and(|(time, clicked)| {
                     clicked == index && now.duration_since(time) < MULTI_CLICK
                 });
-                self.selected = index;
+                match self.browser.as_mut().filter(|_| self.browsing) {
+                    Some(browser) => browser.selected = index,
+                    None => self.selected = index,
+                }
                 self.keep_in_view();
                 if double {
                     self.last_click = None;
@@ -210,20 +319,72 @@ impl Chooser {
     }
 
     fn open_selected(&self) -> Action {
+        if self.browsing {
+            // A path typed goes there.
+            if let Some(browser) = self.browser.as_ref().filter(|_| self.query.contains('/')) {
+                let path = match self.query.strip_prefix("~/") {
+                    Some(rest) => browser.home.join(rest),
+                    None => browser.dir.join(&self.query),
+                };
+                return Action::List(path);
+            }
+            return self.open_row();
+        }
         match self.shown.get(self.selected) {
             Some(&index) => Action::Open(index),
             None => Action::Continue,
         }
     }
 
+    /// What opening the folder row selected does.
+    fn open_row(&self) -> Action {
+        let Some(browser) = &self.browser else {
+            return Action::Continue;
+        };
+        match browser.shown.get(browser.selected) {
+            Some(Row::Here) => Action::OpenPath(browser.dir.clone()),
+            Some(Row::Up) => self.go_up(),
+            Some(&Row::Entry(index)) => {
+                let Some(Ok(entries)) = &browser.entries else {
+                    return Action::Continue;
+                };
+                let entry = &entries[index];
+                let path = browser.dir.join(&entry.name);
+                match entry.is_dir {
+                    true => Action::List(path),
+                    false => Action::OpenPath(path),
+                }
+            }
+            None => Action::Continue,
+        }
+    }
+
+    /// Lists the folder above the one browsed, if there's one.
+    fn go_up(&self) -> Action {
+        match self
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.dir.parent())
+        {
+            Some(parent) => Action::List(parent.to_path_buf()),
+            None => Action::Continue,
+        }
+    }
+
+    /// Switches scope: this folder's sessions or all of them, or the
+    /// sessions or the folders.
     fn toggle_all(&mut self) {
-        self.all = !self.all;
+        match self.browser {
+            Some(_) => self.browsing = !self.browsing,
+            None => self.all = !self.all,
+        }
         self.refilter();
     }
 
     /// Lists the sessions in scope that have every word typed, keeping the
     /// one selected if it still is.
     fn refilter(&mut self) {
+        self.refilter_rows();
         let selected = self.shown.get(self.selected).copied();
         let words: Vec<String> = self
             .query
@@ -241,7 +402,54 @@ impl Chooser {
         self.keep_in_view();
     }
 
+    /// Lists the rows of the folder browsed that have every word typed,
+    /// keeping the one selected if it still is.
+    fn refilter_rows(&mut self) {
+        let words: Vec<String> = self
+            .query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        let rows = self.rows_in_view();
+        let Some(browser) = &mut self.browser else {
+            return;
+        };
+        let selected = browser.shown.get(browser.selected).copied();
+        let mut shown = Vec::new();
+        if words.is_empty() {
+            shown.push(Row::Here);
+            if browser.dir.parent().is_some() {
+                shown.push(Row::Up);
+            }
+        }
+        if let Some(Ok(entries)) = &browser.entries {
+            shown.extend(
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| {
+                        let name = entry.name.to_lowercase();
+                        words.iter().all(|word| name.contains(word))
+                    })
+                    .map(|(index, _)| Row::Entry(index)),
+            );
+        }
+        browser.shown = shown;
+        browser.selected = selected
+            .and_then(|selected| browser.shown.iter().position(|&row| row == selected))
+            .unwrap_or(0);
+        browser.scroll = 0;
+        browser.keep_in_view(rows);
+    }
+
     fn step(&mut self, step: isize) {
+        if self.browsing {
+            let rows = self.rows_in_view();
+            if let Some(browser) = &mut self.browser {
+                browser.step(step, rows);
+            }
+            return;
+        }
         if self.shown.is_empty() {
             return;
         }
@@ -250,14 +458,24 @@ impl Chooser {
         self.keep_in_view();
     }
 
-    /// Sessions that fit in the list.
+    /// Sessions, or the folder's rows, that fit in the list.
     fn rows_in_view(&self) -> usize {
         let rows = self.height.saturating_sub(LIST_TOP + 1);
+        if self.browsing {
+            return rows.max(1) as usize;
+        }
         // The last needs no blank row after it.
         ((rows + 1) / ITEM_ROWS).max(1) as usize
     }
 
     fn keep_in_view(&mut self) {
+        if self.browsing {
+            let rows = self.rows_in_view();
+            if let Some(browser) = &mut self.browser {
+                browser.keep_in_view(rows);
+            }
+            return;
+        }
         let rows = self.rows_in_view();
         if self.selected < self.scroll {
             self.scroll = self.selected;
@@ -267,9 +485,14 @@ impl Chooser {
         self.scroll = self.scroll.min(self.shown.len().saturating_sub(rows));
     }
 
-    /// The session shown on row `y`, by its place among those shown.
+    /// The session shown on row `y`, by its place among those shown; or
+    /// the folder's row, while browsing.
     fn item_at(&self, y: u32) -> Option<usize> {
         let row = y.checked_sub(LIST_TOP)?;
+        if let Some(browser) = self.browser.as_ref().filter(|_| self.browsing) {
+            let index = browser.scroll + row as usize;
+            return (y + 1 < self.height && index < browser.shown.len()).then_some(index);
+        }
         if y + 1 >= self.height || row % ITEM_ROWS == ITEM_ROWS - 1 {
             return None;
         }
@@ -280,12 +503,21 @@ impl Chooser {
     /// The columns of the header's two scopes: this folder's sessions, and
     /// all of them.
     fn scope_tabs(&self) -> (std::ops::Range<u32>, std::ops::Range<u32>) {
-        let all_x = self.width.saturating_sub(SCOPE_ALL.len() as u32 + 1);
-        let here_x = all_x.saturating_sub(SCOPE_HERE.len() as u32 + 1);
+        let [here, all] = self.scopes();
+        let all_x = self.width.saturating_sub(all.len() as u32 + 1);
+        let here_x = all_x.saturating_sub(here.len() as u32 + 1);
         (
-            here_x..here_x + SCOPE_HERE.len() as u32,
-            all_x..all_x + SCOPE_ALL.len() as u32,
+            here_x..here_x + here.len() as u32,
+            all_x..all_x + all.len() as u32,
         )
+    }
+
+    /// What the header's two scopes are called.
+    fn scopes(&self) -> [&'static str; 2] {
+        match self.browser {
+            Some(_) => [SCOPE_SESSIONS, SCOPE_FOLDERS],
+            None => [SCOPE_HERE, SCOPE_ALL],
+        }
     }
 
     // --- drawing ------------------------------------------------------------------
@@ -303,20 +535,30 @@ impl Chooser {
         // The header: what this is, and the scopes.
         frame.fill_rect(0, 0, width, 1, colors.surface);
         let (here, all) = self.scope_tabs();
-        let title = " Resume Session";
+        let title = truncate(&self.title, (width / 2) as usize);
+        let title = title.as_str();
         frame.draw_text(title, 0, 0, colors.text, None, Attributes::BOLD);
-        let folder = format!("  {}", self.folder);
-        let room = (here.start as usize).saturating_sub(title.len() + 1);
+        let folder = match self.browser.as_ref().filter(|_| self.browsing) {
+            Some(browser) => format!("  {}", tilde(&browser.dir)),
+            None if self.browser.is_some() => String::new(),
+            None => format!("  {}", self.folder),
+        };
+        let room = (here.start as usize).saturating_sub(title.chars().count() + 1);
         let folder = truncate(&folder, room);
         frame.draw_text(
             &folder,
-            title.len() as u32,
+            title.chars().count() as u32,
             0,
             colors.muted,
             None,
             Attributes::NONE,
         );
-        for (range, label, on) in [(here, SCOPE_HERE, !self.all), (all, SCOPE_ALL, self.all)] {
+        let [here_label, all_label] = self.scopes();
+        let on_all = match self.browser {
+            Some(_) => self.browsing,
+            None => self.all,
+        };
+        for (range, label, on) in [(here, here_label, !on_all), (all, all_label, on_all)] {
             let (fg, bg, attributes) = match on {
                 true => (colors.on_accent, Some(colors.accent), Attributes::BOLD),
                 false => (colors.muted, None, Attributes::NONE),
@@ -324,13 +566,33 @@ impl Chooser {
             frame.draw_text(label, range.start, 0, fg, bg, attributes);
         }
 
-        // The query, and how many sessions it leaves.
-        let in_scope = (0..self.listings.len())
-            .filter(|&i| self.all || self.here[i])
-            .count();
-        let count = match self.query.is_empty() {
-            true => plural(in_scope, "session"),
-            false => format!("{} of {}", self.shown.len(), in_scope),
+        // The query, and how many sessions, or files and folders, it
+        // leaves.
+        let count = match self.browser.as_ref().filter(|_| self.browsing) {
+            Some(browser) => {
+                let entries = match &browser.entries {
+                    Some(Ok(entries)) => entries.len(),
+                    _ => 0,
+                };
+                let shown = browser
+                    .shown
+                    .iter()
+                    .filter(|row| matches!(row, Row::Entry(_)))
+                    .count();
+                match self.query.is_empty() {
+                    true => plural(entries, "item"),
+                    false => format!("{shown} of {entries}"),
+                }
+            }
+            None => {
+                let in_scope = (0..self.listings.len())
+                    .filter(|&i| self.all || self.here[i])
+                    .count();
+                match self.query.is_empty() {
+                    true => plural(in_scope, "session"),
+                    false => format!("{} of {}", self.shown.len(), in_scope),
+                }
+            }
         };
         let count_x = width.saturating_sub(count.chars().count() as u32 + 2);
         frame.draw_text(&count, count_x, 2, colors.muted, None, Attributes::NONE);
@@ -341,16 +603,75 @@ impl Chooser {
         let (shown, cursor) = self.caret.view(&self.query, room);
         match self.query.is_empty() {
             true => {
-                let placeholder =
-                    truncate("Search names, folders, tabs, files, and programs", room);
+                let placeholder = match self.browsing {
+                    true => "Filter files and folders, or type a path",
+                    false => "Search names, folders, tabs, files, and programs",
+                };
+                let placeholder = truncate(placeholder, room);
                 frame.draw_text(&placeholder, x, 2, colors.faint, None, Attributes::NONE);
             }
             false => frame.draw_text(&shown, x, 2, colors.text, None, Attributes::NONE),
         }
 
-        self.draw_list(frame);
+        match self.browser.as_ref().filter(|_| self.browsing) {
+            Some(browser) => self.draw_folder(frame, browser),
+            None => self.draw_list(frame),
+        }
         self.draw_hints(frame);
         Some((x + cursor as u32, 2))
+    }
+
+    /// Draws the folder browsed: opening it, the folder above, and what's
+    /// in it, a row each.
+    fn draw_folder(&self, frame: &Buffer, browser: &Browser) {
+        let colors = theme::colors();
+        let width = self.width;
+        let bottom = self.height - 1;
+        let message = match &browser.entries {
+            None => Some("Listing…".to_string()),
+            Some(Err(err)) => Some(format!("Can't list {}: {err}", tilde(&browser.dir))),
+            Some(Ok(_)) => None,
+        };
+        let mut y = LIST_TOP;
+        for (index, row) in browser.shown.iter().enumerate().skip(browser.scroll) {
+            if y >= bottom {
+                break;
+            }
+            let selected = index == browser.selected;
+            if selected {
+                frame.fill_rect(0, y, width, 1, colors.selected);
+                frame.draw_text("▌", 0, y, colors.accent, None, Attributes::NONE);
+            }
+            let bold = match selected {
+                true => Attributes::BOLD,
+                false => Attributes::NONE,
+            };
+            let room = width.saturating_sub(4) as usize;
+            let (text, fg, attributes) = match *row {
+                Row::Here => (
+                    format!("Open {}", tilde(&browser.dir)),
+                    colors.accent,
+                    Attributes::BOLD,
+                ),
+                Row::Up => ("..".to_string(), colors.muted, bold),
+                Row::Entry(entry) => {
+                    let Some(Ok(entries)) = &browser.entries else {
+                        continue;
+                    };
+                    let entry = &entries[entry];
+                    match entry.is_dir {
+                        true => (format!("{}/", entry.name), colors.text, bold),
+                        false => (entry.name.clone(), colors.muted, bold),
+                    }
+                }
+            };
+            frame.draw_text(&truncate(&text, room), 2, y, fg, None, attributes);
+            y += 1;
+        }
+        if let Some(message) = message.filter(|_| y < bottom) {
+            let text = truncate(&message, width.saturating_sub(4) as usize);
+            frame.draw_text(&text, 2, y + 1, colors.muted, None, Attributes::NONE);
+        }
     }
 
     fn draw_list(&self, frame: &Buffer) {
@@ -360,6 +681,8 @@ impl Chooser {
         if self.shown.is_empty() {
             let text = if !self.query.is_empty() {
                 format!("No sessions match “{}”.", self.query)
+            } else if self.browser.is_some() {
+                "No sessions. Press Tab to open a folder.".to_string()
             } else if !self.all {
                 format!("No sessions in {}. Press Tab to show all.", self.folder)
             } else {
@@ -450,9 +773,11 @@ impl Chooser {
                 .shortcut_in(command, Context::Picker)
                 .map(|key| format!("{key:#}"))
         };
-        let scope = match self.all {
-            true => "this folder",
-            false => "all sessions",
+        let scope = match (self.browser.is_some(), self.browsing, self.all) {
+            (true, true, _) => "sessions",
+            (true, false, _) => "folders",
+            (false, _, true) => "this folder",
+            (false, _, false) => "all sessions",
         };
         let mut hints = Vec::new();
         if let (Some(up), Some(down)) = (key(Command::PickerUp), key(Command::PickerDown)) {
@@ -460,6 +785,9 @@ impl Chooser {
         }
         if let Some(accept) = key(Command::PickerAccept) {
             hints.push(format!("{accept} open"));
+        }
+        if self.browsing {
+            hints.push("Backspace up".to_string());
         }
         hints.push(format!("Tab {scope}"));
         if let Some(close) = key(Command::PickerClose) {
@@ -472,6 +800,28 @@ impl Chooser {
 
 const SCOPE_HERE: &str = " This Folder ";
 const SCOPE_ALL: &str = " All ";
+const SCOPE_SESSIONS: &str = " Sessions ";
+const SCOPE_FOLDERS: &str = " Folders ";
+
+impl Browser {
+    fn step(&mut self, step: isize, rows: usize) {
+        if self.shown.is_empty() {
+            return;
+        }
+        let last = self.shown.len() as isize - 1;
+        self.selected = (self.selected as isize + step).clamp(0, last) as usize;
+        self.keep_in_view(rows);
+    }
+
+    fn keep_in_view(&mut self, rows: usize) {
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + rows {
+            self.scroll = self.selected + 1 - rows;
+        }
+        self.scroll = self.scroll.min(self.shown.len().saturating_sub(rows));
+    }
+}
 
 /// What a session is found by: its name, folders, tabs, files, terminals,
 /// and id, lowercase.
@@ -594,7 +944,38 @@ fn draw_found(
 
 /// Shows `listings` full screen, those with `folder` in their workspace
 /// unless `all`, and returns the one chosen, if any.
-pub fn choose(mut listings: Vec<Listing>, folder: &Path, all: bool) -> io::Result<Option<Listing>> {
+pub fn choose(listings: Vec<Listing>, folder: &Path, all: bool) -> io::Result<Option<Listing>> {
+    let chosen = run(
+        |keymap, width, height| Chooser::new(listings, folder, all, keymap, width, height),
+        |_| Err(io::Error::other("Folders aren't browsed here.")),
+    )?;
+    Ok(match chosen {
+        Some(Chosen::Session(listing)) => Some(*listing),
+        _ => None,
+    })
+}
+
+/// Shows `listings`, another machine's sessions, under `title`, and its
+/// folders from `home`, as `list` lists them, full screen; returns the
+/// session, or the folder or file, chosen, if any.
+pub fn choose_or_browse(
+    listings: Vec<Listing>,
+    home: &Path,
+    title: &str,
+    list: impl FnMut(&Path) -> io::Result<Vec<Entry>>,
+) -> io::Result<Option<Chosen>> {
+    run(
+        |keymap, width, height| Chooser::browsing(listings, home, title, keymap, width, height),
+        list,
+    )
+}
+
+/// Shows the chooser `make` makes, full screen, until something's chosen,
+/// listing folders it browses with `list`.
+fn run(
+    make: impl FnOnce(Keymap, u32, u32) -> Chooser,
+    mut list: impl FnMut(&Path) -> io::Result<Vec<Entry>>,
+) -> io::Result<Option<Chosen>> {
     let (config, _) = config::load();
     config::set(config);
     let keymap = Keymap::new(&config::get().keys);
@@ -603,14 +984,11 @@ pub fn choose(mut listings: Vec<Listing>, folder: &Path, all: bool) -> io::Resul
         .map_err(|err| io::Error::other(err.to_string()))?;
     renderer.setup_terminal(true);
     renderer.enable_mouse(false);
-    let mut chooser = Chooser::new(
-        std::mem::take(&mut listings),
-        folder,
-        all,
-        keymap,
-        width,
-        height,
-    );
+    let mut chooser = make(keymap, width, height);
+    if let Some(dir) = chooser.browser.as_ref().map(|browser| browser.dir.clone()) {
+        let entries = list(&dir).map_err(|err| err.to_string());
+        chooser.listed(dir, entries);
+    }
 
     // Drawn once the terminal says what its colors are, for the theme.
     write_to_terminal(&theme::color_queries());
@@ -676,7 +1054,16 @@ pub fn choose(mut listings: Vec<Listing>, folder: &Path, all: bool) -> io::Resul
         }
         match action {
             Action::Continue => {}
-            Action::Open(index) => break Some(index),
+            Action::Open(index) => {
+                break Some(Chosen::Session(Box::new(
+                    chooser.listings.swap_remove(index),
+                )))
+            }
+            Action::OpenPath(path) => break Some(Chosen::Path(path)),
+            Action::List(dir) => {
+                let entries = list(&dir).map_err(|err| err.to_string());
+                chooser.listed(dir, entries);
+            }
             Action::Cancel => break None,
         }
         if tty::size() != (width, height) {
@@ -687,7 +1074,7 @@ pub fn choose(mut listings: Vec<Listing>, folder: &Path, all: bool) -> io::Resul
         }
     };
     drop(renderer);
-    Ok(chosen.map(|index| chooser.listings.swap_remove(index)))
+    Ok(chosen)
 }
 
 /// Puts the theme the settings pick for the terminal's colors in use.
@@ -792,6 +1179,75 @@ mod tests {
         let frame = OwnedBuffer::new(80, 20, false, WidthMethod::Unicode, "test").unwrap();
         chooser.draw(&frame);
         frame.to_text(true)
+    }
+
+    /// A chooser of another machine's sessions and folders, browsing
+    /// `/home/me`.
+    fn browser() -> Chooser {
+        let listings = vec![listing("a1", &["/home/me/cue"], &[], 300, true)];
+        let home = Path::new("/home/me");
+        let mut chooser = Chooser::browsing(listings, home, "devbox", Keymap::new(&[]), 80, 20);
+        let entries = vec![
+            Entry::named("cue", true),
+            Entry::named("notes", true),
+            Entry::named("todo.md", false),
+        ];
+        chooser.listed(home.to_path_buf(), Ok(entries));
+        chooser
+    }
+
+    #[test]
+    fn another_machines_folders_are_browsed_beside_its_sessions() {
+        let _serial = crate::test_serial();
+        let mut chooser = browser();
+        assert!(!chooser.browsing, "the sessions first, there being one");
+        assert_eq!(ids(&chooser), ["a1"]);
+        key(&mut chooser, KeyCode::Tab);
+        assert!(chooser.browsing);
+        let text = screen(&chooser);
+        assert!(
+            text.contains("Open ~") || text.contains("Open /home/me"),
+            "{text}"
+        );
+        assert!(text.contains("notes/"), "{text}");
+        // Opening the folder itself, then going into one, then a file.
+        assert_eq!(
+            key(&mut chooser, KeyCode::Enter),
+            Action::OpenPath("/home/me".into())
+        );
+        type_text(&mut chooser, "not");
+        assert_eq!(
+            key(&mut chooser, KeyCode::Enter),
+            Action::List("/home/me/notes".into())
+        );
+        chooser.query.clear();
+        chooser.refilter();
+        type_text(&mut chooser, "todo");
+        assert_eq!(
+            key(&mut chooser, KeyCode::Enter),
+            Action::OpenPath("/home/me/todo.md".into())
+        );
+        // Backspace with nothing typed goes up; a path typed goes there.
+        chooser.query.clear();
+        chooser.refilter();
+        assert_eq!(
+            key(&mut chooser, KeyCode::Backspace),
+            Action::List("/home".into())
+        );
+        type_text(&mut chooser, "~/src/app");
+        assert_eq!(
+            key(&mut chooser, KeyCode::Enter),
+            Action::List("/home/me/src/app".into())
+        );
+    }
+
+    #[test]
+    fn with_no_sessions_the_folders_show_first() {
+        let _serial = crate::test_serial();
+        let home = Path::new("/home/me");
+        let chooser = Chooser::browsing(Vec::new(), home, "devbox", Keymap::new(&[]), 80, 20);
+        assert!(chooser.browsing);
+        assert!(screen(&chooser).contains("Listing…"));
     }
 
     #[test]

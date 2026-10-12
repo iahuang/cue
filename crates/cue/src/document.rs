@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -26,13 +26,16 @@ use opentui::{EditBuffer, LogicalCursor, WidthMethod};
 use crate::config;
 use crate::git::Tracked;
 use crate::history::{EditKind, History};
+use crate::host::Link;
 use crate::indent::Indent;
 use crate::language::{self, Language};
+use crate::replica::{DocId, Replica};
 use crate::symbols::{self, Symbol};
 use crate::syntax::Highlighter;
 use crate::theme::{self, Theme};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LineEnding {
     #[default]
     Lf,
@@ -57,7 +60,7 @@ pub struct File {
 
 /// The file on disk as last read or written, to tell whether it changed
 /// since.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stamp {
     modified: Option<SystemTime>,
     len: u64,
@@ -121,6 +124,9 @@ struct OnDisk {
     /// `None` if there was no file.
     stamp: Option<Stamp>,
     disk: Disk,
+    /// The file it is, links followed, as the host last said; `None` if
+    /// there was none, or it's been renamed since.
+    real: Option<PathBuf>,
 }
 
 /// The text as last loaded or saved, so that edits which put it back, like
@@ -173,6 +179,8 @@ pub struct Document {
     tracked: RefCell<Option<Rc<Tracked>>>,
     /// What the text defines, as last outlined (see [`Document::outline`]).
     outline: RefCell<Option<Outline>>,
+    /// Its copy on the host, once it has one (see [`crate::replica`]).
+    replica: RefCell<Option<Replica>>,
 }
 
 /// What a document's text defines, as of its content epoch, in the
@@ -262,17 +270,26 @@ pub struct Parked {
 }
 
 impl Document {
-    /// Opens the file at `path`, or a new, unnamed document, and a notice
-    /// for the status bar if loading it had anything to say. The error is
-    /// the reason alone, without the path.
-    pub fn open(
-        path: Option<PathBuf>,
+    /// A new, unnamed document.
+    pub fn untitled(theme: Rc<Theme>) -> Result<Rc<Document>, String> {
+        Document::open(None, theme).map(|(doc, _)| doc)
+    }
+
+    /// A document of the file at `path`, as `loaded` (see [`load`]), and a
+    /// notice for the status bar if loading it had anything to say. The
+    /// error is the reason alone, without the path.
+    pub fn loaded(
+        loaded: Loaded,
         theme: Rc<Theme>,
     ) -> Result<(Rc<Document>, Option<String>), String> {
-        let loaded = match &path {
-            Some(path) => Some(load(path).map_err(|e| e.to_string())?),
-            None => None,
-        };
+        Document::open(Some((loaded.path.clone(), loaded)), theme)
+    }
+
+    fn open(
+        file: Option<(PathBuf, Loaded)>,
+        theme: Rc<Theme>,
+    ) -> Result<(Rc<Document>, Option<String>), String> {
+        let (path, loaded) = file.unzip();
         let buffer = Rc::new(EditBuffer::new(WidthMethod::Unicode).map_err(|e| e.to_string())?);
         buffer.set_tab_width(config::get().tab_width as u8);
         let mut file = File {
@@ -281,8 +298,10 @@ impl Document {
         };
         let mut notice = None;
         let mut stamp = None;
+        let mut real = None;
         if let Some(loaded) = loaded {
             stamp = loaded.stamp;
+            real = loaded.real;
             buffer.set_text(&loaded.text);
             buffer.set_cursor(0, 0);
             file.line_ending = loaded.line_ending;
@@ -295,6 +314,7 @@ impl Document {
         }
         let doc = Document::new(buffer, file, theme);
         doc.on_disk.borrow_mut().stamp = stamp;
+        doc.on_disk.borrow_mut().real = real;
         Ok((Rc::new(doc), notice))
     }
 
@@ -305,7 +325,7 @@ impl Document {
         text: &str,
         theme: Rc<Theme>,
     ) -> Result<Rc<Document>, String> {
-        let (doc, _) = Self::open(None, theme)?;
+        let doc = Document::untitled(theme)?;
         doc.restore_text(text);
         doc.rename(path);
         doc.history.borrow_mut().mark_unsaved();
@@ -339,6 +359,7 @@ impl Document {
             saved: RefCell::new(Saved::of(&text)),
             tracked: RefCell::default(),
             outline: RefCell::default(),
+            replica: RefCell::default(),
         }
     }
 
@@ -454,13 +475,16 @@ impl Document {
             .then(|| untitled_name(self.untitled.get()))
     }
 
-    /// Whether the document is the file at `path`, however it's named.
+    /// Whether the document is the file at `path`, which has been
+    /// [`resolve`]d (as the host does) or [`normalize`]d.
     pub fn is_file(&self, path: &Path) -> bool {
-        self.file
-            .borrow()
-            .path
-            .as_deref()
-            .is_some_and(|open| same_file(open, path))
+        self.file.borrow().path.as_deref() == Some(path)
+    }
+
+    /// Whether the document is the file `loaded` is, however it's named:
+    /// a symlink and the file it points to are one.
+    pub fn is_loaded(&self, loaded: &Loaded) -> bool {
+        self.is_file(&loaded.path) || loaded.real.is_some() && self.real() == loaded.real
     }
 
     /// Whether the text differs from the saved state: undoing back to it,
@@ -533,6 +557,43 @@ impl Document {
         self.buffer.text()
     }
 
+    /// Takes `replica` as its copy on the host, made of the file it was
+    /// loaded from (see [`Replica::loading`]).
+    pub fn set_replica(&self, replica: Replica) {
+        *self.replica.borrow_mut() = Some(replica);
+    }
+
+    /// Brings its copy on `host` up to date with the text, sending what
+    /// changed, or the whole text if it has none yet. Returns the copy's
+    /// id.
+    pub fn sync(&self, host: &Link) -> DocId {
+        let mut replica = self.replica.borrow_mut();
+        let replica = replica.get_or_insert_with(|| {
+            let epoch = self.buffer.content_epoch();
+            Replica::open(host, self.buffer.text(), Some(epoch))
+        });
+        replica.sync(&self.buffer);
+        replica.id()
+    }
+
+    /// Its copy's id, if it has one.
+    pub fn replica_id(&self) -> Option<DocId> {
+        Some(self.replica.borrow().as_ref()?.id())
+    }
+
+    /// Notes that its copy on the host has `version`.
+    pub fn acked(&self, version: u64) {
+        if let Some(replica) = self.replica.borrow_mut().as_mut() {
+            replica.ack(version);
+        }
+    }
+
+    /// The latest version of its copy the host has, for tests.
+    #[cfg(test)]
+    pub fn acked_version(&self) -> Option<u64> {
+        Some(self.replica.borrow().as_ref()?.acked())
+    }
+
     /// What the text defines, in order (see [`symbols::outline`]), outlined
     /// again only once it changed.
     pub fn outline(&self) -> Rc<Vec<Symbol>> {
@@ -556,18 +617,65 @@ impl Document {
     }
 
     /// Writes the text to `path`, with the file's line endings, and marks
-    /// it saved.
+    /// it saved, for tests: the app has the host write it.
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let line_ending = self.file.borrow().line_ending;
         let text = self.buffer.text();
+        let epoch = self.buffer.content_epoch();
         let stamp = save(path, &text, line_ending)?;
-        self.history.borrow_mut().mark_saved();
-        *self.saved.borrow_mut() = Saved::of(&text);
-        *self.on_disk.borrow_mut() = OnDisk {
-            stamp: Some(stamp),
-            disk: Disk::Same,
-        };
+        self.saved_as(&text, epoch, stamp);
         Ok(())
+    }
+
+    /// What to have `host` write to save it, its copy brought up to date:
+    /// the copy, its version, and its text; the buffer's content epoch
+    /// then; and how lines end.
+    pub fn to_write(&self, host: &Link) -> (DocId, u64, String, u64, LineEnding) {
+        let doc = self.sync(host);
+        let replica = self.replica.borrow();
+        let replica = replica.as_ref().expect("synced");
+        (
+            doc,
+            replica.version(),
+            replica.sent().to_string(),
+            self.buffer.content_epoch(),
+            self.file.borrow().line_ending,
+        )
+    }
+
+    /// The file on disk as last loaded or saved, to write over only if it
+    /// still is: `None` if there was no file.
+    pub fn stamp(&self) -> Option<Stamp> {
+        self.on_disk.borrow().stamp
+    }
+
+    /// Marks `text`, the text at content epoch `epoch`, written to the file
+    /// as `stamp`. It's saved, unless it was edited since.
+    pub fn saved_as(&self, text: &str, epoch: u64, stamp: Stamp) {
+        if self.buffer.content_epoch() == epoch {
+            self.history.borrow_mut().mark_saved();
+        }
+        *self.saved.borrow_mut() = Saved::of(text);
+        let mut on_disk = self.on_disk.borrow_mut();
+        on_disk.stamp = Some(stamp);
+        on_disk.disk = Disk::Same;
+    }
+
+    /// The file it is, links followed, as the host last said.
+    pub fn real(&self) -> Option<PathBuf> {
+        self.on_disk.borrow().real.clone()
+    }
+
+    /// Notes the file it is, links followed, as the host said on saving.
+    pub fn set_real(&self, real: Option<PathBuf>) {
+        self.on_disk.borrow_mut().real = real;
+    }
+
+    /// Notes that the file changed on disk since it was loaded or saved,
+    /// as found when saving: saving asks first from now on.
+    pub fn set_changed_on_disk(&self) {
+        self.on_disk.borrow_mut().disk = Disk::Changed;
     }
 
     /// How the file on disk compared with the document when last checked.
@@ -581,33 +689,40 @@ impl Document {
         self.on_disk.borrow().stamp.map(|stamp| stamp.hash)
     }
 
-    /// Catches up with the file on disk, which something else may have
-    /// changed. With no unsaved changes, the document takes the change, as
-    /// one undo step; with some, it keeps them, and saving asks first. A
-    /// file that can't be read is left for later.
+    /// Catches up with the file on disk, as the host found it, for tests.
+    #[cfg(test)]
     pub fn check_disk(&self) -> Option<DiskChange> {
-        let path = self.path()?;
-        let OnDisk { stamp, disk } = *self.on_disk.borrow();
-        let meta = match fs::metadata(&path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+        let checked = check(&self.path()?, self.stamp());
+        self.take_check(self.stamp(), checked)
+    }
+
+    /// Catches up with the file on disk, which something else may have
+    /// changed, as the host found it when it `checked`, against `stamp`.
+    /// With no unsaved changes, the document takes the change, as one undo
+    /// step; with some, it keeps them, and saving asks first. A file that
+    /// can't be read is left for later, as is a check against what the
+    /// document no longer has, having been saved since.
+    pub fn take_check(&self, stamp: Option<Stamp>, checked: Checked) -> Option<DiskChange> {
+        let disk = self.on_disk.borrow().disk;
+        if self.stamp() != stamp {
+            return None;
+        }
+        let loaded = match checked {
+            Checked::Missing => {
                 if stamp.is_none() || disk == Disk::Deleted {
                     return None;
                 }
                 self.on_disk.borrow_mut().disk = Disk::Deleted;
                 return Some(DiskChange::Deleted);
             }
-            Err(_) => return None,
+            Checked::Unreadable => return None,
+            Checked::Same(now) => {
+                // Touched, or changed back.
+                self.on_disk.borrow_mut().stamp = Some(now);
+                return self.restored();
+            }
+            Checked::Changed(loaded) => loaded,
         };
-        if stamp.is_some_and(|stamp| stamp.matches(&meta)) {
-            return self.restored();
-        }
-        let loaded = load(&path).ok()?;
-        if loaded.stamp.map(|s| s.hash) == stamp.map(|s| s.hash) {
-            // Touched, or changed back.
-            self.on_disk.borrow_mut().stamp = loaded.stamp;
-            return self.restored();
-        }
         if !self.is_modified() {
             if self.reload(loaded, true) {
                 return Some(DiskChange::Reloaded);
@@ -632,15 +747,23 @@ impl Document {
         Some(DiskChange::Restored)
     }
 
-    /// Loads the file again, dropping unsaved changes, as one undo step.
-    pub fn revert(&self) -> io::Result<()> {
+    /// Loads the file again, dropping unsaved changes, as one undo step,
+    /// for tests.
+    #[cfg(test)]
+    pub fn revert(&self) -> Result<(), String> {
         let Some(path) = self.path() else {
             return Ok(());
         };
-        if !self.reload(load(&path)?, false) {
-            return Err(io::Error::other("Couldn't load the entire file."));
+        self.revert_to(load(&path).map_err(|err| err.to_string())?)
+    }
+
+    /// Takes the file's text as `loaded` again, dropping unsaved changes,
+    /// as one undo step.
+    pub fn revert_to(&self, loaded: Loaded) -> Result<(), String> {
+        match self.reload(loaded, false) {
+            true => Ok(()),
+            false => Err("Couldn't load the entire file.".to_string()),
         }
-        Ok(())
     }
 
     /// Takes `loaded` as the text, changing only the lines that differ, as
@@ -664,6 +787,7 @@ impl Document {
             *self.on_disk.borrow_mut() = OnDisk {
                 stamp: loaded.stamp,
                 disk: Disk::Same,
+                real: loaded.real,
             };
         } else {
             history.break_group();
@@ -701,6 +825,7 @@ impl Document {
     /// language.
     pub fn rename(&self, path: PathBuf) {
         self.file.borrow_mut().path = Some(path);
+        self.on_disk.borrow_mut().real = None;
         if self.language_override.get() {
             return;
         }
@@ -756,8 +881,12 @@ fn detect_language(buffer: &EditBuffer, path: Option<&Path>) -> Option<&'static 
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Loaded {
+    /// Where it is, [`resolve`]d.
+    pub path: PathBuf,
+    /// The file it is, links followed; `None` if there's none.
+    pub real: Option<PathBuf>,
     /// The text with `\n` line breaks.
     pub text: String,
     pub line_ending: LineEnding,
@@ -767,9 +896,21 @@ pub struct Loaded {
     pub stamp: Option<Stamp>,
 }
 
-/// Reads `path`. A missing file loads as empty, to be created on save.
+/// A file as the host wrote it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Written {
+    /// Where it was written, [`resolve`]d.
+    pub path: PathBuf,
+    /// The file it is, links followed.
+    pub real: Option<PathBuf>,
+    pub stamp: Stamp,
+}
+
+/// Reads `path`, for the host. A missing file loads as empty, to be
+/// created on save.
 pub fn load(path: &Path) -> io::Result<Loaded> {
-    let (bytes, stamp) = match fs::File::open(path) {
+    let path = resolve(path);
+    let (bytes, stamp) = match fs::File::open(&path) {
         Ok(mut file) => {
             let meta = file.metadata()?;
             let mut bytes = Vec::new();
@@ -796,11 +937,94 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
 
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     Ok(Loaded {
+        real: fs::canonicalize(&path).ok(),
+        path,
         text,
         line_ending,
         mixed_endings,
         stamp,
     })
+}
+
+/// How the host found a file compared with what a document last had of it
+/// (see [`check`]).
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Checked {
+    /// It isn't there.
+    Missing,
+    /// It couldn't be read, for now.
+    Unreadable,
+    /// Its text is the same, as of this.
+    Same(Stamp),
+    /// Its text changed, to this.
+    Changed(Loaded),
+}
+
+/// How the file at `path` is, for the host, compared with `stamp`, the
+/// file as a document last loaded or saved it (`None` if there was none).
+pub fn check(path: &Path, stamp: Option<Stamp>) -> Checked {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Checked::Missing,
+        Err(_) => return Checked::Unreadable,
+    };
+    if let Some(stamp) = stamp.filter(|stamp| stamp.matches(&meta)) {
+        return Checked::Same(stamp);
+    }
+    let Ok(loaded) = load(path) else {
+        return Checked::Unreadable;
+    };
+    match loaded.stamp {
+        Some(now) if Some(now.hash) == stamp.map(|s| s.hash) => Checked::Same(now),
+        _ => Checked::Changed(loaded),
+    }
+}
+
+/// Why the host didn't save a file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Unsaved {
+    /// It changed on disk since it was last loaded or saved.
+    Changed,
+    /// Writing failed, for this reason.
+    Failed(String),
+}
+
+/// Writes `text` to `path`, as [`save`] does, for the host, unless the file
+/// isn't as `expected` any more: as it was last loaded or saved (`None` if
+/// there was no file). A file that's gone is written again. With
+/// `make_folder`, the folder it goes in is made if need be.
+pub fn write(
+    path: &Path,
+    text: &str,
+    line_ending: LineEnding,
+    expected: Option<Option<Stamp>>,
+    make_folder: bool,
+) -> Result<Stamp, Unsaved> {
+    if let Some(expected) = expected {
+        if changed_since(path, expected) {
+            return Err(Unsaved::Changed);
+        }
+    }
+    if let Some(folder) = path.parent().filter(|_| make_folder) {
+        fs::create_dir_all(folder)
+            .map_err(|err| Unsaved::Failed(format!("Can't create the folder: {err}")))?;
+    }
+    save(path, text, line_ending).map_err(|err| Unsaved::Failed(err.to_string()))
+}
+
+/// Whether the file at `path` is there, and isn't the one `stamp` is of.
+fn changed_since(path: &Path, stamp: Option<Stamp>) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        // Gone, or unreadable, which writing will tell of.
+        return false;
+    };
+    if stamp.is_some_and(|stamp| stamp.matches(&meta)) {
+        return false;
+    }
+    match load(path) {
+        Ok(loaded) => loaded.stamp.map(|s| s.hash) != stamp.map(|s| s.hash),
+        Err(_) => false,
+    }
 }
 
 /// Writes `text` (with `\n` line breaks) to `path` atomically: a sibling
@@ -847,25 +1071,39 @@ pub fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Result<Stam
 /// `path` made absolute, with `.`, `..`, and symlinked folders resolved, so
 /// that however a file is named it gets the same path as in the file tree.
 /// The file name is kept even if it is a symlink, as the tree shows it. A
-/// path whose folder doesn't exist is only made absolute.
+/// path whose folder doesn't exist is only [`normalize`]d.
+///
+/// It looks at the file system, so it's the host's (loading and saving
+/// resolve the paths they're given), and the client's only for its own
+/// files, such as its settings. The client normalizes what it opens, and
+/// takes the path the host loaded it from.
 pub fn resolve(path: &Path) -> PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     match (absolute.parent(), absolute.file_name()) {
         (Some(parent), Some(name)) => match parent.canonicalize() {
             Ok(parent) => parent.join(name),
-            Err(_) => absolute,
+            Err(_) => normalize(&absolute),
         },
-        _ => absolute,
+        _ => normalize(&absolute),
     }
 }
 
-/// Whether `a` and `b` name the same file, following symlinks.
-pub fn same_file(a: &Path, b: &Path) -> bool {
-    a == b
-        || match (a.canonicalize(), b.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
+/// `path` made absolute, with `.` and `..` taken out, without looking at
+/// the file system: a `..` after a symlinked folder goes back up the
+/// link's name, not the folder it points to.
+pub fn normalize(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut normal = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normal.pop();
+            }
+            component => normal.push(component),
         }
+    }
+    normal
 }
 
 fn resolve_symlinks(path: &Path) -> io::Result<PathBuf> {
@@ -952,13 +1190,50 @@ mod tests {
     }
 
     #[test]
+    fn writes_only_over_the_file_as_last_known() {
+        let dir = temp_dir("write");
+        let path = dir.join("a.txt");
+        fs::write(&path, "one\n").unwrap();
+        let stamp = load(&path).unwrap().stamp;
+        let written = write(&path, "two\n", LineEnding::Lf, Some(stamp), false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two\n");
+
+        // Changed since, it's left alone, unless overwriting.
+        fs::write(&path, "other\n").unwrap();
+        let stale = Some(Some(written));
+        assert_eq!(
+            write(&path, "three\n", LineEnding::Lf, stale, false),
+            Err(Unsaved::Changed)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "other\n");
+        write(&path, "three\n", LineEnding::Lf, None, false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "three\n");
+
+        // Gone, it's written again; new, it's there only if it wasn't.
+        fs::remove_file(&path).unwrap();
+        write(&path, "four\n", LineEnding::Lf, stale, false).unwrap();
+        let new = dir.join("new.txt");
+        fs::write(&new, "there\n").unwrap();
+        assert_eq!(
+            write(&new, "", LineEnding::Lf, Some(None), false),
+            Err(Unsaved::Changed)
+        );
+
+        // Its folder is made only if asked.
+        let deep = dir.join("made/b.txt");
+        assert!(write(&deep, "", LineEnding::Lf, None, false).is_err());
+        write(&deep, "b\n", LineEnding::Lf, None, true).unwrap();
+        assert_eq!(fs::read_to_string(&deep).unwrap(), "b\n");
+    }
+
+    #[test]
     fn takes_changes_on_disk_unless_it_has_unsaved_ones() {
         let _serial = crate::test_serial();
         let dir = temp_dir("disk");
         let path = dir.join("a.txt");
         fs::write(&path, "one\ntwo\n").unwrap();
         let theme = Rc::new(Theme::new().unwrap());
-        let (doc, _) = Document::open(Some(path.clone()), theme).unwrap();
+        let (doc, _) = Document::loaded(load(&path).unwrap(), theme).unwrap();
         assert_eq!(doc.check_disk(), None);
         doc.save(&path).unwrap();
         assert_eq!(doc.check_disk(), None, "its own save isn't a change");
@@ -1084,8 +1359,16 @@ mod tests {
         // Symlinked file names are kept, but still count as the same file.
         let link = dir.join("real/link.txt");
         assert_eq!(resolve(&link), link);
-        assert!(same_file(&link, &a));
-        assert!(!same_file(&a, &dir.join("real/new.txt")));
+        let (link, a) = (load(&link).unwrap(), load(&a).unwrap());
+        assert_eq!(link.real, a.real);
+        assert_eq!(load(&dir.join("real/new.txt")).unwrap().real, None);
+    }
+
+    #[test]
+    fn normalize_leaves_the_file_system_alone() {
+        assert_eq!(normalize(Path::new("/a/./b/../c/")), PathBuf::from("/a/c"));
+        assert_eq!(normalize(Path::new("/..")), PathBuf::from("/"));
+        assert!(normalize(Path::new("x")).is_absolute());
     }
 
     #[cfg(unix)]

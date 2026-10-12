@@ -11,13 +11,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
 
 use opentui::{Attributes, Buffer};
 
-use crate::document::Document;
+use crate::document::{Document, Loaded};
 use crate::editor::Editor;
 use crate::file_dialog::human_size;
+use crate::host::{Call, Link, Reply, Request};
 use crate::icons;
 use crate::image::{self, ImageView};
 use crate::input::{Mouse, MouseKind};
@@ -27,6 +29,7 @@ use crate::picker::{self, Area};
 use crate::status::Status;
 use crate::theme::{self, Theme};
 use crate::tree;
+use serde::{Deserialize, Serialize};
 
 /// The widest it gets, in columns.
 const MAX_WIDTH: u32 = 120;
@@ -48,29 +51,69 @@ enum Body {
 
 pub struct QuickLook {
     path: PathBuf,
+    /// Where it is, as the title says it.
+    shown: String,
     /// Under the title: where it is and how big.
     about: String,
     body: Body,
     area: Area,
+    /// The host looking at it, until it has.
+    peeking: Option<Call>,
+    theme: Rc<Theme>,
 }
 
 impl QuickLook {
-    /// A look at `path`, as shown by `shown`, floating in `bounds`.
-    pub fn new(path: &Path, shown: String, theme: &Rc<Theme>, bounds: Rect) -> QuickLook {
-        let (body, about) = load(path, theme);
-        let about = match about {
-            Some(about) if !shown.is_empty() => format!("{shown}  ·  {about}"),
-            Some(about) => about,
-            None => shown,
-        };
+    /// A look at `path`, as shown by `shown`, floating in `bounds`, once
+    /// the host on `host` has looked at it.
+    pub fn new(
+        host: &Link,
+        path: &Path,
+        shown: String,
+        theme: &Rc<Theme>,
+        bounds: Rect,
+    ) -> QuickLook {
         let mut look = QuickLook {
             path: path.to_path_buf(),
-            about,
-            body,
+            about: shown.clone(),
+            shown,
+            body: Body::Note(String::new()),
             area: place(bounds),
+            peeking: Some(host.call(Request::Peek {
+                path: path.to_path_buf(),
+            })),
+            theme: theme.clone(),
         };
         look.set_bounds(bounds);
+        #[cfg(test)]
+        while crate::host::at_once() && look.peeking.is_some() {
+            look.poll();
+        }
         look
+    }
+
+    /// Shows what the host found, once it has. Returns whether it did.
+    pub fn poll(&mut self) -> bool {
+        let Some(peeking) = &self.peeking else {
+            return false;
+        };
+        let peek = match peeking.try_recv() {
+            Ok(Reply::Peeked(peek)) => peek,
+            Ok(_) | Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Peek::Note("No preview".into(), None),
+        };
+        self.peeking = None;
+        let (body, about) = body_of(&self.path, peek, &self.theme);
+        self.body = body;
+        self.about = match about {
+            Some(about) if !self.shown.is_empty() => format!("{}  ·  {about}", self.shown),
+            Some(about) => about,
+            None => self.shown.clone(),
+        };
+        let body = self.body_area();
+        if let Body::Text(editor) = &mut self.body {
+            editor.set_area(body.x, body.y, body.width, body.height);
+        }
+        true
     }
 
     /// What's being looked at.
@@ -219,36 +262,70 @@ fn place(bounds: Rect) -> Area {
     }
 }
 
-/// Reads what's at `path`, and says how big it is, if that's known.
-fn load(path: &Path, theme: &Rc<Theme>) -> (Body, Option<String>) {
+/// What the host found at a path, for Quick Look to show (see [`peek`]).
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Peek {
+    /// Why there's nothing to show, and how big it is, if known.
+    Note(String, Option<u64>),
+    /// A folder's entries, folders first: names, and whether each is one.
+    Folder(Vec<(String, bool)>),
+    /// An image's or PDF's bytes, and how big it is.
+    Image(image::FileRead, u64),
+    /// A file's text, and how big it is.
+    Text(Loaded, u64),
+}
+
+/// What's at `path`, for the host.
+pub fn peek(path: &Path) -> Peek {
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
-        Err(err) => return (Body::Note(err.to_string()), None),
+        Err(err) => return Peek::Note(err.to_string(), None),
     };
     if meta.is_dir() {
         return match list(path) {
-            Ok(entries) => {
-                let about = match entries.len() {
-                    1 => "1 item".to_string(),
-                    n => format!("{n} items"),
-                };
-                (Body::Folder(entries, 0), Some(about))
-            }
-            Err(err) => (Body::Note(err.to_string()), None),
+            Ok(entries) => Peek::Folder(entries),
+            Err(err) => Peek::Note(err.to_string(), None),
         };
     }
-    let size = human_size(meta.len());
+    let size = meta.len();
     if image::is_image(path) {
-        // The image says its own size, with its dimensions.
-        return match ImageView::open(path) {
-            Ok(image) => (Body::Image(image), None),
-            Err(reason) => (Body::Note(reason), Some(size)),
+        return match image::read_if_changed(path, None) {
+            Ok(Some(read)) => Peek::Image(read, size),
+            Ok(None) => Peek::Note("No preview".into(), Some(size)),
+            Err(err) => Peek::Note(err, Some(size)),
         };
     }
-    if meta.len() > MAX_BYTES {
-        return (Body::Note("Too large to preview".into()), Some(size));
+    if size > MAX_BYTES {
+        return Peek::Note("Too large to preview".into(), Some(size));
     }
-    let doc = match Document::open(Some(path.to_path_buf()), theme.clone()) {
+    match crate::document::load(path) {
+        Ok(loaded) => Peek::Text(loaded, size),
+        Err(_) => Peek::Note("No preview".into(), Some(size)),
+    }
+}
+
+/// What to show of what the host found at `path`, and how big it is, if
+/// that's known.
+fn body_of(path: &Path, peek: Peek, theme: &Rc<Theme>) -> (Body, Option<String>) {
+    let (loaded, size) = match peek {
+        Peek::Note(note, size) => return (Body::Note(note), size.map(human_size)),
+        Peek::Folder(entries) => {
+            let about = match entries.len() {
+                1 => "1 item".to_string(),
+                n => format!("{n} items"),
+            };
+            return (Body::Folder(entries, 0), Some(about));
+        }
+        Peek::Image((data, stamp), size) => {
+            // The image says its own size, with its dimensions.
+            return match ImageView::decoded(path, data, stamp) {
+                Ok(image) => (Body::Image(image), None),
+                Err(reason) => (Body::Note(reason), Some(human_size(size))),
+            };
+        }
+        Peek::Text(loaded, size) => (loaded, human_size(size)),
+    };
+    let doc = match Document::loaded(loaded, theme.clone()) {
         Ok((doc, _)) => doc,
         Err(_) => return (Body::Note("No preview".into()), Some(size)),
     };

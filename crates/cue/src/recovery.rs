@@ -41,6 +41,8 @@ struct Tracked {
 pub struct Recovery {
     /// Where copies go; `None` keeps none.
     dir: Option<PathBuf>,
+    /// The files are on this machine, so a copy can be told from its file.
+    here: bool,
     /// This process's lock, held while it runs, once it wrote a copy.
     lock: Option<fs::File>,
     tracked: Vec<Tracked>,
@@ -62,9 +64,31 @@ impl Recovery {
     pub fn new(dir: Option<PathBuf>) -> Recovery {
         Recovery {
             dir,
+            here: true,
             lock: None,
             tracked: Vec::new(),
             next_id: 1,
+        }
+    }
+
+    /// Keeps copies where they go by default: for files on another
+    /// machine, `remote`, in a folder of that machine's, so that they're
+    /// never offered for files here.
+    pub fn for_files_on(remote: Option<&str>) -> Recovery {
+        let Some(remote) = remote else {
+            return Recovery::new(Recovery::default_dir());
+        };
+        let name: String = remote
+            .chars()
+            .map(|c| match c {
+                '/' | '\0' => '_',
+                c => c,
+            })
+            .collect();
+        let dir = Recovery::default_dir().map(|dir| dir.join("remote").join(name));
+        Recovery {
+            here: false,
+            ..Recovery::new(dir)
         }
     }
 
@@ -194,10 +218,12 @@ impl Recovery {
             if !here {
                 continue;
             }
-            let unchanged = path
-                .as_deref()
-                .and_then(|path| document::load(path).ok())
-                .is_some_and(|loaded| loaded.text == text);
+            // Files on another machine aren't read here.
+            let unchanged = self.here
+                && path
+                    .as_deref()
+                    .and_then(|path| document::load(path).ok())
+                    .is_some_and(|loaded| loaded.text == text);
             if unchanged {
                 remove(&[Orphan { file, path, text }]);
                 continue;

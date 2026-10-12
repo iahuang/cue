@@ -87,7 +87,7 @@ const ALIASES: &[(&str, &str)] = &[
 
 /// A syntax color: one of [`SYNTAX`]'s styles. Unlike a style id, it can be
 /// worked out on any thread, and drawn without a `SyntaxStyle`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyntaxColor(u8);
 
 impl SyntaxColor {
@@ -731,6 +731,7 @@ struct Def {
     syntax: &'static [(&'static str, u32)],
 }
 
+use serde::{Deserialize, Serialize};
 use Role::*;
 
 /// The themes besides Terminal, as they're listed.

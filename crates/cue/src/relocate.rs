@@ -182,8 +182,12 @@ fn copy_to(exe: &Path, dir: &Path) -> io::Result<PathBuf> {
 /// Makes `dir` if it isn't there, for this user only, and checks that it
 /// is: a folder, not a link to one, of this user's, that no one else can
 /// write to.
-fn private_folder(dir: &Path) -> io::Result<()> {
-    match fs::DirBuilder::new().mode(0o700).create(dir) {
+pub fn private_folder(dir: &Path) -> io::Result<()> {
+    match fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+    {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(err),

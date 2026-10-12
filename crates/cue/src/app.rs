@@ -65,13 +65,13 @@
 //! and otherwise leaves it saved. End Session lets it go.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use opentui::{Attributes, Buffer};
@@ -83,12 +83,14 @@ use crate::commit_view::{CantCommit, CommitAction, CommitView};
 use crate::config::{self, Config, MIN_TREE_WIDTH};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
 use crate::definition::{self, Found, Reference};
-use crate::document::{self, Disk, DiskChange, Document, Spot};
+use crate::document::{self, Disk, DiskChange, Document, Loaded, Spot, Stamp, Unsaved, Written};
 use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
+use crate::file_ops::{file_name, FileOp};
 use crate::find;
-use crate::git::{self, Carried, Change, Commit, Git, Repo, SwitchTo};
+use crate::git::{self, Carried, Change, Commit, Git, GitAnswer, GitCall, Repo, SwitchTo};
+use crate::host::{About, Call, Link, Notice, Reply, Request, Tell};
 use crate::image::{self, ImageView};
 use crate::indent::{self, Indent};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
@@ -103,19 +105,21 @@ use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::quick_look::QuickLook;
 use crate::recovery::{self, Orphan, Recovery};
+use crate::replica::{DocId, Replica};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
-use crate::session::{self, Session, Shown};
+use crate::session::{self, SessionLink, Shown};
 use crate::status::{self, GitBadge, StatusButton};
 use crate::switcher::{Switcher, SwitcherAction};
 use crate::symbols::{self, Symbol, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
+use crate::term_hub::Colors;
 use crate::terminal::Terminal;
 use crate::theme::{self, TerminalColors, Theme, ThemeId, ThemeSetting};
 use crate::toast::Toasts;
 use crate::tree::{Entry, FileTree, TreeAction};
 use crate::wake;
-use crate::watch::{Changes, Watcher};
+use crate::watch::Changes;
 use crate::workspace::Workspace;
 
 /// How far sideways a header that resizes a split is dragged, before it's
@@ -171,7 +175,7 @@ enum Redo {
     /// Closing a file or terminal the picker lists.
     CloseItem(Choice),
     /// Moving this to the Trash.
-    Trash(PathBuf),
+    Trash(Entry),
     /// Staging these files, in the repository at this root.
     Stage(PathBuf, Vec<PathBuf>),
     /// Stashing the changes in the repository at this root, as this
@@ -226,13 +230,105 @@ struct Saving {
     redo: Redo,
 }
 
+/// A file operation the host is doing (see [`App::start_file_op`]).
+struct PendingOp {
+    op: FileOp,
+    call: Call,
+    /// The file dialog asked for it, and waits for it.
+    from_dialog: bool,
+}
+
+/// What follows opening a file, in the editor showing it.
+type Go = Box<dyn FnOnce(&mut Editor)>;
+
+/// A file being opened (see [`App::open_with`]), and how.
+/// A link followed in reader mode (see [`App::follow_link`]).
+struct Following {
+    /// The path as the link has it.
+    path: String,
+    /// Where it may be, in order.
+    candidates: Vec<PathBuf>,
+    anchor: Option<String>,
+}
+
+struct Opening {
+    path: PathBuf,
+    /// The tab and panel it was opened from, to show it in.
+    panel: (TabId, PanelId),
+    preview: bool,
+    diff: bool,
+    go: Option<Go>,
+    /// What that panel showed then, to tell whether it went somewhere.
+    before: Option<Rc<Document>>,
+    /// Only if the file's there, not to be made by saving: one listed as
+    /// changed may have been deleted.
+    existing: bool,
+}
+
+/// An open file the host is checking (see [`App::check_disk`]), against
+/// what the document had of it then.
+struct Check {
+    path: PathBuf,
+    stamp: Option<Stamp>,
+    doc: Weak<Document>,
+}
+
+/// What to do once git answers (see [`App::git_answered`]).
+enum GitThen {
+    Revert {
+        short: String,
+    },
+    Stage {
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        stage: bool,
+    },
+    Stash {
+        root: PathBuf,
+        staged: bool,
+    },
+    ApplyStash {
+        pop: bool,
+    },
+    DropStash,
+    Branches {
+        root: PathBuf,
+    },
+    Switch {
+        root: PathBuf,
+        name: String,
+    },
+}
+
+/// An image the host is reading, and what for.
+enum ImageRead {
+    /// To show in this tab and panel.
+    Open {
+        panel: (TabId, PanelId),
+        path: PathBuf,
+    },
+    /// To show again where it's shown, if it changed.
+    Reload { path: PathBuf },
+}
+
+/// A file the host is writing (see [`App::write`]).
+struct Writing {
+    doc: Rc<Document>,
+    /// The text written, and the buffer's content epoch then.
+    text: String,
+    epoch: u64,
+    /// What's left of saving files, to carry on with once it's written.
+    saving: Option<Saving>,
+    call: Call,
+}
+
 /// A repository syncing with its remote, in the background.
 struct Syncing {
     /// Its top folder.
     root: PathBuf,
     sync: git::Sync,
     /// How it went, once it's done.
-    done: Receiver<Result<(), String>>,
+    done: Call,
 }
 
 /// What the main loop should do after the app handled input.
@@ -246,6 +342,11 @@ pub enum AppAction {
     /// Start cue again in this process, from its binary as it is now,
     /// keeping everything (see [`App::hand_over`]).
     Restart,
+    /// Another client is taking the session over, from the host process:
+    /// save it and leave (see [`Notice::Moved`]).
+    Moved,
+    /// The session was ended from elsewhere: exit.
+    Ended,
 }
 
 /// A terminal a process this one replaced left running, to adopt.
@@ -359,6 +460,8 @@ struct HeaderDrag {
 }
 
 pub struct App {
+    /// Does what touches the machine the workspace is on.
+    host: Link,
     workspace: Workspace,
     keymap: Keymap,
     tree: FileTree,
@@ -374,6 +477,8 @@ pub struct App {
     /// again, as the terminal's colors changed.
     theme_shown: Option<ThemeId>,
     theme_stale: bool,
+    /// The colors terminals start with, as the host was last told them.
+    told_colors: Option<Colors>,
     /// Running terminals, and exited ones still shown, in the order they
     /// were started.
     terminals: Vec<Rc<RefCell<Terminal>>>,
@@ -418,6 +523,32 @@ pub struct App {
     commit_views: Vec<CommitView>,
     /// The repositories syncing with their remotes, in the background.
     syncing: Vec<Syncing>,
+    /// What the host is doing to files, in the background.
+    file_ops: Vec<PendingOp>,
+    /// Files the host is loading, to show once it has.
+    opening: Vec<(Opening, Call, Replica)>,
+    /// Images the host is reading.
+    reading_images: Vec<(ImageRead, Call)>,
+    /// Files the host is writing.
+    writing: Vec<Writing>,
+    /// What git was asked, and what to do once it answers.
+    asking_git: Vec<(GitThen, Call)>,
+    /// Open files' records from git, waiting to hear what they were in the
+    /// last commit.
+    reading_bases: Vec<(Rc<git::Tracked>, Call)>,
+    /// Open files the host is checking for changes on disk.
+    checking: Vec<(Vec<Check>, Call)>,
+    /// Open files the host is loading again, to revert to, and then what's
+    /// left of saving files, if anything.
+    reverting: Vec<(Rc<Document>, Option<Saving>, Call)>,
+    /// A link followed in reader mode, while the host says what's there.
+    following: Option<(Following, Call)>,
+    /// A folder to add to the workspace, from the file dialog, while the
+    /// host says what it is.
+    adding_folder: Option<(PathBuf, Call)>,
+    /// What the main loop should do, from something done in the
+    /// background (see [`App::take_deferred`]).
+    deferred: Option<AppAction>,
     /// The repository whose branches the picker lists, while it does.
     branch_root: Option<PathBuf>,
     /// What git says about the workspace's repositories.
@@ -454,12 +585,11 @@ pub struct App {
     /// The panel whose editor underlines a name, with Ctrl held, to go to
     /// the definition of.
     underlined: Option<PanelId>,
-    /// Hears of files other programs change, in the tree's open folders
-    /// and those of open files, and of commits and the like in the `.git`
-    /// folders of the workspace's repositories.
-    watcher: Watcher,
     /// The tree's listing, and open files' folders and `.git` folders, the
-    /// watcher last took, to tell when to update it.
+    /// host was last told to watch, to tell when to tell it again. It hears
+    /// of files other programs change, in the tree's open folders and those
+    /// of open files, and of commits and the like in the `.git` folders of
+    /// the workspace's repositories.
     watching: Option<(u64, BTreeSet<PathBuf>)>,
     /// Files and terminals shown in the active panel, most recent first.
     recent: Vec<Recent>,
@@ -494,13 +624,25 @@ pub struct App {
     /// `None` if there was none: when an open document of it was saved
     /// with something else, the settings are read again.
     settings_hash: Option<u64>,
-    /// Where sessions are kept, if anywhere.
+    /// The settings this app read, before the host's part replaced its own
+    /// (see [`config::merge`]).
+    own_settings: Config,
+    /// The host's settings, for a host that isn't in this process, and an
+    /// ask for them again, on its way, once the app's were read again.
+    host_settings: Option<Config>,
+    asking_settings: Option<Call>,
+    /// Where sessions are kept, if anywhere, on the host's machine.
     sessions: Option<PathBuf>,
     /// The session this cue is, if it is one.
-    session: Option<Session>,
+    session: Option<SessionLink>,
     /// When it was last saved, and its terminals' screens.
     session_saved: Option<Instant>,
     screens_saved: Option<Instant>,
+    /// A save on its way to the host, and whether it has the screens.
+    session_saving: Option<(Call, bool)>,
+    /// Files and folders the host said went, and haven't come back, so
+    /// that what's in them isn't offered (see [`App::is_gone`]).
+    gone: HashSet<PathBuf>,
     /// Each terminal's screen as last saved: its name in the session, and
     /// the terminal's output epoch then.
     screens: HashMap<u32, (String, u64)>,
@@ -635,16 +777,34 @@ impl QueryInput for FileDialog {
 }
 
 impl App {
-    /// Shows `workspace`, with `file` open, or an empty panel. Focus starts
-    /// in the editor when there is a file or no tree, in the tree otherwise.
+    /// As [`App::with_host`], on a host in this process.
+    #[cfg(test)]
     pub fn new(
         workspace: Workspace,
         file: Option<PathBuf>,
         width: u32,
         height: u32,
     ) -> Result<App, String> {
-        let file = file.map(|file| document::resolve(&file));
-        let mut tree = FileTree::new(workspace.roots());
+        App::with_host(Link::start(), workspace, file, width, height)
+    }
+
+    /// Shows `workspace`, on `host`, with `file` open, or an empty panel.
+    /// Focus starts in the editor when there is a file or no tree, in the
+    /// tree otherwise.
+    pub fn with_host(
+        host: Link,
+        workspace: Workspace,
+        file: Option<PathBuf>,
+        width: u32,
+        height: u32,
+    ) -> Result<App, String> {
+        let file = file.map(|file| document::normalize(&file));
+        // Tests keep none; those of recovery set a folder of their own.
+        let recovery = match cfg!(test) {
+            true => Recovery::new(None),
+            false => Recovery::for_files_on(host.remote()),
+        };
+        let mut tree = FileTree::new(&host, workspace.roots());
         // Before revealing, so the file's folders stay in view above it.
         // The status bar is below it.
         tree.set_height(height.saturating_sub(1));
@@ -658,45 +818,41 @@ impl App {
             Focus::Tree
         };
         let theme = Rc::new(Theme::new().map_err(|e| e.to_string())?);
-        let (file, image) = match file {
-            Some(file) if image::is_image(&file) => {
-                let image = ImageView::open(&file)
-                    .map_err(|reason| format!("{}: {reason}", file.display()))?;
-                (None, Some(image))
-            }
-            file => (file, None),
-        };
-        let (doc, notice) = match file {
-            Some(file) => {
-                let (doc, notice) = Document::open(Some(file.clone()), theme.clone())
-                    .map_err(|reason| format!("{}: {reason}", file.display()))?;
-                (Some(doc), notice)
-            }
-            None => (None, None),
-        };
         let mut app = App {
-            files: FileIndex::new(&workspace),
-            symbols: SymbolIndex::new(&workspace),
-            git: Git::new(workspace.roots()),
+            files: FileIndex::new(&host, &workspace),
+            symbols: SymbolIndex::new(&host, &workspace),
+            git: Git::new(&host, workspace.roots()),
             changes: ChangesView::new(),
             log: None,
             commit_views: Vec::new(),
             syncing: Vec::new(),
+            file_ops: Vec::new(),
+            opening: Vec::new(),
+            reading_images: Vec::new(),
+            writing: Vec::new(),
+            checking: Vec::new(),
+            asking_git: Vec::new(),
+            reading_bases: Vec::new(),
+            reverting: Vec::new(),
+            following: None,
+            adding_folder: None,
+            deferred: None,
             branch_root: None,
             sidebar: Sidebar::Files,
             index_symbols_after_listing: false,
             pending_definition: None,
             underlined: None,
-            watcher: Watcher::new(),
+            host,
             watching: None,
             workspace,
             keymap: Keymap::new(&config.keys),
             tree,
-            documents: doc.iter().cloned().collect(),
+            documents: Vec::new(),
             theme,
             terminal_colors: TerminalColors::default(),
             theme_shown: None,
             theme_stale: true,
+            told_colors: None,
             terminals: Vec::new(),
             next_terminal: 1,
             terminal_cue_keys: true,
@@ -736,24 +892,23 @@ impl App {
             key_releases: true,
             search_memory: Memory::default(),
             find_memory: find::Memory::default(),
-            // Tests keep none; those of recovery set a folder of their own.
-            recovery: Recovery::new(match cfg!(test) {
-                true => None,
-                false => Recovery::default_dir(),
-            }),
+            recovery,
             settings: match cfg!(test) {
                 true => None,
                 false => config::path().map(|path| document::resolve(&path)),
             },
             settings_hash: None,
+            own_settings: (*config::get()).clone(),
+            host_settings: None,
+            asking_settings: None,
             // Tests keep none; those of sessions set a folder of their own.
-            sessions: match cfg!(test) {
-                true => None,
-                false => session::default_dir(),
-            },
+            // The host says where its are (see `App::use_about`).
+            sessions: None,
             session: None,
             session_saved: None,
             screens_saved: None,
+            session_saving: None,
+            gone: HashSet::new(),
             screens: HashMap::new(),
             attached: true,
             indents: HashMap::new(),
@@ -764,18 +919,10 @@ impl App {
             .and_then(|path| fs::read(path).ok())
             .map(|bytes| document::content_hash(&bytes));
         app.layout();
-        if let Some(doc) = &doc {
-            app.active_panel_mut()
-                .show(doc)
-                .map_err(|e| e.to_string())?;
+        // It shows once the host has loaded it.
+        if let Some(file) = &file {
+            app.open(file, false);
         }
-        if let Some(notice) = notice {
-            app.show_message(notice, false);
-        }
-        if let Some(image) = image {
-            app.show_image(image);
-        }
-        app.note_recent();
         app.watch_folders();
         app.offer_recovery(false);
         Ok(app)
@@ -2327,6 +2474,10 @@ impl App {
     /// whether the screen needs redrawing.
     pub fn poll(&mut self) -> bool {
         let now = Instant::now();
+        // What was typed since, to the host's copies.
+        for doc in &self.documents {
+            doc.sync(&self.host);
+        }
         let mut changed = self.toasts.expire(now);
         // A thread finished something to show, such as a PDF's page.
         changed |= wake::take();
@@ -2356,6 +2507,50 @@ impl App {
             self.prune_terminals();
         }
         changed |= self.search.as_mut().is_some_and(SearchModal::poll);
+        changed |= self.poll_file_ops();
+        changed |= self.poll_opening();
+        changed |= self.poll_following();
+        changed |= self.poll_adding_folder();
+        changed |= self.poll_images();
+        changed |= self.quick_look.as_mut().is_some_and(QuickLook::poll);
+        changed |= self.poll_checks();
+        changed |= self.poll_git_answers();
+        changed |= self.read_bases();
+        for view in &mut self.commit_views {
+            changed |= view.poll_git();
+        }
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            changed |= panel.commit_mut().is_some_and(CommitDiff::poll);
+        }
+        if let Some(action) = self.log.as_mut().and_then(LogView::poll) {
+            changed = true;
+            match self.log_action(action) {
+                AppAction::Continue => {}
+                action => self.deferred = Some(action),
+            }
+        }
+        for action in [self.poll_writing(), self.poll_reverting()]
+            .into_iter()
+            .flatten()
+        {
+            if !matches!(action, AppAction::Continue) {
+                self.deferred = Some(action);
+            }
+            changed = true;
+        }
+        if let Some(action) = self.dialog.as_mut().and_then(FileDialog::poll) {
+            // Enter, pressed before the folder was listed, may act now.
+            match self.dialog_action(action) {
+                AppAction::Continue => {}
+                action => self.deferred = Some(action),
+            }
+            changed = true;
+        }
+        if self.tree.poll() {
+            // The tree may list other folders, to watch.
+            self.watch_folders();
+            changed = true;
+        }
         if self.files.poll() {
             if self.index_symbols_after_listing && !self.files.listing() {
                 self.index_symbols_after_listing = false;
@@ -2381,19 +2576,58 @@ impl App {
         self.recovery
             .sync(&self.documents, self.workspace.roots(), false);
         let due = |at: Option<Instant>, every| at.is_none_or(|at| at.elapsed() >= every);
-        if self.session.is_some() && due(self.session_saved, SESSION_INTERVAL) {
+        self.poll_session_saving();
+        if self.session.is_some()
+            && self.session_saving.is_none()
+            && due(self.session_saved, SESSION_INTERVAL)
+        {
             let screens = due(self.screens_saved, SCREENS_INTERVAL);
-            self.save_session(screens);
+            self.session_saving = self.start_session_save(screens).map(|call| (call, screens));
         }
-        if let Some(changes) = self.watcher.poll() {
-            self.git.refresh();
-            changed |= self.disk_changed(changes);
-            self.refresh_finds();
-            // Folders may have come back for open files, and the tree may
-            // list others.
-            self.watching = None;
-            self.watch_folders();
-            changed |= self.follow_settings();
+        let said = self.asking_settings.as_ref().map(Call::try_recv);
+        match said {
+            Some(Ok(Reply::About(about))) => {
+                self.asking_settings = None;
+                self.host_settings = Some(config::host_settings(about.settings.as_deref()));
+                self.put_settings();
+                changed = true;
+            }
+            Some(Ok(_) | Err(TryRecvError::Disconnected)) => self.asking_settings = None,
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+        for notice in self.host.notices() {
+            match notice {
+                // The host asks git again itself.
+                Notice::DiskChanged(changes) => {
+                    self.disk_changed(changes);
+                    changed = true;
+                    self.refresh_finds();
+                    // Folders may have come back for open files, and the
+                    // tree may list others.
+                    self.watching = None;
+                    self.watch_folders();
+                    changed |= self.follow_settings();
+                }
+                Notice::Acked { doc, version } => {
+                    let acked = self.documents.iter().find(|d| d.replica_id() == Some(doc));
+                    if let Some(acked) = acked {
+                        acked.acked(version);
+                    }
+                }
+                Notice::Moved => self.deferred = Some(AppAction::Moved),
+                Notice::Ended => self.deferred = Some(AppAction::Ended),
+                Notice::Gone => {
+                    let what = match self.host.remote() {
+                        Some(remote) => format!("The connection to {remote} was lost"),
+                        None => "The host stopped".to_string(),
+                    };
+                    self.show_message(
+                        format!("{what}: files can't be opened or saved. Copy what you need, then quit."),
+                        true,
+                    );
+                    changed = true;
+                }
+            }
         }
         let committed: Vec<_> = self
             .commit_views
@@ -2407,8 +2641,8 @@ impl App {
         let mut index = 0;
         while let Some(syncing) = self.syncing.get(index) {
             let result = match syncing.done.try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => {
+                Ok(Reply::Synced(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
                     index += 1;
                     continue;
                 }
@@ -2471,6 +2705,12 @@ impl App {
         }
     }
 
+    /// What the main loop should do since the last call, from something
+    /// [`App::poll`] did, as if input had asked for it.
+    pub fn take_deferred(&mut self) -> Option<AppAction> {
+        self.deferred.take()
+    }
+
     /// Text a terminal's program copied since the last call, for the
     /// system clipboard.
     pub fn take_copied(&mut self) -> Option<String> {
@@ -2494,25 +2734,34 @@ impl App {
         if self.watching.as_ref() == Some(&watching) {
             return;
         }
+        // An open file's folder may be gone, which the host leaves out.
         let mut folders: BTreeSet<PathBuf> = self.tree.open_folders().cloned().collect();
-        for folder in &watching.1 {
-            // An open file's folder may be gone; the tree's were just listed.
-            if !folders.contains(folder) && folder.is_dir() {
-                folders.insert(folder.clone());
-            }
-        }
-        self.watcher.watch(folders);
+        folders.extend(watching.1.iter().cloned());
+        self.host.tell(Tell::Watch(folders));
+        // Tests change files right after, which a watch that hasn't
+        // started yet would miss.
+        #[cfg(test)]
+        self.host.settle();
         self.watching = Some(watching);
     }
 
     /// Catches up with `changes` to files: the tree lists what's in its
-    /// open folders now, and open files take changes to them, or, with
-    /// unsaved changes, note them for saving to ask about. Images are read
-    /// again. Returns whether anything did.
-    fn disk_changed(&mut self, changes: Changes) -> bool {
-        let listed = changes.rescan || self.tree.is_changed_by(&changes.paths);
-        if listed {
+    /// open folders again, and the host checks open files and images, to
+    /// take changes to them once it has.
+    fn disk_changed(&mut self, changes: Changes) {
+        if changes.rescan || self.tree.is_changed_by(&changes) {
             self.tree.refresh();
+        }
+        for path in &changes.paths {
+            match changes.dirs.contains_key(path) {
+                true => self.gone.remove(path),
+                false => self.gone.insert(path.clone()),
+            };
+        }
+        if !changes.dirs.is_empty() {
+            // What came back may be in a folder that did.
+            self.gone
+                .retain(|gone| !changes.dirs.keys().any(|came| came.starts_with(gone)));
         }
         // Those changed, or in a folder that moved or went.
         let touched = |path: &Path| {
@@ -2522,13 +2771,12 @@ impl App {
                     .iter()
                     .any(|changed| path.starts_with(changed))
         };
-        let mut changed = listed;
-        for panel in tab::all_panels_mut(&mut self.tabs) {
-            if let Some(image) = panel.image_mut() {
-                if touched(image.path()) {
-                    changed |= image.reload();
-                }
-            }
+        let images: BTreeSet<PathBuf> = tab::all_panels(&self.tabs)
+            .filter_map(|panel| Some(panel.image()?.path().to_path_buf()))
+            .filter(|path| touched(path))
+            .collect();
+        for path in images {
+            self.reload_images(&path);
         }
         let touched: Vec<Rc<Document>> = self
             .documents
@@ -2536,8 +2784,66 @@ impl App {
             .filter(|doc| doc.path().is_some_and(|path| touched(&path)))
             .cloned()
             .collect();
-        for doc in touched {
-            let Some(change) = doc.check_disk() else {
+        self.check_disk(touched);
+    }
+
+    /// Whether `path`, or a folder it's in, went, as far as the host said.
+    /// What it never said of is taken to be there.
+    fn is_gone(&self, path: &Path) -> bool {
+        is_gone(&self.gone, path)
+    }
+
+    /// Has the host check `docs`' files, which may have changed on disk,
+    /// to catch up with once it has (see [`App::poll_checks`]).
+    fn check_disk(&mut self, docs: Vec<Rc<Document>>) {
+        let checks: Vec<Check> = docs
+            .into_iter()
+            .filter_map(|doc| {
+                Some(Check {
+                    path: doc.path()?,
+                    stamp: doc.stamp(),
+                    doc: Rc::downgrade(&doc),
+                })
+            })
+            .collect();
+        if checks.is_empty() {
+            return;
+        }
+        let files = checks
+            .iter()
+            .map(|check| (check.path.clone(), check.stamp))
+            .collect();
+        let call = self.host.call(Request::CheckDisk { files });
+        self.checking.push((checks, call));
+        #[cfg(test)]
+        while crate::host::at_once() && !self.checking.is_empty() {
+            self.poll_checks();
+        }
+    }
+
+    /// Catches up with the files the host checked since the last call: open
+    /// files take changes to them, or, with unsaved changes, note them for
+    /// saving to ask about. Returns whether any did.
+    fn poll_checks(&mut self) -> bool {
+        let mut checked = Vec::new();
+        self.checking.retain(|(checks, call)| loop {
+            match call.try_recv() {
+                Ok(Reply::Checked { path, checked: how }) => {
+                    if let Some(check) = checks.iter().find(|check| check.path == path) {
+                        checked.push((check.doc.clone(), check.stamp, how));
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        });
+        let mut changed = false;
+        for (doc, stamp, how) in checked {
+            let Some(doc) = doc.upgrade() else {
+                continue;
+            };
+            let Some(change) = doc.take_check(stamp, how) else {
                 continue;
             };
             changed = true;
@@ -2556,15 +2862,69 @@ impl App {
         changed
     }
 
-    /// The terminals' ptys, to wait on with the keyboard: for output, and
-    /// with `true`, for taking input that's waiting. And what other threads
-    /// wake the loop with (see [`wake`]).
+    /// Has the host load `doc`'s file again, to take its text, dropping
+    /// unsaved changes, and then carry on `saving`, if given.
+    fn revert_document(&mut self, doc: Rc<Document>, saving: Option<Saving>) -> AppAction {
+        let Some(path) = doc.path() else {
+            return AppAction::Continue;
+        };
+        // What changed comes back to the host as an edit.
+        let call = self.host.call(Request::Load { path, doc: None });
+        self.reverting.push((doc, saving, call));
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let mut action = AppAction::Continue;
+            while !self.reverting.is_empty() {
+                if let Some(then) = self.poll_reverting() {
+                    action = then;
+                }
+            }
+            return action;
+        }
+        AppAction::Continue
+    }
+
+    /// Takes the text of the files loaded again since the last call. Returns
+    /// what to do then, if any were.
+    fn poll_reverting(&mut self) -> Option<AppAction> {
+        let mut loaded = Vec::new();
+        let mut index = 0;
+        while index < self.reverting.len() {
+            let result = match self.reverting[index].2.try_recv() {
+                Ok(Reply::Loaded(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => Err("The host stopped.".to_string()),
+            };
+            let (doc, saving, _) = self.reverting.remove(index);
+            loaded.push((doc, saving, result));
+        }
+        let mut action = None;
+        for (doc, saving, result) in loaded {
+            let reverted = result.and_then(|loaded| doc.revert_to(loaded));
+            action = Some(match (reverted, saving) {
+                (Err(err), _) => {
+                    let name = self.document_name(&doc);
+                    self.show_message(format!("Can't revert {name}: {err}"), true);
+                    AppAction::Continue
+                }
+                (Ok(()), Some(saving)) => self.save_then_go(saving),
+                (Ok(()), None) => {
+                    // Back into the buffer, for the cursor the reload parked.
+                    self.editor_mut();
+                    AppAction::Continue
+                }
+            });
+        }
+        action
+    }
+
+    /// What to wait on with the keyboard: what other threads, such as the
+    /// host's, wake the loop with (see [`wake`]).
     pub fn watched(&self) -> Vec<(RawFd, bool)> {
-        self.terminals
-            .iter()
-            .filter_map(|terminal| terminal.borrow().watch())
-            .chain(wake::fd().map(|fd| (fd, false)))
-            .collect()
+        wake::fd().map(|fd| (fd, false)).into_iter().collect()
     }
 
     // --- panels -----------------------------------------------------------------
@@ -2730,8 +3090,8 @@ impl App {
     /// skipped. Returns false if there was nowhere to go.
     fn step_history(&mut self, back: bool) -> bool {
         let elsewhere = self.terminals_elsewhere();
-        let (documents, terminals) = (&self.documents, &self.terminals);
-        let usable = |visit: &Visit| visit_usable(visit, documents, terminals, &elsewhere);
+        let (documents, terminals, gone) = (&self.documents, &self.terminals, &self.gone);
+        let usable = |visit: &Visit| visit_usable(visit, documents, terminals, &elsewhere, gone);
         let Some(visit) = self.tabs[self.tab]
             .active_panel_mut()
             .step_history(back, usable)
@@ -2823,7 +3183,13 @@ impl App {
             .map(|(i, visit)| (Some(i), visit));
         for (index, visit) in current.into_iter().chain(earlier) {
             let usable = index.is_none()
-                || visit_usable(visit, &self.documents, &self.terminals, &elsewhere);
+                || visit_usable(
+                    visit,
+                    &self.documents,
+                    &self.terminals,
+                    &elsewhere,
+                    &self.gone,
+                );
             if !usable || listed.iter().any(|seen| seen.shows_same(visit)) {
                 continue;
             }
@@ -2938,7 +3304,7 @@ impl App {
         let mut panel = mark.panel;
         match &mark.visit {
             Visit::File(doc, path, _) => {
-                if !file_usable(&self.documents, doc, path.as_deref()) {
+                if !file_usable(&self.documents, doc, path.as_deref(), &self.gone) {
                     self.mark = None;
                     self.show_message("Marked file no longer exists.", false);
                     return;
@@ -3220,7 +3586,7 @@ impl App {
                         }
                     }
                     Choice::FileAt(path, position) => {
-                        if self.open_and(&path, |editor| editor.go_to(position)) {
+                        if self.open_and(&path, move |editor| editor.go_to(position)) {
                             self.focus = Focus::Editor;
                         }
                     }
@@ -3318,7 +3684,7 @@ impl App {
     /// Selects the name of a symbol, on `line` in its `bytes` there, in the
     /// file at `path`, or without one, in the active editor.
     fn go_to_symbol(&mut self, path: Option<&Path>, line: u32, bytes: std::ops::Range<usize>) {
-        let go = |editor: &mut Editor| editor.select_in_line(line, bytes);
+        let go = move |editor: &mut Editor| editor.select_in_line(line, bytes);
         let shown = match path {
             Some(path) => self.open_and(path, go),
             None => self.editor_mut().map(go).is_some(),
@@ -3541,8 +3907,21 @@ impl App {
             || self.dialog.is_some()
     }
 
-    /// Puts the active editor's cursor at `position`.
+    /// Puts the active editor's cursor at `position`, or, with a file on
+    /// its way to the active panel, that file's, once it's shown.
     pub fn go_to(&mut self, position: Position) {
+        // A file on its way to the active panel, it's in that one.
+        let panel = (self.tab().id, self.tab().active);
+        if let Some((opening, ..)) = self.opening.iter_mut().find(|(o, ..)| o.panel == panel) {
+            let before = opening.go.take();
+            opening.go = Some(Box::new(move |editor: &mut Editor| {
+                if let Some(before) = before {
+                    before(editor);
+                }
+                editor.go_to(position);
+            }));
+            return;
+        }
         if let Some(editor) = self.editor_mut() {
             editor.go_to(position);
         }
@@ -3566,14 +3945,16 @@ impl App {
             .editor()
             .and_then(Editor::selected_text)
             .filter(|text| !text.contains('\n'));
-        // Open files are searched as they are, saved or not.
-        let unsaved: HashMap<PathBuf, String> = self
+        // Open files are searched as they are, saved or not: their copies
+        // on the host.
+        let unsaved: HashMap<PathBuf, DocId> = self
             .documents
             .iter()
             .filter(|doc| doc.is_modified())
-            .filter_map(|doc| Some((doc.path()?, doc.text())))
+            .filter_map(|doc| Some((doc.path()?, doc.sync(&self.host))))
             .collect();
         self.search = Some(SearchModal::new(
+            &self.host,
             &self.workspace,
             &self.keymap,
             self.search_memory.clone(),
@@ -3606,7 +3987,7 @@ impl App {
             SearchAction::Close => self.close_search(),
             SearchAction::Open { path, line, range } => {
                 self.close_search();
-                if self.open_and(&path, |editor| editor.select_in_line(line, range)) {
+                if self.open_and(&path, move |editor| editor.select_in_line(line, range)) {
                     self.focus = Focus::Editor;
                 }
             }
@@ -3617,38 +3998,42 @@ impl App {
     // --- files ------------------------------------------------------------------
 
     /// Shows the file at `path` in the active panel, opening it if it isn't
-    /// open yet. A newly opened file takes the place of an unnamed buffer
-    /// left behind that was never typed in, or as a `preview`, of the
-    /// previous preview, unless another panel shows it. Opening a preview
-    /// without `preview` keeps it. Returns false, with a message, if the
-    /// file can't be opened.
+    /// open yet: once the host has loaded it (see [`App::poll_opening`]).
+    /// A newly opened file takes the place of an unnamed buffer left
+    /// behind that was never typed in, or as a `preview`, of the previous
+    /// preview, unless another panel shows it. Opening a preview without
+    /// `preview` keeps it. Returns false, with a message, if the file can't
+    /// be opened, as far as is known yet.
     fn open(&mut self, path: &Path, preview: bool) -> bool {
-        self.open_as(path, preview, false)
+        self.open_with(path, preview, false, None, false)
     }
 
-    /// Opens `path` as [`App::open`] does, and moves in it with `go`. In a
-    /// file it went to, moving is part of going there, which the panel's
-    /// history notes already, rather than a jump within it.
-    fn open_and(&mut self, path: &Path, go: impl FnOnce(&mut Editor)) -> bool {
-        let before = self.active_panel().document().cloned();
-        if !self.open(path, false) {
-            return false;
-        }
-        let arrived = !before.is_some_and(|doc| self.active_panel().shows(&doc));
-        if let Some(editor) = self.editor_mut() {
-            go(editor);
-            if arrived {
-                editor.take_jump();
-            }
-        }
-        true
+    /// Opens `path` as [`App::open`] does, and moves in it with `go`, once
+    /// it's shown. In a file it went to, moving is part of going there,
+    /// which the panel's history notes already, rather than a jump within
+    /// it.
+    fn open_and(&mut self, path: &Path, go: impl FnOnce(&mut Editor) + 'static) -> bool {
+        self.open_with(path, false, false, Some(Box::new(go)), false)
     }
 
     /// Opens `path` as [`App::open`] does, and with `diff`, shows how it
     /// changed since the last commit rather than its text, unless it shows
-    /// that already. Without, it shows the text.
+    /// that already. Without, it shows the text. A file that isn't there
+    /// isn't opened, but said to be deleted.
     fn open_as(&mut self, path: &Path, preview: bool, diff: bool) -> bool {
-        let path = document::resolve(path);
+        self.open_with(path, preview, diff, None, true)
+    }
+
+    fn open_with(
+        &mut self,
+        path: &Path,
+        preview: bool,
+        diff: bool,
+        go: Option<Go>,
+        existing: bool,
+    ) -> bool {
+        // The host resolves it as it loads it.
+        let path = document::normalize(path);
         // Coming back to a file, the keyboard is for its text.
         if let Some(editor) = self.editor_mut() {
             editor.blur_find();
@@ -3656,24 +4041,118 @@ impl App {
         if image::is_image(&path) {
             return self.open_image(&path);
         }
-        let existing = self.find_document(&path);
-        let had_terminal = self.active_terminal().is_some();
-        let (doc, notice) = match &existing {
-            Some(doc) => (doc.clone(), None),
-            None => match Document::open(Some(path.clone()), self.theme.clone()) {
-                Ok(opened) => opened,
-                Err(reason) => {
-                    self.cant_open(&reason, &path);
-                    return false;
-                }
-            },
+        let opening = Opening {
+            panel: (self.tab().id, self.tab().active),
+            before: self.active_panel().document().cloned(),
+            path: path.clone(),
+            preview,
+            diff,
+            go,
+            existing,
         };
+        if let Some(doc) = self.find_document(&path) {
+            return self.show_opened(doc, None, opening);
+        }
+        // What the panel was to show before, it no longer is.
+        self.opening
+            .retain(|(other, ..)| other.panel != opening.panel);
+        let (call, replica) = load(&self.host, path);
+        self.opening.push((opening, call, replica));
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let mut shown = false;
+            while !self.opening.is_empty() {
+                shown |= self.poll_opening();
+            }
+            return shown;
+        }
+        true
+    }
+
+    /// Shows the files the host loaded since the last call, in the panels
+    /// they were opened in. Returns whether any were shown.
+    fn poll_opening(&mut self) -> bool {
+        let mut loaded = Vec::new();
+        let mut index = 0;
+        while index < self.opening.len() {
+            let result = match self.opening[index].1.try_recv() {
+                Ok(Reply::Loaded(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => Err("The host stopped.".to_string()),
+            };
+            let (opening, _, replica) = self.opening.remove(index);
+            loaded.push((opening, result, replica));
+        }
+        let mut shown = false;
+        for (opening, result, replica) in loaded {
+            shown |= self.opened(opening, result, replica);
+        }
+        shown
+    }
+
+    /// Shows the file `opening` asked for, as `result` loaded it, in the
+    /// panel it was asked from if it's still in this tab. Returns false,
+    /// with a message, if it can't be.
+    fn opened(
+        &mut self,
+        opening: Opening,
+        result: Result<Loaded, String>,
+        replica: Replica,
+    ) -> bool {
+        // Open already by another name, or opened meanwhile, it's that one.
+        let open = result.as_ref().ok().and_then(|loaded| {
+            self.documents
+                .iter()
+                .find(|doc| doc.is_loaded(loaded))
+                .cloned()
+        });
+        let opened = match (open, result) {
+            (Some(doc), _) => Ok((doc, None)),
+            (None, Ok(loaded)) if opening.existing && loaded.stamp.is_none() => {
+                let message = format!("{} was deleted.", file_name(&loaded.path));
+                self.show_message(message, false);
+                return false;
+            }
+            (None, result) => {
+                result.and_then(|loaded| document_of(loaded, replica, self.theme.clone()))
+            }
+        };
+        let (doc, notice) = match opened {
+            Ok(opened) => opened,
+            Err(reason) => {
+                self.cant_open(&reason, &opening.path);
+                return false;
+            }
+        };
+        let (tab, panel) = opening.panel;
+        if self.tab().id == tab && self.tab().panels.iter().any(|p| p.id == panel) {
+            self.tab_mut().active = panel;
+        }
+        self.show_opened(doc, notice, opening)
+    }
+
+    /// Shows `doc`, open or newly loaded with `notice`, in the active
+    /// panel, as `opening` asked.
+    fn show_opened(&mut self, doc: Rc<Document>, notice: Option<String>, opening: Opening) -> bool {
+        let Opening {
+            path,
+            preview,
+            diff,
+            go,
+            before,
+            ..
+        } = opening;
+        let existing = self.documents.iter().any(|open| Rc::ptr_eq(open, &doc));
+        let had_terminal = self.active_terminal().is_some();
         let left = self.active_panel().document().cloned();
         if let Err(err) = self.active_panel_mut().show(&doc) {
             self.cant_open(&err.to_string(), &path);
             return false;
         }
-        if existing.is_none() {
+        if !existing {
             self.apply_indent(&doc);
             let replaced = match left {
                 Some(left) if left.is_blank() => Some(left),
@@ -3712,6 +4191,15 @@ impl App {
                 false => editor.set_diffing(false),
             }
         }
+        if let Some(go) = go {
+            let arrived = !before.is_some_and(|doc| self.active_panel().shows(&doc));
+            if let Some(editor) = self.editor_mut() {
+                go(editor);
+                if arrived {
+                    editor.take_jump();
+                }
+            }
+        }
         self.prune_documents();
         if had_terminal {
             self.prune_terminals();
@@ -3721,27 +4209,136 @@ impl App {
     }
 
     /// Shows the image at `path` in the active panel, unless it's on
-    /// screen there already, though read again if it changed. Returns
-    /// false, with a message, if it can't be opened.
+    /// screen there already, though read again if it changed, once the
+    /// host has read it. Returns false, with a message, if it can't be
+    /// opened, as far as is known yet.
     fn open_image(&mut self, path: &Path) -> bool {
-        let shown = match self.active_panel_mut().image_mut() {
-            Some(image) if image.path() == path => {
-                image.reload();
-                true
-            }
-            _ => false,
+        let unless = match self.active_panel().image() {
+            Some(image) if image.path() == path => Some(image.stamp()),
+            _ => None,
         };
-        if !shown {
-            match ImageView::open(path) {
-                Ok(image) => self.show_image(image),
-                Err(reason) => {
-                    self.cant_open(&reason, path);
-                    return false;
+        let panel = (self.tab().id, self.tab().active);
+        // What the panel was to show before, it no longer is.
+        self.opening.retain(|(other, ..)| other.panel != panel);
+        self.reading_images.retain(
+            |(read, _)| !matches!(read, ImageRead::Open { panel: other, .. } if *other == panel),
+        );
+        let call = self.host.call(Request::ReadFile {
+            path: path.to_path_buf(),
+            unless: unless.flatten(),
+        });
+        let path = path.to_path_buf();
+        self.reading_images
+            .push((ImageRead::Open { panel, path }, call));
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let mut shown = false;
+            while !self.reading_images.is_empty() {
+                shown |= self.poll_images();
+            }
+            return shown;
+        }
+        true
+    }
+
+    /// Has the host read the images shown from `path` again, if they
+    /// changed, to show once it has.
+    fn reload_images(&mut self, path: &Path) {
+        let unless = tab::all_panels(&self.tabs)
+            .filter_map(Panel::image)
+            .find(|image| image.path() == path)
+            .and_then(ImageView::stamp);
+        let call = self.host.call(Request::ReadFile {
+            path: path.to_path_buf(),
+            unless,
+        });
+        let path = path.to_path_buf();
+        self.reading_images.push((ImageRead::Reload { path }, call));
+        #[cfg(test)]
+        while crate::host::at_once() && !self.reading_images.is_empty() {
+            self.poll_images();
+        }
+    }
+
+    /// Shows the images the host read since the last call. Returns whether
+    /// any are shown.
+    fn poll_images(&mut self) -> bool {
+        let mut read = Vec::new();
+        let mut index = 0;
+        while index < self.reading_images.len() {
+            let result = match self.reading_images[index].1.try_recv() {
+                Ok(Reply::Bytes(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
                 }
+                Err(TryRecvError::Disconnected) => Err("The host stopped.".to_string()),
+            };
+            let (what, _) = self.reading_images.remove(index);
+            read.push((what, result));
+        }
+        let mut shown = false;
+        for (what, result) in read {
+            shown |= self.image_read(what, result);
+        }
+        shown
+    }
+
+    /// Shows an image the host read, as `what` asked. Returns whether it's
+    /// shown.
+    fn image_read(
+        &mut self,
+        what: ImageRead,
+        result: Result<Option<image::FileRead>, String>,
+    ) -> bool {
+        match what {
+            ImageRead::Reload { path } => {
+                let Ok(Some((data, stamp))) = result else {
+                    return false;
+                };
+                let mut shown = false;
+                for panel in tab::all_panels_mut(&mut self.tabs) {
+                    if let Some(image) = panel.image_mut().filter(|image| image.path() == path) {
+                        shown |= image.reload_with(data.clone(), stamp);
+                    }
+                }
+                shown
+            }
+            ImageRead::Open {
+                panel: (tab, panel),
+                path,
+            } => {
+                if self.tab().id == tab && self.tab().panels.iter().any(|p| p.id == panel) {
+                    self.tab_mut().active = panel;
+                }
+                let shown = match result {
+                    // Unchanged, and on screen there already.
+                    Ok(None) => true,
+                    Ok(Some((data, stamp))) => match self.active_panel_mut().image_mut() {
+                        Some(image) if image.path() == path => {
+                            image.reload_with(data, stamp);
+                            true
+                        }
+                        _ => match ImageView::decoded(&path, data, stamp) {
+                            Ok(image) => {
+                                self.show_image(image);
+                                true
+                            }
+                            Err(reason) => {
+                                self.cant_open(&reason, &path);
+                                false
+                            }
+                        },
+                    },
+                    Err(reason) => {
+                        self.cant_open(&reason, &path);
+                        false
+                    }
+                };
+                self.show_active_in_tree();
+                shown
             }
         }
-        self.show_active_in_tree();
-        true
     }
 
     fn show_image(&mut self, image: ImageView) {
@@ -3888,8 +4485,7 @@ impl App {
             .iter()
             .filter(|recent| shown.as_ref() != Some(*recent))
             .filter_map(|recent| match recent {
-                Recent::File(path) => path
-                    .is_file()
+                Recent::File(path) => (!self.is_gone(path))
                     .then(|| Item::file(path.clone(), &self.workspace, "recent")),
                 Recent::Terminal(id) => self
                     .terminals
@@ -4086,24 +4682,6 @@ impl App {
         self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
     }
 
-    /// Saves `doc` over its file, whatever is there.
-    fn overwrite(&mut self, doc: &Rc<Document>) -> AppAction {
-        let Some(path) = doc.path() else {
-            return AppAction::Continue;
-        };
-        let action = match self.editor_mut() {
-            Some(editor) if Rc::ptr_eq(editor.document(), doc) => editor.write(path),
-            _ => match doc.save(&path) {
-                Ok(()) => Action::Saved,
-                Err(err) => {
-                    self.show_message(format!("Can't save: {err} ({})", path.display()), true);
-                    Action::Continue
-                }
-            },
-        };
-        self.editor_action(action)
-    }
-
     fn alert_action(&mut self, action: AlertAction<Answer>) -> AppAction {
         let answer = match action {
             AlertAction::Continue => return AppAction::Continue,
@@ -4135,24 +4713,8 @@ impl App {
                 return AppAction::Continue;
             }
             Answer::Save(docs, redo) => Saving { docs, redo },
-            Answer::Overwrite(doc, saving) => {
-                let action = self.overwrite(&doc);
-                match saving {
-                    Some(saving) if !doc.is_modified() => saving,
-                    _ => return action,
-                }
-            }
-            Answer::Revert(doc, saving) => {
-                let name = self.document_name(&doc);
-                if let Err(err) = doc.revert() {
-                    self.show_message(format!("Can't revert {name}: {err}"), true);
-                    return AppAction::Continue;
-                }
-                match saving {
-                    Some(saving) => saving,
-                    None => return AppAction::Continue,
-                }
-            }
+            Answer::Overwrite(doc, saving) => return self.write(doc, true, false, saving),
+            Answer::Revert(doc, saving) => return self.revert_document(doc, saving),
         };
         self.save_then_go(saving)
     }
@@ -4162,27 +4724,23 @@ impl App {
     /// on; one that can't be saved stops it.
     fn save_then_go(&mut self, saving: Saving) -> AppAction {
         let Saving { mut docs, redo } = saving;
-        while !docs.is_empty() {
-            let doc = docs.remove(0);
-            let Some(path) = doc.path() else {
-                self.show_document(&doc);
-                self.show_dialog(Purpose::SaveAs);
-                self.saving = Some(Saving { docs, redo });
-                return AppAction::Continue;
-            };
-            // It may have changed since the alert was put up.
-            doc.check_disk();
-            if doc.disk() == Disk::Changed {
-                self.ask_overwrite(doc, Some(Saving { docs, redo }));
-                return AppAction::Continue;
-            }
-            if let Err(err) = doc.save(&path) {
-                let message = format!("Can't save: {err} ({})", path.display());
-                self.show_message(message, true);
-                return AppAction::Continue;
-            }
+        if docs.is_empty() {
+            return self.go(redo);
         }
-        self.go(redo)
+        let doc = docs.remove(0);
+        let rest = Saving { docs, redo };
+        if doc.path().is_none() {
+            self.show_document(&doc);
+            self.show_dialog(Purpose::SaveAs);
+            self.saving = Some(rest);
+            return AppAction::Continue;
+        }
+        if doc.disk() == Disk::Changed {
+            self.ask_overwrite(doc, Some(rest));
+            return AppAction::Continue;
+        }
+        // The host makes sure it didn't change since the alert was put up.
+        self.write(doc, false, false, Some(rest))
     }
 
     /// Goes ahead with `redo`, which the user confirmed.
@@ -4201,8 +4759,8 @@ impl App {
                 AppAction::Continue
             }
             Redo::CloseItem(choice) => self.picker_action(PickerAction::CloseItem(choice)),
-            Redo::Trash(path) => {
-                self.trash(&path, true);
+            Redo::Trash(target) => {
+                self.trash(&target, true);
                 AppAction::Continue
             }
             Redo::Stage(root, paths) => {
@@ -4297,8 +4855,8 @@ impl App {
     /// Opens a new, untitled file, numbered after the untitled files open,
     /// without showing it.
     fn open_untitled(&mut self) -> Option<Rc<Document>> {
-        let doc = match Document::open(None, self.theme.clone()) {
-            Ok((doc, _)) => doc,
+        let doc = match Document::untitled(self.theme.clone()) {
+            Ok(doc) => doc,
             Err(err) => {
                 self.show_message(format!("Can't open a new file: {err}"), true);
                 return None;
@@ -4386,9 +4944,29 @@ impl App {
     /// settings did, since they may have been changed by hand since.
     /// Terminals already running keep their shell and scrollback.
     fn apply_settings(&mut self, config: Config) {
+        self.own_settings = config;
+        // A host process reads its own, and says what it read; one in this
+        // process shares these, but for tests, where each thread has its
+        // own. Told before what follows asks it anything.
+        self.host.tell(Tell::ReloadConfig);
+        if !self.host.is_local() {
+            self.asking_settings = Some(self.host.call(Request::About));
+        }
+        self.put_settings();
+    }
+
+    /// Puts this app's settings in use, with the host's part replacing its
+    /// own if the host's said what it is, applying what changed.
+    fn put_settings(&mut self) {
+        let config = match &self.host_settings {
+            Some(host) => config::merge(self.own_settings.clone(), host),
+            None => self.own_settings.clone(),
+        };
         let old = config::get();
         config::set(config);
         let new = config::get();
+        #[cfg(test)]
+        self.host.set_config(new.clone());
         self.keymap = Keymap::new(&new.keys);
         if new.tree != old.tree {
             self.tree_visible = new.tree;
@@ -4411,8 +4989,8 @@ impl App {
         }
         if new.exclude != old.exclude {
             self.tree.refresh();
-            self.files = FileIndex::new(&self.workspace);
-            self.symbols = SymbolIndex::new(&self.workspace);
+            self.files = FileIndex::new(&self.host, &self.workspace);
+            self.symbols = SymbolIndex::new(&self.host, &self.workspace);
             self.show_active_in_tree();
         }
         self.layout();
@@ -4440,9 +5018,22 @@ impl App {
     }
 
     /// Puts the theme in use, if it isn't already: the one Select Theme
-    /// has selected, or the setting's, for the terminal's colors. Returns
-    /// whether the colors changed.
+    /// has selected, or the setting's, for the terminal's colors, and
+    /// tells the host its terminals' colors, for answering programs that
+    /// ask. Returns whether the colors changed.
     pub fn update_theme(&mut self) -> bool {
+        let changed = self.put_theme();
+        let colors = theme::colors().terminal.as_ref().map(Colors::from);
+        if let Some(colors) = colors.filter(|&colors| self.told_colors != Some(colors)) {
+            self.told_colors = Some(colors);
+            self.host.tell(Tell::Colors(colors));
+        }
+        changed
+    }
+
+    /// Puts the theme in use, if it isn't already (see
+    /// [`App::update_theme`]).
+    fn put_theme(&mut self) -> bool {
         let previewed = self
             .picker
             .as_ref()
@@ -4553,6 +5144,15 @@ impl App {
             self.show_message("Can't locate settings: HOME isn't set.", true);
             return;
         };
+        // Files open from the host's machine, which this file isn't on.
+        if let Some(remote) = self.host.remote() {
+            let message = format!(
+                "Settings are in {} on this machine, and [editor], [terminal], and [files] in {remote}'s. Edit them there, then run Reload Settings.",
+                crate::client::tilde_here(&path)
+            );
+            self.show_message(message, false);
+            return;
+        }
         let made = path
             .parent()
             .map_or(Ok(()), fs::create_dir_all)
@@ -4582,6 +5182,15 @@ impl App {
     }
 
     // --- recovery ---------------------------------------------------------------
+
+    /// A document of the file `loaded`, as [`load_all`] loaded it.
+    fn loaded_document(
+        &self,
+        loaded: Option<(Result<Loaded, String>, Replica)>,
+    ) -> Result<(Rc<Document>, Option<String>), String> {
+        let (loaded, replica) = loaded.ok_or("Not loaded.")?;
+        document_of(loaded?, replica, self.theme.clone())
+    }
 
     /// Offers back the unsaved changes cues that are gone left in this
     /// workspace, if any (see [`crate::recovery`]). `asked`, it says so if
@@ -4613,13 +5222,21 @@ impl App {
     /// Opens the files `orphans` are of with their text, as unsaved changes,
     /// showing the first, and removes the copies.
     fn recover(&mut self, orphans: &[Orphan]) {
+        let paths = orphans.iter().map(|orphan| {
+            orphan
+                .path
+                .clone()
+                .filter(|path| self.find_document(path).is_none())
+        });
+        let mut loaded = load_all(&self.host, paths.collect()).into_iter();
         let mut first = None;
         let mut count = 0;
         for orphan in orphans {
+            let loaded = loaded.next().flatten();
             let doc = match &orphan.path {
                 Some(path) => match self.find_document(path) {
                     Some(doc) => doc,
-                    None => match Document::open(Some(path.clone()), self.theme.clone()) {
+                    None => match self.loaded_document(loaded) {
                         Ok((doc, _)) => {
                             self.apply_indent(&doc);
                             self.documents.push(doc.clone());
@@ -4698,8 +5315,20 @@ impl App {
 
     // --- sessions -----------------------------------------------------------------
 
+    /// Does what touches the machine the workspace is on.
+    pub fn host(&self) -> &Link {
+        &self.host
+    }
+
+    /// Leaves the host, for another client to come to, its terminals
+    /// running on. Their programs' queries were the host's to answer all
+    /// along (see [`crate::term_hub`]), so none is left unanswered.
+    pub fn leave(&mut self) {
+        self.host.leave();
+    }
+
     /// The session this cue is, if any.
-    pub fn session(&self) -> Option<&Session> {
+    pub fn session(&self) -> Option<&SessionLink> {
         self.session.as_ref()
     }
 
@@ -4726,7 +5355,10 @@ impl App {
             }
         };
         let about: String = about.chars().filter(|c| !c.is_control()).collect();
-        format!("cue: {about}")
+        match self.host.remote() {
+            Some(remote) => format!("cue: {about} · {remote}"),
+            None => format!("cue: {about}"),
+        }
     }
 
     /// Stops being a session, removing what it kept, as when it was one
@@ -4736,10 +5368,21 @@ impl App {
         if let Some(session) = self.session.take() {
             session.end();
         }
-        self.recovery = Recovery::new(match cfg!(test) {
-            true => None,
-            false => Recovery::default_dir(),
-        });
+        self.recovery = match cfg!(test) {
+            true => Recovery::new(None),
+            false => Recovery::for_files_on(self.host.remote()),
+        };
+    }
+
+    /// Takes what the host said of its machine: where its sessions are
+    /// kept, and its settings, whose part replaces this app's, `own`,
+    /// unless the host's in this process (see [`config::merge`]).
+    pub fn use_about(&mut self, about: About, own: Config) {
+        self.sessions = about.sessions;
+        self.own_settings = own;
+        if !self.host.is_local() {
+            self.host_settings = Some(config::host_settings(about.settings.as_deref()));
+        }
     }
 
     /// Lets the session go without asking, as `cue --end` does.
@@ -4773,7 +5416,7 @@ impl App {
             self.show_message("Can't save sessions: HOME isn't set.", true);
             return false;
         };
-        match Session::create(&sessions) {
+        match SessionLink::create(&self.host, &sessions) {
             Ok(session) => {
                 self.session = Some(session);
                 if !self.save_session(false) {
@@ -4850,27 +5493,54 @@ impl App {
     }
 
     /// Saves the session, if this is one, as it is now; with `screens`,
-    /// terminals' screens too, where they changed.
+    /// terminals' screens too, where they changed, waiting for the host.
     /// Returns false, with a message, if unsaved text or metadata could
     /// not be written. Callers leaving the app must keep it open then.
     pub fn save_session(&mut self, screens: bool) -> bool {
-        if self.session.is_none() {
-            return true;
+        // In order: one on its way goes first.
+        if let Some((call, screens)) = self.session_saving.take() {
+            self.session_saved(call.wait(), screens);
         }
-        let result = self.session_state(screens).and_then(|state| {
-            let session = self.session.as_mut().unwrap();
-            session.save(&state)?;
-            // Only the committed metadata decides which copies may go.
-            let texts = state
-                .documents
-                .iter()
-                .filter_map(|doc| doc.unsaved.clone())
-                .collect::<Vec<_>>();
-            session.prune_texts(&texts);
-            Ok(())
-        });
+        match self.start_session_save(screens) {
+            Some(call) => self.session_saved(call.wait(), screens),
+            None => true,
+        }
+    }
+
+    /// Takes in how the save on its way went, if the host's said.
+    fn poll_session_saving(&mut self) {
+        let Some((call, _)) = &self.session_saving else {
+            return;
+        };
+        let reply = match call.try_recv() {
+            Ok(reply) => Some(reply),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        let (_, screens) = self.session_saving.take().unwrap();
+        self.session_saved(reply, screens);
+    }
+
+    /// Has the host save the session, if this is one (see
+    /// [`App::save_session`]).
+    fn start_session_save(&mut self, screens: bool) -> Option<Call> {
+        self.session.as_ref()?;
+        let state = self.session_state(screens);
         self.session_saved = Some(Instant::now());
-        if let Err(err) = result {
+        Some(self.session.as_mut()?.save(state, screens))
+    }
+
+    /// Catches up with a save of the session, as the host's `reply` says.
+    /// Returns false, with a message, if it failed.
+    fn session_saved(&mut self, reply: Option<Reply>, screens: bool) -> bool {
+        let Some(session) = &mut self.session else {
+            return true;
+        };
+        if let Err(err) = session.saved(reply) {
+            // Written again with the next save.
+            for (_, epoch) in self.screens.values_mut() {
+                *epoch = u64::MAX;
+            }
             self.show_message(format!("Can't save session: {err}"), true);
             return false;
         }
@@ -4880,26 +5550,23 @@ impl App {
         true
     }
 
-    /// Everything the session keeps, writing unsaved changes, and with
-    /// `screens`, terminals' screens, where they changed.
-    fn session_state(&mut self, screens: bool) -> io::Result<session::State> {
+    /// Everything the session keeps, noting unsaved changes to be written
+    /// with it, and with `screens`, terminals' screens, where they changed.
+    fn session_state(&mut self, screens: bool) -> session::State {
         let Some(session) = &mut self.session else {
-            return Ok(session::State::default());
+            return session::State::default();
         };
         let documents = self
             .documents
             .iter()
             .filter(|doc| !doc.is_blank())
-            .map(|doc| {
-                let unsaved = session.save_text(doc)?;
-                Ok(session::Doc {
-                    path: doc.path(),
-                    untitled: doc.untitled.get(),
-                    unsaved,
-                    preview: self.preview.as_ref().is_some_and(|p| Rc::ptr_eq(p, doc)),
-                })
+            .map(|doc| session::Doc {
+                path: doc.path(),
+                untitled: doc.untitled.get(),
+                unsaved: session.save_text(doc),
+                preview: self.preview.as_ref().is_some_and(|p| Rc::ptr_eq(p, doc)),
             })
-            .collect::<io::Result<Vec<_>>>()?;
+            .collect();
 
         let mut terminals = Vec::new();
         for terminal in &self.terminals {
@@ -4908,9 +5575,12 @@ impl App {
             let epoch = terminal.epoch();
             let saved = self.screens.get(&id).map(|(_, at)| *at);
             if screens && saved != Some(epoch) {
-                let name = terminal
-                    .screen(false)
-                    .and_then(|(screen, _)| session.save_screen(id, &screen).ok());
+                let name = match terminal.host_id().filter(|_| terminal.host_keeps_screen()) {
+                    Some(on_host) => Some(session.save_host_screen(id, on_host)),
+                    None => terminal
+                        .screen(false)
+                        .map(|(screen, _)| session.save_screen(id, screen)),
+                };
                 if let Some(name) = name {
                     self.screens.insert(id, (name, epoch));
                 }
@@ -4923,18 +5593,11 @@ impl App {
                 program: terminal.is_busy().then(|| terminal.program()).flatten(),
                 screen: self.screens.get(&id).map(|(name, _)| name.clone()),
                 size: (cols, rows),
+                host_id: terminal.host_id(),
             });
         }
         let ids: Vec<u32> = terminals.iter().map(|terminal| terminal.id).collect();
         self.screens.retain(|id, _| ids.contains(id));
-        if screens {
-            let kept: Vec<String> = self
-                .screens
-                .values()
-                .map(|(name, _)| name.clone())
-                .collect();
-            session.prune_screens(&kept);
-        }
 
         let tabs = self
             .tabs
@@ -4979,7 +5642,7 @@ impl App {
                 Recent::Untitled(number) => Shown::Untitled(*number),
             })
             .collect();
-        Ok(session::State {
+        session::State {
             roots: self.workspace.roots().to_vec(),
             saved: session::now(),
             tree_visible: self.tree_visible,
@@ -5003,7 +5666,7 @@ impl App {
             // The session's own, which it saves with this.
             name: None,
             unknown: Default::default(),
-        })
+        }
     }
 
     /// Goes back to `session`, as `state` has it: its files, with their
@@ -5012,7 +5675,7 @@ impl App {
     /// new shells, below what they showed.
     pub fn restore_session(
         &mut self,
-        mut session: Session,
+        mut session: SessionLink,
         state: session::State,
         adopted: Vec<Adopted>,
     ) -> Result<(), String> {
@@ -5034,20 +5697,35 @@ impl App {
         self.preview = None;
         self.indents = state.indents.iter().cloned().collect();
         let mut docs: Vec<(Shown, Rc<Document>)> = Vec::new();
+        // Asked for all at once, for one wait rather than one each.
+        let names = state
+            .documents
+            .iter()
+            .filter_map(|saved| saved.unsaved.clone());
+        let mut texts = session.texts(names.collect()).into_iter();
+        let paths = state.documents.iter().map(|saved| saved.path.clone());
+        let mut loaded = load_all(&self.host, paths.collect()).into_iter();
         for saved in &state.documents {
             let text = saved
                 .unsaved
                 .as_ref()
                 .map(|name| {
-                    session
-                        .text(name)
+                    texts
+                        .next()
+                        .unwrap_or_else(|| Err(io::Error::other("Not asked for.")))
                         .map_err(|err| format!("Can't read saved changes {name}: {err}"))
                 })
                 .transpose()?;
+            let loaded = loaded.next().flatten();
             let opened = match &saved.path {
                 // A file that's gone comes back only with changes to it.
-                Some(path) if !path.exists() && text.is_none() => None,
-                Some(path) => match Document::open(Some(path.clone()), self.theme.clone()) {
+                Some(_)
+                    if text.is_none()
+                        && matches!(&loaded, Some((Ok(loaded), _)) if loaded.stamp.is_none()) =>
+                {
+                    None
+                }
+                Some(path) => match self.loaded_document(loaded) {
                     Ok(doc) => Some(doc),
                     Err(err) if text.is_some() => {
                         self.show_message(
@@ -5068,7 +5746,7 @@ impl App {
                     }
                     Err(_) => None,
                 },
-                None => Some(Document::open(None, self.theme.clone())?),
+                None => Some((Document::untitled(self.theme.clone())?, None)),
             };
             let Some((doc, _)) = opened else {
                 continue;
@@ -5102,25 +5780,38 @@ impl App {
         self.focused_terminal = None;
         self.screens.clear();
         let mut adopted = adopted;
+        let names = state
+            .terminals
+            .iter()
+            .filter_map(|saved| saved.screen.clone());
+        let mut screens = session.screens(names.collect()).into_iter();
+        // Those running on the host still, for a client coming back to them.
+        let running = match state.terminals.iter().any(|saved| saved.host_id.is_some()) {
+            true => terminals_on(&self.host),
+            false => Vec::new(),
+        };
+        let root = self.current_root();
         for saved in &state.terminals {
-            let cwd = match saved.cwd.is_dir() {
-                true => saved.cwd.clone(),
-                false => self.current_root(),
-            };
+            let screen = saved.screen.as_ref().and_then(|_| screens.next().flatten());
+            let cwd = &saved.cwd;
             let (cols, rows) = saved.size;
             let area = Rect {
                 width: cols as u32,
                 height: rows as u32,
                 ..Rect::default()
             };
-            let terminal = match adopted.iter().position(|a| a.id == saved.id) {
-                Some(index) => {
+            let running = saved.host_id.filter(|id| running.contains(id));
+            let terminal = match (adopted.iter().position(|a| a.id == saved.id), running) {
+                (Some(index), _) => {
                     let a = adopted.remove(index);
-                    Terminal::adopt(saved.id, &cwd, area, (a.fd, a.pid), &a.screen, a.size)
+                    let pty = (a.fd, a.pid);
+                    Terminal::adopt(&self.host, saved.id, cwd, area, pty, &a.screen, a.size)
                 }
-                None => {
-                    let screen = saved.screen.as_ref().and_then(|name| session.screen(name));
-                    Terminal::restore(saved.id, &cwd, area, screen.as_deref(), cols, state.saved)
+                (None, Some(host_id)) => Terminal::attach(&self.host, saved.id, cwd, area, host_id),
+                (None, None) => {
+                    let screen = screen.as_deref();
+                    let host = &self.host;
+                    Terminal::restore(host, saved.id, cwd, &root, area, screen, cols, state.saved)
                 }
             };
             match terminal {
@@ -5195,7 +5886,24 @@ impl App {
                 Shown::Image(path) => Some(Visit::Image(path.clone())),
             }
         };
-        for (tab, saved) in self.tabs.iter_mut().zip(&state.tabs) {
+        // The images panels show, read all at once, by tab and panel.
+        let showing: Vec<((usize, PanelId), &Path)> = (state.tabs.iter().enumerate())
+            .flat_map(|(index, tab)| {
+                tab.panels
+                    .iter()
+                    .filter_map(move |panel| match &panel.shows {
+                        Some(Shown::Image(path)) => Some(((index, panel.id), path.as_path())),
+                        _ => None,
+                    })
+            })
+            .collect();
+        let paths: Vec<&Path> = showing.iter().map(|(_, path)| *path).collect();
+        let mut images: HashMap<(usize, PanelId), Result<ImageView, String>> = showing
+            .iter()
+            .map(|(at, _)| *at)
+            .zip(images_now(&self.host, &paths))
+            .collect();
+        for (index, (tab, saved)) in self.tabs.iter_mut().zip(&state.tabs).enumerate() {
             for saved in &saved.panels {
                 let Some(panel) = tab.panel_mut(saved.id) else {
                     continue;
@@ -5220,9 +5928,11 @@ impl App {
                         .find(|terminal| terminal.borrow().id() == *id)
                         .map(|terminal| panel.show_terminal(terminal.clone()))
                         .is_some(),
-                    Some(Shown::Image(path)) => ImageView::open(path)
+                    Some(Shown::Image(_)) => images
+                        .remove(&(index, saved.id))
+                        .and_then(Result::ok)
                         .map(|image| panel.show_image(image))
-                        .is_ok(),
+                        .is_some(),
                     Some(doc) => find_doc(doc).is_some_and(|doc| panel.show(&doc).is_ok()),
                     None => false,
                 };
@@ -5266,20 +5976,29 @@ impl App {
         Ok(())
     }
 
+    /// Saves the session, for a cue that's to go on from it in this one's
+    /// place, made one for the while if this isn't one (`true` then), with
+    /// terminals' screens if `screens`: its folder. `None`, with a message,
+    /// if there's nowhere to keep it.
+    pub fn keep_to_restart(&mut self, screens: bool) -> Option<(PathBuf, bool)> {
+        let ephemeral = self.session.is_none();
+        if ephemeral && !self.keep_session(false) {
+            return None;
+        }
+        if !self.save_session(screens) {
+            return None;
+        }
+        Some((self.session.as_ref()?.dir().to_path_buf(), ephemeral))
+    }
+
     /// Lets go of everything, for a process that replaces this one to go
     /// on with (see [`App::restore_session`]): the session saved, made one
     /// for the while if this isn't one (`true` then), and the terminals,
     /// their shells still running, each with its screen in full. `None`,
     /// with a message, if there's nowhere to keep it.
     pub fn hand_over(&mut self) -> Option<(PathBuf, bool, Vec<Adopted>)> {
-        let ephemeral = self.session.is_none();
-        if ephemeral && !self.keep_session(false) {
-            return None;
-        }
-        if !self.save_session(false) {
-            return None;
-        }
-        let dir = self.session.take()?.dir().to_path_buf();
+        let (dir, ephemeral) = self.keep_to_restart(false)?;
+        self.session = None;
         // Nothing else holds the terminals then.
         self.close_popups();
         self.focused_terminal = None;
@@ -5293,10 +6012,14 @@ impl App {
             };
             let mut terminal = terminal.into_inner();
             let id = terminal.id();
-            let Some((screen, size)) = terminal.screen(true) else {
+            // Released first, taking in what it wrote meanwhile, for the
+            // screen to have it.
+            let Some((fd, pid)) = terminal.release() else {
                 continue;
             };
-            let (fd, pid) = terminal.release();
+            let (screen, size) = terminal
+                .screen(true)
+                .unwrap_or_else(|| (Vec::new(), terminal.screen_size()));
             adopted.push(Adopted {
                 id,
                 fd,
@@ -5353,6 +6076,7 @@ impl App {
     fn open_dialog(&mut self, purpose: Purpose, dir: &Path, name: &str, current: Option<PathBuf>) {
         self.close_popups();
         self.dialog = Some(FileDialog::new(
+            &self.host,
             purpose,
             dir,
             name,
@@ -5374,14 +6098,15 @@ impl App {
                     true => Some(entry.path),
                     false => entry.path.parent().map(Path::to_path_buf),
                 });
-            // A folder in the changes may be gone.
-            if let Some(folder) = folder.filter(|folder| folder.is_dir()) {
+            // A folder in the changes may be gone. If the host hasn't said,
+            // the dialog goes up from it.
+            if let Some(folder) = folder.filter(|folder| !self.is_gone(folder)) {
                 return folder;
             }
         }
         let file = self.active_panel().path();
         match file.as_deref().and_then(Path::parent) {
-            Some(folder) if folder.is_dir() => folder.to_path_buf(),
+            Some(folder) if !self.is_gone(folder) => folder.to_path_buf(),
             _ => self.current_root(),
         }
     }
@@ -5397,6 +6122,44 @@ impl App {
                 let Some(mut dialog) = self.dialog.take() else {
                     return AppAction::Continue;
                 };
+                if self.file_ops.iter().any(|op| op.from_dialog) {
+                    // Still doing what it last chose.
+                    self.dialog = Some(dialog);
+                    return AppAction::Continue;
+                }
+                let op = match dialog.purpose() {
+                    Purpose::Create => Some(Ok(FileOp::CreateFile(path.clone()))),
+                    Purpose::CreateFolder => Some(Ok(FileOp::CreateFolder(path.clone()))),
+                    Purpose::Move | Purpose::Duplicate => dialog.current().map(|from| {
+                        let (from, to) = (from.to_path_buf(), path.clone());
+                        match dialog.purpose() {
+                            Purpose::Move if to.starts_with(&from) && to != from => {
+                                Err("Can't move a folder into itself.".to_string())
+                            }
+                            Purpose::Move => Ok(FileOp::Move { from, to }),
+                            _ if to.starts_with(&from) => {
+                                Err("Can't copy a folder into itself.".to_string())
+                            }
+                            _ => Ok(FileOp::Copy { from, to }),
+                        }
+                    }),
+                    _ => None,
+                };
+                if let Some(op) = op {
+                    // The dialog stays until it's done, or to choose
+                    // another path.
+                    match op {
+                        Ok(op) => {
+                            self.dialog = Some(dialog);
+                            self.start_file_op(op, true);
+                        }
+                        Err(error) => {
+                            dialog.show_error(error);
+                            self.dialog = Some(dialog);
+                        }
+                    }
+                    return AppAction::Continue;
+                }
                 let result = match dialog.purpose() {
                     Purpose::Open => {
                         if self.open(&path, false) {
@@ -5405,33 +6168,16 @@ impl App {
                         Ok(AppAction::Continue)
                     }
                     Purpose::SaveAs => self.save_as(&path),
-                    Purpose::Create => self.create_file(&path),
-                    Purpose::CreateFolder => self.create_folder(&path),
-                    Purpose::AddFolder => self.add_folder(&path),
-                    Purpose::Move | Purpose::Duplicate => match dialog.current() {
-                        Some(from) => {
-                            let from = from.to_path_buf();
-                            match dialog.purpose() {
-                                Purpose::Move => self.move_entry(&from, &path),
-                                _ => self.duplicate(&from, &path),
-                            }
-                        }
-                        None => Ok(AppAction::Continue),
-                    },
+                    Purpose::AddFolder => {
+                        // The dialog stays until the host says what it is.
+                        self.dialog = Some(dialog);
+                        self.add_folder(&path);
+                        return AppAction::Continue;
+                    }
+                    _ => Ok(AppAction::Continue),
                 };
                 match result {
-                    Ok(action) => {
-                        if let Some(saving) = self.saving.take() {
-                            if self
-                                .active_panel()
-                                .document()
-                                .is_some_and(|doc| !doc.is_modified())
-                            {
-                                return self.save_then_go(saving);
-                            }
-                        }
-                        return action;
-                    }
+                    Ok(action) => return action,
                     // The dialog stays, to choose another path.
                     Err(error) => {
                         dialog.show_error(error);
@@ -5445,51 +6191,220 @@ impl App {
 
     /// Saves the active file to `path` from now on, creating its folder if
     /// need be, unless another file open is that one.
+    /// Saving files, it carries on with the rest once it's saved.
     fn save_as(&mut self, path: &Path) -> Result<AppAction, String> {
-        let current = self.active_panel().document();
-        let open = self.find_document(&document::resolve(path));
-        if open.is_some_and(|open| !current.is_some_and(|current| Rc::ptr_eq(current, &open))) {
+        let current = self.active_panel().document().cloned();
+        let path = &document::normalize(path);
+        let open = self.find_document(path);
+        if open.is_some_and(|open| !current.as_ref().is_some_and(|c| Rc::ptr_eq(c, &open))) {
             return Err(format!("{} is open. Close it first.", file_name(path)));
         }
-        if let Some(folder) = path.parent() {
-            fs::create_dir_all(folder)
-                .map_err(|err| format!("Can't create the destination folder: {err}"))?;
-        }
-        let action = match self.editor_mut() {
-            Some(editor) => editor.save_as(document::resolve(path)),
-            None => Action::Continue,
+        let Some(doc) = current else {
+            return Ok(AppAction::Continue);
         };
+        if let Some(editor) = self.editor_mut() {
+            editor.save_as(path.clone());
+        }
         // How it was chosen to indent goes with it.
-        let doc = self.active_panel().document();
-        if let Some(indent) = doc.and_then(|doc| doc.chosen_indent()) {
-            self.indents.insert(document::resolve(path), indent);
+        if let Some(indent) = doc.chosen_indent() {
+            self.indents.insert(path.clone(), indent);
         }
         self.focus = Focus::Editor;
-        Ok(self.editor_action(action))
+        let saving = self.saving.take();
+        Ok(self.write(doc, true, true, saving))
     }
 
-    /// Creates an empty file at `path`, and its folder if need be, and
-    /// opens it.
-    fn create_file(&mut self, path: &Path) -> Result<AppAction, String> {
-        let created = (|| {
-            if let Some(folder) = path.parent() {
-                fs::create_dir_all(folder)?;
+    /// Has the host write `doc` to its file, unless it changed on disk since
+    /// it was last loaded or saved, or with `overwrite`, whatever's there,
+    /// making its folder with `make_folder`. Once it's written, it carries
+    /// on `saving`, if given (see [`App::wrote`]).
+    fn write(
+        &mut self,
+        doc: Rc<Document>,
+        overwrite: bool,
+        make_folder: bool,
+        saving: Option<Saving>,
+    ) -> AppAction {
+        let Some(path) = doc.path() else {
+            return AppAction::Continue;
+        };
+        let (copy, version, text, epoch, line_ending) = doc.to_write(&self.host);
+        let call = self.host.call(Request::Save {
+            path,
+            doc: copy,
+            version,
+            line_ending,
+            expected: (!overwrite).then(|| doc.stamp()),
+            make_folder,
+        });
+        self.writing.push(Writing {
+            doc,
+            text,
+            epoch,
+            saving,
+            call,
+        });
+        #[cfg(test)]
+        if crate::host::at_once() {
+            let mut action = AppAction::Continue;
+            while !self.writing.is_empty() {
+                if let Some(then) = self.poll_writing() {
+                    action = then;
+                }
             }
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map(drop)
-        })();
-        created.map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
+            return action;
+        }
+        AppAction::Continue
+    }
+
+    /// Takes in the files written since the last call. Returns what to do
+    /// then, if any were.
+    fn poll_writing(&mut self) -> Option<AppAction> {
+        let mut done = Vec::new();
+        let mut index = 0;
+        while index < self.writing.len() {
+            let result = match self.writing[index].call.try_recv() {
+                Ok(Reply::Saved(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    Err(Unsaved::Failed("The host stopped.".to_string()))
+                }
+            };
+            done.push((self.writing.remove(index), result));
+        }
+        let mut action = None;
+        for (writing, result) in done {
+            match self.wrote(writing, result) {
+                AppAction::Continue => {
+                    action.get_or_insert(AppAction::Continue);
+                }
+                then => action = Some(then),
+            }
+        }
+        action
+    }
+
+    /// Catches up with `writing` done: the file's saved, and saving goes
+    /// on, or it changed on disk, which asks whether to overwrite it, or it
+    /// couldn't be written.
+    fn wrote(&mut self, writing: Writing, result: Result<Written, Unsaved>) -> AppAction {
+        let Writing {
+            doc,
+            text,
+            epoch,
+            saving,
+            ..
+        } = writing;
+        match result {
+            Ok(Written { path, real, stamp }) => {
+                doc.saved_as(&text, epoch, stamp);
+                // Saved as a name the host resolved otherwise.
+                if let Some(old) = doc.path().filter(|old| *old != path) {
+                    doc.rename(path.clone());
+                    if let Some(indent) = self.indents.remove(&old) {
+                        self.indents.insert(path, indent);
+                    }
+                    self.show_active_in_tree();
+                }
+                doc.set_real(real);
+                let action = self.editor_action(Action::Saved);
+                match saving {
+                    Some(saving) => self.save_then_go(saving),
+                    None => action,
+                }
+            }
+            Err(Unsaved::Changed) => {
+                doc.set_changed_on_disk();
+                self.ask_overwrite(doc, saving);
+                AppAction::Continue
+            }
+            Err(Unsaved::Failed(err)) => {
+                // Reason first: long paths are the least of it.
+                let path = doc.path().unwrap_or_default();
+                self.show_message(format!("Can't save: {err} ({})", path.display()), true);
+                AppAction::Continue
+            }
+        }
+    }
+
+    /// Opens the empty file just created at `path`.
+    fn created_file(&mut self, path: &Path) {
         self.tree.refresh();
         self.files.refresh();
-        let path = document::resolve(path);
+        let path = document::normalize(path);
         if self.open(&path, false) {
             self.tree.reveal(&path);
             self.focus = Focus::Editor;
         }
-        Ok(AppAction::Continue)
+    }
+
+    /// Has the host do `op` to the files, and catches up once it's done
+    /// (see [`App::file_op_done`]). From the file dialog, the dialog stays
+    /// until then.
+    fn start_file_op(&mut self, op: FileOp, from_dialog: bool) {
+        let call = self.host.call(Request::FileOp(op.clone()));
+        self.file_ops.push(PendingOp {
+            op,
+            call,
+            from_dialog,
+        });
+        #[cfg(test)]
+        while crate::host::at_once() && !self.file_ops.is_empty() {
+            self.poll_file_ops();
+        }
+    }
+
+    /// Takes in the file operations done since the last call. Returns
+    /// whether any were.
+    fn poll_file_ops(&mut self) -> bool {
+        let mut done = Vec::new();
+        self.file_ops.retain(|pending| {
+            let result = match pending.call.try_recv() {
+                Ok(Reply::FileOpDone(result)) => result,
+                Ok(_) | Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => Err("The host stopped.".to_string()),
+            };
+            done.push((pending.op.clone(), pending.from_dialog, result));
+            false
+        });
+        let any = !done.is_empty();
+        for (op, from_dialog, result) in done {
+            self.file_op_done(op, from_dialog, result);
+        }
+        any
+    }
+
+    /// Catches up with `op`, done: shows what it made and where, and open
+    /// files go with what moved. From the file dialog, it closes, or shows
+    /// why it couldn't be done, to choose another path.
+    fn file_op_done(&mut self, op: FileOp, from_dialog: bool, result: Result<(), String>) {
+        if let Err(error) = result {
+            match &mut self.dialog {
+                Some(dialog) if from_dialog => dialog.show_error(error),
+                _ => self.show_message(error, true),
+            }
+            return;
+        }
+        if from_dialog {
+            self.dialog = None;
+        }
+        match op {
+            FileOp::CreateFile(path) => self.created_file(&path),
+            FileOp::CreateFolder(path) => {
+                self.tree.refresh();
+                self.tree.reveal(&path);
+            }
+            FileOp::Move { from, to } => self.moved_entry(&from, &to),
+            FileOp::Copy { to, .. } => {
+                self.tree.refresh();
+                self.tree.reveal(&to);
+                self.files.refresh();
+            }
+            FileOp::Trash(path) => self.trashed(&path),
+        }
     }
 
     /// Quits, but for a session, which it leaves to come back to (see
@@ -5562,10 +6477,6 @@ impl App {
                 preview,
             } => (path, focus, preview),
         };
-        if !path.exists() {
-            self.show_message(format!("{} was deleted.", file_name(&path)), false);
-            return;
-        }
         if self.open_as(&path, preview, true) && focus {
             self.focus = Focus::Editor;
         }
@@ -5579,7 +6490,7 @@ impl App {
                 return;
             };
             let name = self.changes.name_of(root).unwrap_or_default();
-            self.log = Some(LogView::open(repo, name));
+            self.log = Some(LogView::open(&self.host, repo, name));
         }
         self.sidebar = Sidebar::Log;
         self.layout();
@@ -5659,12 +6570,148 @@ impl App {
             self.show_message("Wait for the commit to finish.", false);
             return;
         }
-        match git::revert(root, &commit.hash) {
-            Ok(()) => self.show_message(format!("Reverted {}.", commit.short), false),
-            Err(err) if err.contains("CONFLICT") => {
-                self.show_git_error("Reverted with Conflicts", &err)
+        let call = GitCall::Revert {
+            root: root.to_path_buf(),
+            commit: commit.hash.clone(),
+        };
+        let short = commit.short.clone();
+        self.ask_git(call, GitThen::Revert { short });
+    }
+
+    /// Has the host ask git `call`, and once it's answered, carries on as
+    /// `then` says (see [`App::git_answered`]).
+    fn ask_git(&mut self, call: GitCall, then: GitThen) {
+        let call = self.host.call(Request::Git(call));
+        self.asking_git.push((then, call));
+        #[cfg(test)]
+        while crate::host::at_once() && !self.asking_git.is_empty() {
+            self.poll_git_answers();
+        }
+    }
+
+    /// Asks git what open files were in the last commit, for those whose
+    /// diffs want it, and takes what it said since the last call. Returns
+    /// whether it said anything.
+    fn read_bases(&mut self) -> bool {
+        for doc in &self.documents {
+            let Some(tracked) = doc.tracked() else {
+                continue;
+            };
+            if let Some(call) = tracked.wants_base() {
+                let call = self.host.call(Request::Git(call));
+                self.reading_bases.push((tracked, call));
             }
-            Err(err) => self.show_git_error("Can't Revert", &err),
+        }
+        let mut read = false;
+        self.reading_bases
+            .retain(|(tracked, call)| match call.try_recv() {
+                Ok(Reply::Git(GitAnswer::File(base))) => {
+                    tracked.set_base(base);
+                    read = true;
+                    false
+                }
+                Ok(_) | Err(TryRecvError::Empty) => true,
+                Err(TryRecvError::Disconnected) => false,
+            });
+        read
+    }
+
+    /// Takes git's answers since the last call. Returns whether there were
+    /// any.
+    fn poll_git_answers(&mut self) -> bool {
+        let mut answered = Vec::new();
+        let mut index = 0;
+        while index < self.asking_git.len() {
+            let answer = match self.asking_git[index].1.try_recv() {
+                Ok(Reply::Git(answer)) => Some(answer),
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => None,
+            };
+            let (then, _) = self.asking_git.remove(index);
+            answered.push((then, answer));
+        }
+        let any = !answered.is_empty();
+        for (then, answer) in answered {
+            match answer {
+                Some(answer) => self.git_answered(then, answer),
+                None => self.show_message("git stopped unexpectedly.", true),
+            }
+        }
+        any
+    }
+
+    /// Carries on with what git answered: says how it went, and has git
+    /// say what the repositories are like now.
+    fn git_answered(&mut self, then: GitThen, answer: GitAnswer) {
+        let done = |answer: GitAnswer| match answer {
+            GitAnswer::Done(result) => result,
+            _ => Err("git answered something else.".to_string()),
+        };
+        match then {
+            GitThen::Revert { short } => match done(answer) {
+                Ok(()) => self.show_message(format!("Reverted {short}."), false),
+                Err(err) if err.contains("CONFLICT") => {
+                    self.show_git_error("Reverted with Conflicts", &err)
+                }
+                Err(err) => self.show_git_error("Can't Revert", &err),
+            },
+            GitThen::Stage { root, paths, stage } => match done(answer) {
+                Ok(()) => {
+                    for view in &mut self.commit_views {
+                        if view.root() == root {
+                            view.set_staged(&paths, stage);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let what = if stage { "stage" } else { "unstage" };
+                    let reason = err.lines().next().unwrap_or("");
+                    self.show_message(format!("Can't {what}: {reason}"), true);
+                }
+            },
+            GitThen::Stash { root, staged } => match done(answer) {
+                Ok(()) => {
+                    if let Some(view) = self.commit_view_of(&root) {
+                        view.stashed();
+                    }
+                    let what = if staged {
+                        "the staged changes"
+                    } else {
+                        "the changes"
+                    };
+                    self.show_message(format!("Stashed {what}."), false);
+                }
+                Err(err) => self.show_git_error("Can't Stash", &err),
+            },
+            GitThen::ApplyStash { pop } => match done(answer) {
+                Ok(()) if pop => self.show_message("Popped the stash.", false),
+                Ok(()) => self.show_message("Applied the stash.", false),
+                Err(err) if err.contains("CONFLICT") => {
+                    self.show_git_error("Stash Applied with Conflicts", &err)
+                }
+                Err(err) => self.show_git_error("Can't Apply Stash", &err),
+            },
+            GitThen::DropStash => match done(answer) {
+                Ok(()) => self.show_message("Dropped the stash.", false),
+                Err(err) => self.show_git_error("Can't Drop Stash", &err),
+            },
+            GitThen::Branches { root } => {
+                let GitAnswer::Branches(branches) = answer else {
+                    return;
+                };
+                self.branches_listed(root, branches);
+                return;
+            }
+            GitThen::Switch { root, name } => {
+                let result = match answer {
+                    GitAnswer::Switched(result) => result,
+                    _ => Err("git answered something else.".to_string()),
+                };
+                self.switched(&root, &name, result);
+            }
         }
         self.git.restart();
     }
@@ -5686,7 +6733,8 @@ impl App {
                     return;
                 };
                 let name = self.changes.name_of(root).unwrap_or_default();
-                self.commit_views.insert(0, CommitView::open(repo, name));
+                self.commit_views
+                    .insert(0, CommitView::open(&self.host, repo, name));
             }
         }
         self.sidebar = Sidebar::Commit;
@@ -5764,17 +6812,12 @@ impl App {
             self.show_message("Wait for the commit to finish.", false);
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        let (dir, what) = (root.clone(), sync.clone());
-        std::thread::spawn(move || {
-            let _ = sender.send(git::sync(&dir, &what));
+        let done = self.host.call(Request::GitSync {
+            root: root.clone(),
+            sync: sync.clone(),
         });
         self.changes.set_syncing(&root, Some(sync.clone()));
-        self.syncing.push(Syncing {
-            root,
-            sync,
-            done: receiver,
-        });
+        self.syncing.push(Syncing { root, sync, done });
     }
 
     /// Says how `sync`, of the repository at `root`, went.
@@ -5963,11 +7006,8 @@ impl App {
     /// or unless `stage`, unstages them.
     fn stage(&mut self, root: PathBuf, paths: Vec<PathBuf>, stage: bool) -> AppAction {
         if stage {
-            // git has the paths as they really are.
-            let wanted = |path: &Path| {
-                paths.iter().any(|wanted| wanted == path)
-                    || path.canonicalize().is_ok_and(|path| paths.contains(&path))
-            };
+            // Open files' folders are resolved, as git has them.
+            let wanted = |path: &Path| paths.iter().any(|wanted| wanted == path);
             let docs: Vec<Rc<Document>> = self
                 .documents
                 .iter()
@@ -5990,25 +7030,19 @@ impl App {
             .repos()
             .iter()
             .any(|repo| repo.root == root && repo.commit.is_none());
-        let result = match stage {
-            true => git::stage(root, paths),
-            false => git::unstage(root, paths, initial),
+        let (root, paths) = (root.to_path_buf(), paths.to_vec());
+        let call = match stage {
+            true => GitCall::Stage {
+                root: root.clone(),
+                paths: paths.clone(),
+            },
+            false => GitCall::Unstage {
+                root: root.clone(),
+                paths: paths.clone(),
+                initial,
+            },
         };
-        match result {
-            Ok(()) => {
-                for view in &mut self.commit_views {
-                    if view.root() == root {
-                        view.set_staged(paths, stage);
-                    }
-                }
-            }
-            Err(err) => {
-                let what = if stage { "stage" } else { "unstage" };
-                let reason = err.lines().next().unwrap_or("");
-                self.show_message(format!("Can't {what}: {reason}"), true);
-            }
-        }
-        self.git.restart();
+        self.ask_git(call, GitThen::Stage { root, paths, stage });
     }
 
     /// Commits what's staged with the message written, in the commit view
@@ -6017,7 +7051,7 @@ impl App {
         let Some(view) = self.commit_views.first_mut() else {
             return;
         };
-        match view.commit() {
+        match view.commit(&self.host) {
             Ok(()) => {}
             Err(CantCommit::NoMessage) => {
                 view.set_editing(true);
@@ -6077,10 +7111,7 @@ impl App {
                 .documents
                 .iter()
                 .filter(|doc| doc.is_modified())
-                .filter(|doc| {
-                    let path = doc.path().and_then(|path| path.canonicalize().ok());
-                    path.is_some_and(|path| path.starts_with(&root))
-                })
+                .filter(|doc| doc.path().is_some_and(|path| path.starts_with(&root)))
                 .cloned()
                 .collect();
             if !docs.is_empty() {
@@ -6102,48 +7133,38 @@ impl App {
     }
 
     fn stash_now(&mut self, root: &Path, message: &str, staged: bool) {
-        match git::stash(root, message, staged) {
-            Ok(()) => {
-                if let Some(view) = self.commit_view_of(root) {
-                    view.stashed();
-                }
-                let what = if staged {
-                    "the staged changes"
-                } else {
-                    "the changes"
-                };
-                self.show_message(format!("Stashed {what}."), false);
-            }
-            Err(err) => self.show_git_error("Can't Stash", &err),
-        }
-        self.git.restart();
+        let call = GitCall::Stash {
+            root: root.to_path_buf(),
+            message: message.to_string(),
+            staged,
+        };
+        let root = root.to_path_buf();
+        self.ask_git(call, GitThen::Stash { root, staged });
     }
 
     /// Puts the changes stashed as `hash`, in the repository at `root`,
     /// back, and if `pop`, drops the stash.
     fn apply_stash(&mut self, root: &Path, hash: &str, pop: bool) {
-        let result = git::apply_stash(root, hash, pop);
-        if let Some(view) = self.commit_view_of(root) {
-            view.read_stashes();
-        }
-        self.git.restart();
-        match result {
-            Ok(()) if pop => self.show_message("Popped the stash.", false),
-            Ok(()) => self.show_message("Applied the stash.", false),
-            Err(err) if err.contains("CONFLICT") => {
-                self.show_git_error("Stash Applied with Conflicts", &err)
-            }
-            Err(err) => self.show_git_error("Can't Apply Stash", &err),
-        }
+        let call = GitCall::ApplyStash {
+            root: root.to_path_buf(),
+            hash: hash.to_string(),
+            pop,
+        };
+        self.ask_git(call, GitThen::ApplyStash { pop });
     }
 
     /// Lists the branches of the repository at `root`, to switch to one,
-    /// or to a new one.
+    /// or to a new one, once git has.
     fn show_branches(&mut self, root: PathBuf) {
+        let call = GitCall::Branches { root: root.clone() };
+        self.ask_git(call, GitThen::Branches { root });
+    }
+
+    fn branches_listed(&mut self, root: PathBuf, branches: Vec<git::Branch>) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs() as i64);
-        let items = git::branches(&root)
+        let items = branches
             .iter()
             .map(|branch| Item::branch(branch, now))
             .collect();
@@ -6167,10 +7188,7 @@ impl App {
             .documents
             .iter()
             .filter(|doc| doc.is_modified())
-            .filter(|doc| {
-                let path = doc.path().and_then(|path| path.canonicalize().ok());
-                path.is_some_and(|path| path.starts_with(&root))
-            })
+            .filter(|doc| doc.path().is_some_and(|path| path.starts_with(&root)))
             .cloned()
             .collect();
         if !docs.is_empty() {
@@ -6192,8 +7210,20 @@ impl App {
             );
             return;
         }
-        let name = to.name().to_string();
-        let result = git::switch(root, to);
+        let call = GitCall::Switch {
+            root: root.to_path_buf(),
+            to: to.clone(),
+        };
+        let then = GitThen::Switch {
+            root: root.to_path_buf(),
+            name: to.name().to_string(),
+        };
+        self.ask_git(call, then);
+    }
+
+    /// Says how switching the repository at `root` to the branch `name`
+    /// went.
+    fn switched(&mut self, root: &Path, name: &str, result: Result<Carried, String>) {
         if result.is_ok() {
             if let Some(view) = self.commit_view_of(root) {
                 view.clear_amend();
@@ -6220,23 +7250,15 @@ impl App {
             }
             Err(err) => self.show_git_error("Can't Switch Branch", &err),
         }
-        if let Some(view) = self.commit_view_of(root) {
-            view.read_stashes();
-        }
-        self.git.restart();
     }
 
     /// Drops the stash `hash`, in the repository at `root`.
     fn drop_stash(&mut self, root: &Path, hash: &str) {
-        let result = git::drop_stash(root, hash);
-        if let Some(view) = self.commit_view_of(root) {
-            view.read_stashes();
-        }
-        self.git.restart();
-        match result {
-            Ok(()) => self.show_message("Dropped the stash.", false),
-            Err(err) => self.show_git_error("Can't Drop Stash", &err),
-        }
+        let call = GitCall::DropStash {
+            root: root.to_path_buf(),
+            hash: hash.to_string(),
+        };
+        self.ask_git(call, GitThen::DropStash);
     }
 
     /// Shows how `commit`, in the repository at `root`, made `change`, in
@@ -6248,7 +7270,7 @@ impl App {
             .is_some_and(|shown| shown.is(root, &commit.hash, &change.path));
         if !shown {
             let had_terminal = self.active_terminal().is_some();
-            let diff = CommitDiff::open(root, commit, change);
+            let diff = CommitDiff::open(&self.host, root, commit, change);
             self.active_panel_mut().show_commit(diff);
             self.prune_documents();
             if had_terminal {
@@ -6280,6 +7302,10 @@ impl App {
         match action {
             Action::Continue => AppAction::Continue,
             Action::Copy(text) => AppAction::Copy(text),
+            Action::Save { overwrite } => match self.active_panel().document().cloned() {
+                Some(doc) => self.write(doc, overwrite, false, None),
+                None => AppAction::Continue,
+            },
             Action::Saved => {
                 // The file may be new, or saved under a new name.
                 self.track_documents();
@@ -6827,7 +7853,8 @@ impl App {
             false => parent.clone(),
         };
         let name = file_name(&target.path);
-        if matches!(command, Command::TreeOpen | Command::TreeOpenToSide) && !target.path.exists() {
+        let gone = !target.is_root && self.tree.lists(&target.path) == Some(false);
+        if matches!(command, Command::TreeOpen | Command::TreeOpenToSide) && gone {
             self.show_message(format!("{name} was deleted."), false);
             return AppAction::Continue;
         }
@@ -6864,11 +7891,11 @@ impl App {
                     Command::TreeRename => {
                         self.open_dialog(Purpose::Move, &parent, &name, Some(target.path));
                     }
-                    _ => self.trash(&target.path, from_menu),
+                    _ => self.trash(&target, from_menu),
                 }
             }
             Command::TreeDuplicate => {
-                let copy = copy_name(&target.path);
+                let copy = copy_name(&target, |path| self.tree.lists(path) == Some(true));
                 self.open_dialog(Purpose::Duplicate, &parent, &copy, Some(target.path));
             }
             Command::AddFolder => self.show_dialog(Purpose::AddFolder),
@@ -6899,21 +7926,54 @@ impl App {
         AppAction::Copy(text)
     }
 
-    /// Adds the folder `path` to the workspace, and selects it in the tree.
-    fn add_folder(&mut self, path: &Path) -> Result<AppAction, String> {
-        let root = path
-            .canonicalize()
-            .map_err(|err| format!("Can't add {}: {err}", file_name(path)))?;
-        if self.workspace.roots().contains(&root) {
-            return Err(format!("{} is already in the workspace.", file_name(path)));
+    /// Adds the folder `path`, chosen in the file dialog, to the
+    /// workspace, and selects it in the tree, once the host says where it
+    /// really is (see [`App::poll_adding_folder`]).
+    fn add_folder(&mut self, path: &Path) {
+        let call = self.host.call(Request::Look {
+            paths: vec![path.to_path_buf()],
+        });
+        self.adding_folder = Some((path.to_path_buf(), call));
+        #[cfg(test)]
+        while crate::host::at_once() && self.adding_folder.is_some() {
+            self.poll_adding_folder();
         }
-        self.workspace
-            .add_root(&root)
-            .map_err(|err| format!("Can't add {}: {err}", file_name(path)))?;
-        self.roots_changed();
-        self.tree.reveal(&root);
-        self.focus = Focus::Tree;
-        Ok(AppAction::Continue)
+    }
+
+    /// Adds the folder the dialog chose, once the host says what it is,
+    /// closing the dialog, or shows in it why it can't be. Returns whether
+    /// it did either.
+    fn poll_adding_folder(&mut self) -> bool {
+        let Some((path, call)) = &self.adding_folder else {
+            return false;
+        };
+        let look = match call.try_recv() {
+            Ok(Reply::Looked(mut looked)) => looked.pop().flatten(),
+            Ok(_) | Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => return false,
+        };
+        let name = file_name(path);
+        self.adding_folder = None;
+        let error = match look {
+            None => Some(format!("Can't add {name}: it isn't there.")),
+            Some(look) if !look.is_dir => Some(format!("Can't add {name}: not a folder.")),
+            Some(look) if self.workspace.roots().contains(&look.real) => {
+                Some(format!("{name} is already in the workspace."))
+            }
+            Some(look) => {
+                self.workspace.add_folder(look.real.clone());
+                self.roots_changed();
+                self.tree.reveal(&look.real);
+                self.focus = Focus::Tree;
+                None
+            }
+        };
+        match (error, &mut self.dialog) {
+            (Some(error), Some(dialog)) => dialog.show_error(error),
+            (Some(error), None) => self.show_message(error, true),
+            (None, _) => self.dialog = None,
+        }
+        true
     }
 
     /// Takes `target`, a workspace folder, out of the workspace. Its files
@@ -6934,8 +7994,8 @@ impl App {
     fn roots_changed(&mut self) {
         self.tree.set_roots(self.workspace.roots());
         self.git.set_roots(self.workspace.roots());
-        self.files = FileIndex::new(&self.workspace);
-        self.symbols = SymbolIndex::new(&self.workspace);
+        self.files = FileIndex::new(&self.host, &self.workspace);
+        self.symbols = SymbolIndex::new(&self.host, &self.workspace);
         self.watching = None;
         self.watch_folders();
         self.show_active_in_tree();
@@ -6943,7 +8003,7 @@ impl App {
 
     /// The workspace folders in `path`, or that are it.
     fn roots_in(&self, path: &Path) -> Vec<PathBuf> {
-        let path = document::resolve(path);
+        let path = document::normalize(path);
         let roots = self.workspace.roots().iter();
         roots
             .filter(|root| root.starts_with(&path))
@@ -6951,28 +8011,10 @@ impl App {
             .collect()
     }
 
-    /// Creates the folder `path`, and those it's in if need be.
-    fn create_folder(&mut self, path: &Path) -> Result<AppAction, String> {
-        fs::create_dir_all(path)
-            .map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
-        self.tree.refresh();
-        self.tree.reveal(path);
-        Ok(AppAction::Continue)
-    }
-
-    /// Renames or moves the file or folder `from` to `to`, creating the
-    /// folder it goes in if need be. Open files go with it.
-    fn move_entry(&mut self, from: &Path, to: &Path) -> Result<AppAction, String> {
-        if to.starts_with(from) && to != from {
-            return Err("Can't move a folder into itself.".to_string());
-        }
-        if let Some(folder) = to.parent() {
-            fs::create_dir_all(folder)
-                .map_err(|err| format!("Can't create the destination folder: {err}"))?;
-        }
-        fs::rename(from, to).map_err(|err| format!("Can't move {}: {err}", file_name(from)))?;
-        // Open files have their paths resolved.
-        let (resolved_from, resolved_to) = (document::resolve(from), document::resolve(to));
+    /// Catches up with the file or folder `from` having moved to `to`:
+    /// open files go with it.
+    fn moved_entry(&mut self, from: &Path, to: &Path) {
+        let (resolved_from, resolved_to) = (document::normalize(from), document::normalize(to));
         let moved = |path: &Path| {
             let rest = path.strip_prefix(&resolved_from).ok()?;
             Some(match rest.as_os_str().is_empty() {
@@ -7005,47 +8047,30 @@ impl App {
         self.tree.moved(from, to);
         self.files.refresh();
         self.show_active_in_tree();
-        Ok(AppAction::Continue)
     }
 
-    /// Copies the file or folder `from` to `to`, creating the folder it goes
-    /// in if need be.
-    fn duplicate(&mut self, from: &Path, to: &Path) -> Result<AppAction, String> {
-        if to.starts_with(from) {
-            return Err("Can't copy a folder into itself.".to_string());
-        }
-        if let Some(folder) = to.parent() {
-            fs::create_dir_all(folder)
-                .map_err(|err| format!("Can't create the destination folder: {err}"))?;
-        }
-        copy_all(from, to).map_err(|err| format!("Can't copy {}: {err}", file_name(from)))?;
-        self.tree.refresh();
-        self.tree.reveal(to);
-        self.files.refresh();
-        Ok(AppAction::Continue)
-    }
-
-    /// Moves the file or folder at `path` to the Trash, after asking, unless
+    /// Moves the file or folder `target` to the Trash, after asking, unless
     /// `confirmed`. Open files that were in it close, unless they have
     /// unsaved changes, which saving puts back.
-    fn trash(&mut self, path: &Path, confirmed: bool) {
-        let name = file_name(path);
+    fn trash(&mut self, target: &Entry, confirmed: bool) {
         if !confirmed {
-            let message = match path.is_dir() {
+            let message = match target.is_dir {
                 true => "You can restore this folder and its contents from the Trash.",
                 false => "You can restore this file from the Trash.",
             };
-            let redo = Redo::Trash(path.to_path_buf());
+            let redo = Redo::Trash(target.clone());
             let buttons = vec![Button::new("Move to &Trash", Answer::Go(redo)).danger()];
-            let title = format!("Move {name} to the Trash?");
+            let title = format!("Move {} to the Trash?", file_name(&target.path));
             self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
             return;
         }
-        let resolved = document::resolve(path);
-        if let Err(err) = move_to_trash(path) {
-            self.show_message(format!("Can't move {name} to the Trash: {err}"), true);
-            return;
-        }
+        self.start_file_op(FileOp::Trash(target.path.clone()), false);
+    }
+
+    /// Catches up with `path` gone to the Trash: open files that were in it
+    /// close, unless they have unsaved changes.
+    fn trashed(&mut self, path: &Path) {
+        let resolved = document::normalize(path);
         let closing: Vec<Rc<Document>> = self
             .documents
             .iter()
@@ -7065,6 +8090,10 @@ impl App {
 
     /// Shows `path` in the Finder, or elsewhere, opens its folder.
     fn reveal(&mut self, path: &Path) {
+        if let Some(remote) = self.host.remote() {
+            self.show_message(format!("{} is on {remote}.", file_name(path)), false);
+            return;
+        }
         let mut command = match cfg!(target_os = "macos") {
             true => {
                 let mut command = std::process::Command::new("open");
@@ -7113,32 +8142,68 @@ impl App {
         .unwrap_or_else(|| self.current_root());
         // A path from `/` is from the workspace's folder, as on GitHub,
         // unless it's a file there.
-        let target = match path.strip_prefix('/') {
-            Some(rest) if !Path::new(&path).exists() => self.current_root().join(rest),
-            _ => base.join(&path),
+        let candidates = match path.strip_prefix('/') {
+            Some(rest) => vec![PathBuf::from(&path), self.current_root().join(rest)],
+            None => vec![base.join(&path)],
         };
-        if !target.exists() {
-            self.show_message(format!("Can't find {path}."), true);
-            return;
+        let call = self.host.call(Request::Look {
+            paths: candidates.clone(),
+        });
+        let following = Following {
+            path,
+            candidates,
+            anchor: anchor.map(str::to_string),
+        };
+        // A newer one replaces it.
+        self.following = Some((following, call));
+        #[cfg(test)]
+        while crate::host::at_once() && self.following.is_some() {
+            self.poll_following();
         }
-        if target.is_dir() {
+    }
+
+    /// Goes where the link followed leads, once the host says what's
+    /// there. Returns whether it went anywhere, or said why not.
+    fn poll_following(&mut self) -> bool {
+        let Some((_, call)) = &self.following else {
+            return false;
+        };
+        let looked = match call.try_recv() {
+            Ok(Reply::Looked(looked)) => looked,
+            Ok(_) | Err(TryRecvError::Disconnected) => Vec::new(),
+            Err(TryRecvError::Empty) => return false,
+        };
+        let (following, _) = self.following.take().unwrap();
+        let found = following
+            .candidates
+            .into_iter()
+            .zip(looked)
+            .find_map(|(candidate, look)| Some((candidate, look?.is_dir)));
+        let Some((target, is_dir)) = found else {
+            self.show_message(format!("Can't find {}.", following.path), true);
+            return true;
+        };
+        if is_dir {
             self.tree_visible = true;
             self.layout();
             self.tree.reveal(&target);
-            return;
+            return true;
         }
-        if !self.open(&target, false) {
-            return;
-        }
-        self.focus = Focus::Editor;
-        if let Some(editor) = self.editor_mut().filter(|editor| editor.is_markdown()) {
-            if !editor.reading() {
-                editor.read_from(0);
+        let anchor = following.anchor;
+        let go = move |editor: &mut Editor| {
+            if editor.is_markdown() {
+                if !editor.reading() {
+                    editor.read_from(0);
+                }
+                if let Some(anchor) = anchor {
+                    editor.go_to_anchor(&anchor);
+                }
             }
-            if let Some(anchor) = anchor {
-                editor.go_to_anchor(anchor);
-            }
+        };
+        if self.open_and(&target, go) {
+            self.focus = Focus::Editor;
         }
+        true
     }
 
     /// Opens `url` in the browser.
@@ -7201,7 +8266,7 @@ impl App {
             // the terminal keeps running.
             None => self.split(Axis::Horizontal),
         }
-        let go = |editor: &mut Editor| {
+        let go = move |editor: &mut Editor| {
             if let Some(position) = position {
                 editor.go_to(position);
             }
@@ -7220,7 +8285,7 @@ impl App {
     fn new_terminal_in(&mut self, cwd: &Path) {
         let body = self.active_panel().body();
         let id = self.next_terminal;
-        match Terminal::new(id, cwd, body) {
+        match Terminal::new(&self.host, id, cwd, body) {
             Ok(terminal) => {
                 self.next_terminal += 1;
                 let terminal = Rc::new(RefCell::new(terminal));
@@ -7551,7 +8616,7 @@ impl App {
             _ => String::new(),
         };
         let bounds = self.quick_look_bounds();
-        self.quick_look = Some(QuickLook::new(path, shown, &self.theme, bounds));
+        self.quick_look = Some(QuickLook::new(&self.host, path, shown, &self.theme, bounds));
     }
 
     /// Keeps Quick Look on the sidebar's selection as it moves, and puts it
@@ -7646,11 +8711,16 @@ fn running_programs(terminals: &[Rc<RefCell<Terminal>>]) -> Vec<String> {
 
 /// Whether the file `doc` is, or failing that, `path`, can be shown: it's
 /// open in `documents`, or there to open again.
-fn file_usable(documents: &[Rc<Document>], doc: &Weak<Document>, path: Option<&Path>) -> bool {
+fn file_usable(
+    documents: &[Rc<Document>],
+    doc: &Weak<Document>,
+    path: Option<&Path>,
+    gone: &HashSet<PathBuf>,
+) -> bool {
     let open = doc
         .upgrade()
         .is_some_and(|doc| documents.iter().any(|d| Rc::ptr_eq(d, &doc)));
-    open || path.is_some_and(Path::is_file)
+    open || path.is_some_and(|path| !is_gone(gone, path))
 }
 
 /// Whether the active panel can go back to `visit`: its file can be
@@ -7661,15 +8731,21 @@ fn visit_usable(
     documents: &[Rc<Document>],
     terminals: &[Rc<RefCell<Terminal>>],
     elsewhere: &[u32],
+    gone: &HashSet<PathBuf>,
 ) -> bool {
     match visit {
-        Visit::File(doc, path, _) => file_usable(documents, doc, path.as_deref()),
+        Visit::File(doc, path, _) => file_usable(documents, doc, path.as_deref(), gone),
         Visit::Terminal(id) => {
             !elsewhere.contains(id) && terminals.iter().any(|t| t.borrow().id() == *id)
         }
-        Visit::Image(path) => path.is_file(),
-        Visit::Commit { root, .. } => root.is_dir(),
+        Visit::Image(path) => !is_gone(gone, path),
+        Visit::Commit { root, .. } => !is_gone(gone, root),
     }
+}
+
+/// Whether `path`, or a folder it's in, is among those `gone`.
+fn is_gone(gone: &HashSet<PathBuf>, path: &Path) -> bool {
+    !gone.is_empty() && path.ancestors().any(|path| gone.contains(path))
 }
 
 /// The header row of a panel in `area`.
@@ -7738,6 +8814,87 @@ impl Drop for App {
     }
 }
 
+/// The images at `paths`, read by `host`, waiting for them, as
+/// [`load_all`].
+fn images_now(host: &Link, paths: &[&Path]) -> Vec<Result<ImageView, String>> {
+    let calls: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            host.call(Request::ReadFile {
+                path: path.to_path_buf(),
+                unless: None,
+            })
+        })
+        .collect();
+    calls
+        .iter()
+        .zip(paths)
+        .map(|(call, path)| match call.wait() {
+            Some(Reply::Bytes(read)) => match read? {
+                Some((data, stamp)) => ImageView::decoded(path, data, stamp),
+                None => Err("The host read nothing.".to_string()),
+            },
+            _ => Err("The host stopped.".to_string()),
+        })
+        .collect()
+}
+
+/// The terminals running on `host`, by their ids there, waiting for it
+/// to say.
+fn terminals_on(host: &Link) -> Vec<crate::term_hub::TermId> {
+    match host.call(Request::Terminals).wait() {
+        Some(Reply::Terminals(ids)) => ids,
+        _ => Vec::new(),
+    }
+}
+
+/// Has `host` load the file at `path`, keeping it as the copy of the
+/// document to be made of it (see [`crate::replica`]).
+fn load(host: &Link, path: PathBuf) -> (Call, Replica) {
+    let replica = Replica::loading(host);
+    let doc = Some(replica.id());
+    (host.call(Request::Load { path, doc }), replica)
+}
+
+/// A document of the file as `loaded`, whose copy on the host is
+/// `replica`, and a notice for the status bar if loading it had anything
+/// to say (see [`Document::loaded`]).
+fn document_of(
+    loaded: Loaded,
+    mut replica: Replica,
+    theme: Rc<Theme>,
+) -> Result<(Rc<Document>, Option<String>), String> {
+    replica.loaded(loaded.text.clone());
+    let (doc, notice) = Document::loaded(loaded, theme)?;
+    doc.set_replica(replica);
+    Ok((doc, notice))
+}
+
+/// The files at `paths`, loaded by `host`, waiting for them all at once,
+/// each with its copy on the host: `None` for each `None` in `paths`. Only
+/// for what can't go on without them yet: restoring sessions and unsaved
+/// changes.
+fn load_all(
+    host: &Link,
+    paths: Vec<Option<PathBuf>>,
+) -> Vec<Option<(Result<Loaded, String>, Replica)>> {
+    let calls: Vec<_> = paths
+        .into_iter()
+        .map(|path| path.map(|path| load(host, path)))
+        .collect();
+    calls
+        .into_iter()
+        .map(|call| {
+            let (call, replica) = call?;
+            let loaded = match call.wait() {
+                Some(Reply::Loaded(loaded)) => loaded,
+                _ => Err("The host stopped.".to_string()),
+            };
+            Some((loaded, replica))
+        })
+        .collect()
+}
+
 /// `doc`, as the picker lists it.
 fn document_target(doc: &Document) -> Recent {
     match doc.path() {
@@ -7746,12 +8903,13 @@ fn document_target(doc: &Document) -> Recent {
     }
 }
 
-/// A name for a copy of `path` next to it, as the Finder names them:
-/// `a copy.txt`, then `a copy 2.txt`, and so on.
-fn copy_name(path: &Path) -> String {
+/// A name for a copy of `target` next to it, as the Finder names them:
+/// `a copy.txt`, then `a copy 2.txt`, and so on, skipping those `taken`.
+fn copy_name(target: &Entry, taken: impl Fn(&Path) -> bool) -> String {
+    let path = &target.path;
     let name = file_name(path);
     let (stem, extension) = match path.extension() {
-        Some(extension) if !path.is_dir() => (
+        Some(extension) if !target.is_dir => (
             name.strip_suffix(&format!(".{}", extension.to_string_lossy()))
                 .unwrap_or(&name),
             format!(".{}", extension.to_string_lossy()),
@@ -7763,59 +8921,8 @@ fn copy_name(path: &Path) -> String {
             1 => format!("{stem} copy{extension}"),
             n => format!("{stem} copy {n}{extension}"),
         })
-        .find(|copy| fs::symlink_metadata(path.with_file_name(copy)).is_err())
+        .find(|copy| !taken(&path.with_file_name(copy)))
         .unwrap_or_default()
-}
-
-/// Copies the file, folder, or symlink `from` to `to`, which doesn't exist.
-fn copy_all(from: &Path, to: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(from)?;
-    if meta.file_type().is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(from)?, to)
-    } else if meta.is_dir() {
-        fs::create_dir(to)?;
-        for entry in fs::read_dir(from)? {
-            let entry = entry?;
-            copy_all(&entry.path(), &to.join(entry.file_name()))?;
-        }
-        Ok(())
-    } else {
-        fs::copy(from, to).map(drop)
-    }
-}
-
-/// Moves `path` to the Trash.
-#[cfg(not(test))]
-fn move_to_trash(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let trashed = {
-        use trash::macos::{DeleteMethod, TrashContextExtMacos};
-        let mut context = trash::TrashContext::default();
-        // The default, the Finder's AppleScript, asks for permission to
-        // control the Finder, and plays its sound.
-        context.set_delete_method(DeleteMethod::NsFileManager);
-        context.delete(path)
-    };
-    #[cfg(not(target_os = "macos"))]
-    let trashed = trash::delete(path);
-    trashed.map_err(|err| err.to_string())
-}
-
-/// Tests delete instead, to leave the Trash alone.
-#[cfg(test)]
-fn move_to_trash(path: &Path) -> Result<(), String> {
-    let removed = match path.is_dir() {
-        true => fs::remove_dir_all(path),
-        false => fs::remove_file(path),
-    };
-    removed.map_err(|err| err.to_string())
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
 }
 
 /// Whether cue finds definitions in `language`: it has a tags query.
@@ -8357,6 +9464,75 @@ mod tests {
             app.poll();
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn edits_go_to_the_hosts_copy_which_acks_them_and_saving_writes_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("replicated", &[("a.txt", "alpha\n")]);
+        let mut app = app(&root, Some("a.txt"));
+        let doc = app.documents[0].clone();
+        type_text(&mut app, "x");
+        wait_until(&mut app, "the first edit", |_| {
+            doc.acked_version() == Some(1)
+        });
+        // What's typed between two looks goes as one edit.
+        type_text(&mut app, "yz");
+        key(&mut app, KeyCode::End);
+        type_text(&mut app, "!");
+        wait_until(&mut app, "the second", |_| doc.acked_version() == Some(2));
+        ctrl(&mut app, 's');
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "xyzalpha!\n"
+        );
+        assert!(!doc.is_modified());
+    }
+
+    #[test]
+    fn edits_made_while_saving_stay_unsaved() {
+        let _serial = crate::test_serial();
+        let root = fixture("saving", &[("a.txt", "alpha\n")]);
+        let mut app = app(&root, Some("a.txt"));
+        crate::host::set_at_once(false);
+        type_text(&mut app, "x");
+        ctrl(&mut app, 's');
+        // Typed before the host says it's written.
+        type_text(&mut app, "y");
+        wait_until(&mut app, "the save", |app| app.writing.is_empty());
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "xalpha\n");
+        assert!(app.ed().document().is_modified());
+        key(&mut app, KeyCode::Backspace);
+        assert!(!app.ed().document().is_modified(), "back to the text saved");
+    }
+
+    #[test]
+    fn files_show_once_the_host_has_loaded_them() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "loading",
+            &[
+                ("a.txt", "alpha\n"),
+                ("b.txt", "one\ntwo\nthree\n"),
+                ("c.txt", ""),
+            ],
+        );
+        let mut app = app(&root, Some("a.txt"));
+        crate::host::set_at_once(false);
+        let (a, b, c) = (root.join("a.txt"), root.join("b.txt"), root.join("c.txt"));
+
+        // Until it's loaded, the panel shows what it did; a newer file to
+        // open there takes the place of the one on its way.
+        assert!(app.open(&b, false));
+        assert_eq!(app.ed().path(), Some(a.clone()));
+        assert!(app.open(&c, false));
+        wait_until(&mut app, "c.txt", |app| app.ed().path() == Some(c.clone()));
+        assert!(app.find_document(&b).is_none(), "b.txt never opened");
+
+        // What follows opening it happens once it's shown.
+        app.open_and(&b, |editor| editor.select_in_line(2, 0..5));
+        wait_until(&mut app, "b.txt", |app| app.ed().path() == Some(b.clone()));
+        assert_eq!(app.ed().selected_text().as_deref(), Some("three"));
     }
 
     #[test]
@@ -9481,6 +10657,23 @@ mod tests {
     }
 
     #[test]
+    fn diffs_show_once_git_says_what_the_file_was() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-diff-later");
+        fs::write(root.join("a.txt"), "a\nnew\n").unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+        crate::host::set_at_once(false);
+        app.run(Command::ToggleDiff, false);
+        assert!(app.ed().diffing());
+        assert!(screen(&app).contains("Reading the last commit"));
+        wait_until(&mut app, "the last commit", |app| {
+            !screen(app).contains("Reading the last commit")
+        });
+        assert!(screen(&app).contains("+ new"), "{}", screen(&app));
+    }
+
+    #[test]
     fn changed_files_open_to_their_diffs_and_headers_toggle_them() {
         let _serial = crate::test_serial();
         let root = crate::git::tests::repo("app-diff");
@@ -9978,7 +11171,7 @@ mod tests {
         let _serial = crate::test_serial();
         let root = fixture("save-as-open", &[("a.txt", "original")]);
         let mut app = app(&root, Some("a.txt"));
-        let (doc, _) = Document::open(None, app.theme.clone()).unwrap();
+        let doc = Document::untitled(app.theme.clone()).unwrap();
         app.documents.push(doc.clone());
         app.active_panel_mut().show(&doc).unwrap();
         type_text(&mut app, "other");
@@ -10068,8 +11261,8 @@ mod tests {
         assert!(app.active_panel().image().is_some());
 
         // It follows the file when it's renamed.
-        app.move_entry(&root.join("red.png"), &root.join("blue.png"))
-            .unwrap();
+        let (from, to) = (root.join("red.png"), root.join("blue.png"));
+        app.start_file_op(FileOp::Move { from, to }, false);
         assert_eq!(app.tab().title(), "blue.png");
 
         // Closing it empties the panel.
@@ -10162,8 +11355,9 @@ mod tests {
         assert!(app.documents.is_empty());
         assert_eq!(app.focus, Focus::Editor);
         let workspace = Workspace::new([root.clone()]).unwrap();
-        let bad = App::new(workspace, Some(root.join("missing.png")), 80, 10);
-        assert!(bad.is_err());
+        let bad = App::new(workspace, Some(root.join("missing.png")), 80, 10).unwrap();
+        assert!(bad.active_panel().image().is_none());
+        assert!(screen(&bad).contains("missing.png"), "{}", screen(&bad));
     }
 
     #[test]
@@ -12588,6 +13782,29 @@ mod tests {
     }
 
     #[test]
+    fn the_command_lines_line_waits_for_its_file() {
+        let _serial = crate::test_serial();
+        let root = fixture("command-line-waits", &[("a.txt", &numbered(20))]);
+        crate::host::set_at_once(false);
+        let mut app = app(&root, Some("a.txt"));
+        app.go_to(Position::printed(12, Some(3)));
+        wait_until(&mut app, "a.txt", |app| app.editor().is_some());
+        assert_eq!(cursor_at(&app), "Ln 12, Col 3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_and_its_file_are_one_document() {
+        let _serial = crate::test_serial();
+        let root = fixture("symlinked-file", &[("a.txt", "alpha")]);
+        std::os::unix::fs::symlink(root.join("a.txt"), root.join("link.txt")).unwrap();
+        let mut app = app(&root, Some("link.txt"));
+        assert!(app.open(&root.join("a.txt"), false));
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(app.ed().path(), Some(root.join("link.txt")));
+    }
+
+    #[test]
     fn ctrl_click_in_a_terminal_opens_the_file_beside_it() {
         let _serial = crate::test_serial();
         let root = fixture("terminal-links", &[("src/main.rs", &numbered(20))]);
@@ -12981,10 +14198,16 @@ mod tests {
     }
 
     fn reopen_dir(dir: &Path, sessions: Option<PathBuf>, adopted: Vec<Adopted>) -> App {
-        let session = Session::open(dir).unwrap();
+        // The app that had it may have only just let go (see `let_go`).
         let state = session::read(dir).unwrap();
         let workspace = Workspace::new(state.roots.clone()).unwrap();
         let mut app = App::new(workspace, None, 80, 10).unwrap();
+        let session = RefCell::new(None);
+        crate::let_go(|| {
+            *session.borrow_mut() = SessionLink::open(&app.host, dir).ok();
+            session.borrow().is_none()
+        });
+        let session = session.into_inner().expect("the session let go");
         app.sessions = sessions;
         app.restore_session(session, state, adopted).unwrap();
         app
@@ -13044,7 +14267,7 @@ mod tests {
         assert!(editor.text().contains("liXne 20"), "{}", editor.text());
         assert_eq!(editor.place().0, 19, "the cursor's row");
         // Going back still works from where it was.
-        assert_eq!(app.session().map(Session::dir), Some(dir.as_path()));
+        assert_eq!(app.session().map(SessionLink::dir), Some(dir.as_path()));
 
         // Nothing running: quitting saves it and exits, keeping it.
         assert!(matches!(ctrl(&mut app, 'q'), AppAction::Quit));
@@ -13059,7 +14282,8 @@ mod tests {
             2
         );
         drop(app);
-        assert!(!session::is_live(&dir));
+        // The host lets go of it once it hears the app's gone.
+        assert!(crate::let_go(|| session::is_live(&dir)));
     }
 
     #[test]
@@ -13242,6 +14466,88 @@ mod tests {
     }
 
     #[test]
+    fn a_client_coming_back_to_a_host_process_attaches_to_its_terminals() {
+        let _serial = crate::test_serial();
+        let root = fixture("session-attach", &[("a.txt", "alpha")]);
+        let path = root.join("host.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Without screens: the native core's the apps', on this thread.
+        let host = std::thread::spawn(move || crate::host::serve_listener(listener, false, None));
+        let workspace = Workspace::new([root.clone()]).unwrap();
+        let link = Link::connect(&path).unwrap();
+        let mut app = App::with_host(link, workspace, Some(root.join("a.txt")), 80, 10).unwrap();
+        app.sessions = Some(sessions_dir("attach"));
+        app.run(Command::KeepSession, false);
+        app.run(Command::NewTerminal, false);
+        type_text(&mut app, "echo mark-$((6*7))");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the shell's output", |app| {
+            snapshot_text(&app.terminals[0]).contains("mark-42")
+        });
+        let dir = app.session().unwrap().dir().to_path_buf();
+
+        // Another client comes, to the session's socket: this one hears
+        // it, saves, and leaves, the shell running on.
+        let link = Link::connect(&session::socket_path(&dir)).unwrap();
+        wait_until(&mut app, "the move", |app| {
+            matches!(app.deferred, Some(AppAction::Moved))
+        });
+        app.set_attached(false);
+        app.leave();
+        let closed = app.host().closed();
+        drop(app);
+        closed.wait(Duration::from_secs(5));
+        let session = SessionLink::open(&link, &dir).unwrap();
+        let state = session::read(&dir).unwrap();
+        assert!(state.terminals[0].host_id.is_some());
+        let workspace = Workspace::new(state.roots.clone()).unwrap();
+        let mut app = App::with_host(link, workspace, None, 80, 10).unwrap();
+        app.restore_session(session, state, Vec::new()).unwrap();
+        assert_eq!(app.terminals.len(), 1);
+        assert!(app.active_terminal().is_some(), "still on screen");
+        type_text(&mut app, "echo again-$((1+1))");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "the same shell's output", |app| {
+            snapshot_text(&app.terminals[0]).contains("again-2")
+        });
+        let text = snapshot_text(&app.terminals[0]);
+        assert!(!text.contains("restored session from"), "{text}");
+
+        // Ended and quit: the shell's hung up on, and the host ends.
+        app.end_session_now();
+        let closed = app.host().closed();
+        drop(app);
+        closed.wait(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !host.is_finished() {
+            assert!(Instant::now() < deadline, "the host goes on");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn sessions_save_as_they_go_without_waiting() {
+        let _serial = crate::test_serial();
+        let root = fixture("session-background", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.sessions = Some(sessions_dir("background"));
+        type_text(&mut app, "x");
+        assert!(app.keep_session(false));
+        let dir = app.session().unwrap().dir().to_path_buf();
+        crate::host::set_at_once(false);
+        type_text(&mut app, "y");
+        app.session_saved = None;
+        app.poll();
+        assert!(app.session_saving.is_some(), "on its way");
+        wait_until(&mut app, "the save", |app| app.session_saving.is_none());
+        let state = session::read(&dir).unwrap();
+        let name = state.documents[0].unsaved.clone().unwrap();
+        let text = fs::read_to_string(dir.join("docs").join(name)).unwrap();
+        assert_eq!(text, "xyalpha");
+        app.end_session_now();
+    }
+
+    #[test]
     fn session_snapshot_failure_preserves_copy_and_blocks_leaving() {
         let _serial = crate::test_serial();
         let root = fixture("session-save-failure", &[("a.txt", "alpha")]);
@@ -13342,7 +14648,7 @@ mod tests {
         let mut restored = App::new(workspace, None, 80, 10).unwrap();
         assert!(restored
             .restore_session(
-                Session::open(&dir).unwrap(),
+                SessionLink::open(&restored.host, &dir).unwrap(),
                 session::read(&dir).unwrap(),
                 Vec::new()
             )

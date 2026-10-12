@@ -5,24 +5,28 @@
 //!
 //! [`outline`] lists a file's symbols in order, each with the names of the
 //! symbols around it, as a method's class. A [`SymbolIndex`] lists every
-//! symbol in the workspace, on background threads, and keeps them for the
-//! session: indexing again reads only the files that changed since.
+//! symbol in the workspace, indexed on the host (see [`crate::host`]),
+//! which keeps them for the session: indexing again reads only the files
+//! that changed since.
 
 use std::collections::HashMap;
 use std::fs;
 use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use tree_sitter::{ParseOptions, ParseState, Parser, Query, QueryCursor, StreamingIterator};
 
+use crate::host::{Call, Link, Reply, Request, Responder};
 use crate::language::{self, Language};
 use crate::picker::Item;
 use crate::theme::SyntaxColor;
 use crate::workspace::Workspace;
+use serde::{Deserialize, Serialize};
 
 /// Larger files aren't outlined, or indexed for the workspace.
 const MAX_BYTES: usize = 4 << 20;
@@ -35,7 +39,7 @@ const MAX_SYMBOLS: usize = 500_000;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Something a file defines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Symbol {
     pub name: String,
     /// What it is: `function`, `struct`, `heading`, and so on.
@@ -70,6 +74,31 @@ const NODE_KINDS: &[&str] = &[
     "type",
     "union",
 ];
+
+/// A [`Symbol`] as sent, its kind one of [`kind_name`]'s or
+/// [`NODE_KINDS`].
+#[derive(Deserialize)]
+struct Sent {
+    name: String,
+    kind: String,
+    line: u32,
+    bytes: Range<usize>,
+    container: String,
+}
+
+impl<'de> Deserialize<'de> for Symbol {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Symbol, D::Error> {
+        let sent = Sent::deserialize(de)?;
+        let known = NODE_KINDS.iter().find(|&&known| known == sent.kind);
+        Ok(Symbol {
+            name: sent.name,
+            kind: known.copied().unwrap_or_else(|| kind_name(&sent.kind)),
+            line: sent.line,
+            bytes: sent.bytes,
+            container: sent.container,
+        })
+    }
+}
 
 /// A language's compiled tags query.
 struct Tags {
@@ -268,42 +297,46 @@ pub fn color(kind: &str) -> Option<SyntaxColor> {
 
 // --- the workspace's symbols ----------------------------------------------------
 
-/// A file's symbols, and as listed, as of its modification time and size.
+/// A file's symbols, as of its modification time and size.
 #[derive(Clone)]
 struct Indexed {
     modified: Option<SystemTime>,
     len: u64,
     symbols: Vec<Symbol>,
-    items: Vec<Item>,
 }
 
-type Cache = HashMap<PathBuf, Indexed>;
-
-enum Message {
-    /// More symbols, during the first indexing.
-    Found(Vec<Item>),
-    /// Every symbol, by file, then line, and what to reuse next time.
-    Done(Vec<Item>, Cache),
+/// What the host keeps of the last indexing, to read only the files that
+/// changed the next time.
+#[derive(Default)]
+pub struct Cache {
+    files: Mutex<Arc<HashMap<PathBuf, Indexed>>>,
 }
+
+/// Each file's symbols, by path.
+pub type FileSymbols = Vec<(PathBuf, Vec<Symbol>)>;
 
 pub struct SymbolIndex {
+    host: Link,
     workspace: Workspace,
     /// Shared with an open picker, which keeps its copy until given a new one.
     items: Rc<Vec<Item>>,
-    cache: Arc<Cache>,
+    /// Each file's symbols, as of the last indexing to complete.
+    files: FileSymbols,
     /// Whether `items` is a whole index, not the first in progress.
     complete: bool,
-    indexing: Option<Receiver<Message>>,
+    indexing: Option<Call>,
     /// Files to index once the indexing in progress is done.
     again: Option<Vec<PathBuf>>,
 }
 
 impl SymbolIndex {
-    pub fn new(workspace: &Workspace) -> SymbolIndex {
+    /// An index of `workspace`'s symbols, made on `host`.
+    pub fn new(host: &Link, workspace: &Workspace) -> SymbolIndex {
         SymbolIndex {
+            host: host.clone(),
             workspace: workspace.clone(),
             items: Rc::new(Vec::new()),
-            cache: Arc::new(HashMap::new()),
+            files: Vec::new(),
             complete: false,
             indexing: None,
             again: None,
@@ -329,11 +362,10 @@ impl SymbolIndex {
     /// The symbols named `name`, and the files they're in, as of the last
     /// indexing to complete.
     pub fn named(&self, name: &str) -> Vec<(PathBuf, Symbol)> {
-        self.cache
+        self.files
             .iter()
-            .flat_map(|(path, indexed)| {
-                indexed
-                    .symbols
+            .flat_map(|(path, symbols)| {
+                symbols
                     .iter()
                     .filter(|symbol| symbol.name == name)
                     .map(|symbol| (path.clone(), symbol.clone()))
@@ -348,19 +380,10 @@ impl SymbolIndex {
             self.again = Some(files);
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        let workspace = self.workspace.clone();
-        let cache = Arc::clone(&self.cache);
-        let progress = !self.complete;
-        std::thread::spawn(move || {
-            let (items, cache) = index(&workspace, &files, &cache, |found| {
-                if progress {
-                    let _ = sender.send(Message::Found(found));
-                }
-            });
-            let _ = sender.send(Message::Done(items, cache));
-        });
-        self.indexing = Some(receiver);
+        self.indexing = Some(self.host.call(Request::IndexSymbols {
+            files,
+            progress: !self.complete,
+        }));
     }
 
     /// Takes in what the indexing found since the last call. Returns
@@ -372,17 +395,19 @@ impl SymbolIndex {
         let mut changed = false;
         loop {
             match indexing.try_recv() {
-                Ok(Message::Found(found)) => {
+                Ok(Reply::SymbolsFound(found)) => {
+                    let found = items(&self.workspace, &found);
                     Rc::make_mut(&mut self.items).extend(found);
                     changed = true;
                 }
-                Ok(Message::Done(items, cache)) => {
-                    self.items = Rc::new(items);
-                    self.cache = Arc::new(cache);
+                Ok(Reply::Symbols(files)) => {
+                    self.items = Rc::new(items(&self.workspace, &files).collect());
+                    self.files = files;
                     self.complete = true;
                     changed = true;
                     break;
                 }
+                Ok(_) => {}
                 Err(TryRecvError::Empty) => {
                     self.indexing = Some(indexing);
                     return changed;
@@ -409,27 +434,40 @@ impl SymbolIndex {
     }
 }
 
-/// The symbols in `files`, reusing those in `cache` for files that haven't
-/// changed, on as many threads as there are cores (up to 8). `found` hears
-/// of them as they're found, now and then.
-fn index(
-    workspace: &Workspace,
-    files: &[PathBuf],
-    cache: &Cache,
-    mut found: impl FnMut(Vec<Item>),
-) -> (Vec<Item>, Cache) {
+/// `files`' symbols, as the picker lists them.
+fn items<'a>(workspace: &'a Workspace, files: &'a FileSymbols) -> impl Iterator<Item = Item> + 'a {
+    files.iter().flat_map(|(path, symbols)| {
+        let shown = workspace.display_path(path);
+        symbols
+            .iter()
+            .map(move |symbol| Item::workspace_symbol(symbol.clone(), Some(path.clone()), &shown))
+    })
+}
+
+/// Indexes the symbols in `files`, for the host, reusing those in `cache`
+/// for files that haven't changed, on as many threads as there are cores
+/// (up to 8). Replies with the symbols found now and then as it goes, if
+/// `progress`, and then with all of them, by path. Stops if the call is
+/// cancelled, leaving the cache as it was.
+pub fn index(files: &[PathBuf], cache: &Cache, progress: bool, responder: &Responder) {
+    let old = Arc::clone(&lock(&cache.files));
     let threads = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .clamp(1, 8);
     let chunk = files.len().div_ceil(threads).max(1);
     let (sender, receiver) = mpsc::channel::<(PathBuf, Indexed)>();
-    std::thread::scope(|scope| {
+    let cancelled = responder.cancelled();
+    let new = std::thread::scope(|scope| {
         for files in files.chunks(chunk) {
             let sender = sender.clone();
+            let old = &old;
             scope.spawn(move || {
                 let mut parser = Parser::new();
                 for path in files {
-                    let Some(indexed) = index_file(workspace, path, cache, &mut parser) else {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let Some(indexed) = index_file(path, old, &mut parser) else {
                         continue;
                     };
                     if sender.send((path.clone(), indexed)).is_err() {
@@ -440,40 +478,47 @@ fn index(
         }
         drop(sender);
 
-        let mut new_cache = Cache::new();
+        let mut new = HashMap::new();
         let mut count = 0;
         let mut pending = Vec::new();
         let mut last_sent = Instant::now();
         for (path, mut indexed) in receiver {
-            if count >= MAX_SYMBOLS {
-                indexed.items.clear();
+            indexed.symbols.truncate(MAX_SYMBOLS - count);
+            count += indexed.symbols.len();
+            if progress {
+                pending.push((path.clone(), indexed.symbols.clone()));
             }
-            indexed.items.truncate(MAX_SYMBOLS - count);
-            indexed.symbols.truncate(indexed.items.len());
-            count += indexed.items.len();
-            pending.extend(indexed.items.iter().cloned());
-            new_cache.insert(path, indexed);
+            new.insert(path, indexed);
             if last_sent.elapsed() >= PROGRESS_INTERVAL && !pending.is_empty() {
-                found(std::mem::take(&mut pending));
+                if !responder.reply(Reply::SymbolsFound(std::mem::take(&mut pending))) {
+                    return None;
+                }
                 last_sent = Instant::now();
             }
         }
-        let mut paths: Vec<&PathBuf> = new_cache.keys().collect();
-        paths.sort();
-        let items = paths
-            .into_iter()
-            .flat_map(|path| new_cache[path].items.iter().cloned())
-            .collect();
-        (items, new_cache)
-    })
+        Some(new)
+    });
+    let Some(new) = new.filter(|_| !responder.is_cancelled()) else {
+        return;
+    };
+    let mut files: FileSymbols = new
+        .iter()
+        .map(|(path, indexed)| (path.clone(), indexed.symbols.clone()))
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    *lock(&cache.files) = Arc::new(new);
+    responder.reply(Reply::Symbols(files));
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The symbols in the file at `path`, from `cache` if it hasn't changed, or
 /// `None` if cue can't outline it.
 fn index_file(
-    workspace: &Workspace,
     path: &PathBuf,
-    cache: &Cache,
+    cache: &HashMap<PathBuf, Indexed>,
     parser: &mut Parser,
 ) -> Option<Indexed> {
     let language = language::detect(Some(path), String::new)?;
@@ -491,16 +536,10 @@ fn index_file(
         let text = fs::read_to_string(path).ok()?;
         outline_with(&tags, parser, &text)
     };
-    let shown = workspace.display_path(path);
-    let items = symbols
-        .iter()
-        .map(|symbol| Item::workspace_symbol(symbol.clone(), Some(path.clone()), &shown))
-        .collect();
     Some(Indexed {
         modified,
         len: meta.len(),
         symbols,
-        items,
     })
 }
 
@@ -671,7 +710,7 @@ static COUNT: u32 = 0;
             root.join("src/a.rs"),
         ];
         let workspace = Workspace::new([root.clone()]).unwrap();
-        let mut index = SymbolIndex::new(&workspace);
+        let mut index = SymbolIndex::new(&Link::local(), &workspace);
         assert!(index.indexing());
         index.refresh(files.clone());
         index.wait();

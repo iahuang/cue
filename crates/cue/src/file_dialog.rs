@@ -27,7 +27,8 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
 
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
@@ -35,6 +36,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::document;
+use crate::host::{Call, Link, Reply, Request};
 use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
@@ -42,6 +44,7 @@ use crate::line_edit::{self, Caret, Edit};
 use crate::picker::{self, Area};
 use crate::theme;
 use crate::tree;
+use serde::{Deserialize, Serialize};
 
 /// The widest the popup gets, in columns.
 const MAX_WIDTH: u32 = 90;
@@ -96,12 +99,24 @@ pub enum DialogAction {
 }
 
 /// Something in the folder listed.
-#[derive(Debug, Clone)]
-struct Entry {
-    name: String,
-    is_dir: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entry {
+    pub name: String,
+    pub is_dir: bool,
     /// A file's size, in bytes.
     size: Option<u64>,
+}
+
+impl Entry {
+    /// A folder, or a file of no size, called `name`, for tests.
+    #[cfg(test)]
+    pub fn named(name: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: name.to_string(),
+            is_dir,
+            size: (!is_dir).then_some(0),
+        }
+    }
 }
 
 /// A row of the list.
@@ -119,9 +134,12 @@ struct Listing {
     /// Why it couldn't be read, if it couldn't.
     error: Option<io::ErrorKind>,
     entries: Vec<Entry>,
+    /// Whether the host has listed it yet.
+    listed: bool,
 }
 
 pub struct FileDialog {
+    host: Link,
     purpose: Purpose,
     /// The path, as typed.
     text: String,
@@ -136,6 +154,11 @@ pub struct FileDialog {
     /// it.
     name_selected: bool,
     listing: Listing,
+    /// The host listing the folder, until it has.
+    reading: Option<Call>,
+    /// Enter was pressed before the folder was listed: it's taken once it
+    /// is.
+    accepting: bool,
     rows: Vec<Row>,
     /// The row Enter takes, if any. Opening, it's the best match; saving
     /// or creating, Enter takes the path typed unless a row is picked.
@@ -157,8 +180,11 @@ pub struct FileDialog {
 
 impl FileDialog {
     /// A dialog for `purpose` over a screen `width` x `height`, listing
-    /// `dir`, with `name` suggested. Saving over `current` doesn't ask.
+    /// `dir` on `host`, with `name` suggested. Saving over `current` doesn't
+    /// ask.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        host: &Link,
         purpose: Purpose,
         dir: &Path,
         name: &str,
@@ -177,15 +203,18 @@ impl FileDialog {
             .filter_map(|&(command, name)| Some(format!("{} {name}", keymap.shortcut(command)?)))
             .collect::<Vec<_>>()
             .join(" · ");
-        let dir = normalize(dir);
+        let dir = document::normalize(dir);
         let mut dialog = FileDialog {
+            host: host.clone(),
             purpose,
             text: format!("{}{name}", display_dir(&dir)),
             caret: Caret::default(),
             base: dir.clone(),
             current,
             name_selected: !name.is_empty(),
-            listing: Listing::read(&dir, purpose),
+            listing: Listing::unlisted(&dir),
+            reading: None,
+            accepting: false,
             rows: Vec::new(),
             selected: None,
             scroll: 0,
@@ -197,8 +226,80 @@ impl FileDialog {
             screen_width: width,
             screen_height: height,
         };
+        dialog.read();
         dialog.refilter();
         dialog
+    }
+
+    /// Asks the host to list the folder.
+    fn read(&mut self) {
+        self.reading = Some(self.host.call(Request::ReadDir {
+            dir: self.listing.dir.clone(),
+        }));
+        #[cfg(test)]
+        while crate::host::at_once() && self.reading.is_some() {
+            self.poll();
+        }
+    }
+
+    /// Takes in the folder's listing, once it comes. Returns what to do
+    /// then, if anything changed: what Enter does, if it was pressed
+    /// meanwhile.
+    pub fn poll(&mut self) -> Option<DialogAction> {
+        let reply = match self.reading.as_ref()?.try_recv() {
+            Ok(Reply::Dir { dir, entries }) => Some((dir, entries)),
+            Ok(_) | Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        self.reading = None;
+        let entries = match reply {
+            Some((dir, entries)) if dir == self.listing.dir => entries,
+            Some(_) => return None,
+            None => Err(io::ErrorKind::Other),
+        };
+        match entries {
+            // The folder it started in went: it starts in the one above.
+            Err(io::ErrorKind::NotFound) if self.listing.dir == self.base => {
+                if let Some(parent) = self.base.parent().map(Path::to_path_buf) {
+                    self.base = parent.clone();
+                    self.navigate(&parent, true);
+                    return Some(DialogAction::Continue);
+                }
+                self.listing.error = Some(io::ErrorKind::NotFound);
+            }
+            Ok(entries) => {
+                self.listing.entries = entries
+                    .into_iter()
+                    .filter(|entry| entry.is_dir || self.purpose != Purpose::AddFolder)
+                    .collect();
+            }
+            Err(error) => self.listing.error = Some(error),
+        }
+        self.listing.listed = true;
+        self.refilter();
+        if std::mem::take(&mut self.accepting) {
+            return Some(self.accept());
+        }
+        Some(DialogAction::Continue)
+    }
+
+    /// Whether `path` is a folder, as far as the listing tells: one the
+    /// folder listed is in, or one of its entries. `None` if it isn't
+    /// there, as far as it tells.
+    fn is_dir(&self, path: &Path) -> Option<bool> {
+        if self.listing.dir.starts_with(path) {
+            return Some(true);
+        }
+        if path.parent() != Some(self.listing.dir.as_path()) {
+            return None;
+        }
+        let name = path.file_name()?.to_string_lossy();
+        let entry = self
+            .listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)?;
+        Some(entry.is_dir)
     }
 
     pub fn purpose(&self) -> Purpose {
@@ -428,14 +529,16 @@ impl FileDialog {
             },
             _ => self.base.join(typed),
         };
-        normalize(&path)
+        document::normalize(&path)
     }
 
     fn text_changed(&mut self) {
         self.confirm = None;
         let dir = self.resolve(self.folder_text());
         if dir != self.listing.dir {
-            self.listing = Listing::read(&dir, self.purpose);
+            self.listing = Listing::unlisted(&dir);
+            self.accepting = false;
+            self.read();
         }
         self.refilter();
     }
@@ -532,8 +635,13 @@ impl FileDialog {
         DialogAction::Continue
     }
 
-    /// Enter: takes the selected row, or the path typed.
+    /// Enter: takes the selected row, or the path typed, once the folder
+    /// is listed.
     fn accept(&mut self) -> DialogAction {
+        if !self.listing.listed {
+            self.accepting = true;
+            return DialogAction::Continue;
+        }
         match self.selected.and_then(|i| self.rows.get(i)) {
             Some(Row::Parent) => {
                 self.go_up(false);
@@ -551,8 +659,9 @@ impl FileDialog {
             None => {}
         }
         let path = self.resolve(&self.text);
+        let is_dir = self.is_dir(&path);
         if self.purpose == Purpose::AddFolder {
-            return match path.is_dir() {
+            return match is_dir == Some(true) {
                 // The folder listed.
                 true if self.name().is_empty() => DialogAction::Accept(path),
                 true => {
@@ -569,7 +678,7 @@ impl FileDialog {
             // Left where it is.
             return DialogAction::Close;
         }
-        if path.is_dir() {
+        if is_dir == Some(true) {
             // `..` typed, or a folder the list didn't narrow to.
             self.navigate(&path, false);
             return DialogAction::Continue;
@@ -577,7 +686,7 @@ impl FileDialog {
         if self.name().is_empty() {
             return DialogAction::Continue;
         }
-        if self.purpose == Purpose::Open && !path.is_file() {
+        if self.purpose == Purpose::Open && is_dir != Some(false) {
             self.show_error(format!("{} not found.", self.name()));
             return DialogAction::Continue;
         }
@@ -586,7 +695,7 @@ impl FileDialog {
 
     /// Takes `path`, after asking whether to save over another file.
     fn choose(&mut self, path: PathBuf) -> DialogAction {
-        let exists = fs::symlink_metadata(&path).is_ok();
+        let exists = self.is_dir(&path).is_some();
         let name = file_name(&path);
         match self.purpose {
             Purpose::Open | Purpose::AddFolder => DialogAction::Accept(path),
@@ -595,15 +704,6 @@ impl FileDialog {
                 DialogAction::Continue
             }
             Purpose::Create => DialogAction::Accept(path),
-            // A new name for the same file, as when only its case changes.
-            Purpose::Move
-                if self
-                    .current
-                    .as_deref()
-                    .is_some_and(|current| document::same_file(current, &path)) =>
-            {
-                DialogAction::Accept(path)
-            }
             Purpose::CreateFolder | Purpose::Move | Purpose::Duplicate if exists => {
                 self.show_error(format!("{name} already exists."));
                 DialogAction::Continue
@@ -612,10 +712,7 @@ impl FileDialog {
                 DialogAction::Accept(path)
             }
             Purpose::SaveAs => {
-                let current = self
-                    .current
-                    .as_deref()
-                    .is_some_and(|current| document::same_file(current, &path));
+                let current = self.current.as_ref() == Some(&path);
                 if !exists || current || self.confirm.as_ref() == Some(&path) {
                     return DialogAction::Accept(path);
                 }
@@ -928,52 +1025,48 @@ impl FileDialog {
 }
 
 impl Listing {
-    /// The entries of `dir`, folders first, each group by name ignoring
-    /// case, as in the file tree. Only folders, for adding one.
-    fn read(dir: &Path, purpose: Purpose) -> Listing {
-        let read = match fs::read_dir(dir) {
-            Ok(read) => read,
-            Err(err) => {
-                // Reading a file as a folder fails with an unhelpful error.
-                let error = match dir.is_file() {
-                    true => io::ErrorKind::NotADirectory,
-                    false => err.kind(),
-                };
-                return Listing {
-                    dir: dir.to_path_buf(),
-                    error: Some(error),
-                    entries: Vec::new(),
-                };
-            }
-        };
-        let mut entries: Vec<Entry> = read
-            .filter_map(Result::ok)
-            .filter(|entry| !tree::is_hidden(&entry.file_name()))
-            .map(|entry| {
-                // Following symlinks, to folders or files.
-                let meta = fs::metadata(entry.path()).ok();
-                let is_dir = meta.as_ref().is_some_and(fs::Metadata::is_dir);
-                Entry {
-                    name: entry.file_name().to_string_lossy().into_owned(),
-                    is_dir,
-                    size: meta.filter(|_| !is_dir).map(|meta| meta.len()),
-                }
-            })
-            .filter(|entry| entry.is_dir || purpose != Purpose::AddFolder)
-            .collect();
-        entries.sort_by(|a, b| {
-            (!a.is_dir, a.name.to_lowercase(), &a.name).cmp(&(
-                !b.is_dir,
-                b.name.to_lowercase(),
-                &b.name,
-            ))
-        });
+    /// `dir`, before the host lists it.
+    fn unlisted(dir: &Path) -> Listing {
         Listing {
             dir: dir.to_path_buf(),
             error: None,
-            entries,
+            entries: Vec::new(),
+            listed: false,
         }
     }
+}
+
+/// The entries of `dir`, for the host, folders first, each group by name
+/// ignoring case, as in the file tree, or why it can't be read.
+pub fn read(dir: &Path) -> Result<Vec<Entry>, io::ErrorKind> {
+    let read = match fs::read_dir(dir) {
+        Ok(read) => read,
+        // Reading a file as a folder fails with an unhelpful error.
+        Err(_) if dir.is_file() => return Err(io::ErrorKind::NotADirectory),
+        Err(err) => return Err(err.kind()),
+    };
+    let mut entries: Vec<Entry> = read
+        .filter_map(Result::ok)
+        .filter(|entry| !tree::is_hidden(&entry.file_name()))
+        .map(|entry| {
+            // Following symlinks, to folders or files.
+            let meta = fs::metadata(entry.path()).ok();
+            let is_dir = meta.as_ref().is_some_and(fs::Metadata::is_dir);
+            Entry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                is_dir,
+                size: meta.filter(|_| !is_dir).map(|meta| meta.len()),
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        (!a.is_dir, a.name.to_lowercase(), &a.name).cmp(&(
+            !b.is_dir,
+            b.name.to_lowercase(),
+            &b.name,
+        ))
+    });
+    Ok(entries)
 }
 
 fn home() -> Option<PathBuf> {
@@ -994,23 +1087,6 @@ fn display_dir(dir: &Path) -> String {
         shown.push('/');
     }
     shown
-}
-
-/// `path` without `.` and `..`, which go nowhere and up. Symlinks are kept,
-/// so `..` may not go where the file system would take it; the folder
-/// listed is the one the path names.
-fn normalize(path: &Path) -> PathBuf {
-    let mut normal = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normal.pop();
-            }
-            component => normal.push(component),
-        }
-    }
-    normal
 }
 
 fn file_name(path: &Path) -> String {
@@ -1061,7 +1137,25 @@ mod tests {
     }
 
     fn dialog(purpose: Purpose, dir: &Path, name: &str) -> FileDialog {
-        FileDialog::new(purpose, dir, name, None, &Keymap::default(), 80, 24)
+        FileDialog::new(
+            &Link::local(),
+            purpose,
+            dir,
+            name,
+            None,
+            &Keymap::default(),
+            80,
+            24,
+        )
+    }
+
+    #[test]
+    fn a_folder_that_went_starts_the_dialog_above_it() {
+        let root = fixture("went", &["a.txt"]);
+        let dialog = dialog(Purpose::SaveAs, &root.join("gone/deeper"), "b.txt");
+        assert_eq!(dialog.listing.dir, root);
+        assert_eq!(dialog.text, format!("{}b.txt", display_dir(&root)));
+        assert_eq!(listed(&dialog), ["../", "a.txt"]);
     }
 
     /// The rows listed, folders ending in `/`.
@@ -1148,6 +1242,24 @@ mod tests {
     }
 
     #[test]
+    fn enter_before_the_folder_is_listed_is_taken_once_it_is() {
+        let root = fixture("unlisted", &["a.rs", "b.rs"]);
+        crate::host::set_at_once(false);
+        let mut dialog = dialog(Purpose::Open, &root, "");
+        type_text(&mut dialog, "a");
+        assert_eq!(dialog.run(Command::PickerAccept), DialogAction::Continue);
+        let start = Instant::now();
+        let action = loop {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            if let Some(action) = dialog.poll() {
+                break action;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(action, DialogAction::Accept(root.join("a.rs")));
+    }
+
+    #[test]
     fn opening_takes_only_files_that_exist() {
         let root = fixture("open", &["a.rs"]);
         let mut dialog = dialog(Purpose::Open, &root, "");
@@ -1169,6 +1281,7 @@ mod tests {
         let root = fixture("save", &["other.txt", "dir/"]);
         let mine = root.join("mine.txt");
         let mut dialog = FileDialog::new(
+            &Link::local(),
             Purpose::SaveAs,
             &root,
             "mine.txt",

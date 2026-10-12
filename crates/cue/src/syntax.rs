@@ -1170,6 +1170,21 @@ fn line_starts(text: &str) -> Vec<usize> {
 /// The edit that turns `old` into `new`: the bytes between what they start
 /// and end with in common. `None` if they're the same.
 fn edit(old: &str, old_lines: &[usize], new: &str, new_lines: &[usize]) -> Option<InputEdit> {
+    let (start, old_end, new_end) = changed(old, new)?;
+    Some(InputEdit {
+        start_byte: start,
+        old_end_byte: old_end,
+        new_end_byte: new_end,
+        start_position: point(old_lines, start),
+        old_end_position: point(old_lines, old_end),
+        new_end_position: point(new_lines, new_end),
+    })
+}
+
+/// Where `old` and `new` differ, if they do: the bytes between what they
+/// start and end with in common, from `start`, up to `old_end` in `old` and
+/// `new_end` in `new`, on character boundaries.
+pub fn changed(old: &str, new: &str) -> Option<(usize, usize, usize)> {
     if old == new {
         return None;
     }
@@ -1183,16 +1198,7 @@ fn edit(old: &str, old_lines: &[usize], new: &str, new_lines: &[usize]) -> Optio
     while !boundary(old.len() - suffix, new.len() - suffix) {
         suffix -= 1;
     }
-    let old_end = old.len() - suffix;
-    let new_end = new.len() - suffix;
-    Some(InputEdit {
-        start_byte: start,
-        old_end_byte: old_end,
-        new_end_byte: new_end,
-        start_position: point(old_lines, start),
-        old_end_position: point(old_lines, old_end),
-        new_end_position: point(new_lines, new_end),
-    })
+    Some((start, old.len() - suffix, new.len() - suffix))
 }
 
 /// How many bytes `a` and `b` start with in common. Compares blocks first,

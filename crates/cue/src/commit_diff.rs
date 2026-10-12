@@ -4,12 +4,14 @@
 //! as it is now.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use opentui::Buffer;
 
 use crate::diff::DiffView;
-use crate::git::{self, Base, Change, Commit, Kind};
+use crate::git::{Base, Change, Commit, GitAnswer, GitCall};
+use crate::host::{Call, Link, Reply, Request};
 use crate::input::{Key, Mouse};
 use crate::keymap::Command;
 use crate::layout::Rect;
@@ -30,29 +32,55 @@ pub struct CommitDiff {
     root: PathBuf,
     commit: Commit,
     change: Change,
+    /// Empty until git has said what the file was on both sides.
     view: DiffView,
+    /// Asking git that.
+    reading: Option<Call>,
+    size: (u32, u32),
 }
 
 impl CommitDiff {
-    /// How `commit`, in the repository at `root`, made `change`, reading
-    /// both sides from git.
-    pub fn open(root: &Path, commit: Commit, change: Change) -> CommitDiff {
-        let relative = |path: &Path| path.strip_prefix(root).unwrap_or(path).to_path_buf();
-        let old_path = relative(change.from.as_deref().unwrap_or(&change.path));
-        let old = match (&commit.parent, change.kind) {
-            (Some(parent), kind) if kind != Kind::Added => git::file_at(root, parent, &old_path),
-            _ => Base::Missing,
-        };
-        let new = match change.kind {
-            Kind::Deleted => Base::Missing,
-            _ => git::file_at(root, &commit.hash, &relative(&change.path)),
-        };
-        CommitDiff {
+    /// How `commit`, in the repository at `root`, made `change`, once git on
+    /// `host` has read both sides.
+    pub fn open(host: &Link, root: &Path, commit: Commit, change: Change) -> CommitDiff {
+        let empty = || Base::Text(String::new());
+        let diff = CommitDiff {
             root: root.to_path_buf(),
-            view: DiffView::fixed(old, new, change.path.clone()),
+            view: DiffView::fixed(empty(), empty(), change.path.clone()),
+            reading: Some(host.call(Request::Git(GitCall::Sides {
+                root: root.to_path_buf(),
+                commit: commit.clone(),
+                change: change.clone(),
+            }))),
+            size: (1, 1),
             commit,
             change,
-        }
+        };
+        #[cfg(test)]
+        let diff = {
+            let mut diff = diff;
+            while crate::host::at_once() && diff.reading.is_some() {
+                diff.poll();
+            }
+            diff
+        };
+        diff
+    }
+
+    /// Takes in both sides, once git has read them. Returns whether it did.
+    pub fn poll(&mut self) -> bool {
+        let Some(reading) = &self.reading else {
+            return false;
+        };
+        let (old, new) = match reading.try_recv() {
+            Ok(Reply::Git(GitAnswer::Sides(old, new))) => (old, new),
+            Ok(_) | Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => (Base::Binary, Base::Binary),
+        };
+        self.reading = None;
+        self.view = DiffView::fixed(old, new, self.change.path.clone());
+        self.view.set_size(self.size.0, self.size.1);
+        true
     }
 
     pub fn root(&self) -> &Path {
@@ -73,6 +101,7 @@ impl CommitDiff {
     }
 
     pub fn set_size(&mut self, width: u32, height: u32) {
+        self.size = (width, height);
         self.view.set_size(width, height);
     }
 

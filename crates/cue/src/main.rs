@@ -4,6 +4,7 @@ mod alert;
 mod app;
 mod attach;
 mod autoindent;
+mod bridge;
 mod changes;
 mod client;
 mod commit_diff;
@@ -17,9 +18,11 @@ mod document;
 mod editor;
 mod file_dialog;
 mod file_index;
+mod file_ops;
 mod find;
 mod git;
 mod history;
+mod host;
 mod icons;
 mod image;
 mod indent;
@@ -40,6 +43,8 @@ mod quick_look;
 mod reader;
 mod recovery;
 mod relocate;
+mod remote;
+mod replica;
 mod resume;
 mod scroller;
 mod search;
@@ -50,6 +55,7 @@ mod switcher;
 mod symbols;
 mod syntax;
 mod tab;
+mod term_hub;
 mod terminal;
 mod theme;
 mod toast;
@@ -57,6 +63,7 @@ mod tree;
 mod tty;
 mod wake;
 mod watch;
+mod wire;
 mod words;
 mod workspace;
 
@@ -75,9 +82,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use app::{App, AppAction};
 use attach::{Control, Request};
+use host::Link;
 use input::{Event, Parser};
 use keymap::{Command, Keymap};
-use session::Session;
+use session::SessionLink;
 use workspace::Workspace;
 
 /// How long input must be idle before a lone ESC counts as the Escape key.
@@ -113,21 +121,92 @@ fn main() -> ExitCode {
     let mode = parse_args();
     // Only a client needs the copy it runs from, if it does: to start a
     // server.
-    if !matches!(mode, Ok(Mode::Client(_))) {
+    if !matches!(mode, Ok(Mode::Client(_) | Mode::Restarted(..))) {
         relocate::release();
     }
+    // Whether the app's shown in this process, the client's.
+    let here = match &mode {
+        Ok(Mode::Client(args)) => args.remote.is_some() || env_flag(HOST_PROCESS_VARIABLE),
+        Ok(Mode::Restarted(..)) => true,
+        _ => false,
+    };
+    // The session's only for restarting, to forget once it's back.
+    let mut ephemeral = false;
+    // The bridge to the host on another machine, if it's there.
+    let mut bridge = None;
     let start = match mode {
         Ok(Mode::Serve(start)) => start,
+        Ok(Mode::Restarted(dir, only_for_restart, None)) => {
+            ephemeral = only_for_restart;
+            // Its host may have had nothing left to wait for.
+            match session::is_live(&dir) {
+                true => Start::Attach(dir),
+                false => Start::Restore(dir),
+            }
+        }
+        Ok(Mode::Restarted(dir, only_for_restart, Some(host))) => {
+            ephemeral = only_for_restart;
+            match reach(&host).and_then(|mut reached| {
+                let live = reached.sessions()?.iter().any(|l| l.dir == dir && l.live);
+                bridge = Some(reached);
+                Ok(live)
+            }) {
+                Ok(true) => Start::Attach(dir),
+                Ok(false) => Start::Restore(dir),
+                Err(err) => {
+                    relocate::release();
+                    eprintln!("cue: can't reach {host}: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        Ok(Mode::Client(args)) if args.remote.is_some() => {
+            let destination = args.remote.clone().unwrap();
+            let mut reached = match reach(&destination.host) {
+                Ok(reached) => reached,
+                Err(err) => {
+                    relocate::release();
+                    eprintln!("cue: can't reach {}: {err}", destination.host);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let opening = remote::target(&mut reached, &destination, &args);
+            bridge = Some(reached);
+            match opening {
+                Ok(remote::Opening::Session(listing)) if listing.live => Start::Attach(listing.dir),
+                Ok(remote::Opening::Session(listing)) => Start::Restore(listing.dir),
+                Ok(remote::Opening::Paths(paths)) => Start::Paths(paths),
+                Err(code) => {
+                    relocate::release();
+                    return code;
+                }
+            }
+        }
+        Ok(Mode::Client(args)) if here => match client::target(&args) {
+            Ok(Some(listing)) if listing.live => Start::Attach(listing.dir),
+            Ok(Some(listing)) => Start::Restore(listing.dir),
+            Ok(None) => Start::Paths(args.paths),
+            Err(code) => {
+                relocate::release();
+                return code;
+            }
+        },
         Ok(Mode::Client(args)) => {
             let code = client::run(args);
             relocate::release();
             return code;
         }
+        Ok(Mode::Host(adopt)) => return host_process(adopt),
+        Ok(Mode::Bridge) => return bridge::run(),
         Ok(Mode::List) => return client::list(),
         Ok(Mode::End(id)) => return client::end(id),
         Err(code) => return code,
     };
-    let result = std::panic::catch_unwind(|| serve(start));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match here {
+        true => show(start, ephemeral, bridge),
+        false => serve(start),
+    }));
+    relocate::release();
     if let Some(panic) = crash::take_panic() {
         eprintln!("cue crashed: {}", panic.text);
         // Said, unless stderr is the background's log.
@@ -152,13 +231,14 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "usage: cue [FOLDER]... [FILE[:LINE[:COLUMN]]]
        cue --resume [--all] | --fresh [FOLDER]...
+       cue [USER@]HOST:[PATH]
        cue --list | --end [SESSION]";
 
 /// Usage and every command with its shortcut.
 fn help() -> String {
     let keymap = Keymap::new(&config::load().0.keys);
     let mut help = format!(
-        "{USAGE}\n\nOpens the specified folders, or the current folder if none are specified.\nOpens FILE, or a new unnamed buffer if no file is specified.\nAppend :LINE or :LINE:COLUMN to a file path, for example src/main.rs:12:5.\nHold Shift while moving the cursor, or drag with the mouse, to select text.\nSettings are stored in {}. Use Open Settings in the command palette to create the file.\n\nSessions preserve tabs, files, unsaved changes, and terminals.\nUse Keep Session to create a session. Quitting with unsaved changes or running\nprograms also creates one. When you quit, programs in session terminals continue\nrunning in the background. Use End Session to end the session.\nWithout FILE, cue resumes the folder's session if exactly one exists.\n\n  -r, --resume   choose a session for the folder\n  -a, --all      choose from all sessions (implies --resume)\n      --fresh    start a new cue instance\n  -l, --list     list all sessions\n      --end      end SESSION (an ID or name), or the folder's session\n\n",
+        "{USAGE}\n\nOpens the specified folders, or the current folder if none are specified.\nOpens FILE, or a new unnamed buffer if no file is specified.\nAppend :LINE or :LINE:COLUMN to a file path, for example src/main.rs:12:5.\nHold Shift while moving the cursor, or drag with the mouse, to select text.\nSettings are stored in {}. Use Open Settings in the command palette to create the file.\n\nSessions preserve tabs, files, unsaved changes, and terminals.\nUse Keep Session to create a session. Quitting with unsaved changes or running\nprograms also creates one. When you quit, programs in session terminals continue\nrunning in the background. Use End Session to end the session.\nWithout FILE, cue resumes the folder's session if exactly one exists.\n\nHOST:PATH opens PATH on another machine, over ssh, as scp names it: PATH is\nfrom the home folder there. Without PATH, choose one of its sessions or folders.\n\n  -r, --resume   choose a session for the folder\n  -a, --all      choose from all sessions (implies --resume)\n      --fresh    start a new cue instance\n  -l, --list     list all sessions\n      --end      end SESSION (an ID or name), or the folder's session\n\n",
         config::path().map_or("~/.config/cue/config.toml".into(), |path| path.display().to_string())
     );
     let key = |command| {
@@ -186,9 +266,25 @@ enum Mode {
     /// Do the work, in the terminal the client handed over (see
     /// [`attach`]).
     Serve(Start),
+    /// Show the session in this folder, as a client that restarted (see
+    /// [`restart_client`]), forgetting it once it's back if it was only
+    /// for that; on another machine, if one's named.
+    Restarted(PathBuf, bool, Option<String>),
+    /// Be a host (see [`host::serve_listener`]), on the socket the app
+    /// that started this process handed it, or with a folder, the host
+    /// process this one replaced (see [`host::Handover`]).
+    Host(Option<PathBuf>),
+    /// Be the bridge a client on another machine reaches over ssh (see
+    /// [`bridge`]).
+    Bridge,
     List,
     End(Option<String>),
 }
+
+/// Has the app use a host process (see [`host::Link::spawn`]), shown by
+/// the `cue` the shell ran (see [`show`]): experimental, until it's how
+/// cue always runs.
+const HOST_PROCESS_VARIABLE: &str = "CUE_HOST_PROCESS";
 
 /// What a server starts with.
 enum Start {
@@ -199,12 +295,41 @@ enum Start {
     /// The session in this folder, from a process this one replaced, and
     /// its running terminals (see [`attach::exec`]).
     Adopt(PathBuf),
+    /// The session in this folder, from the host process running it, its
+    /// terminals included (see [`show`]).
+    Attach(PathBuf),
 }
 
 /// What the command line asks for, or the exit code for `--help`,
 /// `--version`, or bad usage.
 fn parse_args() -> Result<Mode, ExitCode> {
     let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "--host") {
+        args.next();
+        let adopt = match args.next() {
+            Some(arg) if arg == "--adopt" => {
+                Some(args.next().map(PathBuf::from).ok_or(ExitCode::FAILURE)?)
+            }
+            _ => None,
+        };
+        return Ok(Mode::Host(adopt));
+    }
+    if args.peek().is_some_and(|arg| arg == "--bridge") {
+        return Ok(Mode::Bridge);
+    }
+    if args.peek().is_some_and(|arg| arg == RESTARTED) {
+        args.next();
+        let dir = args.next().map(PathBuf::from).ok_or(ExitCode::FAILURE)?;
+        let (mut ephemeral, mut remote) = (false, None);
+        while let Some(arg) = args.next() {
+            match arg.to_str() {
+                Some(EPHEMERAL) => ephemeral = true,
+                Some(REMOTE) => remote = args.next().and_then(|host| host.into_string().ok()),
+                _ => {}
+            }
+        }
+        return Ok(Mode::Restarted(dir, ephemeral, remote));
+    }
     if args.peek().is_some_and(|arg| arg == "--serve") {
         args.next();
         let folder = |args: &mut dyn Iterator<Item = std::ffi::OsString>| {
@@ -253,11 +378,22 @@ fn parse_args() -> Result<Mode, ExitCode> {
                 eprintln!("cue: unknown option {option}\n{USAGE}");
                 return Err(ExitCode::FAILURE);
             }
-            _ => client.paths.push(PathBuf::from(arg)),
+            _ => match remote::destination(&arg) {
+                Some(destination) if client.remote.is_none() => client.remote = Some(destination),
+                Some(_) => {
+                    eprintln!("cue: only one host can be named\n{USAGE}");
+                    return Err(ExitCode::FAILURE);
+                }
+                None => client.paths.push(PathBuf::from(arg)),
+            },
         }
     }
+    if client.remote.is_some() && !client.paths.is_empty() {
+        eprintln!("cue: a host's path is named after it, as HOST:PATH\n{USAGE}");
+        return Err(ExitCode::FAILURE);
+    }
     // For debugging: no server, and no sessions to go back to.
-    if env_flag("CUE_NO_SERVER") && !client.resume {
+    if env_flag("CUE_NO_SERVER") && !client.resume && client.remote.is_none() {
         return Ok(Mode::Serve(Start::Paths(client.paths)));
     }
     Ok(Mode::Client(client))
@@ -285,22 +421,23 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
     // Load before taking over the terminal so errors print normally.
     let (width, height) = tty::size();
     let mut app = match start {
-        Start::Paths(paths) => open(paths, width, height)?,
-        Start::Restore(dir) => resume(&dir, width, height, Vec::new())?,
+        Start::Paths(paths) => {
+            let cwd = std::env::current_dir()?;
+            open(Link::start(), paths, &cwd, width, height)?
+        }
+        Start::Restore(dir) => resume(Link::start(), &dir, width, height, Vec::new())?,
         Start::Adopt(dir) => {
             let (ephemeral, adopted) =
                 attach::read_manifest(&dir).ok_or("No session state found to take over.")?;
-            let mut app = resume(&dir, width, height, adopted)?;
+            let mut app = resume(Link::start(), &dir, width, height, adopted)?;
             if ephemeral {
                 app.forget_session();
             }
             app
         }
+        Start::Attach(_) => return Err("Only a host process's client attaches.".into()),
     };
     app.warn_about_config(&config_warnings);
-    if let Some(note) = background_sessions(&app) {
-        app.show_message_now(note, false);
-    }
     if let Some(note) = crashes() {
         app.show_message_now(note, true);
     }
@@ -360,6 +497,16 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
                 app.hang_up();
                 return Ok(());
             }
+            // Only from a host process, as with `CUE_NO_SERVER` too.
+            Outcome::Moved => {
+                app.save_session(true);
+                leave(app);
+                return Ok(());
+            }
+            Outcome::Ended => {
+                leave(app);
+                return Ok(());
+            }
             Outcome::End(requester) => {
                 app.end_session_now();
                 if let Some(control) = &mut control {
@@ -416,62 +563,176 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// An app showing `paths`: the folders named, or the current one, with
-/// the file named open, at the line and column given.
-fn open(paths: Vec<PathBuf>, width: u32, height: u32) -> Result<App, Box<dyn std::error::Error>> {
-    let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) =
-        paths.into_iter().partition(|path| path.is_dir());
-    let mut files = files.into_iter();
-    let (file, position) = match files.next() {
-        Some(file) => {
-            let (file, position) = file_and_position(file);
-            (Some(file), position)
+/// What an app starts with, asked of its host at once, so that the
+/// answers come together.
+struct Starting {
+    host: Link,
+    about: host::Call,
+    sessions: host::Call,
+}
+
+impl Starting {
+    fn new(host: Link) -> Starting {
+        Starting {
+            about: host.call(host::Request::About),
+            sessions: host.call(host::Request::Sessions),
+            host,
         }
-        None => (None, None),
-    };
-    if let Some(extra) = files.next() {
+    }
+
+    /// What the host's machine is like, once it's said, put in use: its
+    /// settings, but `[ui]` and `[keys]`, and its home folder, where it's
+    /// another machine. A host in this process shares this one's. With this
+    /// app's own settings, as they were.
+    fn about(&self) -> (host::About, config::Config) {
+        let about = match self.about.wait() {
+            Some(host::Reply::About(about)) => about,
+            _ => host::About::default(),
+        };
+        let own = (*config::get()).clone();
+        if !self.host.is_local() {
+            let theirs = config::host_settings(about.settings.as_deref());
+            config::set(config::merge(own.clone(), &theirs));
+        }
+        if self.host.remote().is_some() {
+            client::set_home(about.home.clone());
+        }
+        (about, own)
+    }
+
+    /// The app, made, given what it's to know of the host.
+    fn finish(self, mut app: App, (about, own): (host::About, config::Config)) -> App {
+        app.use_about(about, own);
+        let sessions = match self.sessions.wait() {
+            Some(host::Reply::Sessions(sessions)) => sessions,
+            _ => Vec::new(),
+        };
+        if let Some(note) = background_sessions(&app, sessions) {
+            app.show_message_now(note, false);
+        }
+        app
+    }
+}
+
+/// What the host found at each of `paths`, waiting for it.
+fn look(host: &Link, paths: Vec<PathBuf>) -> Vec<Option<host::Look>> {
+    let count = paths.len();
+    match host.call(host::Request::Look { paths }).wait() {
+        Some(host::Reply::Looked(looked)) if looked.len() == count => looked,
+        _ => vec![None; count],
+    }
+}
+
+/// An app showing `paths`, relative to `cwd`, on `host`: the folders
+/// named, or `cwd`, with the file named open, at the line and column
+/// given. The host says what each is.
+fn open(
+    host: Link,
+    paths: Vec<PathBuf>,
+    cwd: &Path,
+    width: u32,
+    height: u32,
+) -> Result<App, Box<dyn std::error::Error>> {
+    let starting = Starting::new(host.clone());
+    // Each path, and what it'd name with the position printed after it
+    // taken off, as in `src/main.rs:12:5`.
+    let named: Vec<(PathBuf, Option<(PathBuf, location::Position)>)> = paths
+        .iter()
+        .map(|path| {
+            let split = path
+                .to_str()
+                .and_then(|text| match location::split_position(text) {
+                    (file, Some(position)) if !file.is_empty() => Some((cwd.join(file), position)),
+                    _ => None,
+                });
+            (cwd.join(path), split)
+        })
+        .collect();
+    let mut asked = vec![cwd.to_path_buf()];
+    for (whole, split) in &named {
+        asked.push(whole.clone());
+        asked.extend(split.as_ref().map(|(file, _)| file.clone()));
+    }
+    let mut looked = look(&host, asked).into_iter();
+    let here = looked.next().flatten();
+    let mut folders = Vec::new();
+    let mut files = Vec::new();
+    for (whole, split) in named {
+        let found = looked.next().flatten();
+        if split.is_some() {
+            looked.next();
+        }
+        match (found, split) {
+            (Some(look), _) if look.is_dir => folders.push(look.real),
+            (None, Some((file, position))) => files.push((file, Some(position))),
+            _ => files.push((whole, None)),
+        }
+    }
+    let mut files = files.into_iter();
+    let (file, position) = files.next().unzip();
+    if let Some((extra, _)) = files.next() {
         return Err(format!("{}: only one file can be specified", extra.display()).into());
     }
-    let workspace = match folders.is_empty() {
-        true => Workspace::new([std::env::current_dir()?])?,
-        false => Workspace::new(folders)?,
-    };
-    let mut app = App::new(workspace, file, width, height)?;
-    if let Some(position) = position {
+    if folders.is_empty() {
+        let here = here.filter(|look| look.is_dir);
+        let here = here.ok_or_else(|| format!("{} isn't a folder", cwd.display()))?;
+        folders.push(here.real);
+    }
+    let about = starting.about();
+    let workspace = Workspace::found(folders);
+    let app = App::with_host(host, workspace, file, width, height)?;
+    let mut app = starting.finish(app, about);
+    if let Some(position) = position.flatten() {
         app.go_to(position);
     }
     Ok(app)
 }
 
-/// An app going back to the session in `dir`, with the terminals
-/// `adopted` from a process this one replaced.
+/// An app going back to the session in `dir`, on `host`, with the
+/// terminals `adopted` from a process this one replaced.
 fn resume(
+    host: Link,
     dir: &Path,
     width: u32,
     height: u32,
     adopted: Vec<app::Adopted>,
 ) -> Result<App, Box<dyn std::error::Error>> {
-    let session = Session::open(dir).map_err(|err| format!("can't open the session: {err}"))?;
-    let state = session::read(dir).ok_or("the session can't be read")?;
+    let starting = Starting::new(host.clone());
+    let read = host.call(host::Request::Session(session::SessionCall::Read(
+        dir.to_path_buf(),
+    )));
+    // First: a host process taken over from a client says so once that
+    // one's saved it, and left.
+    let session =
+        SessionLink::open(&host, dir).map_err(|err| format!("can't open the session: {err}"))?;
+    let state = match read.wait() {
+        Some(host::Reply::Session(session::SessionAnswer::State(Some(state)))) => *state,
+        _ => return Err("the session can't be read".into()),
+    };
+    let looked = look(&host, state.roots.clone());
     let roots: Vec<PathBuf> = state
         .roots
         .iter()
-        .filter(|root| root.is_dir())
-        .cloned()
+        .zip(looked)
+        .filter(|(_, look)| look.as_ref().is_some_and(|look| look.is_dir))
+        .map(|(root, _)| root.clone())
         .collect();
     if roots.is_empty() {
         return Err("The session's folders no longer exist.".into());
     }
-    let mut app = App::new(Workspace::new(roots)?, None, width, height)?;
+    let about = starting.about();
+    let mut app = App::with_host(host, Workspace::found(roots), None, width, height)?;
+    // Before what's running elsewhere is said, which this isn't.
     app.restore_session(session, state, adopted)?;
-    Ok(app)
+    Ok(starting.finish(app, about))
 }
 
-/// A note of the sessions running in the background but `app`'s own, so
-/// that none is forgotten, if there are any.
-fn background_sessions(app: &App) -> Option<String> {
-    let own = app.session().map(Session::id);
-    let running: Vec<String> = session::list(&session::default_dir()?)
+/// A note of the sessions running in the background but `app`'s own,
+/// among `sessions`, the host's, so that none is forgotten, if there are
+/// any.
+fn background_sessions(app: &App, sessions: Vec<session::Listing>) -> Option<String> {
+    let own = app.session().map(SessionLink::id);
+    let running: Vec<String> = sessions
         .into_iter()
         .filter(|listing| listing.live && !listing.state.attached)
         .filter(|listing| Some(listing.id.as_str()) != own)
@@ -484,14 +745,18 @@ fn background_sessions(app: &App) -> Option<String> {
             }
         })
         .collect();
+    let list = match app.host().remote() {
+        Some(remote) => format!("`cue {remote}:`"),
+        None => "`cue --list`".to_string(),
+    };
     match running.len() {
         0 => None,
         1 => Some(format!(
-            "One session is running in the background: {}. Run `cue --list` for details.",
+            "One session is running in the background: {}. Run {list} for details.",
             running[0]
         )),
         n => Some(format!(
-            "{n} sessions are running in the background: {}. Run `cue --list` for details.",
+            "{n} sessions are running in the background: {}. Run {list} for details.",
             running.join(", ")
         )),
     }
@@ -504,14 +769,217 @@ fn crashes() -> Option<String> {
         [] => None,
         [report] => Some(format!(
             "cue crashed. The report is in {}.",
-            client::tilde(report)
+            client::tilde_here(report)
         )),
         reports => Some(format!(
             "cue crashed {} times. The reports are in {}.",
             reports.len(),
-            client::tilde(&dir)
+            client::tilde_here(&dir)
         )),
     }
+}
+
+/// Runs a host process, until its client's gone; with `adopt`, in place
+/// of one of another build, for the session in that folder (see
+/// [`host::Handover`]).
+fn host_process(adopt: Option<PathBuf>) -> ExitCode {
+    let Some(listener) = host::listener_from_env() else {
+        eprintln!("cue: --host is for cue to start");
+        return ExitCode::FAILURE;
+    };
+    let (config, _) = config::load();
+    config::set(config);
+    // Where a panic's said: there's no terminal.
+    attach::let_go_of_stdio(crash::open_log());
+    let handover = match adopt.as_deref().map(host::Handover::from_env) {
+        Some(Ok(handover)) => Some(handover),
+        Some(Err(err)) => {
+            eprintln!("cue: can't take over the session: {err}");
+            crash::close_log();
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+    host::serve_listener(listener, true, handover);
+    crash::close_log();
+    ExitCode::SUCCESS
+}
+
+/// How long leaving waits for the host to hear what's left to say.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Shows the app in this process's terminal, as the `cue` the shell ran,
+/// with its host a process of its own (`CUE_HOST_PROCESS`, for now): a
+/// new one, or with [`Start::Attach`], the one running the session,
+/// which another client showing it leaves first. Quitting hangs up on its
+/// terminals; detaching, or the terminal going, leaves them running in the
+/// host, for `cue` to come back to; it exits either way, unless it
+/// restarts (see [`restart_client`]). The session's forgotten once it's
+/// back if it's `ephemeral`.
+fn show(
+    start: Start,
+    ephemeral: bool,
+    bridge: Option<remote::Bridge>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (config, config_warnings) = config::load();
+    config::set(config);
+    let (width, height) = tty::size();
+    let spawn = || Link::spawn().map_err(|err| format!("can't start a host process: {err}"));
+    let connect = |bridge: remote::Bridge, target| {
+        let host = bridge.name().to_string();
+        bridge
+            .connect(target)
+            .map_err(|err| format!("can't reach cue on {host}: {err}"))
+    };
+    let mut app = match (start, bridge) {
+        (Start::Paths(paths), None) => {
+            let cwd = std::env::current_dir()?;
+            open(spawn()?, paths, &cwd, width, height)?
+        }
+        (Start::Paths(paths), Some(bridge)) => {
+            let home = bridge.home.clone();
+            open(
+                connect(bridge, bridge::Target::New)?,
+                paths,
+                &home,
+                width,
+                height,
+            )?
+        }
+        (Start::Restore(dir), None) => resume(spawn()?, &dir, width, height, Vec::new())?,
+        (Start::Restore(dir), Some(bridge)) => {
+            let host = connect(bridge, bridge::Target::New)?;
+            resume(host, &dir, width, height, Vec::new())?
+        }
+        (Start::Attach(dir), None) => {
+            let host = Link::connect(&session::socket_path(&dir))
+                .map_err(|err| format!("can't reach the session: {err}"))?;
+            resume(host, &dir, width, height, Vec::new())?
+        }
+        (Start::Attach(dir), Some(bridge)) => {
+            let host = connect(bridge, bridge::Target::Attach(dir.clone()))?;
+            resume(host, &dir, width, height, Vec::new())?
+        }
+        (Start::Adopt(_), _) => return Err("Only a server takes over.".into()),
+    };
+    if ephemeral {
+        app.forget_session();
+    }
+    // The host's started, from the copy this runs from, if it does.
+    relocate::release();
+    app.warn_about_config(&config_warnings);
+    if let Some(note) = crashes() {
+        app.show_message_now(note, true);
+    }
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        unsafe {
+            libc::signal(
+                signal,
+                on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            )
+        };
+    }
+    loop {
+        let said = match attached(&mut app, None, &mut None, None)? {
+            Outcome::Quit => {
+                app.discard_recovery();
+                close(app);
+                return Ok(());
+            }
+            Outcome::Restart => {
+                let Some((dir, ephemeral)) = app.keep_to_restart(true) else {
+                    continue;
+                };
+                app.set_attached(false);
+                let remote = app.host().remote().map(str::to_string);
+                let resume = match ephemeral {
+                    true => String::new(),
+                    false => format!(" Run `{}` to resume.", resume_command(&app)),
+                };
+                leave(app);
+                let err = restart_client(&dir, ephemeral, remote.as_deref());
+                return Err(format!("can't restart: {err}.{resume}").into());
+            }
+            Outcome::Detach => {
+                app.set_attached(false);
+                detached(&app)
+            }
+            Outcome::HangUp | Outcome::Terminate => {
+                if !app.hang_up() {
+                    close(app);
+                    return Ok(());
+                }
+                // Nowhere to say it.
+                String::new()
+            }
+            Outcome::Moved => {
+                app.set_attached(false);
+                "the session moved to another terminal.".to_string()
+            }
+            // Not served any more.
+            Outcome::Ended => "the session was ended.".to_string(),
+            Outcome::Attach(..) | Outcome::End(_) => unreachable!("it takes no clients"),
+        };
+        leave(app);
+        if !said.is_empty() {
+            eprintln!("cue: {said}");
+        }
+        return Ok(());
+    }
+}
+
+/// Says a client restarted, with the session's folder: `cue --restarted
+/// DIR [--ephemeral] [--remote HOST]`.
+const RESTARTED: &str = "--restarted";
+const EPHEMERAL: &str = "--ephemeral";
+const REMOTE: &str = "--remote";
+
+/// Reaches `host` over ssh (see [`remote`]), its paths shown from its
+/// home folder from then on.
+fn reach(host: &str) -> std::io::Result<remote::Bridge> {
+    let bridge = remote::Bridge::open(host)?;
+    client::set_home(Some(bridge.home.clone()));
+    Ok(bridge)
+}
+
+/// Starts the cue that's on disk now, as a client, in this one's place,
+/// to come back to the session in `dir`, which this one left, on `remote`
+/// if it's on another machine; and to forget it once it's back, if it's
+/// `ephemeral`. Its host takes up that build too, if it's another (see
+/// [`host::serve_listener`]). Returns only if it can't.
+fn restart_client(dir: &Path, ephemeral: bool, remote: Option<&str>) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(relocate::origin());
+    command.arg(RESTARTED).arg(dir);
+    if ephemeral {
+        command.arg(EPHEMERAL);
+    }
+    if let Some(remote) = remote {
+        command.arg(REMOTE).arg(remote);
+    }
+    command.exec()
+}
+
+/// What to run to come back to `app`'s session.
+fn resume_command(app: &App) -> String {
+    match app.host().remote() {
+        Some(remote) => format!("cue {remote}:"),
+        None => "cue --resume".to_string(),
+    }
+}
+
+/// Lets `app` go, hanging up on its terminals, once the host hears.
+fn close(app: App) {
+    let closed = app.host().closed();
+    drop(app);
+    closed.wait(CLOSE_TIMEOUT);
+}
+
+/// Lets `app` go, leaving its terminals running in the host, for a
+/// client to come back to.
+fn leave(mut app: App) {
+    app.leave();
+    close(app);
 }
 
 /// What the client that detached says about how to come back.
@@ -525,7 +993,10 @@ fn detached(app: &App) -> String {
     let session = app.session();
     let id = session.map(|session| session.name().unwrap_or(session.id()));
     let id = id.unwrap_or_default();
-    format!("Session {id} detached{with}. Run `cue --resume` to resume.")
+    format!(
+        "Session {id} detached{with}. Run `{}` to resume.",
+        resume_command(app)
+    )
 }
 
 /// A session's socket, listened on.
@@ -541,9 +1012,9 @@ impl Drop for Listener {
 }
 
 /// Listens for clients on the session's socket, if `app` is a session and
-/// it isn't yet.
+/// it isn't yet, unless its host is a process: then that does.
 fn listen(app: &App, listener: &mut Option<Listener>) -> std::io::Result<()> {
-    let (None, Some(session)) = (&listener, app.session()) else {
+    let (None, Some(session), true) = (&listener, app.session(), app.host().is_local()) else {
         return Ok(());
     };
     let path = session.socket();
@@ -626,7 +1097,7 @@ fn restart(
             error
         }
     };
-    let mut app = resume(&dir, width, height, adopted)?;
+    let mut app = resume(Link::start(), &dir, width, height, adopted)?;
     if ephemeral {
         app.forget_session();
     }
@@ -648,6 +1119,10 @@ enum Outcome {
     Attach(Control, attach::Attach),
     /// A client asked to end the session.
     End(Control),
+    /// Another client is taking over, from the host process.
+    Moved,
+    /// The session was ended, from the host process.
+    Ended,
 }
 
 /// What woke a detached app.
@@ -675,6 +1150,8 @@ fn headless(app: &mut App, listener: Option<&std::os::unix::net::UnixListener>) 
         HUNG_UP.store(false, Ordering::Relaxed);
         app.poll();
         let _ = app.take_copied();
+        // Nothing's typed while detached, to act on.
+        let _ = app.take_deferred();
         let Some(listener) = listener else {
             continue;
         };
@@ -831,6 +1308,17 @@ fn attached(
                     Vec::new()
                 };
                 changed |= app.poll();
+                match app.take_deferred() {
+                    Some(AppAction::Quit) => return Ok(Outcome::Quit),
+                    Some(AppAction::Detach) => return Ok(Outcome::Detach),
+                    Some(AppAction::Restart) => return Ok(Outcome::Restart),
+                    Some(AppAction::Moved) => return Ok(Outcome::Moved),
+                    Some(AppAction::Ended) => return Ok(Outcome::Ended),
+                    Some(AppAction::Copy(text)) => {
+                        renderer.copy_to_clipboard(&text);
+                    }
+                    Some(AppAction::Continue) | None => {}
+                }
                 if let Some(text) = app.take_copied() {
                     renderer.copy_to_clipboard(&text);
                 }
@@ -869,6 +1357,8 @@ fn attached(
                 AppAction::Quit => return Ok(Outcome::Quit),
                 AppAction::Detach => return Ok(Outcome::Detach),
                 AppAction::Restart => return Ok(Outcome::Restart),
+                AppAction::Moved => return Ok(Outcome::Moved),
+                AppAction::Ended => return Ok(Outcome::Ended),
                 AppAction::Copy(text) => {
                     renderer.copy_to_clipboard(&text);
                 }
@@ -1096,21 +1586,6 @@ fn take_reply(renderer: &mut Renderer, app: &mut App, bytes: &[u8]) {
     if !renderer.process_kitty_image_reply(bytes) {
         renderer.process_capability_response(bytes);
         math::set_images(renderer.draws_images());
-    }
-}
-
-/// A file argument, and the position printed after its name, as in
-/// `src/main.rs:12:5`, unless a file is named that whole.
-fn file_and_position(arg: PathBuf) -> (PathBuf, Option<location::Position>) {
-    if arg.exists() {
-        return (arg, None);
-    }
-    let Some(text) = arg.to_str() else {
-        return (arg, None);
-    };
-    match location::split_position(text) {
-        (path, Some(position)) if !path.is_empty() => (PathBuf::from(path), Some(position)),
-        _ => (arg, None),
     }
 }
 

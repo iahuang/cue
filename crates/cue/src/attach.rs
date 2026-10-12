@@ -202,11 +202,10 @@ impl Attach {
 /// Listens on `path` for clients. Whatever is there is a socket left by
 /// a server that's gone, since this one has the session's lock.
 pub fn listen(path: &Path) -> io::Result<UnixListener> {
+    // Another user may have made the folder first, to put their own
+    // socket in its place.
     if let Some(dir) = path.parent() {
-        if !dir.exists() {
-            fs::create_dir_all(dir)?;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-        }
+        crate::relocate::private_folder(dir)?;
     }
     let _ = fs::remove_file(path);
     let listener = UnixListener::bind(path)?;

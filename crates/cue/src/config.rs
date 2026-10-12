@@ -9,6 +9,17 @@
 //! They're read at startup, and again when the file is saved from cue, or
 //! on Reload Settings, into a [`Config`] that anything can get (see
 //! [`get`]), on any thread.
+//!
+//! Once cue is a client and a host apart (see `docs/client-server.md`),
+//! each reads its own file, and takes its own part of it: the client
+//! `[ui]` and `[keys]`, which are about the screen and the keyboard in
+//! front of you; the host the rest (`[editor]`, `[terminal]`, `[files]`),
+//! which are about the machine the files are on. A host process reads its
+//! file when it starts, and again when the client reads its own
+//! (`Tell::ReloadConfig`), and sends the client its text (`Request::About`),
+//! whose part of it the client puts in place of its own (see [`merge`]): on
+//! one machine, they're the same file. A host in the app's process shares
+//! the app's settings.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -173,6 +184,28 @@ pub fn get() -> Arc<Config> {
 #[cfg(test)]
 pub fn set(config: Config) {
     CURRENT.with(|current| *current.borrow_mut() = Arc::new(config));
+}
+
+/// The client's settings, `own`, with the host's part taken from `host`,
+/// its own: `[editor]`, `[terminal]`, and `[files]`.
+pub fn merge(own: Config, host: &Config) -> Config {
+    Config {
+        tab_width: host.tab_width,
+        indent: host.indent,
+        indent_guides: host.indent_guides,
+        wrap: host.wrap,
+        scroll_margin: host.scroll_margin,
+        shell: host.shell.clone(),
+        scrollback: host.scrollback,
+        exclude: host.exclude.clone(),
+        ..own
+    }
+}
+
+/// The host's settings, from its file's `text`, or the defaults without
+/// one. What's wrong with it is the host's to say.
+pub fn host_settings(text: Option<&str>) -> Config {
+    text.map(|text| parse(text).0).unwrap_or_default()
 }
 
 /// Where the settings are, if there's anywhere for them.

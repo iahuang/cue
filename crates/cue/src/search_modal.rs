@@ -14,11 +14,13 @@ use std::time::Instant;
 
 use opentui::{Attributes, Buffer, Rgba};
 
+use crate::host::Link;
 use crate::icons;
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::{self, Caret, Edit};
 use crate::picker::{self, Area};
+use crate::replica::DocId;
 use crate::search::{FileMatches, Found, Line, Query, Search, Toggle, CONTEXT_LINES};
 use crate::theme;
 use crate::workspace::Workspace;
@@ -75,9 +77,10 @@ struct MatchAt {
 }
 
 pub struct SearchModal {
+    host: Link,
     workspace: Workspace,
     /// Unsaved text of open files, searched instead of what's on disk.
-    unsaved: HashMap<PathBuf, String>,
+    unsaved: HashMap<PathBuf, DocId>,
     query: Query,
     /// The cursor and selection in the query. The query filled in on
     /// opening is selected, so typing replaces it.
@@ -114,12 +117,14 @@ impl SearchModal {
     /// A search popup over a screen `width` x `height`, starting from where
     /// the last one left off, with `text` as the query if given. `unsaved`
     /// has the text of open files with unsaved changes.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        host: &Link,
         workspace: &Workspace,
         keymap: &Keymap,
         memory: Memory,
         text: Option<String>,
-        unsaved: HashMap<PathBuf, String>,
+        unsaved: HashMap<PathBuf, DocId>,
         width: u32,
         height: u32,
     ) -> SearchModal {
@@ -140,6 +145,7 @@ impl SearchModal {
             _ => memory.selected,
         };
         let mut modal = SearchModal {
+            host: host.clone(),
             workspace: workspace.clone(),
             unsaved,
             query,
@@ -398,7 +404,12 @@ impl SearchModal {
             self.layout(false);
             return;
         }
-        match Search::start(&self.workspace, &self.query, self.unsaved.clone()) {
+        match Search::start(
+            &self.host,
+            &self.workspace,
+            &self.query,
+            self.unsaved.clone(),
+        ) {
             Ok(search) => {
                 self.search = Some(search);
                 self.stale = true;
@@ -939,6 +950,7 @@ mod tests {
     fn modal(root: &Path, memory: Memory, text: Option<&str>, height: u32) -> SearchModal {
         let workspace = Workspace::new([root.to_path_buf()]).unwrap();
         SearchModal::new(
+            &Link::local(),
             &workspace,
             &Keymap::default(),
             memory,

@@ -7,12 +7,13 @@
 //! writes. A save is several changes in a row, so changes are handed over
 //! in batches, once they settle.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use serde::{Deserialize, Serialize};
 
 /// How long changes have to stop for before they're handed over.
 const SETTLE: Duration = Duration::from_millis(50);
@@ -20,14 +21,29 @@ const SETTLE: Duration = Duration::from_millis(50);
 const MAX_WAIT: Duration = Duration::from_millis(300);
 
 /// What changed in the watched folders.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Changes {
     /// The files and folders that came, went, or changed. Which of those
     /// isn't told: on macOS, a file created lately is told as created again
     /// each time it changes.
     pub paths: HashSet<PathBuf>,
+    /// Those of `paths` that are there, as [`Changes::look`] found them,
+    /// by whether each is a folder, or a symlink to one.
+    pub dirs: HashMap<PathBuf, bool>,
     /// Changes may have been missed: anything may have changed.
     pub rescan: bool,
+}
+
+impl Changes {
+    /// Looks at what `paths` are now, for `dirs`.
+    pub fn look(&mut self) {
+        self.dirs = self
+            .paths
+            .iter()
+            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+            .map(|path| (path.clone(), path.is_dir()))
+            .collect();
+    }
 }
 
 pub struct Watcher {
@@ -40,10 +56,13 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    pub fn new() -> Watcher {
+    /// A watcher that calls `nudge` whenever it hears something, for
+    /// [`Watcher::poll`] to take in.
+    pub fn new(nudge: impl Fn() + Send + 'static) -> Watcher {
         let (sender, events) = mpsc::channel();
         let watcher = notify::recommended_watcher(move |event| {
             let _ = sender.send(event);
+            nudge();
         });
         Watcher {
             watcher: watcher.ok(),
@@ -77,6 +96,13 @@ impl Watcher {
             watched.clear();
         }
         self.watched = watched;
+    }
+
+    /// When changes heard will have settled, for [`Watcher::poll`] to hand
+    /// them over, if any were heard.
+    pub fn due(&self) -> Option<Instant> {
+        let (_, first, last) = self.pending.as_ref()?;
+        Some((*last + SETTLE).min(*first + MAX_WAIT))
     }
 
     /// The changes since the last batch, once they've settled.
@@ -159,7 +185,7 @@ mod tests {
     #[test]
     fn hears_files_in_watched_folders_but_not_in_folders_inside() {
         let dir = fixture("files");
-        let mut watcher = Watcher::new();
+        let mut watcher = Watcher::new(|| {});
         watcher.watch(BTreeSet::from([dir.clone()]));
         // Let the watch start before changing anything.
         std::thread::sleep(Duration::from_millis(100));

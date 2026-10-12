@@ -82,6 +82,9 @@ ttf-parser = "0.25"
 hayro = "0.8"
 # Diff mode: line diffs, and which words in a changed line changed.
 similar = { version = "3", features = ["inline"] }
+# The host's messages, as sent between processes.
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 
 
 # musl's allocator is slow under contention (parallel search, file indexing).
