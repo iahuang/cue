@@ -5,6 +5,7 @@
 //! repository: a file belongs to the deepest root it's in.
 
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,9 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// A workspace of the directories in `roots`.
+    /// A workspace of the directories in `roots`, as the file system has
+    /// them, for tests.
+    #[cfg(test)]
     pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> io::Result<Workspace> {
         let mut workspace = Workspace {
             roots: Vec::new(),
@@ -29,13 +32,27 @@ impl Workspace {
         Ok(workspace)
     }
 
+    /// A workspace of `roots`, folders the host found, absolute and
+    /// symlink-free.
+    pub fn found(roots: impl IntoIterator<Item = PathBuf>) -> Workspace {
+        let mut workspace = Workspace {
+            roots: Vec::new(),
+            names: Vec::new(),
+        };
+        for root in roots {
+            workspace.add_folder(root);
+        }
+        workspace
+    }
+
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
 
     /// Adds the directory `path`, unless it is already a root. It looks
-    /// at the file system, so it's for starting, before there's a host;
-    /// after, see [`Workspace::add_folder`].
+    /// at the file system, so it's for tests; the app has the host look
+    /// (see [`Workspace::found`] and [`Workspace::add_folder`]).
+    #[cfg(test)]
     pub fn add_root(&mut self, path: &Path) -> io::Result<()> {
         let root = path.canonicalize()?;
         if !root.is_dir() {

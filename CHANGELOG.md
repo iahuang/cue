@@ -16,7 +16,8 @@
 - With `CUE_HOST_PROCESS=1`, a `cue` of another build has a session's host start that build in its place, terminals still running, and Restart works there too (`aadc9dd`)
 - A host process reads its settings again when the app does, so Reload Settings reaches new terminals' shells and excluded files (`141008f`)
 - Stream edits to the host as they're made, which keeps a copy of each open file; saving, sessions, and workspace search use its copy instead of sending whole texts (`facfea4`)
-- A host process answers its terminals' queries itself, in the app's colors, even while a client's attached, so a query asked as a client comes or goes gets one answer
+- A host process answers its terminals' queries itself, in the app's colors, even while a client's attached, so a query asked as a client comes or goes gets one answer (`f6e3b76`)
+- Add `cue user@host:path` and `cue user@host`, which open a folder or a host's sessions over the system's `ssh`, sending cue to the host if it hasn't this build; `install.sh` also installs the linux-x64 build on Macs to send
 
 ## v0.4.2 — 2026-10-11
 

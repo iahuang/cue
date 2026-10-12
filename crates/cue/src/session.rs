@@ -451,6 +451,10 @@ pub struct Snapshot {
     pub texts: Vec<(String, DocId)>,
     /// Terminals' screens that changed, by terminal.
     pub screens: Vec<(u32, Vec<u8>)>,
+    /// Screens that changed that the host keeps too, of the terminals it
+    /// runs, by terminal, and its id on the host: the host's is saved, so
+    /// they needn't be sent.
+    pub host_screens: Vec<(u32, crate::term_hub::TermId)>,
     /// Whether the screens the state doesn't name go.
     pub prune_screens: bool,
 }
@@ -472,6 +476,8 @@ pub enum SessionCall {
     Texts(Vec<String>),
     /// Terminals' screens, by name.
     Screens(Vec<String>),
+    /// What the session in this folder kept, which needn't be the host's.
+    Read(PathBuf),
     /// Lets it go, removing everything it kept.
     End,
 }
@@ -485,6 +491,8 @@ pub enum SessionAnswer {
     Saved(Result<bool, String>),
     Texts(Vec<Result<String, String>>),
     Screens(Vec<Option<Vec<u8>>>),
+    /// What a session kept, if it can be read.
+    State(Option<Box<State>>),
     Done,
 }
 
@@ -507,6 +515,7 @@ pub fn run(call: SessionCall, session: &mut Option<Session>, copies: &Texts) -> 
             return SessionAnswer::Opened(Ok((held.id.clone(), held.dir.clone())));
         }
         SessionCall::Open(dir) => return opened(Session::open(dir), session),
+        SessionCall::Read(dir) => return SessionAnswer::State(read(dir).map(Box::new)),
         _ => {}
     }
     let Some(current) = session else {
@@ -521,7 +530,7 @@ pub fn run(call: SessionCall, session: &mut Option<Session>, copies: &Texts) -> 
         };
     };
     match call {
-        SessionCall::Create(_) | SessionCall::Open(_) => SessionAnswer::Done,
+        SessionCall::Create(_) | SessionCall::Open(_) | SessionCall::Read(_) => SessionAnswer::Done,
         SessionCall::Rename(name) => {
             current.rename(name.as_deref());
             SessionAnswer::Done
@@ -568,6 +577,7 @@ pub struct SessionLink {
     /// the next save.
     pending_texts: Vec<(String, DocId)>,
     pending_screens: Vec<(u32, Vec<u8>)>,
+    pending_host_screens: Vec<(u32, crate::term_hub::TermId)>,
 }
 
 impl SessionLink {
@@ -593,6 +603,7 @@ impl SessionLink {
                 next_text: 1,
                 pending_texts: Vec::new(),
                 pending_screens: Vec::new(),
+                pending_host_screens: Vec::new(),
             }),
             SessionAnswer::Opened(Err(err)) => Err(io::Error::other(err)),
             _ => Err(other_answer()),
@@ -647,6 +658,7 @@ impl SessionLink {
             state,
             texts: std::mem::take(&mut self.pending_texts),
             screens: std::mem::take(&mut self.pending_screens),
+            host_screens: std::mem::take(&mut self.pending_host_screens),
             prune_screens,
         };
         self.host
@@ -732,6 +744,14 @@ impl SessionLink {
         screen_name(id)
     }
 
+    /// Notes for the next save that terminal `id`'s screen is the host's
+    /// to save, from its own of the terminal `on_host`, returning its name
+    /// in `terminals/`.
+    pub fn save_host_screen(&mut self, id: u32, on_host: crate::term_hub::TermId) -> String {
+        self.pending_host_screens.push((id, on_host));
+        screen_name(id)
+    }
+
     /// Unsaved texts kept by [`SessionLink::save_text`], by name.
     pub fn texts(&self, names: Vec<String>) -> Vec<io::Result<String>> {
         let count = names.len();
@@ -785,7 +805,7 @@ pub fn socket_path(dir: &Path) -> PathBuf {
 }
 
 /// A session, as listed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Listing {
     pub id: String,
     pub dir: PathBuf,
@@ -803,21 +823,11 @@ impl Listing {
     /// Its folders, shortest first, with `~` for the home folder, as
     /// `~/cue + ~/notes`.
     pub fn folders(&self) -> String {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut roots: Vec<String> = self
             .state
             .roots
             .iter()
-            .map(|root| {
-                match home
-                    .as_deref()
-                    .and_then(|home| root.strip_prefix(home).ok())
-                {
-                    Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-                    Some(rest) => format!("~/{}", rest.display()),
-                    None => root.display().to_string(),
-                }
-            })
+            .map(|root| crate::client::tilde(root))
             .collect();
         roots.sort_by_key(|root| (root.chars().count(), root.clone()));
         roots.join(" + ")

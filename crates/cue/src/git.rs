@@ -22,10 +22,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::host::{Call, Link, Reply, Request};
+use crate::host::{Call, Link, Reply, Request, Responder, Tell};
 use crate::theme::Hue;
 use serde::{Deserialize, Serialize};
 
@@ -1105,18 +1105,21 @@ pub fn run(call: &GitCall) -> GitAnswer {
     }
 }
 
+/// What git says of the workspace's repositories, as the host pushes it:
+/// it asks git on its own, when files change and every few seconds, and
+/// says what it found only when that changed, or when this asked (see
+/// [`follow`]).
 pub struct Git {
     host: Link,
     roots: Vec<PathBuf>,
     /// As of the last run, in the order of the roots they hold.
     repos: Vec<Repo>,
-    /// The run in progress, if any, and when it started.
-    running: Option<(Call, Instant)>,
-    /// Something asked for a run while one was in progress, or too soon
-    /// after the last started.
-    again: bool,
-    /// When the last run started and how long it took, once it ended.
-    last: Option<(Instant, Duration)>,
+    /// The host's runs, as they're told.
+    call: Option<Call>,
+    /// How many runs this asked for, counting the first, and how many of
+    /// those the host has answered.
+    asked: u64,
+    answered: u64,
 }
 
 impl Git {
@@ -1127,9 +1130,9 @@ impl Git {
             host: host.clone(),
             roots: roots.to_vec(),
             repos: Vec::new(),
-            running: None,
-            again: false,
-            last: None,
+            call: None,
+            asked: 0,
+            answered: 0,
         };
         git.start();
         git
@@ -1139,7 +1142,7 @@ impl Git {
     pub fn set_roots(&mut self, roots: &[PathBuf]) {
         if self.roots != roots {
             self.roots = roots.to_vec();
-            self.refresh();
+            self.start();
         }
     }
 
@@ -1177,75 +1180,151 @@ impl Git {
         })
     }
 
-    /// Asks git again: now, unless a run is in progress or one started
-    /// moments ago, and otherwise once [`Git::poll`] finds it can.
+    /// Has the host ask git again: now, unless a run is in progress or one
+    /// started moments ago.
     pub fn refresh(&mut self) {
-        self.again = true;
-        let soon = self
-            .last
-            .is_some_and(|(started, _)| started.elapsed() < MIN_GAP);
-        if self.running.is_none() && !soon {
-            self.start();
-        }
+        self.ask(false);
     }
 
-    /// Asks git again now, dropping a run in progress, which may have
-    /// read the repositories before this app changed them.
+    /// Has the host ask git again now, dropping a run in progress, which
+    /// may have read the repositories before this app changed them.
     pub fn restart(&mut self) {
-        self.running = None;
-        self.start();
+        self.ask(true);
     }
 
-    /// Takes the result of a run that ended, and starts another if one was
-    /// asked for or it's time. Returns whether the repositories changed.
+    fn ask(&mut self, restart: bool) {
+        let Some(call) = &self.call else {
+            return;
+        };
+        self.asked += 1;
+        self.host.tell(Tell::GitAgain {
+            call: call.id(),
+            asked: self.asked,
+            restart,
+        });
+    }
+
+    /// Takes what the host said since. Returns whether the repositories
+    /// changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        if let Some((call, started)) = &self.running {
-            match call.try_recv() {
-                Ok(Reply::Repos(repos)) => {
-                    self.last = Some((*started, started.elapsed()));
-                    self.running = None;
-                    changed = repos != self.repos;
-                    self.repos = repos;
-                }
-                Ok(_) | Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => {
-                    self.last = Some((*started, started.elapsed()));
-                    self.running = None;
-                }
-            }
-        }
-        let due = match self.last {
-            None => true,
-            Some((started, took)) => {
-                let since = started.elapsed();
-                let ended = since.saturating_sub(took);
-                (self.again && since >= MIN_GAP) || ended >= INTERVAL.max(took * SLOWDOWN)
-            }
-        };
-        if due {
-            self.start();
+        while let Some(reply) = self.call.as_ref().and_then(|call| call.try_recv().ok()) {
+            changed |= self.take(reply);
         }
         changed
     }
 
-    /// Waits for the run in progress, for tests.
+    /// Takes in the host's `reply`. Returns whether the repositories
+    /// changed.
+    fn take(&mut self, reply: Reply) -> bool {
+        let Reply::Repos { repos, asked } = reply else {
+            return false;
+        };
+        self.answered = self.answered.max(asked);
+        match repos {
+            Some(repos) if repos != self.repos => {
+                self.repos = repos;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Waits for the host to answer every run asked for, for tests.
     #[cfg(test)]
     pub fn wait(&mut self) {
-        while let Some((call, started)) = self.running.take() {
-            if let Some(Reply::Repos(repos)) = call.wait() {
-                self.repos = repos;
-            }
-            self.last = Some((started, started.elapsed()));
+        while self.answered < self.asked {
+            let Some(reply) = self.call.as_ref().and_then(Call::wait) else {
+                return;
+            };
+            self.take(reply);
         }
     }
 
     fn start(&mut self) {
-        let call = self.host.call(Request::GitStatus {
+        // The first run counts as asked for.
+        self.asked = 1;
+        self.answered = 0;
+        self.call = Some(self.host.call(Request::GitStatus {
             roots: self.roots.clone(),
-        });
-        self.running = Some((call, Instant::now()));
-        self.again = false;
+        }));
+    }
+}
+
+/// What a host's [`follow`] call hears as it goes.
+pub enum Nudge {
+    /// Files changed in the watched folders.
+    Changed,
+    /// The app asked for a run, the `asked`th, dropping one in progress if
+    /// `restart`.
+    Asked { asked: u64, restart: bool },
+}
+
+/// Asks git what the repositories `roots` are in are like, for the host,
+/// as long as the call lasts: at once, then as `nudges` say things
+/// changed or the app asks, and every few seconds otherwise, slower for a
+/// slow repository. Replies only with what changed since the last reply,
+/// unless the app asked for a run, which it's always answered: with the
+/// number of the last run asked for before this one started.
+pub fn follow(roots: &[PathBuf], nudges: Receiver<Nudge>, responder: &Responder) {
+    // The repositories as last sent, if they were.
+    let mut sent: Option<Vec<Repo>> = None;
+    let mut asked = 1;
+    let mut answered = 0;
+    loop {
+        let started = Instant::now();
+        let covered = asked;
+        let repos = read_repos(roots);
+        let took = started.elapsed();
+        // A run's wanted once it's been long enough since this one started.
+        let mut again = false;
+        let mut restart = false;
+        let mut take = |nudge: Nudge, again: &mut bool, restart: &mut bool| {
+            *again = true;
+            if let Nudge::Asked {
+                asked: number,
+                restart: now,
+            } = nudge
+            {
+                asked = asked.max(number);
+                *restart |= now;
+            }
+        };
+        loop {
+            match nudges.try_recv() {
+                Ok(nudge) => take(nudge, &mut again, &mut restart),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        if !restart {
+            let changed = sent.as_ref() != Some(&repos);
+            if changed || covered > answered {
+                let reply = Reply::Repos {
+                    repos: changed.then(|| repos.clone()),
+                    asked: covered,
+                };
+                if !responder.reply(reply) {
+                    return;
+                }
+                answered = covered;
+                sent = Some(repos);
+            }
+        }
+        while !restart {
+            let due = match again {
+                true => started + MIN_GAP,
+                false => started + took + INTERVAL.max(took * SLOWDOWN),
+            };
+            let Some(wait) = due.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match nudges.recv_timeout(wait) {
+                Ok(nudge) => take(nudge, &mut again, &mut restart),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
     }
 }
 

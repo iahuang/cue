@@ -231,9 +231,9 @@ Progress:
 - [ ] Left for later: Ctrl+hover and Ctrl+click on a path in a
   terminal look for the file on the client (`location::find_file`), on
   every hover. That wants either a batch ask per hover or to move with
-  the VT to the host. `Workspace::new` canonicalizes the folders it's
-  started with, on the client, before there's a host: step 3's
-  handshake should have the host do it.
+  the VT to the host; on a remote, it finds nothing for now (3.11).
+  `Workspace::new` canonicalized the folders it's started with, on the
+  client, before there was a host: the host looks at them now (3.4).
 
 Step 1 is done but for those: the app touches the machine only through
 the host, apart from what's the client's by design.
@@ -248,9 +248,9 @@ Notes from 1.1 and 1.2:
 - The walker reads `config::get()` for excludes. That's the host's config,
   which matches the config decision; a host process reloads it when told
   (2.6).
-- `Workspace::add_root` canonicalizes on the client; it's only for
-  starting now, and folders added later come from the host
-  (`Workspace::add_folder`).
+- `Workspace::add_root` canonicalizes on the client; it's only for tests
+  now (3.4), and folders come from the host (`Workspace::found`,
+  `Workspace::add_folder`).
 - Tests mostly expect the host to answer at once. `host::at_once()`
   (test-only, on by default, per thread) makes the tree, the file dialog,
   and file operations wait for their answers as they ask; their own tests
@@ -403,7 +403,7 @@ Progress:
   same file. The host in the app's process shares the app's settings, and
   ignores it. The host sends the client none of its settings yet: the
   client reads `[editor]` from its own file, which over ssh (step 3)
-  won't be the host's.
+  won't be the host's. (3.10 sends them.)
 - [x] 2.7 Edits as operations (`replica`): each document has a copy on
   the host, one per connection, under an id the client picks
   (`Link::next_doc`). Loading a file to open keeps what the host read as
@@ -442,8 +442,11 @@ Progress:
 
 ### 3. ssh
 
-`cue host:path` and `cue host` (a launcher: file browser plus the host's
-sessions). scp's rule decides what's remote: a `:` before any `/`. Bootstrap
+`cue host@123.456.789.01:path` and `cue host@123.456.789.0` (invoking cue into
+a remote without a set path opens TUI file browser plus the host's sessions
+similar to how `--resume` works today).
+
+scp's rule decides what's remote: a `:` before any `/`. Bootstrap
 the server binary over ssh, then run the protocol over the ssh channel.
 
 Large transfers to watch: the file list for the picker (paths relative to
@@ -451,6 +454,114 @@ roots, compressed, then kept up to date from disk change notices rather
 than sent again), and search results. Chunked replies and the writers'
 two queues (see Protocol shape) come in here, before anything's slow.
 The host pushes git status (see below).
+
+Progress:
+
+- [x] 3.1 What's remote (`remote::destination`): a `:` before any `/`,
+  as in `host:src` or `me@host:`, unless what's before it is a file here
+  (`main.rs:12`); or `user@host` alone; or `[::1]:path`. A host named
+  without `@` or `:` is a folder here. The path is from the home folder
+  there. A remote client always shows the app itself, with or without
+  `CUE_HOST_PROCESS`.
+- [x] 3.2 Bootstrap (`remote::Bridge::open`): the system's `ssh -T` (or
+  `CUE_SSH`, split at spaces, for tests and odd setups) runs a one-line
+  `sh` script, in single quotes with none inside, so any login shell
+  passes it on. It picks the build for `uname -sm`, by an id per binary
+  (version, size, and modification time), in `~/.cache/cue/ID/cue`; if
+  that's missing it asks (`@cue@ send PLATFORM [gzip]`), the client sends
+  the length and the binary, gzipped if both ends have gzip, the script
+  `head -c`s it in place and removes the builds sent before. Then it
+  execs `cue --bridge`. Lines the script and bridge say start `@cue@`,
+  so what rc files print is skipped. The binaries: this one for its own
+  platform, `$CUE_REMOTE_BINARIES/cue-PLATFORM`, a cargo build for the
+  target beside this one (`target/aarch64-unknown-linux-musl/debug/cue`
+  beside `target/debug/cue`), or `lib/cue/cue-PLATFORM` beside the `bin/`
+  it's in, which `install.sh` now fills with the linux-x64 build. ssh
+  runs with SIGHUP ignored, which OpenSSH keeps, so a closed terminal
+  still lets cue save the session through it; its stderr shows until the
+  app does, and is kept after.
+- [x] 3.3 The bridge (`bridge.rs`) greets with its source (`CUE_SOURCE`,
+  a hash of `src/` that `build.rs` makes, since builds for different
+  platforms can't be told apart by their binaries), its version, and its
+  home folder; a client of other source says to rebuild. Before there's
+  an app it answers `Ask`s (sessions, looking at paths, listing a folder),
+  then connects to a new host process or a session's, greeting it as a
+  client of its own build, so an older host upgrades to the bridge's
+  binary (2.5's path, through ssh), and passes bytes both ways. Not with
+  `io::copy`: on Linux that splices the pipe and the socket, and replies
+  stalled until more came. The app's link is `Link::over_ssh`, on the
+  other end of a socketpair that's ssh's stdin and stdout; `Link::remote`
+  names the host.
+- [x] 3.4 The app starts through the host, here too: the paths named are
+  looked at by the host (`Request::Look`), as is the session's state
+  (`SessionCall::Read`) and its folders, so `Workspace::new` and
+  `add_root` are test-only now (`Workspace::found`). `Request::About`
+  says the host's home folder, where its sessions are, and its settings
+  file's text; `Request::Sessions` lists its sessions, for the note of
+  those in the background. They're asked at once, with the paths, so
+  starting costs two round trips, three restoring a session.
+- [x] 3.5 `cue host:` with no path chooses, full screen, among the host's
+  sessions and, with Tab, its folders, from its home folder
+  (`resume::choose_or_browse`): Enter goes into a folder or opens a file,
+  the first row opens the folder itself, Backspace goes up, and a path
+  typed (`~/src`, `/srv`) goes there. `cue host:path` goes back to the
+  folder's one session as `cue path` does here, `--resume` and `--fresh`
+  too; a file named opens with its folder as the workspace, there being
+  no folder you're in there. Detaching, and the note of sessions in the
+  background, say to run `cue host:`. Restart passes `--remote HOST` on.
+- [x] 3.6 The wire (`wire.rs`): each side's writer keeps interactive
+  messages apart from bulk ones (`wire::Message`), sending bulk ones in
+  32KiB chunks only while nothing interactive waits, lanes taking turns,
+  so a file opened doesn't wait for the file list. A message waits for
+  bulk ones of its lane (a call's replies and its end; the session's
+  calls), and notices wait for every bulk reply before them. Chunks have
+  flags in their length's top bits, so the handshake reads as before.
+  Bulk: file lists, texts, bytes, previews, listings, search results,
+  symbols, git answers, session answers, a terminal's screen, and saves
+  and terminals that carry screens.
+- [x] 3.7 The file list goes as `Paths`, each as what it doesn't share
+  with the one before; a refresh sends what was added and removed since
+  the list the app has (`Request::ListFiles`'s `since`, `Reply::
+  FilesChanged`), which the host keeps per connection. It still walks the
+  folders again to find that.
+- [x] 3.8 Git status is the host's to schedule (`git::follow`, a long
+  `Request::GitStatus`): it asks git at once, when the connection's
+  watches see changes, and every few seconds (slower for a slow repo),
+  and replies only when the repos changed, or with what the app asked for
+  (`Tell::GitAgain`, which `Git::refresh` and `restart` send), numbered so
+  that tests can wait for it.
+- [x] 3.9 A session's save names the terminals whose screens the host
+  keeps (`Snapshot::host_screens`), and the host saves its own copy of
+  each, rather than the client sending up to 1MB a terminal a minute.
+- [x] 3.10 Settings: the host's `[editor]`, `[terminal]`, and `[files]`
+  replace the client's (`config::merge`), as `Request::About` says, at
+  start and after each reload. Open Settings on a remote says where the
+  two files are rather than opening a file of this machine there.
+- [x] 3.11 What's this machine's: recovery copies of a remote's files go
+  in `recovery/remote/HOST/`, and aren't compared with files here; Reveal
+  in Finder says the file's on the host; a path a terminal printed isn't
+  looked for here (`remote::files_elsewhere`); `~` is the host's home in
+  what's shown of its paths (`client::tilde`, and `tilde_here` for this
+  machine's).
+- [ ] Not yet: linux-arm64 builds in releases (`install.sh` only fetches
+  linux-x64); cross-building Linux on macOS (opentui-sys prelinks with
+  GNU `ld -r` and `objcopy`, so build in a Linux container or on CI);
+  `cue --list` and `--end` for a host; packing search results; the file
+  list following disk change notices instead of walking again; Ctrl+hover
+  paths in remote terminals (with the VT on the host); a dropped
+  connection ends the client (step 4), though the host keeps a session's
+  terminals running.
+
+Notes from step 3:
+
+- Tested end to end with a stand-in `ssh` (`CUE_SSH` naming a script
+  that runs the command with `sh -c`), and against an Alpine container
+  running sshd, with a Linux build made in a `rust:1-bookworm` container
+  with Zig 0.16 and cargo-zigbuild: opening, the picker, terminals,
+  keeping a session, a dropped connection (the host kept the session's
+  program running), attaching again, a host of an older build upgrading
+  with its terminal running, Restart, and the launcher.
+- Typing while the binary's sent goes to the terminal before cue has it.
 
 ### 4. Resumable transport
 

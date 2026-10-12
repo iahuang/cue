@@ -208,6 +208,10 @@ pub fn target_of_link(uri: &str, resolve: impl Fn(&str) -> Option<PathBuf>) -> O
 /// it. A diff's `a/` and `b/` prefixes are dropped if the path isn't found
 /// with them.
 pub fn find_file(path: &str, folders: &[PathBuf]) -> Option<PathBuf> {
+    // They'd be looked for here, which isn't where they are.
+    if crate::remote::files_elsewhere() {
+        return None;
+    }
     let unprefixed = path.strip_prefix("a/").or_else(|| path.strip_prefix("b/"));
     for path in std::iter::once(path).chain(unprefixed) {
         let named = match path.strip_prefix("~/") {

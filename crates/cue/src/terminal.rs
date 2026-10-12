@@ -322,17 +322,13 @@ impl Terminal {
         if full {
             return Some((full_snapshot(&mut self.vt)?, size(self.area)));
         }
-        let mut screen = self.vt.snapshot(false).ok()?;
-        if screen.len() > MAX_SAVED_TEXT {
-            // From the first line in the last of it.
-            let start = screen.len() - MAX_SAVED_TEXT;
-            let cut = screen[start..]
-                .windows(2)
-                .position(|pair| pair == b"\r\n")
-                .map_or(start, |at| start + at + 2);
-            screen.drain(..cut);
-        }
-        Some((screen, size(self.area)))
+        Some((saved_text(&mut self.vt)?, size(self.area)))
+    }
+
+    /// Whether the host keeps its screen too, as a host process does (see
+    /// [`crate::term_hub`]), for a session to save from there.
+    pub fn host_keeps_screen(&self) -> bool {
+        self.pty.host_answers && self.pty.id.is_some()
     }
 
     /// Lets go of the shell without hanging up on it, for a process that
@@ -1146,6 +1142,22 @@ fn find_bar(memory: find::Memory, origin: u32) -> FindBar {
 
 /// Everything a new emulator needs to look like `vt`, written to it:
 /// its screen, history, and modes, and its title.
+/// What a session keeps of `vt`'s screen, for [`Terminal::restore`]: its
+/// text, the last of it if there's much.
+pub fn saved_text(vt: &mut EmbeddedTerminal) -> Option<Vec<u8>> {
+    let mut screen = vt.snapshot(false).ok()?;
+    if screen.len() > MAX_SAVED_TEXT {
+        // From the first line in the last of it.
+        let start = screen.len() - MAX_SAVED_TEXT;
+        let cut = screen[start..]
+            .windows(2)
+            .position(|pair| pair == b"\r\n")
+            .map_or(start, |at| start + at + 2);
+        screen.drain(..cut);
+    }
+    Some(screen)
+}
+
 pub fn full_snapshot(vt: &mut EmbeddedTerminal) -> Option<Vec<u8>> {
     let mut screen = vt.snapshot(true).ok()?;
     let title = vt.title();

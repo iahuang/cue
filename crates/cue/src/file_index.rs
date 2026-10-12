@@ -9,12 +9,17 @@
 //! show. Nothing watches the file system yet, so the app refreshes when the
 //! picker opens and after saving.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ignore::{DirEntry, WalkBuilder, WalkState};
+use serde::{Deserialize, Serialize};
 
 use crate::host::{Call, Link, Reply, Request, Responder};
 use crate::picker::Item;
@@ -35,6 +40,8 @@ pub struct FileIndex {
     complete: bool,
     /// Whether some files went unlisted, past `MAX_FILES`.
     truncated: bool,
+    /// Which of the host's lists `files` is, once it's a whole one.
+    version: Option<u64>,
     /// The listing in progress, if any.
     listing: Option<Call>,
     /// A refresh was asked for during a listing: list again after it.
@@ -50,6 +57,7 @@ impl FileIndex {
             files: Rc::new(Vec::new()),
             complete: false,
             truncated: false,
+            version: None,
             listing: None,
             again: false,
         };
@@ -82,6 +90,7 @@ impl FileIndex {
             self.listing = Some(self.host.call(Request::ListFiles {
                 workspace: self.workspace.clone(),
                 progress: !self.complete,
+                since: self.version,
             }));
         }
     }
@@ -98,20 +107,38 @@ impl FileIndex {
                 Ok(Reply::FilesFound(found)) => {
                     let workspace = &self.workspace;
                     let found = found
+                        .unpack()
                         .into_iter()
                         .map(|path| Item::file(path, workspace, ""));
                     Rc::make_mut(&mut self.files).extend(found);
                     changed = true;
                 }
-                Ok(Reply::Files { files, truncated }) => {
+                Ok(Reply::Files {
+                    files,
+                    truncated,
+                    version,
+                }) => {
                     let workspace = &self.workspace;
                     let files = files
+                        .unpack()
                         .into_iter()
                         .map(|path| Item::file(path, workspace, ""));
                     self.files = Rc::new(files.collect());
                     self.truncated = truncated;
+                    self.version = Some(version);
                     self.complete = true;
                     changed = true;
+                    break;
+                }
+                Ok(Reply::FilesChanged {
+                    added,
+                    removed,
+                    truncated,
+                    version,
+                }) => {
+                    changed = self.change(added.unpack(), removed.unpack());
+                    self.truncated = truncated;
+                    self.version = Some(version);
                     break;
                 }
                 Ok(_) => {}
@@ -132,6 +159,29 @@ impl FileIndex {
         changed
     }
 
+    /// Adds `added` to the list, and takes `removed` from it, keeping it
+    /// sorted. Returns whether it changed.
+    fn change(&mut self, added: Vec<PathBuf>, removed: Vec<PathBuf>) -> bool {
+        if added.is_empty() && removed.is_empty() {
+            return false;
+        }
+        let files = Rc::make_mut(&mut self.files);
+        if !removed.is_empty() {
+            let removed: HashSet<PathBuf> = removed.into_iter().collect();
+            files.retain(|item| !item.path().is_some_and(|path| removed.contains(path)));
+        }
+        if !added.is_empty() {
+            let workspace = &self.workspace;
+            files.extend(
+                added
+                    .into_iter()
+                    .map(|path| Item::file(path, workspace, "")),
+            );
+            files.sort_by_cached_key(|item| sort_key(&item.text));
+        }
+        true
+    }
+
     /// Waits for the listing in progress to finish, for tests.
     #[cfg(test)]
     pub fn wait(&mut self) {
@@ -142,11 +192,57 @@ impl FileIndex {
     }
 }
 
+/// Paths, as sent: each as the bytes it doesn't share with the one
+/// before, after how many it does. Sorted, they share most: their roots,
+/// and their folders.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Paths(Vec<(u32, Vec<u8>)>);
+
+impl Paths {
+    pub fn pack<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Paths {
+        let mut packed = Vec::new();
+        let mut before: &[u8] = &[];
+        for path in paths {
+            let bytes = path.as_os_str().as_bytes();
+            let shared = bytes.iter().zip(before).take_while(|(a, b)| a == b).count();
+            packed.push((shared as u32, bytes[shared..].to_vec()));
+            before = bytes;
+        }
+        Paths(packed)
+    }
+
+    pub fn unpack(self) -> Vec<PathBuf> {
+        let mut paths = Vec::with_capacity(self.0.len());
+        let mut before: Vec<u8> = Vec::new();
+        for (shared, rest) in self.0 {
+            before.truncate(shared as usize);
+            before.extend_from_slice(&rest);
+            paths.push(PathBuf::from(OsStr::from_bytes(&before)));
+        }
+        paths
+    }
+}
+
+/// The last whole list the host sent on a connection, for the next to be
+/// sent as what changed since.
+#[derive(Default)]
+pub struct Listed {
+    version: u64,
+    files: Vec<PathBuf>,
+}
+
 /// Lists the files in `workspace`, for the host, replying with the files
-/// found so far along the way if `progress`, and then all of them. A root
-/// inside another is listed once, as itself. The listing stops early if
-/// the call is cancelled.
-pub fn list(workspace: &Workspace, progress: bool, responder: &Responder) {
+/// found so far along the way if `progress`, and then all of them; or, if
+/// the app has the list `listed` was as of `since`, what changed since. A
+/// root inside another is listed once, as itself. The listing stops early
+/// if the call is cancelled.
+pub fn list(
+    workspace: &Workspace,
+    progress: bool,
+    since: Option<u64>,
+    listed: &Mutex<Listed>,
+    responder: &Responder,
+) {
     let (found, paths) = mpsc::channel();
     let walker = walker(workspace);
     std::thread::spawn(move || walk(walker, found));
@@ -172,19 +268,52 @@ pub fn list(workspace: &Workspace, progress: bool, responder: &Responder) {
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if progress && files.len() > sent && last_sent.elapsed() >= PROGRESS_INTERVAL {
-            if !responder.reply(Reply::FilesFound(files[sent..].to_vec())) {
+            if !responder.reply(Reply::FilesFound(Paths::pack(&files[sent..]))) {
                 return;
             }
             sent = files.len();
             last_sent = Instant::now();
         }
     }
-    // Ignoring case, as in the tree.
-    files.sort_by_cached_key(|path| {
-        let text = workspace.display_path(path);
-        (text.to_lowercase(), text)
-    });
-    responder.reply(Reply::Files { files, truncated });
+    files.sort_by_cached_key(|path| sort_key(&workspace.display_path(path)));
+    let mut listed = listed.lock().unwrap_or_else(|e| e.into_inner());
+    let version = listed.version + 1;
+    let reply = match since == Some(listed.version) {
+        true => {
+            let (added, removed) = changes(&listed.files, &files);
+            Reply::FilesChanged {
+                added: Paths::pack(added),
+                removed: Paths::pack(removed),
+                truncated,
+                version,
+            }
+        }
+        false => Reply::Files {
+            files: Paths::pack(&files),
+            truncated,
+            version,
+        },
+    };
+    *listed = Listed { version, files };
+    responder.reply(reply);
+}
+
+/// What a file's sorted by, as shown: ignoring case, as in the tree.
+fn sort_key(text: &str) -> (String, String) {
+    (text.to_lowercase(), text.to_string())
+}
+
+/// The paths in `after` that aren't in `before`, and those in `before`
+/// that aren't in `after`.
+fn changes<'a>(
+    before: &'a [PathBuf],
+    after: &'a [PathBuf],
+) -> (Vec<&'a PathBuf>, Vec<&'a PathBuf>) {
+    let old: HashSet<&Path> = before.iter().map(PathBuf::as_path).collect();
+    let new: HashSet<&Path> = after.iter().map(PathBuf::as_path).collect();
+    let added = after.iter().filter(|path| !old.contains(path.as_path()));
+    let removed = before.iter().filter(|path| !new.contains(path.as_path()));
+    (added.collect(), removed.collect())
 }
 
 /// A walk over the workspace's files, or `None` if it has no roots. It
@@ -367,5 +496,54 @@ mod tests {
         assert!(!index.again);
         assert_eq!(texts(&index), ["a.rs", "b.rs"]);
         assert_eq!(before.len(), 1, "a picker's copy is left alone");
+    }
+
+    #[test]
+    fn paths_pack_by_what_they_share() {
+        let paths: Vec<PathBuf> = ["/w/src/a.rs", "/w/src/b.rs", "/w/z"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let packed = Paths::pack(&paths);
+        assert_eq!(packed.0[1], (7, b"b.rs".to_vec()));
+        assert_eq!(packed.0[2], (3, b"z".to_vec()));
+        assert_eq!(packed.unpack(), paths);
+    }
+
+    #[test]
+    fn a_refresh_sends_only_what_changed() {
+        let root = fixture("changes", &["a.rs", "b.rs", "c/d.rs"]);
+        let link = Link::local();
+        let workspace = Workspace::new([root.clone()]).unwrap();
+        let list = |since| {
+            link.call(Request::ListFiles {
+                workspace: workspace.clone(),
+                progress: false,
+                since,
+            })
+            .wait()
+        };
+        let Some(Reply::Files { version, .. }) = list(None) else {
+            panic!("a whole list comes first");
+        };
+        fs::remove_file(root.join("b.rs")).unwrap();
+        fs::write(root.join("c/e.rs"), "").unwrap();
+        match list(Some(version)) {
+            Some(Reply::FilesChanged { added, removed, .. }) => {
+                assert_eq!(added.unpack(), [root.join("c/e.rs")]);
+                assert_eq!(removed.unpack(), [root.join("b.rs")]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A list the host didn't keep: a whole one.
+        assert!(matches!(list(Some(version)), Some(Reply::Files { .. })));
+
+        let mut index = FileIndex::new(&link, &workspace);
+        index.wait();
+        fs::write(root.join("b.rs"), "").unwrap();
+        fs::remove_file(root.join("a.rs")).unwrap();
+        index.refresh();
+        index.wait();
+        assert_eq!(texts(&index), ["b.rs", "c/d.rs", "c/e.rs"]);
     }
 }

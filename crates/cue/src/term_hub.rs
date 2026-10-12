@@ -100,6 +100,9 @@ enum ToHub {
     HangUpAll,
     /// Which terminals are running, said to this.
     List(Sender<Vec<TermId>>),
+    /// What a session keeps of a terminal's screen, if the hub has it,
+    /// said to this.
+    Text(TermId, Sender<Option<Vec<u8>>>),
     /// Let go of every terminal without hanging up, saying each, with its
     /// screen, to this once they all are.
     Release(Sender<Vec<Adopted>>),
@@ -181,6 +184,15 @@ impl Hub {
     /// How many terminals are running.
     pub fn count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    /// What a session keeps of terminal `id`'s screen (see
+    /// [`crate::terminal::saved_text`]), if it's running and the hub keeps
+    /// its screen.
+    pub fn text(&self, id: TermId) -> Option<Vec<u8>> {
+        let (answer, text) = mpsc::channel();
+        let _ = self.to_hub.send(ToHub::Text(id, answer));
+        text.recv().ok().flatten()
     }
 
     /// Lets go of every terminal, their programs running on, for a process
@@ -434,6 +446,10 @@ fn run(inbox: Receiver<ToHub>, hub: Sender<ToHub>, count: &AtomicUsize, screens:
                 let mut ids: Vec<TermId> = terms.keys().copied().collect();
                 ids.sort_unstable();
                 let _ = answer.send(ids);
+            }
+            ToHub::Text(id, answer) => {
+                let vt = terms.get_mut(&id).and_then(|term| term.vt.as_mut());
+                let _ = answer.send(vt.and_then(crate::terminal::saved_text));
             }
             ToHub::Release(answer) => {
                 for term in terms.values() {

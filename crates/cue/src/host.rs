@@ -31,7 +31,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -43,13 +43,12 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::app::Adopted;
 use crate::document::{self, Checked, LineEnding, Loaded, Stamp, Unsaved, Written};
 use crate::file_dialog;
-use crate::file_index;
+use crate::file_index::{self, Paths};
 use crate::file_ops::{self, FileOp};
 use crate::git::{self, GitAnswer, GitCall, Repo};
 use crate::image;
@@ -63,6 +62,7 @@ use crate::term_hub::{Colors, Hub, TermId, Token};
 use crate::tree::{self, Listed};
 use crate::wake;
 use crate::watch::{Changes, Watcher};
+use crate::wire::{self, read_frame, read_frames, write_frame, write_frames, Lane};
 use crate::workspace::Workspace;
 
 #[cfg(test)]
@@ -106,10 +106,13 @@ const MOVE_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 300 } else 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     /// Every file in `workspace` (see [`crate::file_index`]): the files
-    /// found so far as it goes, if `progress`, and then the whole list.
+    /// found so far as it goes, if `progress`, and then the whole list; or
+    /// what changed since the list the app has, `since`, if the host still
+    /// has it.
     ListFiles {
         workspace: Workspace,
         progress: bool,
+        since: Option<u64>,
     },
     /// The files in `workspace` matching `query` (see [`crate::search`]),
     /// searching the copies of documents open with unsaved changes,
@@ -119,7 +122,8 @@ pub enum Request {
         query: Query,
         unsaved: HashMap<PathBuf, DocId>,
     },
-    /// What git says of the repositories `roots` are in.
+    /// What git says of the repositories `roots` are in, now and as it
+    /// changes, until cancelled (see [`git::follow`]).
     GitStatus { roots: Vec<PathBuf> },
     /// Syncing the repository at `root` with its remote.
     GitSync { root: PathBuf, sync: git::Sync },
@@ -181,6 +185,10 @@ pub enum Request {
     /// Which terminals are running, by their ids on the host, for a
     /// client attaching to them (see [`crate::term_hub`]).
     Terminals,
+    /// What the app's to know of the host's machine (see [`About`]).
+    About,
+    /// The sessions kept on the host's machine, most recent first.
+    Sessions,
     /// Nothing, until cancelled, for tests.
     #[cfg(test)]
     Hold,
@@ -190,7 +198,7 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
     /// Files found so far, during a [`Request::ListFiles`] with progress.
-    FilesFound(Vec<PathBuf>),
+    FilesFound(Paths),
     /// A file's text, or why it couldn't be read.
     Loaded(Result<Loaded, String>),
     /// How a file was found, for a [`Request::CheckDisk`].
@@ -219,10 +227,20 @@ pub enum Reply {
         entries: Vec<Listed>,
     },
     /// Every file, sorted as the picker lists them, and whether some went
-    /// unlisted, there being too many.
+    /// unlisted, there being too many; the list's `version`, for the next
+    /// [`Request::ListFiles`] to send only what changed since.
     Files {
-        files: Vec<PathBuf>,
+        files: Paths,
         truncated: bool,
+        version: u64,
+    },
+    /// What changed since the list a [`Request::ListFiles`] said the app
+    /// has, which makes the list `version`.
+    FilesChanged {
+        added: Paths,
+        removed: Paths,
+        truncated: bool,
+        version: u64,
     },
     /// A file with matches, or the colors of one found before.
     Found(search::Found),
@@ -231,7 +249,13 @@ pub enum Reply {
     SymbolsFound(FileSymbols),
     /// Every file's symbols, sorted by path.
     Symbols(FileSymbols),
-    Repos(Vec<Repo>),
+    /// What git says of a [`Request::GitStatus`]'s repositories, if it
+    /// changed since the last reply, after the `asked`th run the app asked
+    /// for.
+    Repos {
+        repos: Option<Vec<Repo>>,
+        asked: u64,
+    },
     Git(GitAnswer),
     Term(pty::Event),
     Session(SessionAnswer),
@@ -243,6 +267,8 @@ pub enum Reply {
     /// The new commit's abbreviated hash, or what went wrong.
     Committed(Result<String, String>),
     Terminals(Vec<TermId>),
+    About(About),
+    Sessions(Vec<session::Listing>),
 }
 
 /// An [`io::ErrorKind`] in a result, as sent: those the app tells apart,
@@ -274,6 +300,30 @@ mod error_kind {
     }
 }
 
+/// What the app's to know of the host's machine, which needn't be the
+/// app's.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct About {
+    /// Its user's home folder, if it has one.
+    pub home: Option<PathBuf>,
+    /// Where its sessions are kept (see [`session::default_dir`]).
+    pub sessions: Option<PathBuf>,
+    /// Its settings file's text, if it has one, of which the app takes all
+    /// but `[ui]` and `[keys]` (see [`crate::config`]).
+    pub settings: Option<String>,
+}
+
+impl About {
+    /// What this machine is like.
+    pub fn here() -> About {
+        About {
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            sessions: session::default_dir(),
+            settings: crate::config::path().and_then(|path| std::fs::read_to_string(path).ok()),
+        }
+    }
+}
+
 /// What a path is, as the host found it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Look {
@@ -290,6 +340,13 @@ pub enum Tell {
     Watch(BTreeSet<PathBuf>),
     /// Have the terminal of this [`Request::Terminal`] call do something.
     Term { call: CallId, control: pty::Control },
+    /// Have this [`Request::GitStatus`] call ask git again, as the
+    /// `asked`th run asked for, dropping one in progress if `restart`.
+    GitAgain {
+        call: CallId,
+        asked: u64,
+        restart: bool,
+    },
     /// Keep `text` as the copy `doc` (see [`crate::replica`]).
     Open { doc: DocId, text: String },
     /// Make `edit` to the copy `doc`, as `version`.
@@ -419,6 +476,79 @@ enum Output {
     Settled,
 }
 
+/// The lane the session's calls share, so that they arrive in order even
+/// once a save with screens goes in chunks (see [`crate::wire`]).
+const SESSION_LANE: Lane = Lane::MAX;
+
+impl wire::Message for ToHost {
+    fn bulk(&self) -> bool {
+        match self {
+            ToHost::Call(_, Request::Session(SessionCall::Save(snapshot))) => {
+                !snapshot.screens.is_empty()
+            }
+            ToHost::Call(_, Request::Terminal(pty::Start::Shell { above, .. })) => {
+                !above.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    fn lane(&self) -> Option<Lane> {
+        match self {
+            ToHost::Call(_, Request::Session(_)) => Some(SESSION_LANE),
+            ToHost::Call(id, _) | ToHost::Cancel(id) => Some(*id),
+            ToHost::Tell(Tell::Term { call, .. } | Tell::GitAgain { call, .. }) => Some(*call),
+            _ => None,
+        }
+    }
+}
+
+impl wire::Message for Output {
+    fn bulk(&self) -> bool {
+        match self {
+            Output::Reply(_, reply) => reply.bulk(),
+            _ => false,
+        }
+    }
+
+    fn lane(&self) -> Option<Lane> {
+        match self {
+            Output::Reply(id, _) | Output::End(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// A notice comes after the replies before it: a file's text, then
+    /// that it changed on disk since.
+    fn barrier(&self) -> bool {
+        matches!(self, Output::Notice(_))
+    }
+}
+
+impl Reply {
+    /// Whether it may be big, to go in chunks, behind what's typed.
+    fn bulk(&self) -> bool {
+        match self {
+            Reply::Term(event) => matches!(event, pty::Event::Screen { .. }),
+            Reply::FilesFound(_)
+            | Reply::Files { .. }
+            | Reply::FilesChanged { .. }
+            | Reply::Loaded(_)
+            | Reply::Bytes(_)
+            | Reply::Peeked(_)
+            | Reply::Dir { .. }
+            | Reply::Folder { .. }
+            | Reply::Found(_)
+            | Reply::SymbolsFound(_)
+            | Reply::Symbols(_)
+            | Reply::Git(_)
+            | Reply::Session(_)
+            | Reply::Sessions(_) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Where each call's replies go, until it ends; `None` once the host's
 /// gone, or left.
 type Routes = Option<HashMap<CallId, Sender<Reply>>>;
@@ -443,6 +573,8 @@ struct Shared {
     sent: RefCell<Option<Receiver<()>>>,
     /// The host is on a thread of this process.
     local: bool,
+    /// How the host's reached, if it's on another machine.
+    remote: Option<crate::remote::Remote>,
     #[cfg(test)]
     settled: Receiver<()>,
     /// The host's, if it's in this process, for tests.
@@ -484,40 +616,24 @@ impl Link {
     /// Starts a host process (`cue --host`), listening on a socket of its
     /// own, and connects to it. It ends once no client is connected.
     pub fn spawn() -> io::Result<Link> {
-        let uid = unsafe { libc::getuid() };
-        let path = PathBuf::from(format!("/tmp/cue-{uid}/host-{}.sock", std::process::id()));
-        let listener = crate::attach::listen(&path)?;
-        listener.set_nonblocking(false)?;
-        let fd = listener.as_raw_fd();
-        let mut command = Command::new(crate::relocate::exe());
-        command
-            .arg("--host")
-            .env(LISTENER_VARIABLE, fd.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        crate::relocate::pass_on(&mut command);
-        // A session of its own, so that the terminal's signals aren't its;
-        // and the listener, kept across `exec`.
-        unsafe {
-            command.pre_exec(move || {
-                libc::setsid();
-                libc::fcntl(fd, libc::F_SETFD, 0);
-                Ok(())
-            });
-        }
-        let mut child = command.spawn()?;
-        drop(listener);
-        std::thread::spawn(move || child.wait());
-        Link::connect(&path)
+        Link::connect(&spawn_host()?)
     }
 
     /// Connects to the host process listening on `path`. If it serves
     /// another client, that one leaves first (see [`Notice::Moved`]), and
     /// what's asked meanwhile waits.
     pub fn connect(path: &Path) -> io::Result<Link> {
-        let stream = greeted(path, &Hello::new(crate::attach::build(), false))?;
-        Ok(Link::over(stream, false))
+        Ok(Link::over(connect_stream(path)?, false))
+    }
+
+    /// The app's end of a host on another machine, on the other end of
+    /// `stream`, as `remote` reaches it (see [`crate::remote`]).
+    pub fn over_ssh(stream: UnixStream, remote: crate::remote::Remote) -> Link {
+        let mut link = Link::over(stream, false);
+        Rc::get_mut(&mut link.shared)
+            .expect("a new link's its own")
+            .remote = Some(remote);
+        link
     }
 
     /// Connects to the host process on `path` as a client of `build`,
@@ -533,6 +649,11 @@ impl Link {
     /// Whether the host is on a thread of this process.
     pub fn is_local(&self) -> bool {
         self.shared.local
+    }
+
+    /// The machine the host's on, as ssh is told, if it's another.
+    pub fn remote(&self) -> Option<&str> {
+        self.shared.remote.as_ref().map(crate::remote::Remote::name)
     }
 
     /// The app's end of a connection to a host on the other end of
@@ -573,6 +694,7 @@ impl Link {
                 notices,
                 sent: RefCell::new(Some(sent)),
                 local,
+                remote: None,
                 #[cfg(test)]
                 settled,
                 #[cfg(test)]
@@ -746,63 +868,6 @@ fn read(
     *lock(routes) = None;
     let _ = notices.send(Notice::Gone);
     wake::wake();
-}
-
-/// Reads a message: its length, then it.
-fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<T> {
-    let mut len = [0; 8];
-    reader.read_exact(&mut len)?;
-    let mut frame = vec![0; u64::from_le_bytes(len) as usize];
-    reader.read_exact(&mut frame)?;
-    postcard::from_bytes(&frame).map_err(io::Error::other)
-}
-
-/// Writes a message: its length, then it.
-fn write_frame<T: Serialize>(writer: &mut impl Write, message: &T) -> io::Result<()> {
-    let frame = postcard::to_stdvec(message).map_err(io::Error::other)?;
-    writer.write_all(&(frame.len() as u64).to_le_bytes())?;
-    writer.write_all(&frame)
-}
-
-/// Takes each message from `stream`, until it ends, or `take` says to stop.
-fn read_frames<T: DeserializeOwned>(stream: UnixStream, mut take: impl FnMut(T) -> bool) {
-    let mut reader = BufReader::new(stream);
-    loop {
-        let message = match read_frame(&mut reader) {
-            Ok(message) => message,
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(err) => {
-                eprintln!("cue: a message from the other end can't be read: {err}");
-                break;
-            }
-        };
-        if !take(message) {
-            break;
-        }
-    }
-}
-
-/// Sends what comes from `outbox` over `stream`, until it's all sent, or
-/// the other end's gone. Then the connection's done with, both ways: on
-/// either end, nothing's left to read once nothing's left to send.
-fn write_frames<T: Serialize>(stream: UnixStream, outbox: Receiver<T>) {
-    let mut writer = BufWriter::new(&stream);
-    'sending: while let Ok(message) = outbox.recv() {
-        if write_frame(&mut writer, &message).is_err() {
-            break;
-        }
-        // What's come meanwhile goes in the same write.
-        while let Ok(message) = outbox.try_recv() {
-            if write_frame(&mut writer, &message).is_err() {
-                break 'sending;
-            }
-        }
-        if writer.flush().is_err() {
-            break;
-        }
-    }
-    drop(writer);
-    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1195,6 +1260,55 @@ fn greet(stream: UnixStream) -> Option<Happened> {
     })
 }
 
+/// Starts a host process (`cue --host`), listening on a socket of its own,
+/// whose path it returns. It ends if no client comes soon.
+pub fn spawn_host() -> io::Result<PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    let path = PathBuf::from(format!("/tmp/cue-{uid}/host-{}.sock", std::process::id()));
+    let listener = crate::attach::listen(&path)?;
+    listener.set_nonblocking(false)?;
+    let fd = listener.as_raw_fd();
+    let mut command = Command::new(crate::relocate::exe());
+    command
+        .arg("--host")
+        .env(LISTENER_VARIABLE, fd.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    crate::relocate::pass_on(&mut command);
+    // A session of its own, so that the terminal's signals aren't its;
+    // and the listener, kept across `exec`.
+    unsafe {
+        command.pre_exec(move || {
+            libc::setsid();
+            libc::fcntl(fd, libc::F_SETFD, 0);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    drop(listener);
+    std::thread::spawn(move || child.wait());
+    Ok(path)
+}
+
+/// A connection to the host process listening on `path`, as a client of
+/// this build, once it's said hello.
+pub fn connect_stream(path: &Path) -> io::Result<UnixStream> {
+    greeted(path, &Hello::new(crate::attach::build(), false))
+}
+
+/// What each of `paths` is, or `None` where nothing is.
+pub fn look(paths: &[PathBuf]) -> Vec<Option<Look>> {
+    paths
+        .iter()
+        .map(|path| {
+            let real = std::fs::canonicalize(path).ok()?;
+            let is_dir = real.is_dir();
+            Some(Look { real, is_dir })
+        })
+        .collect()
+}
+
 /// A connection to the host process on `path`, once it's taken `hello`.
 fn greeted(path: &Path, hello: &Hello) -> io::Result<UnixStream> {
     let stream = UnixStream::connect(path)?;
@@ -1258,8 +1372,10 @@ fn serve(
     let mut calls: HashMap<CallId, Arc<AtomicBool>> = HashMap::new();
     // The terminal each terminal call hears of, and its token for it.
     let mut terminals: HashMap<CallId, (TermId, Token)> = HashMap::new();
-    // The app's documents' copies, which its calls read.
-    let copies = Arc::new(Mutex::new(Copies::default()));
+    // Where each git status call hears what it's to know.
+    let mut statuses: HashMap<CallId, Sender<git::Nudge>> = HashMap::new();
+    // What the app has: its documents' copies, which its calls read.
+    let conn = Arc::new(Connection::default());
     let mut left = false;
     loop {
         let input = match watcher.due() {
@@ -1284,6 +1400,19 @@ fn serve(
                 let opened = state.hub.open(start, responder);
                 terminals.insert(id, opened);
             }
+            Ok(Input::Call(id, Request::GitStatus { roots })) => {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                calls.insert(id, Arc::clone(&cancelled));
+                let responder = Responder {
+                    id,
+                    output: output.clone(),
+                    inbox: host_inbox.clone(),
+                    cancelled,
+                };
+                let (nudge, nudges) = mpsc::channel();
+                statuses.insert(id, nudge);
+                std::thread::spawn(move || git::follow(&roots, nudges, &responder));
+            }
             Ok(Input::Call(id, request)) => {
                 let cancelled = Arc::new(AtomicBool::new(false));
                 calls.insert(id, Arc::clone(&cancelled));
@@ -1295,9 +1424,9 @@ fn serve(
                 };
                 let state = Arc::clone(&state);
                 // As they are now, before the edits that come after.
-                let texts = texts_for(&request, &lock(&copies));
-                let copies = Arc::clone(&copies);
-                std::thread::spawn(move || answer(request, &state, &copies, texts, responder));
+                let texts = texts_for(&request, &lock(&conn.copies));
+                let conn = Arc::clone(&conn);
+                std::thread::spawn(move || answer(request, &state, &conn, texts, responder));
             }
             Ok(Input::Cancel(id)) => {
                 if let Some(cancelled) = calls.remove(&id) {
@@ -1307,10 +1436,21 @@ fn serve(
                 if let Some((terminal, _)) = terminals.remove(&id) {
                     state.hub.control(terminal, pty::Control::HangUp);
                 }
+                statuses.remove(&id);
             }
             Ok(Input::Finished(id)) => {
                 calls.remove(&id);
                 terminals.remove(&id);
+                statuses.remove(&id);
+            }
+            Ok(Input::Tell(Tell::GitAgain {
+                call,
+                asked,
+                restart,
+            })) => {
+                if let Some(status) = statuses.get(&call) {
+                    let _ = status.send(git::Nudge::Asked { asked, restart });
+                }
             }
             Ok(Input::Tell(Tell::Term { call, control })) => {
                 if let Some(&(terminal, _)) = terminals.get(&call) {
@@ -1321,14 +1461,14 @@ fn serve(
             Ok(Input::Tell(Tell::ReloadConfig)) => state.reload_config(),
             // Here too, before the terminals asked for after.
             Ok(Input::Tell(Tell::Colors(colors))) => state.hub.set_colors(colors),
-            Ok(Input::Tell(Tell::Open { doc, text })) => lock(&copies).open(doc, text),
+            Ok(Input::Tell(Tell::Open { doc, text })) => lock(&conn.copies).open(doc, text),
             Ok(Input::Tell(Tell::Edit { doc, version, edit })) => {
-                if lock(&copies).edit(doc, version, &edit) {
+                if lock(&conn.copies).edit(doc, version, &edit) {
                     let acked = Notice::Acked { doc, version };
                     let _ = output.send(Output::Notice(acked));
                 }
             }
-            Ok(Input::Tell(Tell::Close(doc))) => lock(&copies).close(doc),
+            Ok(Input::Tell(Tell::Close(doc))) => lock(&conn.copies).close(doc),
             Ok(Input::Tell(Tell::Watch(folders))) => {
                 watcher.watch(folders.into_iter().filter(|f| f.is_dir()).collect());
             }
@@ -1351,6 +1491,9 @@ fn serve(
             Ok(Input::Evicted | Input::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
         if let Some(mut changes) = watcher.poll() {
+            for status in statuses.values() {
+                let _ = status.send(git::Nudge::Changed);
+            }
             changes.look();
             let _ = output.send(Output::Notice(Notice::DiskChanged(changes)));
         }
@@ -1457,6 +1600,15 @@ impl State {
     }
 }
 
+/// What the host keeps of a connection's app, for its calls.
+#[derive(Default)]
+struct Connection {
+    /// The app's documents' copies.
+    copies: Mutex<Copies>,
+    /// The list of files the app was last sent.
+    listed: Mutex<file_index::Listed>,
+}
+
 /// The texts of the app's `copies` of documents that `request` reads.
 fn texts_for(request: &Request, copies: &Copies) -> Texts {
     match request {
@@ -1469,13 +1621,13 @@ fn texts_for(request: &Request, copies: &Copies) -> Texts {
     }
 }
 
-/// Does what `request` asks, replying as it goes: with the app's copies of
-/// documents, `copies`, which loading adds to, and the `texts` of them it
-/// reads, taken as it came.
+/// Does what `request` asks, replying as it goes: with what the host keeps
+/// of the app's connection, `conn`, such as its documents' copies, which
+/// loading adds to, and the `texts` of them it reads, taken as it came.
 fn answer(
     request: Request,
     state: &State,
-    copies: &Mutex<Copies>,
+    conn: &Connection,
     mut texts: Texts,
     responder: Responder,
 ) {
@@ -1484,7 +1636,8 @@ fn answer(
         Request::ListFiles {
             workspace,
             progress,
-        } => file_index::list(&workspace, progress, &responder),
+            since,
+        } => file_index::list(&workspace, progress, since, &conn.listed, &responder),
         Request::Search {
             workspace,
             query,
@@ -1503,7 +1656,7 @@ fn answer(
             let loaded = document::load(&path).map_err(|err| err.to_string());
             if let Some(doc) = doc {
                 let text = loaded.as_ref().ok().map(|loaded| loaded.text.as_str());
-                lock(copies).loaded(doc, text);
+                lock(&conn.copies).loaded(doc, text);
             }
             responder.reply(Reply::Loaded(loaded));
         }
@@ -1540,15 +1693,7 @@ fn answer(
             responder.reply(Reply::Bytes(image::read_if_changed(&path, unless)));
         }
         Request::Look { paths } => {
-            let looked = paths
-                .iter()
-                .map(|path| {
-                    let real = std::fs::canonicalize(path).ok()?;
-                    let is_dir = real.is_dir();
-                    Some(Look { real, is_dir })
-                })
-                .collect();
-            responder.reply(Reply::Looked(looked));
+            responder.reply(Reply::Looked(look(&paths)));
         }
         Request::Peek { path } => {
             responder.reply(Reply::Peeked(quick_look::peek(&path)));
@@ -1570,7 +1715,15 @@ fn answer(
         }
         // Answered apart, in `serve`, which knows the link's terminals.
         Request::Terminal(_) => {}
-        Request::Session(call) => {
+        Request::Session(mut call) => {
+            if let SessionCall::Save(snapshot) = &mut call {
+                // Those the client didn't send, being the host's.
+                for (id, on_host) in std::mem::take(&mut snapshot.host_screens) {
+                    if let Some(screen) = state.hub.text(on_host) {
+                        snapshot.screens.push((id, screen));
+                    }
+                }
+            }
             let mut session = lock(&state.session);
             let answer = session::run(call, &mut session, &texts);
             state.listen_for(session.as_ref());
@@ -1580,12 +1733,20 @@ fn answer(
         Request::Terminals => {
             responder.reply(Reply::Terminals(state.hub.list()));
         }
+        Request::About => {
+            responder.reply(Reply::About(About::here()));
+        }
+        Request::Sessions => {
+            let sessions = session::default_dir()
+                .map(|dir| session::list(&dir))
+                .unwrap_or_default();
+            responder.reply(Reply::Sessions(sessions));
+        }
         Request::Git(call) => {
             responder.reply(Reply::Git(git::run(&call)));
         }
-        Request::GitStatus { roots } => {
-            responder.reply(Reply::Repos(git::read_repos(&roots)));
-        }
+        // Answered apart, in `serve`, which tells it what changes.
+        Request::GitStatus { .. } => {}
         Request::GitSync { root, sync } => {
             responder.reply(Reply::Synced(git::sync(&root, &sync)));
         }
@@ -1629,10 +1790,13 @@ mod tests {
         let call = link.call(Request::ListFiles {
             workspace,
             progress: false,
+            since: None,
         });
         match call.wait() {
-            Some(Reply::Files { files, truncated }) => {
-                assert_eq!(files, [root.join("a.txt")]);
+            Some(Reply::Files {
+                files, truncated, ..
+            }) => {
+                assert_eq!(files.unpack(), [root.join("a.txt")]);
                 assert!(!truncated);
             }
             other => panic!("{other:?}"),
@@ -1854,6 +2018,55 @@ mod tests {
         drop((attached, reopened, running, second));
         ends(host);
         assert!(!socket.exists(), "the session's socket is removed");
+    }
+
+    #[test]
+    fn a_session_save_has_the_host_write_screens_it_keeps() {
+        let _serial = crate::test_serial();
+        let (path, host) = host_process("host-screens", true);
+        let root = path.parent().unwrap().to_path_buf();
+        let link = Link::connect(&path).unwrap();
+        let sessions = root.join("sessions");
+        let opened = link.call(Request::Session(SessionCall::Create(sessions.clone())));
+        let dir = match opened.wait() {
+            Some(Reply::Session(SessionAnswer::Opened(Ok((_, dir))))) => dir,
+            other => panic!("{other:?}"),
+        };
+        let term = link.call(Request::Terminal(pty::Start::Shell {
+            cwd: root.clone(),
+            or: None,
+            cols: 80,
+            rows: 24,
+            above: Vec::new(),
+        }));
+        let id = match term.wait() {
+            Some(Reply::Term(pty::Event::Started(id))) => id,
+            other => panic!("{other:?}"),
+        };
+        link.tell(Tell::Term {
+            call: term.id(),
+            control: pty::Control::Input(b"echo kept-$((6*7))\r".to_vec()),
+        });
+        wait_for_output(&term, "kept-42");
+        let snapshot = session::Snapshot {
+            state: session::State::default(),
+            texts: Vec::new(),
+            screens: Vec::new(),
+            host_screens: vec![(3, id)],
+            prune_screens: false,
+        };
+        let saved = link.call(Request::Session(SessionCall::Save(Box::new(snapshot))));
+        assert!(matches!(
+            saved.wait(),
+            Some(Reply::Session(SessionAnswer::Saved(Ok(_))))
+        ));
+        let screen = fs::read_to_string(dir.join("terminals").join(session::screen_name(3)));
+        assert!(
+            screen.unwrap().contains("kept-42"),
+            "the host's screen is saved"
+        );
+        drop((term, saved, opened, link));
+        ends(host);
     }
 
     #[test]

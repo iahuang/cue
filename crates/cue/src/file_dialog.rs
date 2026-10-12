@@ -101,10 +101,22 @@ pub enum DialogAction {
 /// Something in the folder listed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
-    name: String,
-    is_dir: bool,
+    pub name: String,
+    pub is_dir: bool,
     /// A file's size, in bytes.
     size: Option<u64>,
+}
+
+impl Entry {
+    /// A folder, or a file of no size, called `name`, for tests.
+    #[cfg(test)]
+    pub fn named(name: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: name.to_string(),
+            is_dir,
+            size: (!is_dir).then_some(0),
+        }
+    }
 }
 
 /// A row of the list.

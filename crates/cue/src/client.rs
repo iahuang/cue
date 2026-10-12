@@ -33,6 +33,9 @@ pub struct Args {
     pub all: bool,
     /// Start a new cue even if the folder has a session.
     pub fresh: bool,
+    /// The machine the files are on, if it's another (see
+    /// [`crate::remote`]).
+    pub remote: Option<crate::remote::Destination>,
 }
 
 /// Opens what `args` say, in a server, and waits on it.
@@ -270,13 +273,32 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// `path` with `~` for the home folder.
+/// The home folder on the machine the files are on, if it isn't this
+/// one's (see [`set_home`]).
+static HOME: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Has [`tilde`] go by `home`, the home folder of the machine the files are
+/// on, once it's another (see [`crate::remote`]).
+pub fn set_home(home: Option<PathBuf>) {
+    let _ = HOME.set(home);
+}
+
+/// `path` with `~` for the home folder, on the machine the files are on.
 pub fn tilde(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    match home
-        .as_deref()
-        .and_then(|home| path.strip_prefix(home).ok())
-    {
+    let home = match HOME.get() {
+        Some(home) => home.clone(),
+        None => std::env::var_os("HOME").map(PathBuf::from),
+    };
+    tilde_in(path, home.as_deref())
+}
+
+/// `path` with `~` for the home folder on this machine.
+pub fn tilde_here(path: &Path) -> String {
+    tilde_in(path, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+}
+
+fn tilde_in(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
@@ -293,6 +315,13 @@ fn pick(listings: Vec<Listing>, folder: &Path, all: bool) -> io::Result<Option<L
     if interactive {
         return crate::resume::choose(listings, folder, all);
     }
+    print_sessions(&listings, folder, all);
+    Ok(None)
+}
+
+/// Prints `listings`, those in `folder` unless `all`, for a `--resume`
+/// without a terminal to choose in.
+pub fn print_sessions(listings: &[Listing], folder: &Path, all: bool) {
     let now = SystemTime::now();
     match all {
         true => eprintln!("Sessions:"),
@@ -301,5 +330,4 @@ fn pick(listings: Vec<Listing>, folder: &Path, all: bool) -> io::Result<Option<L
     for listing in listings.iter().filter(|listing| all || listing.has(folder)) {
         eprintln!("  {}  {}", listing.id, listing.describe(now));
     }
-    Ok(None)
 }

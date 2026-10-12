@@ -90,7 +90,7 @@ use crate::file_index::FileIndex;
 use crate::file_ops::{file_name, FileOp};
 use crate::find;
 use crate::git::{self, Carried, Change, Commit, Git, GitAnswer, GitCall, Repo, SwitchTo};
-use crate::host::{Call, Link, Notice, Reply, Request, Tell};
+use crate::host::{About, Call, Link, Notice, Reply, Request, Tell};
 use crate::image::{self, ImageView};
 use crate::indent::{self, Indent};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
@@ -624,7 +624,14 @@ pub struct App {
     /// `None` if there was none: when an open document of it was saved
     /// with something else, the settings are read again.
     settings_hash: Option<u64>,
-    /// Where sessions are kept, if anywhere.
+    /// The settings this app read, before the host's part replaced its own
+    /// (see [`config::merge`]).
+    own_settings: Config,
+    /// The host's settings, for a host that isn't in this process, and an
+    /// ask for them again, on its way, once the app's were read again.
+    host_settings: Option<Config>,
+    asking_settings: Option<Call>,
+    /// Where sessions are kept, if anywhere, on the host's machine.
     sessions: Option<PathBuf>,
     /// The session this cue is, if it is one.
     session: Option<SessionLink>,
@@ -792,6 +799,11 @@ impl App {
         height: u32,
     ) -> Result<App, String> {
         let file = file.map(|file| document::normalize(&file));
+        // Tests keep none; those of recovery set a folder of their own.
+        let recovery = match cfg!(test) {
+            true => Recovery::new(None),
+            false => Recovery::for_files_on(host.remote()),
+        };
         let mut tree = FileTree::new(&host, workspace.roots());
         // Before revealing, so the file's folders stay in view above it.
         // The status bar is below it.
@@ -880,21 +892,18 @@ impl App {
             key_releases: true,
             search_memory: Memory::default(),
             find_memory: find::Memory::default(),
-            // Tests keep none; those of recovery set a folder of their own.
-            recovery: Recovery::new(match cfg!(test) {
-                true => None,
-                false => Recovery::default_dir(),
-            }),
+            recovery,
             settings: match cfg!(test) {
                 true => None,
                 false => config::path().map(|path| document::resolve(&path)),
             },
             settings_hash: None,
+            own_settings: (*config::get()).clone(),
+            host_settings: None,
+            asking_settings: None,
             // Tests keep none; those of sessions set a folder of their own.
-            sessions: match cfg!(test) {
-                true => None,
-                false => session::default_dir(),
-            },
+            // The host says where its are (see `App::use_about`).
+            sessions: None,
             session: None,
             session_saved: None,
             screens_saved: None,
@@ -2575,10 +2584,21 @@ impl App {
             let screens = due(self.screens_saved, SCREENS_INTERVAL);
             self.session_saving = self.start_session_save(screens).map(|call| (call, screens));
         }
+        let said = self.asking_settings.as_ref().map(Call::try_recv);
+        match said {
+            Some(Ok(Reply::About(about))) => {
+                self.asking_settings = None;
+                self.host_settings = Some(config::host_settings(about.settings.as_deref()));
+                self.put_settings();
+                changed = true;
+            }
+            Some(Ok(_) | Err(TryRecvError::Disconnected)) => self.asking_settings = None,
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
         for notice in self.host.notices() {
             match notice {
+                // The host asks git again itself.
                 Notice::DiskChanged(changes) => {
-                    self.git.refresh();
                     self.disk_changed(changes);
                     changed = true;
                     self.refresh_finds();
@@ -2597,8 +2617,12 @@ impl App {
                 Notice::Moved => self.deferred = Some(AppAction::Moved),
                 Notice::Ended => self.deferred = Some(AppAction::Ended),
                 Notice::Gone => {
+                    let what = match self.host.remote() {
+                        Some(remote) => format!("The connection to {remote} was lost"),
+                        None => "The host stopped".to_string(),
+                    };
                     self.show_message(
-                        "The host stopped: files can't be opened or saved. Copy what you need, then quit.",
+                        format!("{what}: files can't be opened or saved. Copy what you need, then quit."),
                         true,
                     );
                     changed = true;
@@ -4920,13 +4944,27 @@ impl App {
     /// settings did, since they may have been changed by hand since.
     /// Terminals already running keep their shell and scrollback.
     fn apply_settings(&mut self, config: Config) {
+        self.own_settings = config;
+        // A host process reads its own, and says what it read; one in this
+        // process shares these, but for tests, where each thread has its
+        // own. Told before what follows asks it anything.
+        self.host.tell(Tell::ReloadConfig);
+        if !self.host.is_local() {
+            self.asking_settings = Some(self.host.call(Request::About));
+        }
+        self.put_settings();
+    }
+
+    /// Puts this app's settings in use, with the host's part replacing its
+    /// own if the host's said what it is, applying what changed.
+    fn put_settings(&mut self) {
+        let config = match &self.host_settings {
+            Some(host) => config::merge(self.own_settings.clone(), host),
+            None => self.own_settings.clone(),
+        };
         let old = config::get();
         config::set(config);
         let new = config::get();
-        // A host process reads its own; one in this process shares these,
-        // but for tests, where each thread has its own. Told before what
-        // follows asks it anything.
-        self.host.tell(Tell::ReloadConfig);
         #[cfg(test)]
         self.host.set_config(new.clone());
         self.keymap = Keymap::new(&new.keys);
@@ -5106,6 +5144,15 @@ impl App {
             self.show_message("Can't locate settings: HOME isn't set.", true);
             return;
         };
+        // Files open from the host's machine, which this file isn't on.
+        if let Some(remote) = self.host.remote() {
+            let message = format!(
+                "Settings are in {} on this machine, and [editor], [terminal], and [files] in {remote}'s. Edit them there, then run Reload Settings.",
+                crate::client::tilde_here(&path)
+            );
+            self.show_message(message, false);
+            return;
+        }
         let made = path
             .parent()
             .map_or(Ok(()), fs::create_dir_all)
@@ -5308,7 +5355,10 @@ impl App {
             }
         };
         let about: String = about.chars().filter(|c| !c.is_control()).collect();
-        format!("cue: {about}")
+        match self.host.remote() {
+            Some(remote) => format!("cue: {about} · {remote}"),
+            None => format!("cue: {about}"),
+        }
     }
 
     /// Stops being a session, removing what it kept, as when it was one
@@ -5318,10 +5368,21 @@ impl App {
         if let Some(session) = self.session.take() {
             session.end();
         }
-        self.recovery = Recovery::new(match cfg!(test) {
-            true => None,
-            false => Recovery::default_dir(),
-        });
+        self.recovery = match cfg!(test) {
+            true => Recovery::new(None),
+            false => Recovery::for_files_on(self.host.remote()),
+        };
+    }
+
+    /// Takes what the host said of its machine: where its sessions are
+    /// kept, and its settings, whose part replaces this app's, `own`,
+    /// unless the host's in this process (see [`config::merge`]).
+    pub fn use_about(&mut self, about: About, own: Config) {
+        self.sessions = about.sessions;
+        self.own_settings = own;
+        if !self.host.is_local() {
+            self.host_settings = Some(config::host_settings(about.settings.as_deref()));
+        }
     }
 
     /// Lets the session go without asking, as `cue --end` does.
@@ -5514,9 +5575,12 @@ impl App {
             let epoch = terminal.epoch();
             let saved = self.screens.get(&id).map(|(_, at)| *at);
             if screens && saved != Some(epoch) {
-                let name = terminal
-                    .screen(false)
-                    .map(|(screen, _)| session.save_screen(id, screen));
+                let name = match terminal.host_id().filter(|_| terminal.host_keeps_screen()) {
+                    Some(on_host) => Some(session.save_host_screen(id, on_host)),
+                    None => terminal
+                        .screen(false)
+                        .map(|(screen, _)| session.save_screen(id, screen)),
+                };
                 if let Some(name) = name {
                     self.screens.insert(id, (name, epoch));
                 }
@@ -8026,6 +8090,10 @@ impl App {
 
     /// Shows `path` in the Finder, or elsewhere, opens its folder.
     fn reveal(&mut self, path: &Path) {
+        if let Some(remote) = self.host.remote() {
+            self.show_message(format!("{} is on {remote}.", file_name(path)), false);
+            return;
+        }
         let mut command = match cfg!(target_os = "macos") {
             true => {
                 let mut command = std::process::Command::new("open");
