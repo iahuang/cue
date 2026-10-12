@@ -9,6 +9,14 @@
 //! They're read at startup, and again when the file is saved from cue, or
 //! on Reload Settings, into a [`Config`] that anything can get (see
 //! [`get`]), on any thread.
+//!
+//! Once cue is a client and a host apart (see `docs/client-server.md`),
+//! each reads its own file, and takes its own part of it: the client
+//! `[ui]` and `[keys]`, which are about the screen and the keyboard in
+//! front of you; the host the rest (`[editor]`, `[terminal]`, `[files]`),
+//! which are about the machine the files are on, and which the host sends
+//! the client where the client needs them, as the editor's do. For now
+//! the two are one process, with one file.
 
 use std::path::PathBuf;
 use std::sync::Arc;

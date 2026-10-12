@@ -40,6 +40,12 @@ operation (search, indexing, and git stay server-side).
   and paging don't wait on the network.
 - **Config:** the server's, except `[ui]` and `[keys]`, which are the
   client's.
+- **Sessions are the host's.** It keeps their files (`session.toml`,
+  unsaved text, terminal screens) and their lock; the client sends what
+  changes (layout, unsaved text, screens) and asks for them back to
+  restore.
+- **Recovery copies stay the client's**, a safety net for unsaved text
+  that doesn't depend on the host.
 - **Client core vs. renderer.** Inside the client, the model (layout, tabs,
   buffer replicas, keymap, commands) is split from drawing (OpenTUI cells
   today, maybe GPUI later), so a GUI is a new renderer, not a new client.
@@ -183,7 +189,17 @@ Progress:
   detached sessions anyway, and spares the wire a `cat` of a big log).
   `Event::Released` hands over a raw fd, which only means anything in
   the same process: re-exec becomes the server's own business in step 2.
-- [ ] 1.9 onwards.
+- [x] 1.9 Sessions are the host's: it holds the session's lock and files
+  (`Request::Session` with a `SessionCall`, answered by `session::run`),
+  and the app keeps a `SessionLink`: the session's id, folder, and name,
+  and which file has each document's unsaved text. Its calls wait for
+  the host for now, as saving a session before leaving must anyway; the
+  periodic saves should stop waiting once the host is across a network
+  (step 4). Recovery copies stay the client's. Settings are classified
+  in `config.rs`'s docs: `[ui]` and `[keys]` the client's, the rest the
+  host's; one file and one reload until step 2.
+- [ ] 1.10: what stays local (clipboard, opening files externally, the
+  terminal's colors and capabilities), and the leftovers above.
 
 Notes from 1.1 and 1.2:
 

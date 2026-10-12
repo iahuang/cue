@@ -107,7 +107,7 @@ use crate::quick_look::QuickLook;
 use crate::recovery::{self, Orphan, Recovery};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
-use crate::session::{self, Session, Shown};
+use crate::session::{self, SessionLink, Shown};
 use crate::status::{self, GitBadge, StatusButton};
 use crate::switcher::{Switcher, SwitcherAction};
 use crate::symbols::{self, Symbol, SymbolIndex};
@@ -601,7 +601,7 @@ pub struct App {
     /// Where sessions are kept, if anywhere.
     sessions: Option<PathBuf>,
     /// The session this cue is, if it is one.
-    session: Option<Session>,
+    session: Option<SessionLink>,
     /// When it was last saved, and its terminals' screens.
     session_saved: Option<Instant>,
     screens_saved: Option<Instant>,
@@ -5124,8 +5124,13 @@ impl App {
 
     // --- sessions -----------------------------------------------------------------
 
+    /// Does what touches the machine the workspace is on.
+    pub fn host(&self) -> &Link {
+        &self.host
+    }
+
     /// The session this cue is, if any.
-    pub fn session(&self) -> Option<&Session> {
+    pub fn session(&self) -> Option<&SessionLink> {
         self.session.as_ref()
     }
 
@@ -5199,7 +5204,7 @@ impl App {
             self.show_message("Can't save sessions: HOME isn't set.", true);
             return false;
         };
-        match Session::create(&sessions) {
+        match SessionLink::create(&self.host, &sessions) {
             Ok(session) => {
                 self.session = Some(session);
                 if !self.save_session(false) {
@@ -5438,7 +5443,7 @@ impl App {
     /// new shells, below what they showed.
     pub fn restore_session(
         &mut self,
-        mut session: Session,
+        mut session: SessionLink,
         state: session::State,
         adopted: Vec<Adopted>,
     ) -> Result<(), String> {
@@ -13719,15 +13724,15 @@ mod tests {
 
     fn reopen_dir(dir: &Path, sessions: Option<PathBuf>, adopted: Vec<Adopted>) -> App {
         // The app that had it may have only just let go (see `let_go`).
-        let session = RefCell::new(None);
-        crate::let_go(|| {
-            *session.borrow_mut() = Session::open(dir).ok();
-            session.borrow().is_none()
-        });
-        let session = session.into_inner().expect("the session let go");
         let state = session::read(dir).unwrap();
         let workspace = Workspace::new(state.roots.clone()).unwrap();
         let mut app = App::new(workspace, None, 80, 10).unwrap();
+        let session = RefCell::new(None);
+        crate::let_go(|| {
+            *session.borrow_mut() = SessionLink::open(&app.host, dir).ok();
+            session.borrow().is_none()
+        });
+        let session = session.into_inner().expect("the session let go");
         app.sessions = sessions;
         app.restore_session(session, state, adopted).unwrap();
         app
@@ -13787,7 +13792,7 @@ mod tests {
         assert!(editor.text().contains("liXne 20"), "{}", editor.text());
         assert_eq!(editor.place().0, 19, "the cursor's row");
         // Going back still works from where it was.
-        assert_eq!(app.session().map(Session::dir), Some(dir.as_path()));
+        assert_eq!(app.session().map(SessionLink::dir), Some(dir.as_path()));
 
         // Nothing running: quitting saves it and exits, keeping it.
         assert!(matches!(ctrl(&mut app, 'q'), AppAction::Quit));
@@ -14085,7 +14090,7 @@ mod tests {
         let mut restored = App::new(workspace, None, 80, 10).unwrap();
         assert!(restored
             .restore_session(
-                Session::open(&dir).unwrap(),
+                SessionLink::open(&restored.host, &dir).unwrap(),
                 session::read(&dir).unwrap(),
                 Vec::new()
             )

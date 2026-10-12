@@ -33,6 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use toml::{Table, Value};
 
 use crate::document::Document;
+use crate::host::{Link, Reply, Request};
 use crate::indent::Indent;
 use crate::layout::{Axis, Layout, PanelId};
 
@@ -195,7 +196,8 @@ pub fn default_dir() -> Option<PathBuf> {
     Some(state.join("cue/sessions"))
 }
 
-/// The session this cue is: its folder, which it holds the lock on.
+/// A session's files, which the host keeps (see [`SessionLink`] for the
+/// app's end): its folder, which it holds the lock on.
 pub struct Session {
     id: String,
     dir: PathBuf,
@@ -206,8 +208,6 @@ pub struct Session {
     unknown: Table,
     /// The state last written, to write only what changed.
     written: Option<String>,
-    /// The documents whose unsaved text is in `docs/`.
-    texts: Vec<Text>,
     /// Names the next document's text.
     next_text: u32,
 }
@@ -267,6 +267,16 @@ impl Session {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // After the texts it kept already.
+        let next_text = fs::read_dir(dir.join("docs"))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name();
+                name.to_str()?.strip_suffix(".txt")?.parse::<u32>().ok()
+            })
+            .max()
+            .map_or(1, |n| n + 1);
         Ok(Session {
             id,
             name: None,
@@ -274,20 +284,22 @@ impl Session {
             dir: dir.to_path_buf(),
             _lock: lock,
             written: None,
-            texts: Vec::new(),
-            next_text: 1,
+            next_text,
         })
     }
 
+    #[cfg(test)]
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    #[cfg(test)]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
     /// The name it was given, if any.
+    #[cfg(test)]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
@@ -303,11 +315,6 @@ impl Session {
     pub fn carry(&mut self, state: &State) {
         self.name = state.name.clone();
         self.unknown = state.unknown.clone();
-    }
-
-    /// Where it takes attaching while it runs.
-    pub fn socket(&self) -> PathBuf {
-        socket_path(&self.dir)
     }
 
     /// Writes `state`, with its name and what this cue doesn't know,
@@ -327,24 +334,11 @@ impl Session {
         Ok(true)
     }
 
-    /// Keeps `doc`'s unsaved text in `docs/`, unless it's there as it is
-    /// now. Returns its name there, or `None` if it has no unsaved changes.
-    pub fn save_text(&mut self, doc: &Rc<Document>) -> io::Result<Option<String>> {
-        let epoch = doc.buffer.content_epoch();
-        let index = self
-            .texts
-            .iter()
-            .position(|text| text.doc.as_ptr() == Rc::as_ptr(doc));
-        if let Some(text) = index.map(|index| &self.texts[index]) {
-            if text.epoch == epoch && doc.is_modified() {
-                return Ok(Some(text.name.clone()));
-            }
-        }
-        let Some(unsaved) = doc.unsaved_text() else {
-            return Ok(None);
-        };
-        let name = match index {
-            Some(index) => self.texts[index].name.clone(),
+    /// Keeps unsaved `text` in `docs/`, as `name`, or under a new name.
+    /// Returns its name there.
+    pub fn write_text(&mut self, name: Option<&str>, text: &str) -> io::Result<String> {
+        let name = match name {
+            Some(name) => name.to_string(),
             None => {
                 self.next_text += 1;
                 format!("{}.txt", self.next_text - 1)
@@ -352,39 +346,13 @@ impl Session {
         };
         let docs = self.dir.join("docs");
         fs::create_dir_all(&docs)?;
-        write_atomic(&docs.join(&name), unsaved.as_bytes())?;
-        let text = Text {
-            doc: Rc::downgrade(doc),
-            name: name.clone(),
-            epoch,
-        };
-        match index {
-            Some(index) => self.texts[index] = text,
-            None => self.texts.push(text),
-        }
-        Ok(Some(name))
+        write_atomic(&docs.join(&name), text.as_bytes())?;
+        Ok(name)
     }
 
     /// Removes the texts in `docs/` but `kept`.
     pub fn prune_texts(&mut self, kept: &[String]) {
-        self.texts.retain(|text| kept.contains(&text.name));
         prune(&self.dir.join("docs"), kept);
-    }
-
-    /// Notes that `doc`'s unsaved text is kept as `name`, as restored from
-    /// it, so that it isn't written again until it changes.
-    pub fn note_text(&mut self, doc: &Rc<Document>, name: &str) {
-        if let Some(n) = name
-            .strip_suffix(".txt")
-            .and_then(|n| n.parse::<u32>().ok())
-        {
-            self.next_text = self.next_text.max(n + 1);
-        }
-        self.texts.push(Text {
-            doc: Rc::downgrade(doc),
-            name: name.to_string(),
-            epoch: doc.buffer.content_epoch(),
-        });
     }
 
     /// Keeps terminal `id`'s `screen`, returning its name in `terminals/`.
@@ -415,6 +383,293 @@ impl Session {
     pub fn end(self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// What the app asks of its session's files, which the host keeps (see
+/// [`run`]).
+#[derive(Debug, Clone)]
+pub enum SessionCall {
+    /// Makes a new session in this folder of them.
+    Create(PathBuf),
+    /// Takes the session in this folder.
+    Open(PathBuf),
+    Rename(Option<String>),
+    /// Takes its name and the keys this cue doesn't know from this, as
+    /// restored.
+    Carry(State),
+    Save(State),
+    /// Unsaved text, under its name, or a new one.
+    WriteText {
+        name: Option<String>,
+        text: String,
+    },
+    PruneTexts(Vec<String>),
+    Text(String),
+    SaveScreen {
+        id: u32,
+        screen: Vec<u8>,
+    },
+    PruneScreens(Vec<String>),
+    Screen(String),
+    /// Lets it go, removing everything it kept.
+    End,
+}
+
+/// What the host answered a [`SessionCall`].
+#[derive(Debug)]
+pub enum SessionAnswer {
+    /// The session's id and folder.
+    Opened(Result<(String, PathBuf), String>),
+    /// Whether it was written.
+    Saved(Result<bool, String>),
+    /// What a text or screen is kept as.
+    Named(Result<String, String>),
+    Text(Result<String, String>),
+    Screen(Option<Vec<u8>>),
+    Done,
+}
+
+/// Does what `call` asks of `session`, the host's, if it has one.
+pub fn run(call: SessionCall, session: &mut Option<Session>) -> SessionAnswer {
+    let err = |err: io::Error| err.to_string();
+    let opened = |opened: io::Result<Session>, session: &mut Option<Session>| {
+        SessionAnswer::Opened(opened.map_err(err).map(|opened| {
+            let ids = (opened.id.clone(), opened.dir.clone());
+            *session = Some(opened);
+            ids
+        }))
+    };
+    match &call {
+        SessionCall::Create(sessions) => return opened(Session::create(sessions), session),
+        SessionCall::Open(dir) => return opened(Session::open(dir), session),
+        _ => {}
+    }
+    let Some(current) = session else {
+        let none = "Not a session.".to_string();
+        return match call {
+            SessionCall::Save(_) => SessionAnswer::Saved(Err(none)),
+            SessionCall::WriteText { .. } | SessionCall::SaveScreen { .. } => {
+                SessionAnswer::Named(Err(none))
+            }
+            SessionCall::Text(_) => SessionAnswer::Text(Err(none)),
+            SessionCall::Screen(_) => SessionAnswer::Screen(None),
+            _ => SessionAnswer::Done,
+        };
+    };
+    match call {
+        SessionCall::Create(_) | SessionCall::Open(_) => SessionAnswer::Done,
+        SessionCall::Rename(name) => {
+            current.rename(name.as_deref());
+            SessionAnswer::Done
+        }
+        SessionCall::Carry(state) => {
+            current.carry(&state);
+            SessionAnswer::Done
+        }
+        SessionCall::Save(state) => SessionAnswer::Saved(current.save(&state).map_err(err)),
+        SessionCall::WriteText { name, text } => {
+            SessionAnswer::Named(current.write_text(name.as_deref(), &text).map_err(err))
+        }
+        SessionCall::PruneTexts(kept) => {
+            current.prune_texts(&kept);
+            SessionAnswer::Done
+        }
+        SessionCall::Text(name) => SessionAnswer::Text(current.text(&name).map_err(err)),
+        SessionCall::SaveScreen { id, screen } => {
+            SessionAnswer::Named(current.save_screen(id, &screen).map_err(err))
+        }
+        SessionCall::PruneScreens(kept) => {
+            current.prune_screens(&kept);
+            SessionAnswer::Done
+        }
+        SessionCall::Screen(name) => SessionAnswer::Screen(current.screen(&name)),
+        SessionCall::End => {
+            if let Some(ended) = session.take() {
+                ended.end();
+            }
+            SessionAnswer::Done
+        }
+    }
+}
+
+/// The app's end of its session, whose files the host keeps: which of
+/// them has each document's unsaved text. Each call waits for the host,
+/// which for now is at hand.
+pub struct SessionLink {
+    host: Link,
+    id: String,
+    dir: PathBuf,
+    name: Option<String>,
+    /// The documents whose unsaved text is in `docs/`.
+    texts: Vec<Text>,
+}
+
+impl SessionLink {
+    /// Makes a new session in `sessions`, the folder they're kept in, on
+    /// `host`.
+    pub fn create(host: &Link, sessions: &Path) -> io::Result<SessionLink> {
+        SessionLink::taken(host, SessionCall::Create(sessions.to_path_buf()))
+    }
+
+    /// Takes the session in `dir`, on `host`, as [`Session::open`] does.
+    pub fn open(host: &Link, dir: &Path) -> io::Result<SessionLink> {
+        SessionLink::taken(host, SessionCall::Open(dir.to_path_buf()))
+    }
+
+    fn taken(host: &Link, call: SessionCall) -> io::Result<SessionLink> {
+        match ask(host, call) {
+            SessionAnswer::Opened(Ok((id, dir))) => Ok(SessionLink {
+                host: host.clone(),
+                id,
+                dir,
+                name: None,
+                texts: Vec::new(),
+            }),
+            SessionAnswer::Opened(Err(err)) => Err(io::Error::other(err)),
+            _ => Err(other_answer()),
+        }
+    }
+
+    fn ask(&self, call: SessionCall) -> SessionAnswer {
+        ask(&self.host, call)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The name it was given, if any.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Names it `name`, as [`Session::rename`] does.
+    pub fn rename(&mut self, name: Option<&str>) {
+        self.name = name.map(clean_name).filter(|name| !name.is_empty());
+        self.ask(SessionCall::Rename(self.name.clone()));
+    }
+
+    /// Takes what's its own from `state`, as restored.
+    pub fn carry(&mut self, state: &State) {
+        self.name = state.name.clone();
+        self.ask(SessionCall::Carry(state.clone()));
+    }
+
+    /// Where it takes attaching while it runs.
+    pub fn socket(&self) -> PathBuf {
+        socket_path(&self.dir)
+    }
+
+    /// Writes `state`, as [`Session::save`] does.
+    pub fn save(&mut self, state: &State) -> io::Result<bool> {
+        match self.ask(SessionCall::Save(state.clone())) {
+            SessionAnswer::Saved(saved) => saved.map_err(io::Error::other),
+            _ => Err(other_answer()),
+        }
+    }
+
+    /// Keeps `doc`'s unsaved text in `docs/`, unless it's there as it is
+    /// now. Returns its name there, or `None` if it has no unsaved changes.
+    pub fn save_text(&mut self, doc: &Rc<Document>) -> io::Result<Option<String>> {
+        let epoch = doc.buffer.content_epoch();
+        let index = self
+            .texts
+            .iter()
+            .position(|text| text.doc.as_ptr() == Rc::as_ptr(doc));
+        if let Some(text) = index.map(|index| &self.texts[index]) {
+            if text.epoch == epoch && doc.is_modified() {
+                return Ok(Some(text.name.clone()));
+            }
+        }
+        let Some(unsaved) = doc.unsaved_text() else {
+            return Ok(None);
+        };
+        let name = index.map(|index| self.texts[index].name.clone());
+        let name = match self.ask(SessionCall::WriteText {
+            name,
+            text: unsaved,
+        }) {
+            SessionAnswer::Named(name) => name.map_err(io::Error::other)?,
+            _ => return Err(other_answer()),
+        };
+        let text = Text {
+            doc: Rc::downgrade(doc),
+            name: name.clone(),
+            epoch,
+        };
+        match index {
+            Some(index) => self.texts[index] = text,
+            None => self.texts.push(text),
+        }
+        Ok(Some(name))
+    }
+
+    /// Removes the texts in `docs/` but `kept`.
+    pub fn prune_texts(&mut self, kept: &[String]) {
+        self.texts.retain(|text| kept.contains(&text.name));
+        self.ask(SessionCall::PruneTexts(kept.to_vec()));
+    }
+
+    /// Notes that `doc`'s unsaved text is kept as `name`, as restored from
+    /// it, so that it isn't written again until it changes.
+    pub fn note_text(&mut self, doc: &Rc<Document>, name: &str) {
+        self.texts.push(Text {
+            doc: Rc::downgrade(doc),
+            name: name.to_string(),
+            epoch: doc.buffer.content_epoch(),
+        });
+    }
+
+    /// Keeps terminal `id`'s `screen`, returning its name in `terminals/`.
+    pub fn save_screen(&self, id: u32, screen: &[u8]) -> io::Result<String> {
+        let screen = screen.to_vec();
+        match self.ask(SessionCall::SaveScreen { id, screen }) {
+            SessionAnswer::Named(name) => name.map_err(io::Error::other),
+            _ => Err(other_answer()),
+        }
+    }
+
+    /// Removes the screens in `terminals/` but `kept`.
+    pub fn prune_screens(&self, kept: &[String]) {
+        self.ask(SessionCall::PruneScreens(kept.to_vec()));
+    }
+
+    /// Unsaved text kept by [`SessionLink::save_text`], by name.
+    pub fn text(&self, name: &str) -> io::Result<String> {
+        match self.ask(SessionCall::Text(name.to_string())) {
+            SessionAnswer::Text(text) => text.map_err(io::Error::other),
+            _ => Err(other_answer()),
+        }
+    }
+
+    /// A screen kept by [`SessionLink::save_screen`], by name.
+    pub fn screen(&self, name: &str) -> Option<Vec<u8>> {
+        match self.ask(SessionCall::Screen(name.to_string())) {
+            SessionAnswer::Screen(screen) => screen,
+            _ => None,
+        }
+    }
+
+    /// Lets the session go, removing everything it kept.
+    pub fn end(self) {
+        self.ask(SessionCall::End);
+    }
+}
+
+/// Asks `host` `call` of its session, waiting for the answer.
+fn ask(host: &Link, call: SessionCall) -> SessionAnswer {
+    match host.call(Request::Session(call)).wait() {
+        Some(Reply::Session(answer)) => answer,
+        _ => SessionAnswer::Done,
+    }
+}
+
+fn other_answer() -> io::Error {
+    io::Error::other("The host answered something else.")
 }
 
 /// Where the session in `dir` takes attaching: in it, or if that path is

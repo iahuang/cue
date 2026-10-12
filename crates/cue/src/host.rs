@@ -40,6 +40,7 @@ use crate::image;
 use crate::pty;
 use crate::quick_look::{self, Peek};
 use crate::search::{self, Query};
+use crate::session::{self, Session, SessionAnswer, SessionCall};
 use crate::symbols::{self, FileSymbols};
 use crate::tree::{self, Listed};
 use crate::wake;
@@ -126,6 +127,8 @@ pub enum Request {
     /// A terminal's program (see [`pty::serve`]): what it writes, and how
     /// it's doing, as it goes, until it ends. Cancelling it hangs up.
     Terminal(pty::Start),
+    /// Doing something with the session's files (see [`session::run`]).
+    Session(SessionCall),
     /// Asking git, or having it do something (see [`git::run`]).
     Git(GitCall),
     /// Committing what's staged in the repository at `root`.
@@ -183,6 +186,7 @@ pub enum Reply {
     Repos(Vec<Repo>),
     Git(GitAnswer),
     Term(pty::Event),
+    Session(SessionAnswer),
     /// How a [`Request::GitSync`] went.
     Synced(Result<(), String>),
     /// How a [`Request::FileOp`] went: why it couldn't be done, if it
@@ -510,6 +514,8 @@ fn serve(inbox: Receiver<Input>, host_inbox: Sender<Input>, output: Sender<Outpu
 #[derive(Default)]
 struct State {
     symbols: symbols::Cache,
+    /// The session this host keeps, if it's one.
+    session: Mutex<Option<Session>>,
     /// The settings the app told of, for tests.
     #[cfg(test)]
     config: Mutex<Option<Arc<crate::config::Config>>>,
@@ -591,6 +597,10 @@ fn answer(request: Request, state: &State, responder: Responder) {
         }
         // Started apart, in `serve`, with its controls.
         Request::Terminal(_) => {}
+        Request::Session(call) => {
+            let answer = session::run(call, &mut lock(&state.session));
+            responder.reply(Reply::Session(answer));
+        }
         Request::Git(call) => {
             responder.reply(Reply::Git(git::run(&call)));
         }

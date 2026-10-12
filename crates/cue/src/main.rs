@@ -79,7 +79,7 @@ use app::{App, AppAction};
 use attach::{Control, Request};
 use input::{Event, Parser};
 use keymap::{Command, Keymap};
-use session::Session;
+use session::SessionLink;
 use workspace::Workspace;
 
 /// How long input must be idle before a lone ESC counts as the Escape key.
@@ -453,7 +453,6 @@ fn resume(
     height: u32,
     adopted: Vec<app::Adopted>,
 ) -> Result<App, Box<dyn std::error::Error>> {
-    let session = Session::open(dir).map_err(|err| format!("can't open the session: {err}"))?;
     let state = session::read(dir).ok_or("the session can't be read")?;
     let roots: Vec<PathBuf> = state
         .roots
@@ -465,6 +464,8 @@ fn resume(
         return Err("The session's folders no longer exist.".into());
     }
     let mut app = App::new(Workspace::new(roots)?, None, width, height)?;
+    let session = SessionLink::open(app.host(), dir)
+        .map_err(|err| format!("can't open the session: {err}"))?;
     app.restore_session(session, state, adopted)?;
     Ok(app)
 }
@@ -472,7 +473,7 @@ fn resume(
 /// A note of the sessions running in the background but `app`'s own, so
 /// that none is forgotten, if there are any.
 fn background_sessions(app: &App) -> Option<String> {
-    let own = app.session().map(Session::id);
+    let own = app.session().map(SessionLink::id);
     let running: Vec<String> = session::list(&session::default_dir()?)
         .into_iter()
         .filter(|listing| listing.live && !listing.state.attached)
