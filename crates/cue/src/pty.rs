@@ -401,6 +401,9 @@ pub enum Start {
     },
     /// A pty a process this one replaced left running (see [`Pty::adopt`]).
     Adopt { fd: RawFd, pid: libc::pid_t },
+    /// A terminal the host is running already, which another client
+    /// started (see [`crate::term_hub`]).
+    Attach(crate::term_hub::TermId),
 }
 
 /// What a terminal's program is doing, as the host last looked.
@@ -420,6 +423,15 @@ pub struct Status {
 /// What the host says of a terminal.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Event {
+    /// Which terminal it is, on the host, for attaching to it again.
+    Started(crate::term_hub::TermId),
+    /// What it shows, for a client attaching to it, as
+    /// [`crate::terminal::full_snapshot`] takes it, `cols` by `rows`.
+    Screen {
+        screen: Vec<u8>,
+        cols: u16,
+        rows: u16,
+    },
     /// What the program wrote.
     Output(Vec<u8>),
     Status(Status),
@@ -505,6 +517,8 @@ pub fn serve(start: Start, controls: Controls, mut send: impl FnMut(Event) -> bo
             None => Pty::shell(&cwd, cols, rows),
         },
         Start::Adopt { fd, pid } => Pty::adopt(fd, pid),
+        // The hub's to do (see `crate::term_hub`).
+        Start::Attach(_) => Err(io::Error::other("there's no terminal to attach to")),
     };
     let mut pty = match pty {
         Ok(pty) => pty,

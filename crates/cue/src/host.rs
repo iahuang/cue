@@ -53,6 +53,7 @@ use crate::quick_look::{self, Peek};
 use crate::search::{self, Query};
 use crate::session::{self, Session, SessionAnswer, SessionCall};
 use crate::symbols::{self, FileSymbols};
+use crate::term_hub::{Hub, TermId, Token};
 use crate::tree::{self, Listed};
 use crate::wake;
 use crate::watch::{Changes, Watcher};
@@ -85,6 +86,8 @@ const LISTENER_VARIABLE: &str = "CUE_HOST_FD";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a host process waits for its first client.
 const FIRST_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a host process with no client looks whether it's to go on.
+const DETACHED_POLL: Duration = Duration::from_secs(1);
 
 /// What the app asks the host to do, answered with [`Reply`]s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,11 +383,16 @@ impl Link {
     /// once the link and its calls are dropped.
     pub fn local() -> Link {
         let (ours, theirs) = UnixStream::pair().expect("can't make a socket pair");
-        let state = Arc::new(State::default());
+        // The process's native core is the app's.
+        let state = Arc::new(State::new(false));
         let link = Link::over(ours, true);
         #[cfg(test)]
         let _ = link.shared.state.set(Arc::clone(&state));
-        std::thread::spawn(move || serve_stream(theirs, mpsc::channel(), state));
+        std::thread::spawn(move || {
+            serve_stream(theirs, mpsc::channel(), &state);
+            // No other client can come for its terminals.
+            state.hub.hang_up_all();
+        });
         link
     }
 
@@ -707,14 +715,17 @@ enum Happened {
 }
 
 /// Runs a host process: serves the clients that connect to `listener`,
-/// one at a time, a newer one taking over, until the one it serves is
-/// gone, or the first doesn't come. Then removes the socket.
-pub fn serve_listener(listener: UnixListener) {
+/// one at a time, a newer one taking over, keeping terminals' screens if
+/// `screens` (see [`crate::term_hub`]). Ends once the one it serves is
+/// gone, unless it keeps a session with terminals running, for another
+/// to attach to; or if the first doesn't come. Then hangs up on its
+/// terminals, and removes the socket.
+pub fn serve_listener(listener: UnixListener, screens: bool) {
     let path = listener
         .local_addr()
         .ok()
         .and_then(|addr| addr.as_pathname().map(Path::to_path_buf));
-    let state = Arc::new(State::default());
+    let state = Arc::new(State::new(screens));
     let (happen, happened) = mpsc::channel();
     let greeted = happen.clone();
     std::thread::spawn(move || {
@@ -737,9 +748,11 @@ pub fn serve_listener(listener: UnixListener) {
     let mut serving: Option<(u64, Sender<Input>)> = None;
     let mut connections = 0;
     loop {
-        let next = match serving {
-            Some(_) => happened.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            None => happened.recv_timeout(FIRST_CLIENT_TIMEOUT),
+        let next = match (&serving, connections) {
+            (Some(_), _) => happened.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            (None, 0) => happened.recv_timeout(FIRST_CLIENT_TIMEOUT),
+            // Looking now and then whether there's still a reason to wait.
+            (None, _) => happened.recv_timeout(DETACHED_POLL),
         };
         match next {
             Ok(Happened::Greeted(stream)) => {
@@ -753,18 +766,23 @@ pub fn serve_listener(listener: UnixListener) {
                 let state = Arc::clone(&state);
                 let ended = happen.clone();
                 std::thread::spawn(move || {
-                    serve_stream(stream, (to_host, inbox), state);
+                    serve_stream(stream, (to_host, inbox), &state);
                     let _ = ended.send(Happened::Ended(id));
                 });
             }
             Ok(Happened::Ended(id)) => {
                 if serving.as_ref().is_some_and(|(serving, _)| *serving == id) {
-                    break;
+                    serving = None;
+                    if !state.keeps_going() {
+                        break;
+                    }
                 }
             }
+            Err(RecvTimeoutError::Timeout) if connections > 0 && state.keeps_going() => {}
             Err(_) => break,
         }
     }
+    state.hub.hang_up_all();
     if let Some(path) = path {
         let _ = std::fs::remove_file(path);
     }
@@ -793,7 +811,7 @@ fn greet(stream: UnixStream) -> Option<UnixStream> {
 fn serve_stream(
     stream: UnixStream,
     (to_host, inbox): (Sender<Input>, Receiver<Input>),
-    state: Arc<State>,
+    state: &Arc<State>,
 ) {
     let (output, outbox) = mpsc::channel();
     let Ok(reading) = stream.try_clone() else {
@@ -807,7 +825,7 @@ fn serve_stream(
         let _ = from_app.send(Input::Shutdown);
     });
     std::thread::spawn(move || write_frames(stream, outbox));
-    serve(inbox, to_host, output, state);
+    serve(inbox, to_host, output, Arc::clone(state));
 }
 
 /// The host's thread: takes calls, tells, and the watcher's changes, until
@@ -824,8 +842,8 @@ fn serve(
     });
     // Each call in progress, by whether it was cancelled.
     let mut calls: HashMap<CallId, Arc<AtomicBool>> = HashMap::new();
-    // Each terminal's controls, by the call it is.
-    let mut terminals: HashMap<CallId, pty::Controller> = HashMap::new();
+    // The terminal each terminal call hears of, and its token for it.
+    let mut terminals: HashMap<CallId, (TermId, Token)> = HashMap::new();
     loop {
         let input = match watcher.due() {
             Some(due) => inbox.recv_timeout(due.saturating_duration_since(Instant::now())),
@@ -841,19 +859,13 @@ fn serve(
                     inbox: host_inbox.clone(),
                     cancelled,
                 };
-                let (controller, controls) = match pty::controls() {
-                    Ok(controls) => controls,
-                    Err(err) => {
-                        responder.reply(Reply::Term(pty::Event::Failed(err.to_string())));
-                        continue;
-                    }
-                };
-                terminals.insert(id, controller);
-                let state = Arc::clone(&state);
-                std::thread::spawn(move || {
-                    state.use_config();
-                    pty::serve(start, controls, |event| responder.reply(Reply::Term(event)));
-                });
+                #[cfg(test)]
+                let opened = state
+                    .hub
+                    .open(start, responder, lock(&state.config).clone());
+                #[cfg(not(test))]
+                let opened = state.hub.open(start, responder);
+                terminals.insert(id, opened);
             }
             Ok(Input::Call(id, request)) => {
                 let cancelled = Arc::new(AtomicBool::new(false));
@@ -871,8 +883,9 @@ fn serve(
                 if let Some(cancelled) = calls.remove(&id) {
                     cancelled.store(true, Ordering::Relaxed);
                 }
-                if let Some(terminal) = terminals.remove(&id) {
-                    terminal.send(pty::Control::HangUp);
+                // The app's done with it.
+                if let Some((terminal, _)) = terminals.remove(&id) {
+                    state.hub.control(terminal, pty::Control::HangUp);
                 }
             }
             Ok(Input::Finished(id)) => {
@@ -880,8 +893,8 @@ fn serve(
                 terminals.remove(&id);
             }
             Ok(Input::Tell(Tell::Term { call, control })) => {
-                if let Some(terminal) = terminals.get(&call) {
-                    terminal.send(control);
+                if let Some(&(terminal, _)) = terminals.get(&call) {
+                    state.hub.control(terminal, control);
                 }
             }
             Ok(Input::Tell(Tell::Watch(folders))) => {
@@ -906,17 +919,19 @@ fn serve(
     for cancelled in calls.values() {
         cancelled.store(true, Ordering::Relaxed);
     }
-    for terminal in terminals.values() {
-        terminal.send(pty::Control::HangUp);
+    // Running on, for another client, or until the host's done.
+    for &(terminal, token) in terminals.values() {
+        state.hub.unwatch(terminal, token);
     }
 }
 
-/// What the host keeps from one call to the next.
-#[derive(Default)]
+/// What the host keeps from one call to the next, and one client to the
+/// next.
 struct State {
     symbols: symbols::Cache,
     /// The session this host keeps, if it's one.
     session: Mutex<Option<Session>>,
+    hub: Hub,
     /// The settings the app said to use, for tests (see
     /// [`Link::set_config`]).
     #[cfg(test)]
@@ -924,6 +939,23 @@ struct State {
 }
 
 impl State {
+    /// Keeping terminals' screens if `screens` (see [`crate::term_hub`]).
+    fn new(screens: bool) -> State {
+        State {
+            symbols: symbols::Cache::default(),
+            session: Mutex::default(),
+            hub: Hub::new(screens),
+            #[cfg(test)]
+            config: Mutex::default(),
+        }
+    }
+
+    /// Whether a host process goes on with no client: while it keeps a
+    /// session with terminals running, for one to attach to.
+    fn keeps_going(&self) -> bool {
+        lock(&self.session).is_some() && self.hub.count() > 0
+    }
+
     /// Puts the settings the app told of in use on this thread, for tests.
     fn use_config(&self) {
         #[cfg(test)]
@@ -1092,11 +1124,14 @@ mod tests {
     }
 
     /// A host process's loop, on a thread, listening on a socket in
-    /// `name`'s fixture folder.
-    fn host_process(name: &str) -> (PathBuf, std::thread::JoinHandle<()>) {
+    /// `name`'s fixture folder, keeping terminals' screens if `screens`.
+    fn host_process(name: &str, screens: bool) -> (PathBuf, std::thread::JoinHandle<()>) {
         let path = fixture(name).join("host.sock");
         let listener = UnixListener::bind(&path).unwrap();
-        (path, std::thread::spawn(move || serve_listener(listener)))
+        (
+            path,
+            std::thread::spawn(move || serve_listener(listener, screens)),
+        )
     }
 
     /// Waits for `host` to end, which it does once its client's gone.
@@ -1110,7 +1145,7 @@ mod tests {
 
     #[test]
     fn a_host_process_serves_its_client_until_it_goes() {
-        let (path, host) = host_process("process");
+        let (path, host) = host_process("process", false);
         let root = path.parent().unwrap().to_path_buf();
         let link = Link::connect(&path).unwrap();
         assert!(!link.is_local());
@@ -1137,7 +1172,7 @@ mod tests {
 
     #[test]
     fn a_client_that_connects_takes_over_from_the_one_before() {
-        let (path, host) = host_process("taken");
+        let (path, host) = host_process("taken", false);
         let first = Link::connect(&path).unwrap();
         let held = first.call(Request::Hold);
         let second = Link::connect(&path).unwrap();
@@ -1159,13 +1194,93 @@ mod tests {
 
     #[test]
     fn a_client_of_another_build_is_refused() {
-        let (path, host) = host_process("refused");
+        let (path, host) = host_process("refused", false);
         let err = Link::connect_as(&path, "another").err().unwrap();
         assert!(err.to_string().contains("another build"), "{err}");
         // It waits on for a client of its own build.
         let link = Link::connect(&path).unwrap();
         drop(link);
         ends(host);
+    }
+
+    /// Takes what `call`'s terminal writes until it's written `text`.
+    fn wait_for_output(call: &Call, text: &str) {
+        let start = Instant::now();
+        let mut output = Vec::new();
+        while !String::from_utf8_lossy(&output).contains(text) {
+            assert!(start.elapsed() < Duration::from_secs(20), "no {text}");
+            match call.try_recv() {
+                Ok(Reply::Term(pty::Event::Output(bytes))) => output.extend(bytes),
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+                Err(TryRecvError::Disconnected) => panic!("the terminal ended"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_runs_on_for_the_next_client_with_its_screen() {
+        // The host's emulators take the native core, one thread's at a time.
+        let _serial = crate::test_serial();
+        let (path, host) = host_process("attach", true);
+        let root = path.parent().unwrap().to_path_buf();
+        let first = Link::connect(&path).unwrap();
+        // A session, so the host goes on without a client.
+        let sessions = root.join("sessions");
+        let opened = first.call(Request::Session(SessionCall::Create(sessions)));
+        assert!(matches!(
+            opened.wait(),
+            Some(Reply::Session(SessionAnswer::Opened(Ok(_))))
+        ));
+        let term = first.call(Request::Terminal(pty::Start::Shell {
+            cwd: root.clone(),
+            or: None,
+            cols: 80,
+            rows: 24,
+        }));
+        let id = match term.wait() {
+            Some(Reply::Term(pty::Event::Started(id))) => id,
+            other => panic!("{other:?}"),
+        };
+        let typed = |link: &Link, call: &Call, text: &str| {
+            let input = pty::Control::Input(text.as_bytes().to_vec());
+            link.tell(Tell::Term {
+                call: call.id(),
+                control: input,
+            });
+        };
+        typed(&first, &term, "echo hi-$((40+2))\r");
+        wait_for_output(&term, "hi-42");
+
+        // Another client takes over: the first's call ends, but not the
+        // terminal.
+        let second = Link::connect(&path).unwrap();
+        while term.wait().is_some() {}
+        drop((term, first));
+        let attached = second.call(Request::Terminal(pty::Start::Attach(id)));
+        match attached.wait() {
+            Some(Reply::Term(pty::Event::Screen { screen, cols, rows })) => {
+                assert!(String::from_utf8_lossy(&screen).contains("hi-42"));
+                assert_eq!((cols, rows), (80, 24));
+            }
+            other => panic!("{other:?}"),
+        }
+        typed(&second, &attached, "echo again-$((1+1))\r");
+        wait_for_output(&attached, "again-2");
+
+        // Closing it hangs up; with no terminals left, the host ends.
+        drop((attached, second));
+        ends(host);
+    }
+
+    #[test]
+    fn attaching_to_a_terminal_that_isnt_there_fails() {
+        let link = Link::local();
+        let call = link.call(Request::Terminal(pty::Start::Attach(7)));
+        assert!(matches!(
+            call.wait(),
+            Some(Reply::Term(pty::Event::Failed(_)))
+        ));
     }
 
     #[test]

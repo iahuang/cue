@@ -312,6 +312,25 @@ Progress:
   shells (`Terminal::release` gives up, so they start over), and
   terminals' `CUE_PID` is the host's, so a cue run in one isn't told it's
   nested; the host loads its settings once, at start.
+- [x] 2.3 Terminals are the host's, not a connection's (`term_hub`): a
+  thread owns each pty's controls and the call that hears of it, keyed by
+  a `TermId` that the first reply says (`Event::Started`). Cancelling a
+  terminal's call hangs up, as when the app closes it; a connection that
+  ends (gone, or moved) only stops hearing of its terminals. A client
+  attaches with `Start::Attach(id)`, taking the terminal from the call
+  before. In a host process the hub keeps an emulator per terminal, fed
+  what the program writes: one attaching gets `Event::Screen` (a full
+  snapshot, `terminal::full_snapshot`) first, then its status and exit,
+  then output; and while no call hears of it, the hub's emulator answers
+  the program's queries (with the default colors: the client's aren't
+  pushed yet). The in-process host has none (the core's the app's), and
+  hangs up on its terminals when the app's gone. A host process goes on
+  without a client while it keeps a session with terminals running,
+  looking every second whether it still does. The app shows an
+  `Event::Screen` in place of what it had (`Terminal::show_screen`, which
+  `Terminal::adopt` now uses too), but doesn't attach yet: that's 2.4,
+  which also needs a way to leave without hanging up (dropping the app
+  cancels its terminals' calls).
 
 ### 3. ssh
 

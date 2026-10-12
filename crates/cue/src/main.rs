@@ -52,6 +52,7 @@ mod switcher;
 mod symbols;
 mod syntax;
 mod tab;
+mod term_hub;
 mod terminal;
 mod theme;
 mod toast;
@@ -534,7 +535,7 @@ fn host_process() -> ExitCode {
     config::set(config);
     // Where a panic's said: there's no terminal.
     attach::let_go_of_stdio(crash::open_log());
-    host::serve_listener(listener);
+    host::serve_listener(listener, true);
     crash::close_log();
     ExitCode::SUCCESS
 }

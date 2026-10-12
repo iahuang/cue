@@ -51,6 +51,7 @@ use crate::location::{self, Target};
 use crate::pty::{self, Control, Event, Start};
 use crate::search::Toggle;
 use crate::status::Status;
+use crate::term_hub::TermId;
 use crate::theme;
 
 /// At most this much output is read per poll, so a flood of it can't keep
@@ -93,6 +94,8 @@ struct Shell {
     call: Call,
     /// How it's doing, as the host last said.
     status: pty::Status,
+    /// Which it is on the host, once it's said.
+    id: Option<TermId>,
 }
 
 impl Shell {
@@ -101,6 +104,7 @@ impl Shell {
             host: host.clone(),
             call: host.call(Request::Terminal(start)),
             status: pty::Status::default(),
+            id: None,
         }
     }
 
@@ -231,26 +235,39 @@ impl Terminal {
         screen: &[u8],
         (cols, rows): (u16, u16),
     ) -> io::Result<Terminal> {
-        let mut vt = EmbeddedTerminal::new(cols.max(1), rows.max(1), config::get().scrollback)
+        let vt = EmbeddedTerminal::new(1, 1, config::get().scrollback)
             .map_err(|e| io::Error::other(e.to_string()))?;
+        let pty = Shell::start(host, Start::Adopt { fd, pid });
+        let mut terminal = Terminal::with(id, vt, pty, cwd, area);
+        terminal.show_screen(screen, (cols, rows));
+        Ok(terminal)
+    }
+
+    /// Shows `screen`, as [`full_snapshot`] took it `cols` by `rows`, in
+    /// place of what it showed, at its own size.
+    fn show_screen(&mut self, screen: &[u8], (cols, rows): (u16, u16)) {
+        let scrollback = config::get().scrollback;
+        let Ok(mut vt) = EmbeddedTerminal::new(cols.max(1), rows.max(1), scrollback) else {
+            return;
+        };
         restyle(&mut vt);
         let _ = vt.write(screen);
         // What it answered for the snapshot's queries isn't the program's.
         vt.drain_responses();
-        let pty = Shell::start(host, Start::Adopt { fd, pid });
         let full_screen = vt.is_alternate_screen();
-        let mut terminal = Terminal::with(id, vt, pty, cwd, Rect::default());
-        terminal.area = Rect {
+        self.vt = vt;
+        let area = self.area;
+        self.area = Rect {
             width: cols as u32,
             height: rows as u32,
             ..area
         };
-        terminal.set_area(area);
+        self.set_area(area);
         if full_screen {
             // Bytes it was in the middle of may have been lost.
-            terminal.pty.control(Control::Redraw);
+            self.pty.control(Control::Redraw);
         }
-        Ok(terminal)
+        self.output_changed();
     }
 
     fn with(id: u32, vt: EmbeddedTerminal, pty: Shell, cwd: &Path, area: Rect) -> Terminal {
@@ -275,8 +292,11 @@ impl Terminal {
     /// needs to look like it (for [`Terminal::adopt`]), or else its text
     /// (for [`Terminal::restore`]), with the size it's at.
     pub fn screen(&mut self, full: bool) -> Option<(Vec<u8>, (u16, u16))> {
-        let mut screen = self.vt.snapshot(full).ok()?;
-        if !full && screen.len() > MAX_SAVED_TEXT {
+        if full {
+            return Some((full_snapshot(&mut self.vt)?, size(self.area)));
+        }
+        let mut screen = self.vt.snapshot(false).ok()?;
+        if screen.len() > MAX_SAVED_TEXT {
             // From the first line in the last of it.
             let start = screen.len() - MAX_SAVED_TEXT;
             let cut = screen[start..]
@@ -284,12 +304,6 @@ impl Terminal {
                 .position(|pair| pair == b"\r\n")
                 .map_or(start, |at| start + at + 2);
             screen.drain(..cut);
-        }
-        if full {
-            let title = self.vt.title();
-            if !title.is_empty() && !title.contains(['\x1b', '\x07']) {
-                screen.extend_from_slice(format!("\x1b]2;{title}\x1b\\").as_bytes());
-            }
         }
         Some((screen, size(self.area)))
     }
@@ -401,6 +415,10 @@ impl Terminal {
                     let _ = self.vt.write(note.as_bytes());
                     self.exit = Some(ExitStatus::from_raw(1 << 8));
                     output = true;
+                }
+                Event::Started(id) => self.pty.id = Some(id),
+                Event::Screen { screen, cols, rows } => {
+                    self.show_screen(&screen, (cols, rows));
                 }
                 Event::Released(..) => {}
             }
@@ -1088,6 +1106,17 @@ fn find_bar(memory: find::Memory, origin: u32) -> FindBar {
     let mut bar = FindBar::new(memory, origin);
     bar.replaceable = false;
     bar
+}
+
+/// Everything a new emulator needs to look like `vt`, written to it:
+/// its screen, history, and modes, and its title.
+pub fn full_snapshot(vt: &mut EmbeddedTerminal) -> Option<Vec<u8>> {
+    let mut screen = vt.snapshot(true).ok()?;
+    let title = vt.title();
+    if !title.is_empty() && !title.contains(['\x1b', '\x07']) {
+        screen.extend_from_slice(format!("\x1b]2;{title}\x1b\\").as_bytes());
+    }
+    Some(screen)
 }
 
 /// "The shell exited", with its code or signal if it failed.
