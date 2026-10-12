@@ -13,7 +13,8 @@
 - Add `cue --host`, a host in a process of its own that serves one client at a time, a newer one taking over; the app uses one with `CUE_HOST_PROCESS=1`, for now (`cf8456d`)
 - Keep terminals running on a host process when its client's gone, for another to attach to and get the screen (`c06ab44`)
 - With `CUE_HOST_PROCESS=1`, show the app in the `cue` the shell ran: detaching exits, leaving terminals running on the host, and coming back reattaches to them; sessions' sockets go only in folders of the user's own (`78adb77`)
-- With `CUE_HOST_PROCESS=1`, a `cue` of another build has a session's host start that build in its place, terminals still running, and Restart works there too
+- With `CUE_HOST_PROCESS=1`, a `cue` of another build has a session's host start that build in its place, terminals still running, and Restart works there too (`aadc9dd`)
+- A host process reads its settings again when the app does, so Reload Settings reaches new terminals' shells and excluded files
 
 ## v0.4.2 — 2026-10-11
 

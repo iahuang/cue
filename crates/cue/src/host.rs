@@ -291,6 +291,10 @@ pub enum Tell {
     Watch(BTreeSet<PathBuf>),
     /// Have the terminal of this [`Request::Terminal`] call do something.
     Term { call: CallId, control: pty::Control },
+    /// Read the settings again: the client did. A host process reads its
+    /// own file, and takes its part of it (see [`crate::config`]); one in
+    /// the app's process shares the app's.
+    ReloadConfig,
 }
 
 /// What the host says unasked.
@@ -1287,6 +1291,8 @@ fn serve(
                     state.hub.control(terminal, control);
                 }
             }
+            // Here, before the calls that come after are answered.
+            Ok(Input::Tell(Tell::ReloadConfig)) => state.reload_config(),
             Ok(Input::Tell(Tell::Watch(folders))) => {
                 watcher.watch(folders.into_iter().filter(|f| f.is_dir()).collect());
             }
@@ -1390,6 +1396,20 @@ impl State {
             }
             Err(err) => eprintln!("cue: can't listen on the session's socket: {err}"),
         }
+    }
+
+    /// Reads the settings file again, if this is a host process. What's
+    /// wrong with it goes to the log: the client says what's wrong with
+    /// its own.
+    fn reload_config(&self) {
+        if self.clients.is_none() {
+            return;
+        }
+        let (config, warnings) = crate::config::load();
+        for warning in warnings {
+            eprintln!("cue: {warning}");
+        }
+        crate::config::set(config);
     }
 
     /// Puts the settings the app told of in use on this thread, for tests.

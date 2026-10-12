@@ -15,8 +15,11 @@
 //! `[ui]` and `[keys]`, which are about the screen and the keyboard in
 //! front of you; the host the rest (`[editor]`, `[terminal]`, `[files]`),
 //! which are about the machine the files are on, and which the host sends
-//! the client where the client needs them, as the editor's do. For now
-//! the two are one process, with one file.
+//! the client where the client needs them, as the editor's do. A host
+//! process reads its file when it starts, and again when the client
+//! reads its own (`Tell::ReloadConfig`); for now, both read the same one,
+//! and the host sends nothing. A host in the app's process shares the
+//! app's settings.
 
 use std::path::PathBuf;
 use std::sync::Arc;

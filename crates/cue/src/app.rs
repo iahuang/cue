@@ -4901,8 +4901,10 @@ impl App {
         let old = config::get();
         config::set(config);
         let new = config::get();
-        // The host's threads share these settings, but for tests, where
-        // each thread has its own.
+        // A host process reads its own; one in this process shares these,
+        // but for tests, where each thread has its own. Told before what
+        // follows asks it anything.
+        self.host.tell(Tell::ReloadConfig);
         #[cfg(test)]
         self.host.set_config(new.clone());
         self.keymap = Keymap::new(&new.keys);

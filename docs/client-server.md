@@ -246,8 +246,8 @@ Notes from 1.1 and 1.2:
 - The client turns listed paths into picker items on the main thread; for
   200k files that may be noticeable. Measure before moving it.
 - The walker reads `config::get()` for excludes. That's the host's config,
-  which matches the config decision, but once the host is a separate
-  process it needs its own config reload.
+  which matches the config decision; a host process reloads it when told
+  (2.6).
 - `Workspace::add_root` canonicalizes on the client; it's only for
   starting now, and folders added later come from the host
   (`Workspace::add_folder`).
@@ -331,7 +331,7 @@ Progress:
   the in-process host otherwise. Under the flag: a restart can't adopt
   shells (`Terminal::release` gives up, so they start over), and
   terminals' `CUE_PID` is the host's, so a cue run in one isn't told it's
-  nested; the host loads its settings once, at start.
+  nested; the host loads its settings once, at start (until 2.6).
 - [x] 2.3 Terminals are the host's, not a connection's (`term_hub`): a
   thread owns each pty's controls and the call that hears of it, keyed by
   a `TermId` that the first reply says (`Event::Started`). Cancelling a
@@ -394,6 +394,16 @@ Progress:
   it. Raw fds still cross the wire only on the old server path
   (`Start::Adopt`, `Event::Released`), which goes once the flag's the
   default.
+- [x] 2.6 A host process reads its settings file when it starts, as
+  before, and again when the client reads its own (Reload Settings,
+  saving the file from cue, Select Theme), which tells it to
+  (`Tell::ReloadConfig`), ahead of what it asks next, such as listing
+  files with new excludes. What's wrong with the host's file goes to its
+  log; the client says what's wrong with its own, which for now is the
+  same file. The host in the app's process shares the app's settings, and
+  ignores it. The host sends the client none of its settings yet: the
+  client reads `[editor]` from its own file, which over ssh (step 3)
+  won't be the host's.
 
 ### 3. ssh
 
