@@ -174,6 +174,7 @@ const EmbeddedTerminalStatus = struct {
     const unsupported: i32 = -3;
     const out_of_space: i32 = -4;
     const processing_failed: i32 = -5;
+    const none_pending: i32 = -6;
 };
 
 pub const ExternalEmbeddedTerminalCursor = extern struct {
@@ -754,6 +755,34 @@ export fn embeddedTerminalTakeClipboard(
     out_required.* = std.math.cast(u32, required) orelse return EmbeddedTerminalStatus.out_of_memory;
     const count = written orelse {
         return if (required > 0) EmbeddedTerminalStatus.out_of_space else 0;
+    };
+    return std.math.cast(i32, count) orelse EmbeddedTerminalStatus.out_of_memory;
+}
+
+/// Whether the bell rang (BEL) since the last call: 1 or 0.
+export fn embeddedTerminalTakeBell(handle: NativeHandle) i32 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    return @intFromBool(terminal_value.takeBell());
+}
+
+/// Takes what the program last asked to notify the user of (OSC 9 or 777):
+/// its length, which may be 0, or -6 with none pending. When `out_len` is
+/// too short, it stays pending and `out_required` gives the length needed.
+export fn embeddedTerminalTakeNotification(
+    handle: NativeHandle,
+    out_ptr: ?[*]u8,
+    out_len: u32,
+    out_required_ptr: ?*u32,
+) i32 {
+    const out_required = out_required_ptr orelse return EmbeddedTerminalStatus.invalid;
+    out_required.* = 0;
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    const output = embeddedTerminalOutput(out_ptr, out_len) orelse return EmbeddedTerminalStatus.invalid;
+    var required: usize = 0;
+    const written = terminal_value.takeNotification(output, &required);
+    out_required.* = std.math.cast(u32, required) orelse return EmbeddedTerminalStatus.out_of_memory;
+    const count = written orelse {
+        return if (required > 0) EmbeddedTerminalStatus.out_of_space else EmbeddedTerminalStatus.none_pending;
     };
     return std.math.cast(i32, count) orelse EmbeddedTerminalStatus.out_of_memory;
 }

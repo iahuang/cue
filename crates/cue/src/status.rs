@@ -4,7 +4,9 @@
 //! position, indentation, language, or wrapping changes it (see
 //! [`StatusButton`]). Shortcut hints
 //! fill the right, and in a session, a badge with its name, or if it has
-//! none, its ID: a click on it offers to detach or end the session. In a
+//! none, its ID: a click on it offers to detach or end the session. Left
+//! of that, while terminals wait for the user (see [`NoticeBadge`]), a
+//! badge names the one waiting longest: a click on it goes there. In a
 //! git repository, a badge at the left end names the branch (see
 //! [`GitBadge`]).
 
@@ -87,6 +89,8 @@ impl Status {
 const MAX_SESSION: usize = 24;
 /// Branch names past this many characters are cut short in the git badge.
 const MAX_BRANCH: usize = 32;
+/// The terminal in the notice badge is named in at most this many columns.
+const MAX_NOTICE: usize = 20;
 /// The git badge shows only if it leaves this many columns for the rest.
 const MIN_REST: u32 = 40;
 
@@ -139,14 +143,7 @@ impl GitBadge {
 
     /// Draws it from the left end of row `y`.
     fn draw(&self, frame: &Buffer, y: u32) {
-        let colors = theme::colors();
-        // A shade lighter than the status bar: toward the text on a dark
-        // theme, and back toward the background on a light one.
-        let lighter = match colors.light {
-            true => theme::mix(colors.surface, colors.bg, 0.5),
-            false => theme::mix(colors.surface, colors.text, 0.08),
-        };
-        frame.fill_rect(0, y, self.width(), 1, lighter);
+        frame.fill_rect(0, y, self.width(), 1, badge_bg());
         let mut x = 1;
         if self.icon() {
             x = icons::branch().draw(frame, x, y, None);
@@ -202,9 +199,54 @@ pub fn session_badge(status: &Status, session: Option<&str>, width: u32) -> Opti
     }
 }
 
+/// The badge left of the session's while terminals wait for the user,
+/// whose bell rang or whose program sent a notification: it names the one
+/// that's waited longest, and counts the others.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeBadge {
+    pub name: String,
+    pub others: usize,
+}
+
+impl NoticeBadge {
+    /// What it says after the bell.
+    fn text(&self) -> String {
+        let name = truncate(&self.name, MAX_NOTICE);
+        match self.others {
+            0 => format!("{name} "),
+            others => format!("{name} +{others} "),
+        }
+    }
+
+    fn width(&self) -> u32 {
+        1 + icons::WIDTH + self.text().width() as u32
+    }
+}
+
+/// The columns `notice` takes in a status bar `width` wide showing
+/// `status`, left of the badge for a session labeled `session` if any:
+/// not over a message, nor where it would crowd out the rest.
+pub fn notice_badge(
+    status: &Status,
+    notice: Option<&NoticeBadge>,
+    session: Option<&str>,
+    width: u32,
+) -> Option<Range<u32>> {
+    let len = notice?.width();
+    let end = session_badge(status, session, width).map_or(width, |badge| badge.start - 1);
+    match status {
+        Status::Info(_) | Status::Terminal(_) | Status::EditorInfo { .. }
+            if end >= len + MIN_REST =>
+        {
+            Some(end - len..end)
+        }
+        _ => None,
+    }
+}
+
 /// Draws `status` across row `y` of `frame`, `width` wide, with the
-/// badge labeled `session` if in a session, and `git`'s badge if
-/// there's room. A terminal's hint says whether cue's shortcuts
+/// badge labeled `session` if in a session, and `git`'s and `notice`'s
+/// badges if there's room. A terminal's hint says whether cue's shortcuts
 /// (`terminal_cue_keys`) or the shell gets keys.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
@@ -215,6 +257,7 @@ pub fn draw(
     keymap: &Keymap,
     session: Option<&str>,
     git: Option<&GitBadge>,
+    notice: Option<&NoticeBadge>,
     terminal_cue_keys: bool,
 ) {
     let colors = theme::colors();
@@ -253,8 +296,12 @@ pub fn draw(
                 .collect();
             let hints = hints.strip_suffix(' ').unwrap_or(&hints);
             let badge = session_badge(status, session, width);
+            let notice_at = notice_badge(status, notice, session, width);
             // The hints end in a space; another sets them off the badge.
-            let right = badge.as_ref().map_or(width, |badge| badge.start - 1);
+            let right = match (&notice_at, &badge) {
+                (Some(at), _) | (None, Some(at)) => at.start - 1,
+                (None, None) => width,
+            };
             let hints_x = right.saturating_sub(hints.len() as u32);
             let x = match git.filter(|_| git_badge(status, git, width).is_some()) {
                 Some(git) => {
@@ -277,6 +324,9 @@ pub fn draw(
                 };
                 frame.draw_text(hints, hints_x, y, fg, None, Attributes::NONE);
             }
+            if let (Some(at), Some(notice)) = (notice_at, notice) {
+                draw_notice(frame, notice, at.start, y);
+            }
             if let (Some(badge), Some(session)) = (badge, session) {
                 let (fg, bg) = (colors.on_accent, Some(colors.accent));
                 let text = session_text(session);
@@ -284,6 +334,25 @@ pub fn draw(
             }
         }
     }
+}
+
+/// The git and notice badges' background: a shade lighter than the status
+/// bar, toward the text on a dark theme, and back toward the background
+/// on a light one.
+fn badge_bg() -> Rgba {
+    let colors = theme::colors();
+    match colors.light {
+        true => theme::mix(colors.surface, colors.bg, 0.5),
+        false => theme::mix(colors.surface, colors.text, 0.08),
+    }
+}
+
+/// Draws `notice` from column `x`, the bell in its own color.
+fn draw_notice(frame: &Buffer, notice: &NoticeBadge, x: u32, y: u32) {
+    frame.fill_rect(x, y, notice.width(), 1, badge_bg());
+    let x = icons::bell().draw(frame, x + 1, y, None);
+    let text = theme::colors().text;
+    frame.draw_text(&notice.text(), x, y, text, None, Attributes::BOLD);
 }
 
 #[cfg(test)]

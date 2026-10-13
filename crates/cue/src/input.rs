@@ -150,6 +150,9 @@ pub enum Event {
     /// A terminal reply (DECRPM, DA, OSC color, cursor report, ...), to be
     /// passed to `Renderer::process_capability_response`.
     Reply(Vec<u8>),
+    /// The terminal cue runs in got (true) or lost the focus: its window,
+    /// or its tab or split.
+    Focus(bool),
 }
 
 const ESC: u8 = 0x1b;
@@ -445,7 +448,7 @@ fn parse_csi(b: &[u8]) -> Option<(Token, usize)> {
             return Some((codepoint_token(typed.unwrap_or(cp), mods), len));
         }
         // Focus in/out.
-        b'I' | b'O' => return Some((Token::Ignored, len)),
+        b'I' | b'O' => return Some((Token::Event(Event::Focus(final_byte == b'I')), len)),
         _ => return reply(),
     };
     Some((key_token(code, mods), len))
@@ -597,6 +600,16 @@ mod tests {
                 ctrl('_'),
             ]
         );
+    }
+
+    #[test]
+    fn focus_in_and_out() {
+        let mut p = Parser::new();
+        let events = p.feed(b"\x1b[O\x1b[Ia");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Focus(false), Event::Focus(true), Event::Key(_)]
+        ));
     }
 
     #[test]

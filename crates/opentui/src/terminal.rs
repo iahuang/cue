@@ -620,6 +620,37 @@ impl EmbeddedTerminal {
         (!text.is_empty()).then_some(text)
     }
 
+    /// Whether the bell rang (BEL) since the last call.
+    pub fn take_bell(&mut self) -> bool {
+        unsafe { sys::embeddedTerminalTakeBell(self.handle) == 1 }
+    }
+
+    /// What the program last asked to notify the user of (OSC 9 or 777),
+    /// if it did since the last call: the notification's body, or its title
+    /// without one, which may be empty.
+    pub fn take_notification(&mut self) -> Option<String> {
+        let mut out = vec![0u8; 256];
+        loop {
+            let mut required = 0u32;
+            let written = unsafe {
+                sys::embeddedTerminalTakeNotification(
+                    self.handle,
+                    out.as_mut_ptr(),
+                    out.len() as u32,
+                    &mut required,
+                )
+            };
+            if written >= 0 {
+                out.truncate(written as usize);
+                return Some(String::from_utf8_lossy(&out).into_owned());
+            }
+            if required as usize <= out.len() {
+                return None;
+            }
+            out.resize(required as usize, 0);
+        }
+    }
+
     /// The native handle, for calling [`sys`](crate::sys) functions directly.
     pub fn raw_handle(&self) -> sys::Handle {
         self.handle

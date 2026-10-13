@@ -46,6 +46,12 @@ pub const EmbeddedTerminal = struct {
     /// taken; the host puts it on its own.
     clipboard: std.ArrayListUnmanaged(u8) = .empty,
     clipboard_pending: bool = false,
+    /// The bell rang (BEL) since the host last asked.
+    bell_pending: bool = false,
+    /// What the program last asked to notify the user of (OSC 9 or 777):
+    /// its body, or its title without one, until taken.
+    notification: std.ArrayListUnmanaged(u8) = .empty,
+    notification_pending: bool = false,
     mouse_last_cell: ?ghostty.Coordinate = null,
     force_redraw: bool = true,
     transparent_background: bool = false,
@@ -80,6 +86,8 @@ pub const EmbeddedTerminal = struct {
         var handler = self.terminal.vtHandler();
         handler.effects.write_pty = &writePty;
         handler.effects.clipboard_write = &clipboardWrite;
+        handler.effects.bell = &bell;
+        handler.effects.desktop_notification = &desktopNotification;
         self.stream = .init(.{ .allocator = allocator, .handler = handler });
         return self;
     }
@@ -92,6 +100,7 @@ pub const EmbeddedTerminal = struct {
         self.terminal.deinit(allocator);
         self.responses.deinit(allocator);
         self.clipboard.deinit(allocator);
+        self.notification.deinit(allocator);
         self.snapshot.deinit(allocator);
         allocator.destroy(self);
     }
@@ -437,6 +446,43 @@ pub const EmbeddedTerminal = struct {
         };
         self.clipboard_pending = true;
         return .success;
+    }
+
+    /// Whether the bell rang since this was last called.
+    pub fn takeBell(self: *EmbeddedTerminal) bool {
+        defer self.bell_pending = false;
+        return self.bell_pending;
+    }
+
+    /// What the program asked to notify the user of since this was last
+    /// called with room for it, or null. Stays pending when `output` is too
+    /// short; `required` is then set to its length. A notification with no
+    /// text is pending with a length of 0.
+    pub fn takeNotification(self: *EmbeddedTerminal, output: []u8, required: *usize) ?usize {
+        required.* = 0;
+        if (!self.notification_pending) return null;
+        const text = self.notification.items;
+        required.* = text.len;
+        if (text.len > output.len) return null;
+        @memcpy(output[0..text.len], text);
+        self.notification_pending = false;
+        self.notification.clearRetainingCapacity();
+        return text.len;
+    }
+
+    fn bell(handler: *ghostty.TerminalStream.Handler) void {
+        const self: *EmbeddedTerminal = @fieldParentPtr("terminal", handler.terminal);
+        self.bell_pending = true;
+    }
+
+    /// Keeps the latest notification for the host, which shows it.
+    fn desktopNotification(handler: *ghostty.TerminalStream.Handler, notification: ghostty.DesktopNotification) void {
+        const self: *EmbeddedTerminal = @fieldParentPtr("terminal", handler.terminal);
+        const body = std.mem.trim(u8, notification.body, " \t\r\n");
+        const text = if (body.len > 0) body else std.mem.trim(u8, notification.title, " \t\r\n");
+        self.notification.clearRetainingCapacity();
+        self.notification.appendSlice(self.allocator, text) catch {};
+        self.notification_pending = true;
     }
 
     fn writePty(handler: *ghostty.TerminalStream.Handler, data: [:0]const u8) void {

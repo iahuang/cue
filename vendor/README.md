@@ -82,7 +82,11 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   `embeddedTerminalGetTitle`, and `embeddedTerminalTakeClipboard`, which hands
   over the latest OSC 52 clipboard write from the program (Ghostty's
   `clipboard_write` effect; reads and clears aren't forwarded) for the host
-  to copy. `embeddedTerminalLineAt` gives what's at a cell, for opening it:
+  to copy. `embeddedTerminalTakeBell` and `embeddedTerminalTakeNotification`
+  hand over whether the bell rang (BEL) and the latest OSC 9 or 777
+  notification's body, or title without one (Ghostty's `bell` and
+  `desktop_notification` effects), for cue to mark the terminal as waiting
+  for the user. `embeddedTerminalLineAt` gives what's at a cell, for opening it:
   an OSC 8 hyperlink's URI, or else the cell's line joined across soft wraps
   (Ghostty's `selectLine`) and the byte offset of the cell in it (from the
   selection string's pin map).

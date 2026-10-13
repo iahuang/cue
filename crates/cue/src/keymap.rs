@@ -152,6 +152,7 @@ commands! {
     GoToTab8 => "tab:go-to-8", "Go to Tab 8";
     GoToTab9 => "tab:go-to-9", "Go to Tab 9";
     NewTerminal => "terminal:new", "New Terminal";
+    GoToWaitingTerminal => "terminal:go-to-waiting", "Go to Waiting Terminal";
     ClearTerminal => "terminal:clear", "Clear Terminal";
     RenameTerminal => "terminal:rename", "Rename Terminal";
     ToggleTerminalKeys => "terminal:toggle-keys", "Terminal: Toggle Sending Shortcuts to the Shell";
@@ -272,10 +273,10 @@ impl Command {
             | FindPrevious | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight
             | SplitDown | ClosePanel | Pop | GoBack | GoForward | RecentlyViewed | SetMark
             | JumpToMark | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown
-            | NewTerminal | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
-            | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5
-            | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch
-            | GitPull | GitPush => Context::Global,
+            | NewTerminal | GoToWaitingTerminal | NewTab | CloseTab | NextTab | PreviousTab
+            | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3
+            | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder
+            | RenameSession | GitFetch | GitPull | GitPush => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename

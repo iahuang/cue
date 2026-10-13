@@ -117,7 +117,7 @@ impl Chooser {
                 self.edit(Edit::Insert(line));
                 Action::Continue
             }
-            Event::Release(_) | Event::Reply(_) => Action::Continue,
+            Event::Release(_) | Event::Reply(_) | Event::Focus(_) => Action::Continue,
         }
     }
 

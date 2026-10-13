@@ -7,13 +7,14 @@
 //!
 //! With more than one tab, a bar across the top of the panels lists them,
 //! numbered, by the name they were given or else by what their active
-//! panel shows, then a `+` for a new one.
+//! panel shows, then a `+` for a new one. A dot after a tab's name says a
+//! terminal in it is waiting for the user.
 
 use opentui::{Attributes, Buffer};
 
 use crate::layout::{Layout, PanelId, Rect};
 use crate::panel::Panel;
-use crate::theme;
+use crate::theme::{self, Hue};
 
 /// Names a tab for as long as it's open.
 pub type TabId = u32;
@@ -25,6 +26,8 @@ const MAX_NAME: usize = 24;
 const EMPTY: &str = "Empty";
 /// The button after the tabs that opens a new one.
 const NEW: &str = " + ";
+/// After the name of a tab with a terminal waiting for the user.
+const WAITING: &str = "●";
 
 pub struct Tab {
     pub id: TabId,
@@ -78,6 +81,15 @@ impl Tab {
             .unwrap_or_else(|| EMPTY.to_string())
     }
 
+    /// Whether a terminal in one of its panels is waiting for the user.
+    pub fn waiting(&self) -> bool {
+        self.panels.iter().any(|panel| {
+            panel
+                .terminal()
+                .is_some_and(|terminal| terminal.borrow().notification().is_some())
+        })
+    }
+
     /// Lays its panels out to fill `area`.
     pub fn set_area(&mut self, area: Rect) {
         for (id, rect) in self.layout.panels(area) {
@@ -111,7 +123,13 @@ pub enum BarItem {
 /// button fit; what still doesn't is left off at the right.
 pub fn bar(tabs: &[Tab], area: Rect) -> Vec<(BarItem, Rect, String)> {
     let titles: Vec<String> = tabs.iter().map(Tab::title).collect();
-    let label = |index: usize, max: usize| format!(" {} {} ", index + 1, cut(&titles[index], max));
+    let label = |index: usize, max: usize| {
+        let title = cut(&titles[index], max);
+        match tabs[index].waiting() {
+            true => format!(" {} {title} {WAITING} ", index + 1),
+            false => format!(" {} {title} ", index + 1),
+        }
+    };
     let width = |max| {
         (0..titles.len())
             .map(|index| label(index, max).chars().count())
@@ -156,7 +174,12 @@ pub fn draw_bar(frame: &Buffer, tabs: &[Tab], current: usize, area: Rect) {
             _ => (colors.muted, None, Attributes::NONE),
         };
         frame.with_clip(rect.x, rect.y, rect.width, rect.height, || {
-            frame.draw_text(&text, rect.x, rect.y, fg, bg, attributes)
+            frame.draw_text(&text, rect.x, rect.y, fg, bg, attributes);
+            if let Some(at) = text.strip_suffix(&format!("{WAITING} ")) {
+                let x = rect.x + at.chars().count() as u32;
+                let dot = colors.hue(Hue::Yellow);
+                frame.draw_text(WAITING, x, rect.y, dot, bg, Attributes::NONE);
+            }
         });
     }
 }

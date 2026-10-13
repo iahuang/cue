@@ -1,9 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Mark terminals whose bell rings or that send a notification (OSC 9 or 777), with a status bar badge that goes to them
+
 ## v0.4.2 — 2026-10-11
 
 - Embedded PDF viewer (`c3deea1`)
-- Build releases with Rust 1.92
+- Build releases with Rust 1.92 (`5f06f75`)
 
 ## v0.4.1 — 2026-10-10
 

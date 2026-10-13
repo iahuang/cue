@@ -106,7 +106,7 @@ use crate::recovery::{self, Orphan, Recovery};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::session::{self, Session, Shown};
-use crate::status::{self, GitBadge, StatusButton};
+use crate::status::{self, GitBadge, NoticeBadge, StatusButton};
 use crate::switcher::{Switcher, SwitcherAction};
 use crate::symbols::{self, Symbol, SymbolIndex};
 use crate::tab::{self, BarItem, Tab, TabId};
@@ -313,6 +313,8 @@ enum MouseTarget {
     Status(StatusButton),
     /// The status bar's session badge.
     Session,
+    /// The status bar's badge for terminals waiting for the user.
+    Notice,
     Tree,
     /// The status bar's git badge: the branch, or the button back to the
     /// files.
@@ -506,6 +508,9 @@ pub struct App {
     screens: HashMap<u32, (String, u64)>,
     /// A terminal shows cue: it isn't detached.
     attached: bool,
+    /// The terminal cue runs in has the focus, as it last said (assumed
+    /// so until it says otherwise): the user may be looking at cue.
+    host_focused: bool,
     /// How files were chosen to indent, from the status bar, while cue
     /// runs, or the session does, by path.
     indents: HashMap<PathBuf, Indent>,
@@ -756,6 +761,7 @@ impl App {
             screens_saved: None,
             screens: HashMap::new(),
             attached: true,
+            host_focused: true,
             indents: HashMap::new(),
         };
         app.settings_hash = app
@@ -1240,6 +1246,7 @@ impl App {
                 self.ask_name("Rename Tab", placeholder, &name, Naming::Tab);
             }
             Command::NewTerminal => self.new_terminal(),
+            Command::GoToWaitingTerminal => self.go_to_waiting(),
             Command::ClearTerminal => {
                 if let Some(terminal) = self.active_terminal() {
                     terminal.borrow_mut().clear();
@@ -1550,6 +1557,11 @@ impl App {
                     self.show_session_menu();
                 }
             }
+            MouseTarget::Notice => {
+                if let MouseKind::Press(_) = mouse.kind {
+                    self.go_to_waiting();
+                }
+            }
             MouseTarget::Tree => match mouse.kind {
                 // Ctrl+click, as on macOS.
                 MouseKind::Press(button)
@@ -1786,6 +1798,15 @@ impl App {
                     status::session_badge(&status, self.session_label().as_deref(), self.width);
                 if session.is_some_and(|badge| badge.contains(&x)) {
                     return Some(MouseTarget::Session);
+                }
+                let notice = status::notice_badge(
+                    &status,
+                    self.notice_badge().as_ref(),
+                    self.session_label().as_deref(),
+                    self.width,
+                );
+                if notice.is_some_and(|badge| badge.contains(&x)) {
+                    return Some(MouseTarget::Notice);
                 }
                 let git = status::git_badge(&status, self.git_badge().as_ref(), self.width);
                 if git.as_ref().is_some_and(|git| git.contains(&x)) {
@@ -2106,6 +2127,7 @@ impl App {
             let y = self.height - 1;
             let session = self.session_label();
             let git = self.git_badge();
+            let notice = self.notice_badge();
             let width = self.width;
             status::draw(
                 frame,
@@ -2115,6 +2137,7 @@ impl App {
                 &self.keymap,
                 session.as_deref(),
                 git.as_ref(),
+                notice.as_ref(),
                 self.terminal_cue_keys,
             );
         }
@@ -2240,6 +2263,13 @@ impl App {
                 self.width,
             )
             .map(span),
+            MouseTarget::Notice => status::notice_badge(
+                &self.active_panel().status(),
+                self.notice_badge().as_ref(),
+                self.session_label().as_deref(),
+                self.width,
+            )
+            .map(span),
             MouseTarget::Status(button) => {
                 let status = self.active_panel().status();
                 let offset = status::git_badge(&status, self.git_badge().as_ref(), self.width)
@@ -2352,6 +2382,8 @@ impl App {
                 self.copied = Some(text);
             }
         }
+        // Not for the terminal the user is in.
+        self.clear_seen_notification();
         if changed {
             self.prune_terminals();
         }
@@ -4762,7 +4794,16 @@ impl App {
     /// Notes whether a terminal shows cue, for the list of sessions.
     pub fn set_attached(&mut self, attached: bool) {
         self.attached = attached;
+        // A terminal that just attached is one the user is in.
+        self.host_focused = attached;
         self.save_session(false);
+    }
+
+    /// Notes whether the terminal cue runs in has the focus, so that a
+    /// terminal's notification is kept while the user is elsewhere.
+    pub fn set_host_focused(&mut self, focused: bool) {
+        self.host_focused = focused;
+        self.clear_seen_notification();
     }
 
     /// Makes this cue a session, saved from now on, which keeps its unsaved
@@ -7318,6 +7359,7 @@ impl App {
     /// Tells terminals when they get or lose the keyboard, for programs
     /// that asked to know.
     fn note_terminal_focus(&mut self) {
+        self.clear_seen_notification();
         let focused = self.keyboard_terminal();
         let same = match (&focused, &self.focused_terminal) {
             (Some(a), Some(b)) => Rc::ptr_eq(a, b),
@@ -7353,6 +7395,65 @@ impl App {
             Recent::File(_) | Recent::Untitled(_) => true,
             Recent::Terminal(id) => terminals.iter().any(|t| t.borrow().id() == *id),
         });
+    }
+
+    /// Forgets the notification of the terminal with the keyboard, if the
+    /// user is looking at it: cue is attached and its terminal has the
+    /// focus. Returns whether there was one.
+    fn clear_seen_notification(&mut self) -> bool {
+        if !self.attached || !self.host_focused {
+            return false;
+        }
+        self.keyboard_terminal()
+            .is_some_and(|terminal| terminal.borrow_mut().clear_notification())
+    }
+
+    /// The terminals waiting for the user, the one waiting longest first.
+    fn waiting_terminals(&self) -> Vec<Rc<RefCell<Terminal>>> {
+        let mut waiting: Vec<_> = self
+            .terminals
+            .iter()
+            .filter(|terminal| terminal.borrow().notification().is_some())
+            .cloned()
+            .collect();
+        waiting.sort_by_key(|terminal| terminal.borrow().notification().map(|n| n.since));
+        waiting
+    }
+
+    /// The status bar's badge for the terminals waiting for the user.
+    fn notice_badge(&self) -> Option<NoticeBadge> {
+        let waiting = self.waiting_terminals();
+        let name = waiting.first()?.borrow().label().0;
+        Some(NoticeBadge {
+            name,
+            others: waiting.len() - 1,
+        })
+    }
+
+    /// Goes to the terminal that's waited longest for the user: to the
+    /// panel showing it, in whatever tab, or else shows it in the active
+    /// panel.
+    fn go_to_waiting(&mut self) {
+        let Some(terminal) = self.waiting_terminals().into_iter().next() else {
+            return;
+        };
+        terminal.borrow_mut().clear_notification();
+        let shown = self.tabs.iter().enumerate().find_map(|(index, tab)| {
+            tab.panels
+                .iter()
+                .find(|panel| panel.terminal().is_some_and(|t| Rc::ptr_eq(t, &terminal)))
+                .map(|panel| (index, panel.id))
+        });
+        match shown {
+            Some((index, id)) => {
+                if index != self.tab {
+                    self.switch_tab(index);
+                }
+                self.activate(id);
+                terminal.borrow_mut().blur_find();
+            }
+            None => self.show_terminal(terminal),
+        }
     }
 
     // --- layout and helpers ----------------------------------------------------
@@ -8343,6 +8444,100 @@ mod tests {
         assert_eq!(app.take_copied(), None);
         // Pasting in cue gets it too.
         assert_eq!(app.clipboard.as_deref(), Some("copied"));
+    }
+
+    #[test]
+    fn a_terminal_waiting_elsewhere_shows_in_the_status_bar_until_gone_to() {
+        let _serial = crate::test_serial();
+        let root = fixture("terminal-notice", &[("a.txt", "")]);
+        let mut app = app(&root, Some("a.txt"));
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('n'), ctrl_shift));
+        let terminal = app.active_terminal().expect("a terminal");
+        // As Claude Code does, once the user has left for another tab.
+        type_text(
+            &mut app,
+            r"sleep 1; printf '\033]777;notify;Claude Code;Waiting for input\a'",
+        );
+        key(&mut app, KeyCode::Enter);
+        ctrl(&mut app, 't');
+        assert_eq!(app.tab, 1);
+        wait_until(&mut app, "the notification", |app| {
+            app.notice_badge().is_some()
+        });
+        let badge = app.notice_badge().unwrap();
+        assert_eq!(badge.others, 0);
+
+        let shown = screen(&app);
+        let status = shown.lines().last().unwrap();
+        assert!(status.contains(&badge.name), "{status}");
+        let tabs = shown.lines().next().unwrap();
+        assert!(tabs.contains("│ 1 zsh ● "), "the tab is marked: {tabs}");
+        let items = app.recent_items();
+        let item = items.iter().find(|item| item.text.contains("Waiting"));
+        assert!(item.is_some(), "the picker says what it's waiting for");
+
+        // Clicking the badge goes back to it, and it's no longer waiting.
+        let at = status::notice_badge(
+            &app.active_panel().status(),
+            Some(&badge),
+            app.session_label().as_deref(),
+            app.width,
+        )
+        .unwrap();
+        let y = app.height - 1;
+        left_click(&mut app, at.start + 1, y);
+        assert_eq!(app.tab, 0);
+        assert!(app
+            .active_terminal()
+            .is_some_and(|t| Rc::ptr_eq(&t, &terminal)));
+        assert!(app.notice_badge().is_none());
+        assert!(terminal.borrow().notification().is_none());
+    }
+
+    #[test]
+    fn the_terminal_in_use_waits_only_while_cue_is_out_of_sight() {
+        let _serial = crate::test_serial();
+        let root = fixture("terminal-bell", &[("a.txt", "")]);
+        let mut app = app(&root, Some("a.txt"));
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('n'), ctrl_shift));
+        let terminal = app.active_terminal().expect("a terminal");
+        let ring = |app: &mut App| {
+            type_text(app, r"printf '\a'; echo rang");
+            key(app, KeyCode::Enter);
+        };
+
+        // Looking at it, a bell is nothing to come back to.
+        ring(&mut app);
+        // The output, past the tree, not the command.
+        wait_until(&mut app, "the bell", |app| screen(app).contains("│rang"));
+        assert!(app.notice_badge().is_none());
+
+        // In another window, it is, until cue has the focus again.
+        app.set_host_focused(false);
+        type_text(&mut app, "clear");
+        key(&mut app, KeyCode::Enter);
+        ring(&mut app);
+        wait_until(&mut app, "the bell", |app| app.notice_badge().is_some());
+        let notification = terminal.borrow().notification().cloned().unwrap();
+        assert_eq!(notification.text, None, "a bell says nothing");
+        app.set_host_focused(true);
+        assert!(app.notice_badge().is_none());
+
+        // Detached, too.
+        app.set_attached(false);
+        ring(&mut app);
+        wait_until(&mut app, "the bell", |app| app.notice_badge().is_some());
+        app.set_attached(true);
+        app.after_input();
+        assert!(app.notice_badge().is_none());
     }
 
     /// Polls `app` until `done`, or panics after a few seconds.

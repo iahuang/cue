@@ -95,6 +95,7 @@ const FOLDER: Icon = Icon::new('\u{e5ff}', BLUE); // custom-folder
 const FOLDER_OPEN: Icon = Icon::new('\u{e5fe}', BLUE); // custom-folder_open
 const TERMINAL: Icon = Icon::new('\u{ea85}', GREEN); // cod-terminal
 const BRANCH: Icon = Icon::new('\u{e725}', PEACH); // dev-git_branch
+const BELL: Icon = Icon::new('\u{eaa2}', YELLOW); // cod-bell
 
 /// A folder's icon, open if its contents are showing.
 pub fn folder(open: bool) -> Icon {
@@ -111,6 +112,14 @@ pub fn terminal() -> Icon {
 
 pub fn branch() -> Icon {
     BRANCH
+}
+
+/// Marks a terminal waiting for the user: with icons off, a dot.
+pub fn bell() -> Icon {
+    match enabled() {
+        true => BELL,
+        false => Icon::new('●', YELLOW),
+    }
 }
 
 /// The icon for a file named `name`: by its whole name, else its extension.

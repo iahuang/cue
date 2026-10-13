@@ -104,6 +104,13 @@ pub const EmbeddedTerminal = struct {
         required.* = 0;
         return null;
     }
+    pub fn takeBell(_: *EmbeddedTerminal) bool {
+        return false;
+    }
+    pub fn takeNotification(_: *EmbeddedTerminal, _: []u8, required: *usize) ?usize {
+        required.* = 0;
+        return null;
+    }
     pub fn drainResponses(_: *EmbeddedTerminal, _: []u8) Error!usize {
         return error.Unsupported;
     }

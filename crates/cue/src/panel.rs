@@ -38,6 +38,7 @@ use crate::layout::{PanelId, Rect};
 use crate::status::Status;
 use crate::terminal::{self, Terminal};
 use crate::theme;
+use crate::tree::truncate;
 use crate::workspace::Workspace;
 
 /// What an empty panel suggests.
@@ -909,8 +910,9 @@ impl Panel {
         }
     }
 
-    /// The title the program set, or the program running, then dimmed,
-    /// whether the shell exited.
+    /// The title the program set, or the program running, then if it's
+    /// waiting for the user, a bell and what it said, and dimmed, whether
+    /// the shell exited.
     fn draw_terminal_header(&self, frame: &Buffer, terminal: &Terminal, active: bool) {
         let colors = theme::colors();
         let area = self.area;
@@ -932,12 +934,27 @@ impl Panel {
         let name = truncate_left(&name, room);
         frame.draw_text(&name, area.x + 1 + icon, area.y, fg, None, Attributes::BOLD);
         self.set_name_columns(icon + label_width(&name));
+        // Notes go a space apart after the name, while there's room.
+        let end = area.x + width;
+        let mut x = area.x + 1 + icon + label_width(&name) + 1;
+        if let Some(notification) = terminal.notification() {
+            if x + icons::WIDTH < end {
+                x = icons::bell().draw(frame, x, area.y, None);
+                let room = end.saturating_sub(x + 1) as usize;
+                match &notification.text {
+                    Some(text) if room > 1 => {
+                        let text = truncate(text, room);
+                        frame.draw_text(&text, x, area.y, fg, None, Attributes::NONE);
+                        x += label_width(&text) + 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
         if let Some(status) = terminal.exit() {
-            let used = (1 + icon) as usize + name.chars().count() + 2;
             let note = format!("[{}]", terminal::describe_exit(status).to_lowercase());
-            if used + note.chars().count() < width as usize {
-                let x = area.x + used as u32;
-                frame.draw_text(&note, x, area.y, colors.muted, None, Attributes::NONE);
+            if x + 1 + label_width(&note) < end {
+                frame.draw_text(&note, x + 1, area.y, colors.muted, None, Attributes::NONE);
             }
         }
     }

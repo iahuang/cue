@@ -80,6 +80,19 @@ pub struct Terminal {
     /// Counts changes to the output, so the find bar knows when to find
     /// its matches again.
     epoch: u64,
+    /// What the program asked to tell the user, until they come to it.
+    notification: Option<Notification>,
+}
+
+/// A terminal asking for attention: its bell rang, or the program sent a
+/// notification (OSC 9 or 777), as agents do when they finish or need an
+/// answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    /// What it said, if anything: the bell says nothing.
+    pub text: Option<String>,
+    /// When it first asked, to go to the one waiting longest first.
+    pub since: Instant,
 }
 
 /// The find bar, and where its matches are.
@@ -199,7 +212,10 @@ impl Terminal {
         Ok(terminal)
     }
 
-    fn with(id: u32, vt: EmbeddedTerminal, pty: Pty, cwd: &Path, area: Rect) -> Terminal {
+    fn with(id: u32, mut vt: EmbeddedTerminal, pty: Pty, cwd: &Path, area: Rect) -> Terminal {
+        // A saved screen replayed into it rang nothing now.
+        vt.take_bell();
+        vt.take_notification();
         Terminal {
             id,
             name: None,
@@ -214,6 +230,7 @@ impl Terminal {
             last_click: None,
             find: None,
             epoch: 0,
+            notification: None,
         }
     }
 
@@ -330,6 +347,7 @@ impl Terminal {
         if !responses.is_empty() {
             self.pty.write(&responses);
         }
+        changed |= self.take_notification();
         if self.exit.is_none() {
             // A shell can exit leaving jobs that hold the pty open.
             if let Some(status) = self.pty.exit_status() {
@@ -338,6 +356,36 @@ impl Terminal {
             }
         }
         changed
+    }
+
+    /// Notes a bell or notification since the last poll. Returns whether
+    /// there was one. Another while one is pending keeps when it started,
+    /// and what it said unless this says something.
+    fn take_notification(&mut self) -> bool {
+        let bell = self.vt.take_bell();
+        let text = self.vt.take_notification();
+        if !bell && text.is_none() {
+            return false;
+        }
+        let text = text.filter(|text| !text.is_empty());
+        let pending = self.notification.take();
+        self.notification = Some(Notification {
+            text: text.or_else(|| pending.as_ref().and_then(|p| p.text.clone())),
+            since: pending.map_or_else(Instant::now, |p| p.since),
+        });
+        true
+    }
+
+    /// What the program asked to tell the user, if they haven't come to it
+    /// since.
+    pub fn notification(&self) -> Option<&Notification> {
+        self.notification.as_ref()
+    }
+
+    /// Forgets the notification, now that the user came to it. Returns
+    /// whether there was one.
+    pub fn clear_notification(&mut self) -> bool {
+        self.notification.take().is_some()
     }
 
     /// The text the program put on the clipboard (OSC 52) since the last
@@ -359,16 +407,21 @@ impl Terminal {
     /// What to call it, and more about it, dimmed after: the name it was
     /// given and what's running in it, or else what's running in it and
     /// the title that sets, as tmux names windows (shells set titles such
-    /// as `user@host: ~`).
+    /// as `user@host: ~`). While it waits for the user, what it said
+    /// instead.
     pub fn label(&self) -> (String, String) {
         if self.exit.is_some() {
             return (self.name(), "exited".to_string());
         }
         let program = self.program().unwrap_or_default();
-        match &self.name {
+        let (name, about) = match &self.name {
             Some(name) => (name.clone(), program),
             None if program.is_empty() => (self.name(), self.title().trim().to_string()),
             None => (program, self.title().trim().to_string()),
+        };
+        match self.notification.as_ref().and_then(|n| n.text.clone()) {
+            Some(text) => (name, text),
+            None => (name, about),
         }
     }
 

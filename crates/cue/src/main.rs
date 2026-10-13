@@ -864,6 +864,10 @@ fn attached(
                     take_reply(&mut renderer, app, &bytes);
                     AppAction::Continue
                 }
+                Event::Focus(focused) => {
+                    app.set_host_focused(focused);
+                    AppAction::Continue
+                }
             };
             match action {
                 AppAction::Quit => return Ok(Outcome::Quit),

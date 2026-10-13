@@ -526,6 +526,36 @@ test "embedded terminal keeps the latest clipboard write for the host" {
     try std.testing.expectEqual(@as(usize, 0), try terminal.drainResponses(&response));
 }
 
+test "embedded terminal keeps the bell and the latest notification for the host" {
+    const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 20, .rows = 4 });
+    defer terminal.deinit();
+    var required: usize = 0;
+    var out: [32]u8 = undefined;
+    try std.testing.expect(!terminal.takeBell());
+    try std.testing.expectEqual(@as(?usize, null), terminal.takeNotification(&out, &required));
+
+    try terminal.write("\x07");
+    try std.testing.expect(terminal.takeBell());
+    try std.testing.expect(!terminal.takeBell());
+
+    // OSC 9 has only a body; OSC 777's body wins over its title. The
+    // latest wins.
+    try terminal.write("\x1b]9;first\x07\x1b]777;notify;Claude Code;Waiting for input\x1b\\");
+    var short: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, null), terminal.takeNotification(&short, &required));
+    try std.testing.expectEqual(@as(usize, 17), required);
+    var len = terminal.takeNotification(&out, &required).?;
+    try std.testing.expectEqualStrings("Waiting for input", out[0..len]);
+    try std.testing.expectEqual(@as(?usize, null), terminal.takeNotification(&out, &required));
+
+    // Without a body, the title; with neither, it's still pending.
+    try terminal.write("\x1b]777;notify;Done;\x07");
+    len = terminal.takeNotification(&out, &required).?;
+    try std.testing.expectEqualStrings("Done", out[0..len]);
+    try terminal.write("\x1b]777;notify;;\x07");
+    try std.testing.expectEqual(@as(?usize, 0), terminal.takeNotification(&out, &required));
+}
+
 comptime {
     _ = ghostty;
 }
