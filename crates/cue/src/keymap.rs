@@ -81,6 +81,7 @@ commands! {
     Undo => "editor:undo", "Undo";
     Redo => "editor:redo", "Redo";
     Copy => "editor:copy", "Copy";
+    CopyReference => "editor:copy-reference", "Copy Reference";
     Cut => "editor:cut", "Cut";
     Paste => "editor:paste", "Paste";
     SelectAll => "editor:select-all", "Select All";

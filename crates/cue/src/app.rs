@@ -1172,6 +1172,7 @@ impl App {
             Command::GoToSymbol => self.show_picker(Mode::Symbols),
             Command::GoToWorkspaceSymbol => self.show_picker(Mode::WorkspaceSymbols),
             Command::GoToDefinition => self.go_to_definition(),
+            Command::CopyReference => return self.copy_reference(),
             Command::GoToTerminal => self.show_picker(Mode::Terminals),
             Command::Palette => self.show_picker(Mode::Commands),
             Command::SearchWorkspace => self.show_search(),
@@ -6811,7 +6812,11 @@ impl App {
                 true => [item(Cut, "Cut"), item(Copy, "Copy")],
                 false => [item(Cut, "Cut Line"), item(Copy, "Copy Line")],
             });
-            items.extend([item(Paste, "Paste"), MenuItem::Separator]);
+            items.push(item(Paste, "Paste"));
+            if editor.path().is_some() {
+                items.push(item(CopyReference, "Copy Reference"));
+            }
+            items.push(MenuItem::Separator);
             let comments = doc.language.get().and_then(|l| l.line_comment());
             if comments.is_some() {
                 items.push(item(ToggleComment, "Toggle Line Comment"));
@@ -6932,6 +6937,27 @@ impl App {
             _ => {}
         }
         AppAction::Continue
+    }
+
+    /// Copies where the selection, or the cursor's line, is, as the file's
+    /// path relative to its root and the lines: `src/main.rs:257-265`.
+    fn copy_reference(&mut self) -> AppAction {
+        let Some(editor) = self.editor().filter(|e| !e.reading() && !e.diffing()) else {
+            return AppAction::Continue;
+        };
+        let Some(path) = editor.path() else {
+            self.show_message("The file has no path yet.".to_string(), false);
+            return AppAction::Continue;
+        };
+        let lines = match editor.selected_lines() {
+            (first, last) if first == last => first.to_string(),
+            (first, last) => format!("{first}-{last}"),
+        };
+        let relative = match self.workspace.root_of(&path) {
+            Some(root) => path.strip_prefix(root).unwrap_or(&path),
+            None => &path,
+        };
+        self.copy_path(format!("{}:{lines}", relative.display()))
     }
 
     /// Puts the path `text` on the clipboard.
@@ -12373,6 +12399,26 @@ mod tests {
             _ => panic!("nothing copied"),
         }
         assert_eq!(app.clipboard.as_deref(), Some("dir/a.txt"));
+    }
+
+    #[test]
+    fn copy_reference_copies_the_path_and_lines() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-reference", &[("dir/a.txt", "one\ntwo\nthree\nfour\n")]);
+        let mut app = tall_app(&root, Some("dir/a.txt"));
+        let copied = |app: &mut App| match app.run(Command::CopyReference, false) {
+            AppAction::Copy(text) => text,
+            _ => panic!("nothing copied"),
+        };
+        cursor_to(&mut app, 2, 1);
+        assert_eq!(copied(&mut app), "dir/a.txt:2");
+        app.run(Command::CursorDown, true);
+        app.run(Command::CursorDown, true);
+        // The selection ends at the start of line 4, so it's lines 2 to 3.
+        assert_eq!(copied(&mut app), "dir/a.txt:2-3");
+        app.run(Command::CursorRight, true);
+        assert_eq!(copied(&mut app), "dir/a.txt:2-4");
+        assert_eq!(app.clipboard.as_deref(), Some("dir/a.txt:2-4"));
     }
 
     #[test]

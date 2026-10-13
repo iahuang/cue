@@ -363,6 +363,24 @@ impl Editor {
             .map(|_| self.view.selected_text())
     }
 
+    /// The lines (1-based, inclusive) holding the selection, or with
+    /// nothing selected, the cursor's line. A selection ending at the start
+    /// of a line doesn't include that line.
+    pub fn selected_lines(&self) -> (u32, u32) {
+        let eb = &*self.buffer;
+        let row = |offset| eb.offset_to_position(offset).map(|p| (p.row, p.col));
+        let selection = self.view.selection().filter(|(s, e)| s != e);
+        let Some((Some(start), Some(end))) = selection.map(|(s, e)| (row(s), row(e))) else {
+            let row = self.cursor().0;
+            return (row + 1, row + 1);
+        };
+        let last = match end {
+            (row, 0) if row > start.0 => row - 1,
+            (row, _) => row,
+        };
+        (start.0 + 1, last + 1)
+    }
+
     /// Selects the bytes `range` of line `row` (0-based), or puts the
     /// cursor at its start if it's empty. A line off screen is scrolled to
     /// a third of the way down.
