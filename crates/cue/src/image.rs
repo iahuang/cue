@@ -16,9 +16,12 @@
 //! end, staying zoomed. Pages are rendered as large as they're drawn, so
 //! that they're sharp at any zoom: whole, unless that's much more than
 //! fits on screen, and then the part of them on screen and around it,
-//! with the whole page as it fits besides. That happens on another
-//! thread, which renders the pages just off screen too; meanwhile, what
-//! was rendered last of each page is drawn, stretched to where it is now.
+//! with the whole page as it fits besides. Nothing's rendered larger than
+//! [`MAX_RENDER_PIXELS`], which on a large screen may leave out what's
+//! around the part on screen. That happens on another
+//! thread, which renders the pages just off screen too, and while they're
+//! zoomed, waits for the zooming to stop; meanwhile, what was rendered
+//! last of each page is drawn, stretched to where it is now.
 //!
 //! When the file changes, as a PDF does when LaTeX builds it again, it's
 //! read again, staying where it was scrolled and zoomed to. Until the
@@ -26,14 +29,14 @@
 //! doesn't read, as one half written may not, leaves what's shown as it
 //! is until it changes again.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use opentui::{Buffer, Image};
 
@@ -64,6 +67,12 @@ const GAP: u32 = 1;
 /// How many times the panel's cells a page may take and still be rendered
 /// whole.
 const WHOLE_PAGE: u64 = 2;
+/// The most pixels rendered at once: well under the most OpenTUI takes in
+/// an image, and few enough to send to the terminal quickly.
+const MAX_RENDER_PIXELS: u64 = 16_000_000;
+/// How long after a PDF's pages last zoomed they're rendered at their new
+/// size, so as not to render each step of the zooming.
+const ZOOM_SETTLE: Duration = Duration::from_millis(120);
 
 /// Whether `path` is opened as an image, going by its extension: a
 /// picture, or a PDF.
@@ -107,6 +116,8 @@ struct Pages {
     at: (f64, f64),
     /// Where a drag that moves the pages started.
     drag: Option<Drag>,
+    /// When they last zoomed.
+    zoomed: Cell<Option<Instant>>,
     renderer: Renderer<Render>,
     /// What's rendered of the pages on screen and around them.
     rendered: RefCell<HashMap<usize, Renders>>,
@@ -399,6 +410,7 @@ impl Pages {
             scale: None,
             at: (0.0, 0.0),
             drag: None,
+            zoomed: Cell::new(None),
             rendered: RefCell::default(),
             stale: RefCell::default(),
             asked: RefCell::default(),
@@ -575,6 +587,7 @@ impl Pages {
         let down = layout.at((mouse.1 - origin.1) / cell_h);
         let layout = Layout::new(&self.sizes, scale, cell);
         self.scale = (scale > fit).then_some(scale);
+        self.zoomed.set(Some(Instant::now()));
         let origin = (
             mouse.0 - across * scale,
             mouse.1 - layout.down(down) * cell_h,
@@ -730,7 +743,7 @@ impl Pages {
                 .get(&page)
                 .and_then(|renders| renders.whole.as_ref())
                 .map(|(render, _)| render.size);
-            let size = match fits_whole((cols, rows), area) {
+            let size = match fits_whole((cols, rows), cell, area) {
                 true => (cols, rows),
                 false if whole.is_none() => (fit.pages[page].0, fit.pages[page].1),
                 false => continue,
@@ -740,8 +753,16 @@ impl Pages {
             }
         }
         if *self.asked.borrow() != wanted {
-            self.renderer
-                .ask(wanted.iter().map(|&render| self.job(render)).collect());
+            let zooming = self
+                .zoomed
+                .get()
+                .is_some_and(|at| at.elapsed() < ZOOM_SETTLE);
+            let settle = match zooming {
+                true => ZOOM_SETTLE,
+                false => Duration::ZERO,
+            };
+            let jobs = wanted.iter().map(|&render| self.job(render)).collect();
+            self.renderer.ask(jobs, settle);
             *self.asked.borrow_mut() = wanted;
         }
     }
@@ -846,7 +867,10 @@ enum Layer {
 
 /// What's drawn of a page, bottom first, while `want` of it is wanted, of
 /// `whole` and `part` as rendered last: either if it has all of `want`, or
-/// else both, stretched to where they are now.
+/// else both, stretched to where they are now. But not `part` if it's
+/// rendered more than twice as large as it's drawn and `whole` is
+/// rendered, as it'd be scaled down to send to the terminal each time it's
+/// drawn.
 fn layers(want: Render, whole: Option<Render>, part: Option<Render>) -> Vec<Layer> {
     let rendered = [(Layer::Whole, whole), (Layer::Part, part)];
     let rendered = rendered
@@ -855,14 +879,22 @@ fn layers(want: Render, whole: Option<Render>, part: Option<Render>) -> Vec<Laye
     if let Some((layer, _)) = rendered.clone().find(|(_, render)| render.covers(want)) {
         return vec![layer];
     }
-    rendered.map(|(layer, _)| layer).collect()
+    let (cols, rows) = want.size;
+    let shrunk = |render: Render| {
+        render.size.0 as u64 * render.size.1 as u64 >= 4 * cols as u64 * rows as u64
+    };
+    rendered
+        .filter(|&(layer, render)| layer == Layer::Whole || whole.is_none() || !shrunk(render))
+        .map(|(layer, _)| layer)
+        .collect()
 }
 
 /// What to render of a page in `area` so that `want` of it is drawn as
 /// large as it's drawn, if what's rendered of it, `whole` and `part`,
 /// won't do: the whole page if it's not much larger than `area`, and
-/// otherwise around `want` (as far as half `area` past it each way), and
-/// the whole page at `fit_size`, if none of it is rendered whole.
+/// otherwise around `want` (as far as a quarter of `area` past it each
+/// way, unless that's more than [`MAX_RENDER_PIXELS`]), and the whole page
+/// at `fit_size`, if none of it is rendered whole.
 fn wants(
     want: Render,
     fit_size: (u32, u32),
@@ -872,7 +904,7 @@ fn wants(
 ) -> Vec<Render> {
     let covered = |want| [whole, part].into_iter().flatten().any(|r| r.covers(want));
     let (cols, rows) = want.size;
-    if fits_whole(want.size, area) {
+    if fits_whole(want.size, want.cell, area) {
         return match covered(want) {
             true => vec![],
             false => vec![Render::whole(want.page, want.size, want.cell)],
@@ -881,8 +913,8 @@ fn wants(
     let mut wants = Vec::new();
     if !covered(want) {
         let around = |at: u32, size: u32, room: u32, most: u32| {
-            let start = at.saturating_sub(room / 2);
-            (start, (at + size + room / 2).min(most) - start)
+            let start = at.saturating_sub(room / 4);
+            (start, (at + size + room / 4).min(most) - start)
         };
         let (x, width) = around(want.part.x, want.part.width, area.width, cols);
         let (y, height) = around(want.part.y, want.part.height, area.height, rows);
@@ -892,6 +924,10 @@ fn wants(
             width,
             height,
         };
+        let part = match pixels((width, height), want.cell) <= MAX_RENDER_PIXELS {
+            true => part,
+            false => want.part,
+        };
         wants.push(Render { part, ..want });
     }
     if whole.is_none() {
@@ -900,9 +936,16 @@ fn wants(
     wants
 }
 
-/// Whether a page `size` cells large is rendered whole in `area`.
-fn fits_whole(size: (u32, u32), area: Rect) -> bool {
+/// Whether a page `size` cells large is rendered whole in `area`, with
+/// cells `cell` pixels in size.
+fn fits_whole(size: (u32, u32), cell: (u32, u32), area: Rect) -> bool {
     size.0 as u64 * size.1 as u64 <= WHOLE_PAGE * area.width as u64 * area.height as u64
+        && pixels(size, cell) <= MAX_RENDER_PIXELS
+}
+
+/// How many pixels `size` cells are, with cells `cell` pixels in size.
+fn pixels(size: (u32, u32), cell: (u32, u32)) -> u64 {
+    size.0 as u64 * cell.0 as u64 * size.1 as u64 * cell.1 as u64
 }
 
 /// The part of something `placed` that's in `area`, in cells from its
@@ -1412,6 +1455,11 @@ mod tests {
         let around = render(0, (40, 40), (10, 10, 20, 20));
         assert_eq!(layers(want, Some(fit), Some(around)), [Layer::Part]);
         assert_eq!(layers(want, None, None), []);
+        // Zoomed out to less than half that, the whole page alone, unless
+        // that's not rendered.
+        let out = render(0, (19, 19), (4, 4, 10, 10));
+        assert_eq!(layers(out, Some(fit), Some(around)), [Layer::Whole]);
+        assert_eq!(layers(out, None, Some(around)), [Layer::Part]);
     }
 
     #[test]
@@ -1432,14 +1480,37 @@ mod tests {
         // Much larger, what's on screen and around it is, and the whole
         // page as it fits if none of it is rendered whole.
         let want = render(0, (40, 40), (15, 15, 10, 10));
-        let around = render(0, (40, 40), (10, 10, 20, 20));
+        let around = render(0, (40, 40), (13, 13, 14, 14));
         assert_eq!(wants(want, (10, 10), None, None, area), [around, fit]);
         assert_eq!(wants(want, (10, 10), Some(whole), None, area), [around]);
         assert_eq!(wants(want, (10, 10), Some(fit), Some(around), area), []);
         // Around it only as far as the page goes.
         let corner = render(0, (40, 40), (0, 30, 10, 10));
-        let around = render(0, (40, 40), (0, 25, 15, 15));
+        let around = render(0, (40, 40), (0, 28, 12, 12));
         assert_eq!(wants(corner, (10, 10), Some(fit), None, area), [around]);
+    }
+
+    #[test]
+    fn nothing_too_many_pixels_is_rendered() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        // Cells 300 pixels square, as if on a very large screen: the panel
+        // is 9 million pixels, and a little more than it, too many.
+        let large = |page, size, (x, y, width, height)| Render {
+            cell: (300, 300),
+            ..render(page, size, (x, y, width, height))
+        };
+        let fit = large(0, (10, 10), (0, 0, 10, 10));
+        // A page a little larger than the panel isn't rendered whole.
+        let some = large(0, (14, 14), (2, 2, 10, 10));
+        assert_eq!(wants(some, (10, 10), Some(fit), None, area), [some]);
+        // Nor is what's around what's on screen.
+        let want = large(0, (40, 40), (15, 15, 10, 10));
+        assert_eq!(wants(want, (10, 10), Some(fit), None, area), [want]);
     }
 
     #[test]
@@ -1534,7 +1605,7 @@ mod tests {
 
         // Rendered again, the page is drawn as it is now.
         let render = Render::whole(0, (10, 10), CELL);
-        new.renderer.ask(vec![new.job(render)]);
+        new.renderer.ask(vec![new.job(render)], Duration::ZERO);
         let start = std::time::Instant::now();
         while !new.stale.borrow().is_empty() {
             assert!(start.elapsed().as_secs() < 10, "nothing rendered");

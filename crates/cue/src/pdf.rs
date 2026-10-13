@@ -5,6 +5,8 @@
 //!
 //! Pages render on a thread of their own, which wakes the main loop when
 //! one's done, as a page full of images can take a good part of a second.
+//! While they're zoomed, what's asked for waits until the zooming stops,
+//! as each step of it changes their size.
 
 use hayro::hayro_interpret::util::TransformExt;
 use hayro::hayro_interpret::InterpreterSettings;
@@ -15,8 +17,9 @@ use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, Tar
 use hayro::{RenderCache, RenderSettings};
 
 use std::collections::VecDeque;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::crash;
 use crate::wake;
@@ -105,27 +108,42 @@ pub type Rendered<T> = (Job<T>, Result<Vec<u8>, String>);
 /// Renders a PDF's pages on a thread of its own, which ends when this is
 /// dropped and what it's rendering is done. Jobs are asked for in lists,
 /// rendered in order, and a list asked for replaces what's left of the
-/// last: it's rendered after the job rendering now.
+/// last: it's rendered after the job rendering now, once it's been
+/// `settle` without a newer one.
 pub struct Renderer<T> {
-    jobs: Sender<Vec<Job<T>>>,
+    jobs: Sender<(Vec<Job<T>>, Duration)>,
     done: Receiver<Rendered<T>>,
 }
 
 impl<T: Send + 'static> Renderer<T> {
     pub fn new(pdf: Arc<Pdf>) -> Renderer<T> {
-        let (jobs, asked) = mpsc::channel::<Vec<Job<T>>>();
+        let (jobs, asked) = mpsc::channel::<(Vec<Job<T>>, Duration)>();
         let (finished, done) = mpsc::channel();
         std::thread::spawn(move || {
             let mut jobs = VecDeque::new();
             loop {
-                if let Some(newer) = asked.try_iter().last() {
-                    jobs = newer.into();
-                }
-                let Some(job) = jobs.pop_front() else {
+                let mut newer = asked.try_iter().last();
+                if newer.is_none() && jobs.is_empty() {
                     match asked.recv() {
-                        Ok(newer) => jobs = newer.into(),
+                        Ok(list) => newer = Some(list),
                         Err(_) => return,
                     }
+                }
+                // Each list waits out its settle for a newer one.
+                while let Some((list, settle)) = newer.take() {
+                    if !settle.is_zero() {
+                        match asked.recv_timeout(settle) {
+                            Ok(list) => {
+                                newer = Some(list);
+                                continue;
+                            }
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    jobs = list.into();
+                }
+                let Some(job) = jobs.pop_front() else {
                     continue;
                 };
                 let rendered = pdf.render(job.page, job.scale, job.from, job.size);
@@ -139,9 +157,10 @@ impl<T: Send + 'static> Renderer<T> {
     }
 
     /// Asks for `jobs` to be rendered, in order, after what's rendering
-    /// now and instead of what was asked for before.
-    pub fn ask(&self, jobs: Vec<Job<T>>) {
-        let _ = self.jobs.send(jobs);
+    /// now and instead of what was asked for before, once `settle` passes
+    /// without asking again.
+    pub fn ask(&self, jobs: Vec<Job<T>>, settle: Duration) {
+        let _ = self.jobs.send((jobs, settle));
     }
 
     /// What's been rendered since the last call, oldest first, as RGBA
@@ -272,8 +291,8 @@ mod tests {
             size: (10, 10),
         };
         wake::take();
-        renderer.ask(vec![job("red", 0), job("blank", 1)]);
-        renderer.ask(vec![job("first", 0), job("second", 1)]);
+        renderer.ask(vec![job("red", 0), job("blank", 1)], Duration::ZERO);
+        renderer.ask(vec![job("first", 0), job("second", 1)], Duration::ZERO);
         let mut done = Vec::new();
         let start = std::time::Instant::now();
         while done
@@ -300,6 +319,32 @@ mod tests {
             };
             assert_eq!(pixel(&rendered.unwrap(), 10, 5, 5), color, "{}", job.tag);
         }
+    }
+
+    #[test]
+    fn what_waits_to_settle_is_replaced_by_what_is_asked_for_meanwhile() {
+        let _serial = crate::test_serial();
+        let pdf = Pdf::open(test_pdf(&[((100, 100), RED_100)])).unwrap();
+        let renderer = Renderer::new(Arc::new(pdf));
+        let job = |tag| Job {
+            tag,
+            page: 0,
+            scale: (1.0, 1.0),
+            from: (0.0, 0.0),
+            size: (10, 10),
+        };
+        let settle = Duration::from_millis(200);
+        renderer.ask(vec![job("zooming")], settle);
+        renderer.ask(vec![job("zoomed")], settle);
+        let start = std::time::Instant::now();
+        let mut done = Vec::new();
+        while done.is_empty() {
+            assert!(start.elapsed().as_secs() < 10, "nothing rendered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            done.extend(renderer.finished().map(|(job, _)| job.tag));
+        }
+        assert!(start.elapsed() >= settle);
+        assert_eq!(done, ["zoomed"]);
     }
 
     #[test]
