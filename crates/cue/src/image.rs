@@ -21,7 +21,8 @@
 //! around the part on screen. That happens on another
 //! thread, which renders the pages just off screen too, and while they're
 //! zoomed, waits for the zooming to stop; meanwhile, what was rendered
-//! last of each page is drawn, stretched to where it is now.
+//! last of each page is drawn, stretched to where it is now. But not
+//! shrunk much: the page as it fits stands in for that, as zooming out.
 //!
 //! The find bar (Ctrl+F) finds in a PDF's text, as the terminal's does in
 //! its output, read from the pages on another thread as they're found in.
@@ -171,10 +172,12 @@ struct Find {
     seek: bool,
 }
 
-/// What's rendered of a page: the whole of it, and a part of it, each as
+/// What's rendered of a page: the whole of it no larger than the panel,
+/// as when it fits, the whole of it larger, and a part of it, each as
 /// rendered last, at whatever size.
 #[derive(Default)]
 struct Renders {
+    fit: Option<Shot>,
     whole: Option<Shot>,
     part: Option<Shot>,
 }
@@ -182,19 +185,47 @@ struct Renders {
 impl Renders {
     fn get(&self, layer: Layer) -> Option<&Shot> {
         match layer {
+            Layer::Fit => self.fit.as_ref(),
             Layer::Whole => self.whole.as_ref(),
             Layer::Part => self.part.as_ref(),
         }
     }
 
-    /// What's rendered, whole and in part.
-    fn renders(&self) -> (Option<Render>, Option<Render>) {
+    /// What's rendered, by layer.
+    fn renders(&self) -> Rendered {
         let render = |slot: &Option<Shot>| slot.as_ref().map(|shot| shot.render);
-        (render(&self.whole), render(&self.part))
+        Rendered {
+            fit: render(&self.fit),
+            whole: render(&self.whole),
+            part: render(&self.part),
+        }
     }
 
     fn shots_mut(&mut self) -> impl Iterator<Item = &mut Shot> {
-        self.whole.iter_mut().chain(self.part.iter_mut())
+        let slots = [&mut self.fit, &mut self.whole, &mut self.part];
+        slots.into_iter().flatten()
+    }
+}
+
+/// What's rendered of a page, as in [`Renders`].
+#[derive(Debug, Clone, Copy, Default)]
+struct Rendered {
+    fit: Option<Render>,
+    whole: Option<Render>,
+    part: Option<Render>,
+}
+
+impl Rendered {
+    /// Each layer with what's rendered of it, bottom first.
+    fn layers(self) -> impl Iterator<Item = (Layer, Render)> + Clone {
+        let layers = [
+            (Layer::Fit, self.fit),
+            (Layer::Whole, self.whole),
+            (Layer::Part, self.part),
+        ];
+        layers
+            .into_iter()
+            .filter_map(|(layer, render)| Some((layer, render?)))
     }
 }
 
@@ -879,6 +910,7 @@ impl Pages {
                     let mut rendered = self.rendered.borrow_mut();
                     let renders = rendered.entry(render.page).or_default();
                     let slot = match render.is_whole() {
+                        true if fits_panel(render.size, self.area.get()) => &mut renders.fit,
                         true => &mut renders.whole,
                         false => &mut renders.part,
                     };
@@ -930,12 +962,11 @@ impl Pages {
                 cell,
             };
             let renders = rendered.get(&page);
-            let (whole, part) = renders.map_or((None, None), Renders::renders);
+            let now = renders.map_or_else(Rendered::default, Renders::renders);
             // Until any of it's rendered again, what was before it changed.
             let drawn = renders.or(stale.get(&page));
             if let Some(drawn) = drawn {
-                let (whole, part) = drawn.renders();
-                for layer in layers(want, whole, part) {
+                for layer in layers(want, drawn.renders()) {
                     if let Some(shot) = drawn.get(layer) {
                         let image = self.marked(shot);
                         let (x, y, cols, rows) = drawn_now(shot.render, placed);
@@ -945,7 +976,7 @@ impl Pages {
             }
             if !failed.contains_key(&page) {
                 let fit_size = (fit.pages[page].0, fit.pages[page].1);
-                wanted.extend(wants(want, fit_size, whole, part, area));
+                wanted.extend(wants(want, fit_size, now, area));
             }
         }
         // The pages just off screen, whole, so they're there to scroll to.
@@ -957,16 +988,15 @@ impl Pages {
                 continue;
             }
             // Any whole page does for one too large to render whole.
-            let whole = rendered
-                .get(&page)
-                .and_then(|renders| renders.whole.as_ref())
-                .map(|shot| shot.render.size);
+            let now = rendered.get(&page).map(Renders::renders);
+            let wholes = now.into_iter().flat_map(|now| [now.fit, now.whole]);
+            let sizes: Vec<_> = wholes.flatten().map(|render| render.size).collect();
             let size = match fits_whole((cols, rows), cell, area) {
                 true => (cols, rows),
-                false if whole.is_none() => (fit.pages[page].0, fit.pages[page].1),
+                false if sizes.is_empty() => (fit.pages[page].0, fit.pages[page].1),
                 false => continue,
             };
-            if whole != Some(size) {
+            if !sizes.contains(&size) {
                 wanted.push(Render::whole(page, size, cell));
             }
         }
@@ -1481,21 +1511,18 @@ fn highlight(rgba: &mut [u8], job: &Job<Render>, rect: kurbo::Rect, color: [u8; 
 /// What [`layers`] draws: what's rendered of a page in [`Renders`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Layer {
+    Fit,
     Whole,
     Part,
 }
 
 /// What's drawn of a page, bottom first, while `want` of it is wanted, of
-/// `whole` and `part` as rendered last: either if it has all of `want`, or
-/// else both, stretched to where they are now. But not `part` if it's
-/// rendered more than twice as large as it's drawn and `whole` is
-/// rendered, as it'd be scaled down to send to the terminal each time it's
-/// drawn.
-fn layers(want: Render, whole: Option<Render>, part: Option<Render>) -> Vec<Layer> {
-    let rendered = [(Layer::Whole, whole), (Layer::Part, part)];
-    let rendered = rendered
-        .into_iter()
-        .filter_map(|(layer, render)| Some((layer, render?)));
+/// what's `rendered` of it last: a layer if it has all of `want`, or else
+/// each, stretched to where they are now. But not, above the bottom one,
+/// any rendered more than twice as large as it's drawn, as it'd be scaled
+/// down to send to the terminal each time it's drawn, as when zooming out.
+fn layers(want: Render, rendered: Rendered) -> Vec<Layer> {
+    let rendered = rendered.layers();
     if let Some((layer, _)) = rendered.clone().find(|(_, render)| render.covers(want)) {
         return vec![layer];
     }
@@ -1504,25 +1531,20 @@ fn layers(want: Render, whole: Option<Render>, part: Option<Render>) -> Vec<Laye
         render.size.0 as u64 * render.size.1 as u64 >= 4 * cols as u64 * rows as u64
     };
     rendered
-        .filter(|&(layer, render)| layer == Layer::Whole || whole.is_none() || !shrunk(render))
-        .map(|(layer, _)| layer)
+        .enumerate()
+        .filter(|&(index, (_, render))| index == 0 || !shrunk(render))
+        .map(|(_, (layer, _))| layer)
         .collect()
 }
 
 /// What to render of a page in `area` so that `want` of it is drawn as
-/// large as it's drawn, if what's rendered of it, `whole` and `part`,
-/// won't do: the whole page if it's not much larger than `area`, and
-/// otherwise around `want` (as far as a quarter of `area` past it each
-/// way, unless that's more than [`MAX_RENDER_PIXELS`]), and the whole page
-/// at `fit_size`, if none of it is rendered whole.
-fn wants(
-    want: Render,
-    fit_size: (u32, u32),
-    whole: Option<Render>,
-    part: Option<Render>,
-    area: Rect,
-) -> Vec<Render> {
-    let covered = |want| [whole, part].into_iter().flatten().any(|r| r.covers(want));
+/// large as it's drawn, if what's `rendered` of it won't do: the whole
+/// page if it's not much larger than `area`, and otherwise around `want`
+/// (as far as a quarter of `area` past it each way, unless that's more
+/// than [`MAX_RENDER_PIXELS`]), and the whole page at `fit_size`, if it's
+/// not rendered as it fits, to stand in for the rest.
+fn wants(want: Render, fit_size: (u32, u32), rendered: Rendered, area: Rect) -> Vec<Render> {
+    let covered = |want| rendered.layers().any(|(_, render)| render.covers(want));
     let (cols, rows) = want.size;
     if fits_whole(want.size, want.cell, area) {
         return match covered(want) {
@@ -1550,10 +1572,16 @@ fn wants(
         };
         wants.push(Render { part, ..want });
     }
-    if whole.is_none() {
+    if rendered.fit.is_none() {
         wants.push(Render::whole(want.page, fit_size, want.cell));
     }
     wants
+}
+
+/// Whether a page `size` cells large is no larger than `area`, but for
+/// rounding, as when it fits.
+fn fits_panel(size: (u32, u32), area: Rect) -> bool {
+    size.0 as u64 * size.1 as u64 <= (area.width as u64 + 1) * (area.height as u64 + 1)
 }
 
 /// Whether a page `size` cells large is rendered whole in `area`, with
@@ -2044,6 +2072,12 @@ mod tests {
         }
     }
 
+    /// What's rendered of a page, as it fits, whole and larger, and in
+    /// part.
+    fn rendered(fit: Option<Render>, whole: Option<Render>, part: Option<Render>) -> Rendered {
+        Rendered { fit, whole, part }
+    }
+
     #[test]
     fn what_was_rendered_stands_in_where_it_is_now() {
         let fit = render(0, (10, 10), (0, 0, 10, 10));
@@ -2062,24 +2096,34 @@ mod tests {
     fn the_whole_page_stands_in_under_what_was_rendered() {
         let fit = render(0, (10, 10), (0, 0, 10, 10));
         // Fit, the whole page is what's rendered.
-        assert_eq!(layers(fit, Some(fit), None), [Layer::Whole]);
+        assert_eq!(layers(fit, rendered(Some(fit), None, None)), [Layer::Fit]);
         // Zoomed four times, with the middle rendered at twice: the whole
         // page under that.
         let want = render(0, (40, 40), (15, 15, 10, 10));
         let less = render(0, (20, 20), (5, 5, 10, 10));
         assert_eq!(
-            layers(want, Some(fit), Some(less)),
-            [Layer::Whole, Layer::Part]
+            layers(want, rendered(Some(fit), None, Some(less))),
+            [Layer::Fit, Layer::Part]
         );
         // Until what's wanted is rendered, or more around it.
         let around = render(0, (40, 40), (10, 10, 20, 20));
-        assert_eq!(layers(want, Some(fit), Some(around)), [Layer::Part]);
-        assert_eq!(layers(want, None, None), []);
-        // Zoomed out to less than half that, the whole page alone, unless
-        // that's not rendered.
+        let both = rendered(Some(fit), None, Some(around));
+        assert_eq!(layers(want, both), [Layer::Part]);
+        assert_eq!(layers(want, Rendered::default()), []);
+        // Zoomed out to less than half that, the page as it fits alone,
+        // unless that's not rendered.
         let out = render(0, (19, 19), (4, 4, 10, 10));
-        assert_eq!(layers(out, Some(fit), Some(around)), [Layer::Whole]);
-        assert_eq!(layers(out, None, Some(around)), [Layer::Part]);
+        assert_eq!(layers(out, both), [Layer::Fit]);
+        assert_eq!(
+            layers(out, rendered(None, None, Some(around))),
+            [Layer::Part]
+        );
+        // So too the whole page rendered larger.
+        let large = render(0, (40, 40), (0, 0, 40, 40));
+        let all = rendered(Some(fit), Some(large), Some(around));
+        assert_eq!(layers(out, all), [Layer::Fit]);
+        let some = render(0, (30, 30), (10, 10, 10, 10));
+        assert_eq!(layers(some, all), [Layer::Fit, Layer::Whole, Layer::Part]);
     }
 
     #[test]
@@ -2091,23 +2135,30 @@ mod tests {
             height: 10,
         };
         let fit = render(0, (10, 10), (0, 0, 10, 10));
-        assert_eq!(wants(fit, (10, 10), None, None, area), [fit]);
-        assert_eq!(wants(fit, (10, 10), Some(fit), None, area), []);
+        let none = Rendered::default();
+        assert_eq!(wants(fit, (10, 10), none, area), [fit]);
+        let fitted = rendered(Some(fit), None, None);
+        assert_eq!(wants(fit, (10, 10), fitted, area), []);
         // A little larger, the whole of it is rendered, at its size.
         let some = render(0, (14, 14), (2, 2, 10, 10));
         let whole = render(0, (14, 14), (0, 0, 14, 14));
-        assert_eq!(wants(some, (10, 10), Some(fit), None, area), [whole]);
+        assert_eq!(wants(some, (10, 10), fitted, area), [whole]);
         // Much larger, what's on screen and around it is, and the whole
-        // page as it fits if none of it is rendered whole.
+        // page as it fits if that's not rendered, even if it's rendered
+        // whole larger.
         let want = render(0, (40, 40), (15, 15, 10, 10));
         let around = render(0, (40, 40), (13, 13, 14, 14));
-        assert_eq!(wants(want, (10, 10), None, None, area), [around, fit]);
-        assert_eq!(wants(want, (10, 10), Some(whole), None, area), [around]);
-        assert_eq!(wants(want, (10, 10), Some(fit), Some(around), area), []);
+        assert_eq!(wants(want, (10, 10), none, area), [around, fit]);
+        let larger = rendered(None, Some(whole), None);
+        assert_eq!(wants(want, (10, 10), larger, area), [around, fit]);
+        let larger = rendered(Some(fit), Some(whole), None);
+        assert_eq!(wants(want, (10, 10), larger, area), [around]);
+        let both = rendered(Some(fit), None, Some(around));
+        assert_eq!(wants(want, (10, 10), both, area), []);
         // Around it only as far as the page goes.
         let corner = render(0, (40, 40), (0, 30, 10, 10));
         let around = render(0, (40, 40), (0, 28, 12, 12));
-        assert_eq!(wants(corner, (10, 10), Some(fit), None, area), [around]);
+        assert_eq!(wants(corner, (10, 10), fitted, area), [around]);
     }
 
     #[test]
@@ -2127,10 +2178,11 @@ mod tests {
         let fit = large(0, (10, 10), (0, 0, 10, 10));
         // A page a little larger than the panel isn't rendered whole.
         let some = large(0, (14, 14), (2, 2, 10, 10));
-        assert_eq!(wants(some, (10, 10), Some(fit), None, area), [some]);
+        let fitted = rendered(Some(fit), None, None);
+        assert_eq!(wants(some, (10, 10), fitted, area), [some]);
         // Nor is what's around what's on screen.
         let want = large(0, (40, 40), (15, 15, 10, 10));
-        assert_eq!(wants(want, (10, 10), Some(fit), None, area), [want]);
+        assert_eq!(wants(want, (10, 10), fitted, area), [want]);
     }
 
     #[test]
@@ -2326,6 +2378,7 @@ mod tests {
         let image = Rc::new(Image::from_rgba(1, 1, &[255; 4]).unwrap());
         for page in [0, 2] {
             let renders = Renders {
+                fit: None,
                 whole: Some(Shot {
                     render: Render::whole(page, (10, 10), CELL),
                     image: image.clone(),
