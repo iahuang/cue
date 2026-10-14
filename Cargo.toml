@@ -6,6 +6,10 @@ members = ["crates/opentui-sys", "crates/opentui", "crates/cue"]
 edition = "2021"
 license = "MIT"
 
+# Full DWARF made target/debug grow by gigabytes per build; backtraces keep file:line.
+[profile.dev]
+debug = "line-tables-only"
+
 # Distributed binaries (deployment/build.sh); plain `release` stays fast to build.
 [profile.dist]
 inherits = "release"
