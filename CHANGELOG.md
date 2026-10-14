@@ -7,7 +7,7 @@
 - Copy Reference in the editor's context menu, which copies the selection's or cursor line's location, like `src/main.rs:257-265` (`818eaa3`)
 - Find in PDFs with Ctrl+F, highlighting matches on the pages (`78ea5c0`)
 - Smaller debug builds, keeping only line tables (`8c6f7ee`)
-- Fix stutter zooming out of PDFs on high-resolution screens
+- Fix stutter zooming out of PDFs on high-resolution screens (`7541939`)
 
 ## v0.4.2 — 2026-10-11
 
