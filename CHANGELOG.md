@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.3 — 2026-10-14
 
 - Mark terminals whose bell rings or that send a notification (OSC 9 or 777), with a status bar badge that goes to them (`a3bff59`)
 - Fix laggy PDF zooming on high-resolution screens, and pages going blank when zoomed far in (`37fc2c7`)
