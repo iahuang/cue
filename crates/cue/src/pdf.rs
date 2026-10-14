@@ -7,16 +7,24 @@
 //! one's done, as a page full of images can take a good part of a second.
 //! While they're zoomed, what's asked for waits until the zooming stops,
 //! as each step of it changes their size.
+//!
+//! Their text, to find in, is read likewise, with where each glyph is.
 
-use hayro::hayro_interpret::util::TransformExt;
-use hayro::hayro_interpret::InterpreterSettings;
+use hayro::hayro_interpret::font::{Glyph, GlyphRun};
+use hayro::hayro_interpret::hayro_cmap::BfString;
+use hayro::hayro_interpret::util::{RectExt, TransformExt};
+use hayro::hayro_interpret::{
+    interpret_page, BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image,
+    ImageDrawProps, InterpreterCache, InterpreterSettings, SoftMask,
+};
 use hayro::hayro_syntax::{DecryptionError, LoadPdfError, Pdf as Parsed};
-use hayro::kurbo::Affine;
+use hayro::kurbo::{self, Affine, BezPath, Point};
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, TargetInit};
 use hayro::{RenderCache, RenderSettings};
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,6 +96,199 @@ impl Pdf {
             pixmap.data_as_u8_slice().to_vec()
         })
         .map_err(|panic| format!("Can't render this page: {panic}"))
+    }
+}
+
+impl Pdf {
+    /// Page `page`'s text, as far as its fonts say what their glyphs are.
+    pub fn text(&self, page: usize) -> Result<PageText, String> {
+        let page = &self.parsed.pages()[page];
+        crash::contain(|| {
+            let cache = InterpreterCache::new();
+            let mut context = Context::new(
+                page.initial_transform(true).to_kurbo(),
+                page.intersected_crop_box().to_kurbo(),
+                &cache,
+                page.xref(),
+                InterpreterSettings::default(),
+            );
+            let mut extractor = TextExtractor::default();
+            interpret_page(page, &mut context, &mut extractor);
+            extractor.text
+        })
+        .map_err(|panic| format!("Can't read this page's text: {panic}"))
+    }
+}
+
+/// A page's text, for finding in, and where each part of it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PageText {
+    /// Its glyphs' characters, in the order the page draws them. Words and
+    /// lines are a space apart, so that what's found can span them.
+    pub text: String,
+    /// Where each glyph is: from the byte its characters start at, and in
+    /// points from the page's top-left corner, as the page is shown. In
+    /// order. The spaces put between words and lines have none.
+    pub boxes: Vec<(usize, kurbo::Rect)>,
+}
+
+impl PageText {
+    /// Where the text in bytes `range` is, as a box around each line of
+    /// it, in points from the page's top-left corner.
+    pub fn rects(&self, range: Range<usize>) -> Vec<kurbo::Rect> {
+        let first = self.boxes.partition_point(|&(at, _)| at < range.start);
+        let mut rects: Vec<kurbo::Rect> = Vec::new();
+        for &(_, glyph) in self.boxes[first..]
+            .iter()
+            .take_while(|&&(at, _)| at < range.end)
+        {
+            // The same line as the last: across from its middle.
+            let middle = (glyph.y0 + glyph.y1) / 2.0;
+            match rects.last_mut() {
+                Some(rect) if rect.y0 < middle && middle < rect.y1 => *rect = rect.union(glyph),
+                _ => rects.push(glyph),
+            }
+        }
+        rects
+    }
+}
+
+/// How far below and above the baseline a glyph's box goes, in thousandths
+/// of the font size: as most fonts' letters do.
+const DESCENT: f64 = 220.0;
+const ASCENT: f64 = 780.0;
+/// How wide a glyph without a width is taken to be, likewise.
+const DEFAULT_ADVANCE: f64 = 500.0;
+/// How far past a glyph, in thousandths of the font size, the next starts
+/// a new word.
+const WORD_GAP: f64 = 150.0;
+
+/// A device that takes in the text that would be drawn, rather than
+/// drawing it.
+#[derive(Default)]
+struct TextExtractor {
+    text: PageText,
+    /// The last glyph taken in: where its baseline starts and ends, and
+    /// its font size, in points.
+    last: Option<(Point, Point, f64)>,
+    /// The last run of glyphs taken in, by where its first is and how
+    /// many it has: a run filled and stroked comes twice.
+    last_run: Option<(Affine, usize)>,
+}
+
+impl TextExtractor {
+    /// Takes in a glyph, that's `chars`, placed by `transform` from its
+    /// thousandths of the font size, and `advance` of them wide.
+    fn glyph(&mut self, chars: &str, transform: Affine, advance: f64) {
+        let start = transform * Point::ZERO;
+        let end = transform * Point::new(advance, 0.0);
+        let size = (transform * Point::new(0.0, 1000.0) - start).hypot();
+        if let Some((last_start, last_end, last_size)) = self.last {
+            let text = &mut self.text.text;
+            let size = size.max(last_size);
+            // Along the last glyph's baseline, and how far off it.
+            let along = last_end - last_start;
+            let along = match along.hypot() {
+                length if length > 0.0 => along / length,
+                _ => kurbo::Vec2::new(1.0, 0.0),
+            };
+            let gap = (start - last_end).dot(along);
+            let off = (start - last_end).cross(along).abs();
+            let same_line = off < size / 2.0 && gap > -size / 2.0;
+            let spaced =
+                text.ends_with(char::is_whitespace) || chars.starts_with(char::is_whitespace);
+            if !spaced && (!same_line || gap > size * WORD_GAP / 1000.0) {
+                text.push(' ');
+            }
+        }
+        let corners = [
+            (0.0, -DESCENT),
+            (advance, -DESCENT),
+            (0.0, ASCENT),
+            (advance, ASCENT),
+        ]
+        .map(|(x, y)| transform * Point::new(x, y));
+        let rect = corners[1..].iter().fold(
+            kurbo::Rect::from_points(corners[0], corners[0]),
+            |rect, &corner| rect.union_pt(corner),
+        );
+        self.text.boxes.push((self.text.text.len(), rect));
+        self.text.text.push_str(chars);
+        self.last = Some((start, end, size));
+    }
+}
+
+impl<'a> Device<'a> for TextExtractor {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, _: &DrawMode) {
+        let glyphs = run.glyphs();
+        let Some(first) = glyphs.first() else {
+            return;
+        };
+        let this_run = (props.transform * first.transform(), glyphs.len());
+        if self.last_run.replace(this_run) == Some(this_run) {
+            return;
+        }
+        for glyph in glyphs {
+            let Some(chars) = glyph.as_unicode() else {
+                continue;
+            };
+            let chars = match chars {
+                BfString::Char(c) => c.to_string(),
+                BfString::String(s) => s,
+            };
+            // Control characters, as some fonts map glyphs to, aren't text.
+            if chars.is_empty() || chars.chars().all(char::is_control) {
+                continue;
+            }
+            let advance = match &**glyph {
+                Glyph::Outline(outline) => outline.advance_width(),
+                Glyph::Type3(_) => None,
+            };
+            let advance = advance
+                .map(f64::from)
+                .filter(|&advance| advance > 0.0)
+                .unwrap_or(DEFAULT_ADVANCE);
+            self.glyph(&chars, props.transform * glyph.transform(), advance);
+        }
+    }
+
+    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
+
+    fn pop_clip(&mut self) {}
+
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// Reads a PDF's pages' text on a thread of its own, first to last, which
+/// ends when this is dropped or it's read them all.
+pub struct TextReader {
+    done: Receiver<(usize, Result<PageText, String>)>,
+}
+
+impl TextReader {
+    pub fn new(pdf: Arc<Pdf>) -> TextReader {
+        let (read, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            for page in 0..pdf.pages() {
+                if read.send((page, pdf.text(page))).is_err() {
+                    return;
+                }
+                wake::wake();
+            }
+        });
+        TextReader { done }
+    }
+
+    /// The pages read since the last call, in order, with their text or
+    /// why it couldn't be read.
+    pub fn finished(&self) -> impl Iterator<Item = (usize, Result<PageText, String>)> + '_ {
+        self.done.try_iter()
     }
 }
 
@@ -189,7 +390,7 @@ fn reason(err: LoadPdfError) -> &'static str {
 }
 
 /// A PDF of `pages`, each `width` x `height` points and drawn by its
-/// content stream.
+/// content stream, which can write in Helvetica as `/F1`.
 #[cfg(test)]
 pub fn test_pdf(pages: &[((u32, u32), &str)]) -> Vec<u8> {
     let mut objects = vec![
@@ -201,7 +402,7 @@ pub fn test_pdf(pages: &[((u32, u32), &str)]) -> Vec<u8> {
         let page = objects.len() + 1;
         kids.push(format!("{page} 0 R"));
         objects.push(format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] /Contents {} 0 R >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] /Resources {HELVETICA} /Contents {} 0 R >>",
             page + 1
         ));
         objects.push(format!(
@@ -231,6 +432,11 @@ pub fn test_pdf(pages: &[((u32, u32), &str)]) -> Vec<u8> {
     );
     pdf.into_bytes()
 }
+
+/// Resources with Helvetica as font `/F1`.
+#[cfg(test)]
+const HELVETICA: &str =
+    "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>";
 
 /// Content filling a 100 x 100 point page with red.
 #[cfg(test)]
@@ -345,6 +551,61 @@ mod tests {
         }
         assert!(start.elapsed() >= settle);
         assert_eq!(done, ["zoomed"]);
+    }
+
+    #[test]
+    fn text_has_its_words_and_lines_a_space_apart() {
+        // Two lines, 12 points high, the first's words spaced by moving
+        // along rather than with a space.
+        let content = "BT /F1 12 Tf 10 80 Td [(Hello) -400 (world)] TJ 0 -20 Td (next line) Tj ET";
+        let pdf = Pdf::open(test_pdf(&[((200, 100), content)])).unwrap();
+        let text = pdf.text(0).unwrap();
+        assert_eq!(text.text, "Hello world next line");
+
+        // A word: on the first line, its baseline 20 points from the top.
+        let world = text.text.find("world").unwrap();
+        let rects = text.rects(world..world + 5);
+        assert_eq!(rects.len(), 1, "{rects:?}");
+        let rect = rects[0];
+        assert!(rect.x0 > 40.0 && rect.x1 < 100.0, "{rect:?}");
+        assert!(rect.y0 < 20.0 && 20.0 < rect.y1, "{rect:?}");
+        assert!(rect.y0 > 5.0 && rect.y1 < 25.0, "{rect:?}");
+
+        // Across lines: a box on each.
+        let rects = text.rects(world..text.text.len());
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        assert!(rects[1].y0 > rect.y1 - 2.0, "{rects:?}");
+        assert_eq!(rects[1].x0, 10.0);
+    }
+
+    #[test]
+    fn text_drawn_twice_is_read_once() {
+        // Filled and stroked.
+        let content = "BT /F1 12 Tf 2 Tr 10 50 Td (twice) Tj ET";
+        let pdf = Pdf::open(test_pdf(&[((100, 100), content)])).unwrap();
+        assert_eq!(pdf.text(0).unwrap().text, "twice");
+        assert_eq!(pdf.text(0).unwrap().boxes.len(), 5);
+    }
+
+    #[test]
+    fn pages_text_is_read_on_its_own_thread() {
+        let _serial = crate::test_serial();
+        let page = |text| format!("BT /F1 12 Tf 10 50 Td ({text}) Tj ET");
+        let content = [page("one"), page("two")];
+        let content: Vec<_> = content.iter().map(|c| ((100, 100), c.as_str())).collect();
+        let reader = TextReader::new(Arc::new(Pdf::open(test_pdf(&content)).unwrap()));
+        let mut read = Vec::new();
+        let start = std::time::Instant::now();
+        while read.len() < 2 {
+            assert!(start.elapsed().as_secs() < 10, "nothing read");
+            std::thread::sleep(Duration::from_millis(5));
+            read.extend(
+                reader
+                    .finished()
+                    .map(|(page, text)| (page, text.unwrap().text)),
+            );
+        }
+        assert_eq!(read, [(0, "one".to_string()), (1, "two".to_string())]);
     }
 
     #[test]

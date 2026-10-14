@@ -603,6 +603,25 @@ impl QueryInput for Terminal {
     }
 }
 
+/// A PDF's find bar's query.
+impl QueryInput for ImageView {
+    fn edit(&mut self, edit: Edit) {
+        self.find_edit(edit);
+    }
+
+    fn edit_selecting(&mut self, edit: Edit) {
+        self.find_edit_selecting(edit);
+    }
+
+    fn select_all(&mut self) {
+        self.find_select_all();
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        self.find_selected_text()
+    }
+}
+
 impl QueryInput for SearchModal {
     fn edit(&mut self, edit: Edit) {
         SearchModal::edit(self, edit);
@@ -907,6 +926,7 @@ impl App {
             _ if self.picker.is_some() => Context::Picker,
             Focus::Tree => Context::Tree,
             Focus::Editor if self.finding_terminal().is_some() => Context::Find,
+            Focus::Editor if self.finding_image() => Context::Find,
             Focus::Editor => self
                 .editor()
                 .and_then(Editor::find_field)
@@ -1031,6 +1051,12 @@ impl App {
                 .dialog
                 .as_mut()
                 .map(|dialog| dialog as &mut dyn QueryInput);
+        }
+        if self.finding_image() {
+            return self
+                .active_panel_mut()
+                .image_mut()
+                .map(|image| image as &mut dyn QueryInput);
         }
         if self.focus != Focus::Editor || self.editor().and_then(Editor::find_field).is_none() {
             return None;
@@ -1298,6 +1324,9 @@ impl App {
                 if let Some(terminal) = self.active_terminal() {
                     // Output can't be replaced; it can be found.
                     terminal.borrow_mut().show_find(&memory);
+                } else if let Some(image) = self.findable_image_mut() {
+                    // Nor can a PDF's text.
+                    image.show_find(&memory);
                 } else if let Some(editor) = self.editor_mut() {
                     editor.show_find(&memory, replacing);
                 }
@@ -1315,6 +1344,8 @@ impl App {
                     // As in other terminals, the next match is the one
                     // above, further back in the output.
                     terminal.borrow_mut().find_step(&memory, forward);
+                } else if let Some(image) = self.findable_image_mut() {
+                    image.find_step(&memory, forward);
                 } else if let Some(editor) = self.editor_mut() {
                     editor.find_step(&memory, forward);
                 }
@@ -1322,6 +1353,26 @@ impl App {
             Command::FindClose if self.active_terminal().is_some() => {
                 if let Some(terminal) = self.active_terminal() {
                     terminal.borrow_mut().close_find();
+                }
+            }
+            Command::FindClose if self.active_panel().image().is_some() => {
+                if let Some(image) = self.active_panel_mut().image_mut() {
+                    image.close_find();
+                }
+            }
+            command
+                if Toggle::for_command(command).is_some()
+                    && self.search.is_none()
+                    && self
+                        .active_panel()
+                        .image()
+                        .is_some_and(ImageView::find_open) =>
+            {
+                if let (Some(image), Some(toggle)) = (
+                    self.active_panel_mut().image_mut(),
+                    Toggle::for_command(command),
+                ) {
+                    image.find_toggle(toggle);
                 }
             }
             command
@@ -2282,6 +2333,8 @@ impl App {
                 let panel = self.tab().panels.iter().find(|panel| panel.id == id)?;
                 if let Some(terminal) = panel.terminal() {
                     terminal.borrow().hover_find(x, y)
+                } else if let Some(image) = panel.image() {
+                    image.hover_find(x, y)
                 } else {
                     panel.editor()?.hover_find(x, y)
                 }
@@ -2361,6 +2414,11 @@ impl App {
         let mut changed = self.toasts.expire(now);
         // A thread finished something to show, such as a PDF's page.
         changed |= wake::take();
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            if let Some(image) = panel.image_mut() {
+                changed |= image.poll();
+            }
+        }
         changed |= self
             .switcher
             .as_mut()
@@ -3826,9 +3884,10 @@ impl App {
     /// Keeps the find bar's query for finding in other files and
     /// terminals.
     fn note_find_memory(&mut self) {
-        let memory = match self.active_terminal() {
-            Some(terminal) => terminal.borrow().find_memory().cloned(),
-            None => self.editor().and_then(Editor::find_memory).cloned(),
+        let memory = match (self.active_terminal(), self.active_panel().image()) {
+            (Some(terminal), _) => terminal.borrow().find_memory().cloned(),
+            (None, Some(image)) => image.find_memory().cloned(),
+            (None, None) => self.editor().and_then(Editor::find_memory).cloned(),
         };
         if let Some(memory) = memory {
             if memory != self.find_memory {
@@ -7347,6 +7406,15 @@ impl App {
 
     /// The terminal keys go to, if one has the keyboard.
     fn keyboard_terminal(&self) -> Option<Rc<RefCell<Terminal>>> {
+        if !self.panel_has_keyboard() {
+            return None;
+        }
+        self.active_terminal()
+    }
+
+    /// Whether the active panel has the keyboard: it's focused, with no
+    /// popup open.
+    fn panel_has_keyboard(&self) -> bool {
         let popup = self.picker.is_some()
             || self.alert.is_some()
             || self.search.is_some()
@@ -7354,10 +7422,23 @@ impl App {
             || self.menu.is_some()
             || self.switcher.is_some()
             || self.input.is_some();
-        if self.focus != Focus::Editor || popup {
-            return None;
-        }
-        self.active_terminal()
+        self.focus == Focus::Editor && !popup
+    }
+
+    /// Whether a PDF's find bar has the keyboard.
+    fn finding_image(&self) -> bool {
+        self.panel_has_keyboard()
+            && self
+                .active_panel()
+                .image()
+                .is_some_and(ImageView::find_focused)
+    }
+
+    /// The PDF in the active panel, to find in, if it shows one.
+    fn findable_image_mut(&mut self) -> Option<&mut ImageView> {
+        self.active_panel_mut()
+            .image_mut()
+            .filter(|image| image.findable())
     }
 
     /// Copies the active terminal's selection, or pastes the last text
@@ -10352,6 +10433,60 @@ mod tests {
     }
 
     #[test]
+    fn find_in_a_pdf_goes_through_its_pages() {
+        let _serial = crate::test_serial();
+        let root = fixture("pdf-find", &[("a.txt", "alpha")]);
+        let content: Vec<_> = ["one", "two needle", "three", "needle four"]
+            .iter()
+            .map(|text| format!("BT /F1 10 Tf 10 85 Td ({text}) Tj ET"))
+            .collect();
+        let pages: Vec<_> = content.iter().map(|c| ((100, 100), c.as_str())).collect();
+        fs::write(root.join("paper.pdf"), crate::pdf::test_pdf(&pages)).unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        assert!(app.open(&root.join("paper.pdf"), false));
+        assert!(screen(&app).contains("Page 1 of 4"), "{}", screen(&app));
+
+        // Ctrl+F opens the bar, which takes what's typed.
+        ctrl(&mut app, 'f');
+        type_text(&mut app, "needle");
+        wait_until(&mut app, "the matches", |app| {
+            screen(app).contains("1 of 2")
+        });
+        let text = screen(&app);
+        assert!(text.contains("Page 2 of 4"), "{text}");
+        let image = |app: &App| app.active_panel().image().unwrap().find_memory().cloned();
+        assert_eq!(image(&app).unwrap().query.text, "needle");
+        assert_eq!(app.find_memory.query.text, "needle", "remembered");
+
+        // Enter goes to the next, Shift+Enter back.
+        key(&mut app, KeyCode::Enter);
+        let text = screen(&app);
+        assert!(
+            text.contains("2 of 2") && text.contains("Page 4 of 4"),
+            "{text}"
+        );
+        app.handle_key(Key::new(KeyCode::Enter, Mods::SHIFT));
+        assert!(screen(&app).contains("Page 2 of 4"), "{}", screen(&app));
+
+        // Clicking the pages gives them the keyboard, leaving the bar.
+        let body = app.active_panel().body();
+        left_click(&mut app, body.x + 1, body.y + body.height - 1);
+        assert!(!app.finding_image());
+        assert!(image(&app).is_some());
+        key(&mut app, KeyCode::End);
+        assert!(screen(&app).contains("Page 4 of 4"), "{}", screen(&app));
+        // The shortcut focuses it again, then closes it; so does Esc.
+        ctrl(&mut app, 'f');
+        assert!(app.finding_image());
+        ctrl(&mut app, 'f');
+        assert!(image(&app).is_none());
+        ctrl(&mut app, 'f');
+        key(&mut app, KeyCode::Esc);
+        assert!(image(&app).is_none());
+        assert!(!screen(&app).contains("of 2"), "{}", screen(&app));
+    }
+
+    #[test]
     fn pdfs_are_read_again_when_they_change() {
         let _serial = crate::test_serial();
         let root = fixture("pdf-changes", &[("a.txt", "a")]);
@@ -12404,7 +12539,10 @@ mod tests {
     #[test]
     fn copy_reference_copies_the_path_and_lines() {
         let _serial = crate::test_serial();
-        let root = fixture("menu-reference", &[("dir/a.txt", "one\ntwo\nthree\nfour\n")]);
+        let root = fixture(
+            "menu-reference",
+            &[("dir/a.txt", "one\ntwo\nthree\nfour\n")],
+        );
         let mut app = tall_app(&root, Some("dir/a.txt"));
         let copied = |app: &mut App| match app.run(Command::CopyReference, false) {
             AppAction::Copy(text) => text,

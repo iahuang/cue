@@ -766,10 +766,9 @@ impl Panel {
             self.draw_buttons(frame, active);
             if let Some(image) = &self.image {
                 let body = self.body();
-                frame.with_clip(body.x, body.y, body.width, body.height, || {
-                    image.draw(frame, body)
+                return frame.with_clip(body.x, body.y, body.width, body.height, || {
+                    image.draw(frame, body, active, keymap)
                 });
-                return None;
             }
             if let Some(commit) = &self.commit {
                 let body = self.body();

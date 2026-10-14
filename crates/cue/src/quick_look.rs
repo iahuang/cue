@@ -189,7 +189,9 @@ impl QuickLook {
                 Body::Text(editor) => {
                     editor.draw(frame, keymap);
                 }
-                Body::Image(image) => image.draw(frame, body),
+                Body::Image(image) => {
+                    image.draw(frame, body, false, keymap);
+                }
                 Body::Folder(entries, scroll) => draw_folder(frame, body, entries, *scroll),
                 Body::Note(note) => {
                     let width = note.chars().count() as u32;

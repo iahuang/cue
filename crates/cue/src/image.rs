@@ -23,6 +23,11 @@
 //! zoomed, waits for the zooming to stop; meanwhile, what was rendered
 //! last of each page is drawn, stretched to where it is now.
 //!
+//! The find bar (Ctrl+F) finds in a PDF's text, as the terminal's does in
+//! its output, read from the pages on another thread as they're found in.
+//! What's found is highlighted on the rendered pages, the current match
+//! in another color, and going to a match scrolls it into view.
+//!
 //! When the file changes, as a PDF does when LaTeX builds it again, it's
 //! read again, staying where it was scrolled and zoomed to. Until the
 //! pages are rendered again, they're drawn as they were. A file that
@@ -38,13 +43,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use hayro::kurbo;
 use opentui::{Buffer, Image};
 
 use crate::config;
+use crate::find::{self, Field, FindBar, Match};
 use crate::input::{Mouse, MouseButton, MouseKind};
-use crate::keymap::Command;
+use crate::keymap::{Command, Keymap};
 use crate::layout::Rect;
-use crate::pdf::{Job, Pdf, Renderer};
+use crate::line_edit::Edit;
+use crate::pdf::{Job, PageText, Pdf, Renderer, TextReader};
+use crate::search::Toggle;
 use crate::status::Status;
 use crate::tty;
 
@@ -70,6 +79,10 @@ const WHOLE_PAGE: u64 = 2;
 /// The most pixels rendered at once: well under the most OpenTUI takes in
 /// an image, and few enough to send to the terminal quickly.
 const MAX_RENDER_PIXELS: u64 = 16_000_000;
+/// The colors what's found in a PDF is highlighted in: the current match,
+/// and the others.
+const CURRENT_MARK: [u8; 3] = [255, 150, 50];
+const MARK: [u8; 3] = [255, 230, 90];
 /// How long after a PDF's pages last zoomed they're rendered at their new
 /// size, so as not to render each step of the zooming.
 const ZOOM_SETTLE: Duration = Duration::from_millis(120);
@@ -128,18 +141,46 @@ struct Pages {
     asked: RefCell<Vec<Render>>,
     /// The pages that can't be rendered, and why.
     failed: RefCell<HashMap<usize, String>>,
+    pdf: Arc<Pdf>,
+    /// Reads the pages' text, once finding needs it.
+    reader: Option<TextReader>,
+    /// Each page's text, once it's read.
+    texts: Vec<Option<PageText>>,
+    /// Counts the pages read, so the find bar knows when to find again.
+    read: u64,
+    /// The find bar, while it's open.
+    find: Option<Find>,
+    /// Counts changes to what's found or which match is current, so that
+    /// what's highlighted is drawn again.
+    marks: u64,
+    /// The area they were last drawn in, to go to what's found in.
+    area: Cell<Rect>,
+}
+
+/// The find bar, and where what it found is. A match's row is its page,
+/// and its bytes are in the page's text.
+struct Find {
+    bar: FindBar,
+    /// Where each match is on its page, in points: a box around each line
+    /// of it.
+    rects: Vec<Vec<kurbo::Rect>>,
+    current: Option<usize>,
+    /// Whether to go to the first match from the bar's origin, its page,
+    /// once there is one: the query changed, and its pages may not all be
+    /// read yet.
+    seek: bool,
 }
 
 /// What's rendered of a page: the whole of it, and a part of it, each as
 /// rendered last, at whatever size.
 #[derive(Default)]
 struct Renders {
-    whole: Option<(Render, Rc<Image>)>,
-    part: Option<(Render, Rc<Image>)>,
+    whole: Option<Shot>,
+    part: Option<Shot>,
 }
 
 impl Renders {
-    fn get(&self, layer: Layer) -> Option<&(Render, Rc<Image>)> {
+    fn get(&self, layer: Layer) -> Option<&Shot> {
         match layer {
             Layer::Whole => self.whole.as_ref(),
             Layer::Part => self.part.as_ref(),
@@ -148,9 +189,23 @@ impl Renders {
 
     /// What's rendered, whole and in part.
     fn renders(&self) -> (Option<Render>, Option<Render>) {
-        let render = |slot: &Option<(Render, Rc<Image>)>| slot.as_ref().map(|(render, _)| *render);
+        let render = |slot: &Option<Shot>| slot.as_ref().map(|shot| shot.render);
         (render(&self.whole), render(&self.part))
     }
+
+    fn shots_mut(&mut self) -> impl Iterator<Item = &mut Shot> {
+        self.whole.iter_mut().chain(self.part.iter_mut())
+    }
+}
+
+/// What's rendered of a page, as an image to draw.
+struct Shot {
+    render: Render,
+    image: Rc<Image>,
+    /// Its pixels, kept while finding, to highlight what's found on them.
+    rgba: Option<Vec<u8>>,
+    /// The image with what's found highlighted, as of [`Pages::marks`].
+    marked: RefCell<Option<(u64, Rc<Image>)>>,
 }
 
 /// What of a page is rendered, and how large.
@@ -303,19 +358,136 @@ impl ImageView {
         self.path = path;
     }
 
-    /// Draws the image or pages in `area`, clipped to it.
-    pub fn draw(&self, frame: &Buffer, area: Rect) {
+    /// Draws the image or pages in `area`, clipped to it, and a PDF's find
+    /// bar over them. Returns where the terminal cursor goes, if `focused`
+    /// and the bar's query is.
+    pub fn draw(
+        &self,
+        frame: &Buffer,
+        area: Rect,
+        focused: bool,
+        keymap: &Keymap,
+    ) -> Option<(u32, u32)> {
         let cell = cell_pixels();
         let image = match &self.shown {
             Shown::Image(image) => image,
-            Shown::Pdf(pages) => return pages.draw(frame, cell, area),
+            Shown::Pdf(pages) => {
+                pages.draw(frame, cell, area);
+                return pages.draw_find(frame, area, keymap).filter(|_| focused);
+            }
         };
-        let Some(placed) = place(size(image), IMAGE_SCALES, self.zoom, cell, area) else {
-            return;
-        };
+        let placed = place(size(image), IMAGE_SCALES, self.zoom, cell, area)?;
         let (cols, rows) = (placed.cols, placed.rows);
         let (x, y) = (placed.x as i32, placed.y as i32);
         frame.draw_image(image, x, y, cols, rows, cols * cell.0, rows * cell.1);
+        None
+    }
+
+    fn pages(&self) -> Option<&Pages> {
+        match &self.shown {
+            Shown::Pdf(pages) => Some(pages),
+            Shown::Image(_) => None,
+        }
+    }
+
+    fn pages_mut(&mut self) -> Option<&mut Pages> {
+        match &mut self.shown {
+            Shown::Pdf(pages) => Some(pages),
+            Shown::Image(_) => None,
+        }
+    }
+
+    /// Catches up on reading a PDF's text to find in. Returns whether
+    /// there's more to show.
+    pub fn poll(&mut self) -> bool {
+        self.pages_mut().is_some_and(Pages::poll)
+    }
+
+    // --- finding in a PDF ------------------------------------------------------
+
+    /// Whether it can be found in: it's a PDF.
+    pub fn findable(&self) -> bool {
+        self.pages().is_some()
+    }
+
+    /// Opens a PDF's find bar with `memory`'s query, and focuses it; with
+    /// it focused already, closes it (see [`Pages::show_find`]).
+    pub fn show_find(&mut self, memory: &find::Memory) {
+        if let Some(pages) = self.pages_mut() {
+            pages.show_find(memory);
+        }
+    }
+
+    /// Goes to the next match, or with `forward` false, the one before
+    /// (see [`Pages::find_step`]).
+    pub fn find_step(&mut self, memory: &find::Memory, forward: bool) {
+        if let Some(pages) = self.pages_mut() {
+            pages.find_step(memory, forward);
+        }
+    }
+
+    /// The find bar's query, while it's open.
+    pub fn find_memory(&self) -> Option<&find::Memory> {
+        Some(&self.pages()?.find.as_ref()?.bar.memory)
+    }
+
+    pub fn find_open(&self) -> bool {
+        self.pages().is_some_and(|pages| pages.find.is_some())
+    }
+
+    /// Whether the find bar has the keyboard.
+    pub fn find_focused(&self) -> bool {
+        self.pages().is_some_and(Pages::find_focused)
+    }
+
+    /// Edits the query: typing, pasting, deleting, or moving the cursor.
+    pub fn find_edit(&mut self, edit: Edit) {
+        if let Some(pages) = self.pages_mut() {
+            if let Some(bar) = pages.find_bar_mut() {
+                bar.edit(edit);
+            }
+            pages.sync_find();
+        }
+    }
+
+    /// Edits the query with Shift held: moving the cursor selects.
+    pub fn find_edit_selecting(&mut self, edit: Edit) {
+        if let Some(bar) = self.pages_mut().and_then(Pages::find_bar_mut) {
+            bar.edit_selecting(edit);
+        }
+    }
+
+    /// Selects all of the query.
+    pub fn find_select_all(&mut self) {
+        if let Some(bar) = self.pages_mut().and_then(Pages::find_bar_mut) {
+            bar.select_all();
+        }
+    }
+
+    /// The part of the query selected.
+    pub fn find_selected_text(&self) -> Option<&str> {
+        self.pages()?.find.as_ref()?.bar.selected_text()
+    }
+
+    pub fn find_toggle(&mut self, toggle: Toggle) {
+        if let Some(pages) = self.pages_mut() {
+            if let Some(bar) = pages.find_bar_mut() {
+                bar.toggle(toggle);
+            }
+            pages.sync_find();
+        }
+    }
+
+    /// Closes the find bar, leaving the pages where they are.
+    pub fn close_find(&mut self) {
+        if let Some(pages) = self.pages_mut() {
+            pages.close_find();
+        }
+    }
+
+    /// The find bar's button under the pointer, in screen coordinates.
+    pub fn hover_find(&self, x: u32, y: u32) -> Option<Rect> {
+        self.pages()?.hover_find(x, y)
     }
 
     /// The wheel zooms, around the mouse, and the left button drags the
@@ -404,9 +576,17 @@ impl ImageView {
 
 impl Pages {
     fn new(pdf: Pdf) -> Pages {
+        let pdf = Arc::new(pdf);
         Pages {
             sizes: (0..pdf.pages()).map(|page| pdf.page_size(page)).collect(),
-            renderer: Renderer::new(Arc::new(pdf)),
+            renderer: Renderer::new(pdf.clone()),
+            texts: vec![None; pdf.pages()],
+            pdf,
+            reader: None,
+            read: 0,
+            find: None,
+            marks: 0,
+            area: Cell::default(),
             scale: None,
             at: (0.0, 0.0),
             drag: None,
@@ -430,6 +610,16 @@ impl Pages {
         stale.extend(old.rendered.into_inner());
         stale.retain(|&page, _| page < self.sizes.len());
         self.stale = RefCell::new(stale);
+        self.area = old.area;
+        self.marks = old.marks + 1;
+        // Finding in it again, but not going anywhere for it.
+        self.find = old.find.map(|mut find| {
+            find.bar.epoch = Some(u64::MAX);
+            find
+        });
+        if self.find.is_some() {
+            self.reader = Some(TextReader::new(self.pdf.clone()));
+        }
     }
 
     /// The scale that fits each page in `area`, with cells `cell` pixels
@@ -535,6 +725,9 @@ impl Pages {
     /// pages around. `mouse` is in screen cells, and the pages are in
     /// `area`.
     fn handle_mouse(&mut self, mouse: Mouse, cell: (u32, u32), area: Rect) {
+        if self.handle_find_mouse(mouse, area) {
+            return;
+        }
         let lines = config::get().scroll_lines as f64;
         let (across, down) = (lines * cell.0 as f64, lines * cell.1 as f64);
         match mouse.kind {
@@ -628,6 +821,8 @@ impl Pages {
             Command::DocumentStart | Command::LineStart => 0.0,
             // Past the last page, which keeps it at its end.
             Command::DocumentEnd | Command::LineEnd => self.sizes.len() as f64,
+            // Esc, as in the editor.
+            Command::ClearSelection => return self.close_find(),
             _ => return,
         };
         self.at = (-self.origin(&layout, cell, area).0 / layout.scale, at);
@@ -637,6 +832,18 @@ impl Pages {
     /// are zoomed past fitting, or why the page can't be shown.
     fn status(&self, bytes: u64, cell: (u32, u32), area: Rect) -> Status {
         self.take_finished();
+        // While typing a query that isn't a valid regex, why.
+        if let Some(error) = self
+            .find
+            .as_ref()
+            .filter(|find| find.bar.focus.is_some())
+            .and_then(|find| find.bar.error())
+        {
+            return Status::Message {
+                text: format!("Invalid regex: {error}"),
+                error: true,
+            };
+        }
         let page = self.current(cell, area);
         if let Some(reason) = self.failed.borrow().get(&page) {
             return Status::Message {
@@ -656,22 +863,31 @@ impl Pages {
 
     /// Takes what the renderer finished.
     fn take_finished(&self) {
+        let keep = self.find.is_some();
         for (job, rendered) in self.renderer.finished() {
             let render = job.tag;
             self.asked.borrow_mut().retain(|asked| *asked != render);
             self.stale.borrow_mut().remove(&render.page);
             let image = rendered.and_then(|rgba| {
-                Image::from_rgba(job.size.0, job.size.1, &rgba).map_err(|err| err.to_string())
+                let image = Image::from_rgba(job.size.0, job.size.1, &rgba);
+                image
+                    .map(|image| (image, rgba))
+                    .map_err(|err| err.to_string())
             });
             match image {
-                Ok(image) => {
+                Ok((image, rgba)) => {
                     let mut rendered = self.rendered.borrow_mut();
                     let renders = rendered.entry(render.page).or_default();
                     let slot = match render.is_whole() {
                         true => &mut renders.whole,
                         false => &mut renders.part,
                     };
-                    *slot = Some((render, Rc::new(image)));
+                    *slot = Some(Shot {
+                        render,
+                        image: Rc::new(image),
+                        rgba: keep.then_some(rgba),
+                        marked: RefCell::default(),
+                    });
                 }
                 Err(reason) => {
                     self.failed.borrow_mut().insert(render.page, reason);
@@ -684,6 +900,7 @@ impl Pages {
     /// isn't to be: of them, and of the pages just above and below them.
     /// Forgets what's rendered of the pages further away.
     fn draw(&self, frame: &Buffer, cell: (u32, u32), area: Rect) {
+        self.area.set(area);
         self.take_finished();
         let Some(layout) = self.layout(cell, area) else {
             return;
@@ -719,9 +936,10 @@ impl Pages {
             if let Some(drawn) = drawn {
                 let (whole, part) = drawn.renders();
                 for layer in layers(want, whole, part) {
-                    if let Some((render, image)) = drawn.get(layer) {
-                        let (x, y, cols, rows) = drawn_now(*render, placed);
-                        frame.draw_image(image, x, y, cols, rows, cols * cell.0, rows * cell.1);
+                    if let Some(shot) = drawn.get(layer) {
+                        let image = self.marked(shot);
+                        let (x, y, cols, rows) = drawn_now(shot.render, placed);
+                        frame.draw_image(&image, x, y, cols, rows, cols * cell.0, rows * cell.1);
                     }
                 }
             }
@@ -742,7 +960,7 @@ impl Pages {
             let whole = rendered
                 .get(&page)
                 .and_then(|renders| renders.whole.as_ref())
-                .map(|(render, _)| render.size);
+                .map(|shot| shot.render.size);
             let size = match fits_whole((cols, rows), cell, area) {
                 true => (cols, rows),
                 false if whole.is_none() => (fit.pages[page].0, fit.pages[page].1),
@@ -782,6 +1000,387 @@ impl Pages {
             from: (part.x as f64 * cell_w, part.y as f64 * cell_h),
             size: (part.width * render.cell.0, part.height * render.cell.1),
         }
+    }
+
+    /// `shot`'s image, with what's found on its page highlighted.
+    fn marked(&self, shot: &Shot) -> Rc<Image> {
+        let (Some(find), Some(rgba)) = (&self.find, &shot.rgba) else {
+            return shot.image.clone();
+        };
+        let page = shot.render.page as u32;
+        let matches = &find.bar.matches;
+        let first = matches.partition_point(|m| m.row < page);
+        let count = matches[first..].partition_point(|m| m.row == page);
+        if count == 0 {
+            return shot.image.clone();
+        }
+        if let Some((marks, image)) = &*shot.marked.borrow() {
+            if *marks == self.marks {
+                return image.clone();
+            }
+        }
+        let job = self.job(shot.render);
+        let mut rgba = rgba.clone();
+        for index in first..first + count {
+            let color = match find.current == Some(index) {
+                true => CURRENT_MARK,
+                false => MARK,
+            };
+            for &rect in &find.rects[index] {
+                highlight(&mut rgba, &job, rect, color);
+            }
+        }
+        let image = match Image::from_rgba(job.size.0, job.size.1, &rgba) {
+            Ok(image) => Rc::new(image),
+            Err(_) => shot.image.clone(),
+        };
+        *shot.marked.borrow_mut() = Some((self.marks, image.clone()));
+        image
+    }
+}
+
+impl Pages {
+    // --- finding -------------------------------------------------------------
+
+    /// Opens the find bar with `memory`'s query, selected, and focuses it,
+    /// going to the first match from the page most on screen. With the
+    /// query focused already, it closes the bar.
+    fn show_find(&mut self, memory: &find::Memory) {
+        if self.find_focused() {
+            return self.close_find();
+        }
+        let page = self.current(cell_pixels(), self.area.get()) as u32;
+        self.open_find(memory);
+        if let Some(find) = &mut self.find {
+            find.bar.focus = Some(Field::Find);
+            find.bar.origin = page;
+            // Typing replaces the query.
+            find.bar.select_query();
+        }
+        self.sync_find();
+    }
+
+    /// Opens the find bar, if it isn't, with `memory`'s query and the
+    /// keyboard on the pages, and starts reading their text.
+    fn open_find(&mut self, memory: &find::Memory) {
+        if self.find.is_some() {
+            return;
+        }
+        let mut bar = FindBar::new(memory.clone(), 0);
+        bar.replaceable = false;
+        bar.focus = None;
+        self.find = Some(Find {
+            bar,
+            rects: Vec::new(),
+            current: None,
+            seek: false,
+        });
+        if self.reader.is_none() && self.texts.iter().any(Option::is_none) {
+            self.reader = Some(TextReader::new(self.pdf.clone()));
+        }
+        // Rendered again with their pixels kept, to highlight on; until
+        // then, drawn as they are.
+        let stale = self.stale.get_mut();
+        stale.extend(self.rendered.get_mut().drain());
+        self.asked.get_mut().clear();
+    }
+
+    /// Goes to the next match, or with `forward` false, the one before,
+    /// from the current one or the page most on screen. With the find bar
+    /// closed, it opens with `memory`'s query, keeping the keyboard on the
+    /// pages, or if there's no query, to type one.
+    fn find_step(&mut self, memory: &find::Memory, forward: bool) {
+        if self.find.is_none() && memory.query.text.is_empty() {
+            return self.show_find(memory);
+        }
+        let page = self.current(cell_pixels(), self.area.get()) as u32;
+        self.open_find(memory);
+        self.sync_find();
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let matches = &find.bar.matches;
+        let count = matches.len();
+        let index = match find.current {
+            Some(i) if forward => Some((i + 1) % count),
+            Some(i) => Some((i + count - 1) % count),
+            None if count == 0 => None,
+            None if forward => Some(matches.partition_point(|m| m.row < page) % count),
+            None => Some(
+                matches
+                    .partition_point(|m| m.row <= page)
+                    .checked_sub(1)
+                    .unwrap_or(count - 1),
+            ),
+        };
+        match index {
+            Some(index) => self.select_match(index),
+            // Once the pages are read.
+            None => {
+                find.bar.origin = page;
+                find.seek = true;
+            }
+        }
+    }
+
+    fn find_focused(&self) -> bool {
+        self.find
+            .as_ref()
+            .is_some_and(|find| find.bar.focus.is_some())
+    }
+
+    fn find_bar_mut(&mut self) -> Option<&mut FindBar> {
+        self.find.as_mut().map(|find| &mut find.bar)
+    }
+
+    /// Closes the find bar, leaving the pages where they are, and
+    /// forgets their pixels, kept to highlight on.
+    fn close_find(&mut self) {
+        if self.find.take().is_none() {
+            return;
+        }
+        self.marks += 1;
+        for renders in self.rendered.get_mut().values_mut() {
+            for shot in renders.shots_mut() {
+                shot.rgba = None;
+                shot.marked = RefCell::default();
+            }
+        }
+    }
+
+    /// Takes in the pages' text read since the last call, finding in it.
+    /// Returns whether any was.
+    fn poll(&mut self) -> bool {
+        let Some(reader) = &self.reader else {
+            return false;
+        };
+        let mut read = false;
+        for (page, text) in reader.finished() {
+            if let Some(slot) = self.texts.get_mut(page) {
+                // A page whose text can't be read has none to find.
+                *slot = Some(text.unwrap_or_default());
+                read = true;
+            }
+        }
+        if !read {
+            return false;
+        }
+        self.read += 1;
+        if self.texts.iter().all(Option::is_some) {
+            self.reader = None;
+        }
+        self.sync_find();
+        true
+    }
+
+    /// Finds the matches again if the query changed or more of the text
+    /// is read, keeping the current match. A new query goes to the first
+    /// match from where finding started.
+    fn sync_find(&mut self) {
+        let read = self.read;
+        let all_read = self.texts.iter().all(Option::is_some);
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let bar = &mut find.bar;
+        if bar.epoch == Some(read) {
+            return;
+        }
+        if bar.epoch.is_none() && bar.focus == Some(Field::Find) {
+            find.seek = true;
+        }
+        bar.epoch = Some(read);
+        let current = find
+            .current
+            .map(|i| (bar.matches[i].row, bar.matches[i].bytes.start));
+        bar.matches.clear();
+        bar.error = None;
+        bar.truncated = false;
+        find.rects.clear();
+        'pages: for (page, text) in self.texts.iter().enumerate() {
+            let Some(text) = text else {
+                continue;
+            };
+            let ranges = match find::find(&text.text, &bar.memory.query) {
+                Ok((ranges, truncated)) => {
+                    bar.truncated |= truncated;
+                    ranges
+                }
+                Err(error) => {
+                    bar.error = Some(error);
+                    break;
+                }
+            };
+            for bytes in ranges {
+                if bar.matches.len() == find::MAX_MATCHES {
+                    bar.truncated = true;
+                    break 'pages;
+                }
+                find.rects.push(text.rects(bytes.clone()));
+                bar.matches.push(Match {
+                    row: page as u32,
+                    cols: 0..0,
+                    offsets: bytes.start as u32..bytes.end as u32,
+                    bytes,
+                });
+            }
+        }
+        find.current = current.and_then(|(page, start)| {
+            bar.matches
+                .iter()
+                .position(|m| m.row == page && m.bytes.start == start)
+        });
+        self.marks += 1;
+        if find.seek {
+            let matches = &find.bar.matches;
+            let from = matches.partition_point(|m| m.row < find.bar.origin);
+            let index = match from < matches.len() {
+                true => Some(from),
+                // Wrapping around, once there's nothing further to read.
+                false if all_read => (!matches.is_empty()).then_some(0),
+                false => return,
+            };
+            find.seek = false;
+            match index {
+                Some(index) => self.select_match(index),
+                None => find.current = None,
+            }
+        }
+    }
+
+    /// Makes match `index` the current one, scrolling to it if it's out
+    /// of view.
+    fn select_match(&mut self, index: usize) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let (Some(m), Some(rect)) = (find.bar.matches.get(index), find.rects[index].first()) else {
+            return;
+        };
+        let (page, rect) = (m.row as usize, *rect);
+        find.current = Some(index);
+        find.bar.origin = page as u32;
+        self.marks += 1;
+        let (cell, area) = (cell_pixels(), self.area.get());
+        let Some(layout) = self.layout(cell, area) else {
+            return;
+        };
+        let (cell_w, cell_h) = (cell.0 as f64, cell.1 as f64);
+        let (cols, rows, top) = layout.pages[page];
+        let (width, height) = self.sizes[page];
+        let (scale_x, scale_y) = (cols as f64 * cell_w / width, rows as f64 * cell_h / height);
+        // Where the match is, in screen pixels from the pages' top-left
+        // corner.
+        let left = ((layout.cols - cols) / 2) as f64 * cell_w;
+        let (x0, x1) = (left + rect.x0 * scale_x, left + rect.x1 * scale_x);
+        let (y0, y1) = (
+            top as f64 * cell_h + rect.y0 * scale_y,
+            top as f64 * cell_h + rect.y1 * scale_y,
+        );
+        let origin = self.origin(&layout, cell, area);
+        let (view_w, view_h) = (area.width as f64 * cell_w, area.height as f64 * cell_h);
+        // The bar covers the top row.
+        let view_top = match area.height > 2 {
+            true => cell_h,
+            false => 0.0,
+        };
+        let mut moved = origin;
+        if origin.1 + y0 < view_top || origin.1 + y1 > view_h {
+            moved.1 = (view_top + view_h - y0 - y1) / 2.0;
+        }
+        if origin.0 + x0 < 0.0 || origin.0 + x1 > view_w {
+            moved.0 = (view_w - x0 - x1) / 2.0;
+        }
+        if moved != origin {
+            self.move_to(&layout, moved, cell);
+        }
+    }
+
+    /// Where the find bar floats in `area`: the top right, a column in
+    /// from the edge, as (screen column, width).
+    fn find_area(area: Rect) -> (u32, u32) {
+        let width = find::MAX_WIDTH.min(area.width.saturating_sub(1)).max(1);
+        (area.x + area.width.saturating_sub(width + 1), width)
+    }
+
+    /// The find bar's button under the pointer, in screen coordinates.
+    fn hover_find(&self, x: u32, y: u32) -> Option<Rect> {
+        let find = self.find.as_ref()?;
+        let area = self.area.get();
+        let (start, width) = Pages::find_area(area);
+        if !(start..start + width).contains(&x) || !(area.y..area.y + find.bar.rows()).contains(&y)
+        {
+            return None;
+        }
+        let columns = find.bar.hover_columns(x, y - area.y)?;
+        let left = columns.start.max(start);
+        Some(Rect {
+            x: left,
+            y,
+            width: columns.end.min(start + width).saturating_sub(left),
+            height: 1,
+        })
+    }
+
+    /// A mouse event on the find bar, in `area`, which it handles; returns
+    /// false if it's elsewhere. A press elsewhere gives the pages the
+    /// keyboard. A drag from the query selects in it, wherever it goes.
+    fn handle_find_mouse(&mut self, mouse: Mouse, area: Rect) -> bool {
+        let (x, width) = Pages::find_area(area);
+        let dragging = self.drag.is_some();
+        let Some(find) = &mut self.find else {
+            return false;
+        };
+        if find.bar.pressed() {
+            match mouse.kind {
+                MouseKind::Drag(_) => {
+                    find.bar.drag(mouse.x);
+                    return true;
+                }
+                MouseKind::Release(_) => {
+                    find.bar.release();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        let inside = (x..x + width).contains(&mouse.x)
+            && (area.y..area.y + find.bar.rows()).contains(&mouse.y);
+        let press = matches!(mouse.kind, MouseKind::Press(_));
+        if !inside || (dragging && !press) {
+            if press {
+                find.bar.focus = None;
+            }
+            return false;
+        }
+        match mouse.kind {
+            // The wheel scrolls the pages under the bar.
+            MouseKind::ScrollUp
+            | MouseKind::ScrollDown
+            | MouseKind::ScrollLeft
+            | MouseKind::ScrollRight => return false,
+            MouseKind::Press(MouseButton::Left) => {}
+            _ => return true,
+        }
+        match find.bar.target(mouse.x, mouse.y - area.y) {
+            find::Target::Field(_) => find.bar.press(Field::Find, mouse.x, Instant::now()),
+            find::Target::Toggle(toggle) => {
+                find.bar.toggle(toggle);
+                self.sync_find();
+            }
+            find::Target::Close => self.close_find(),
+            find::Target::Expander | find::Target::Replace | find::Target::ReplaceAll => {}
+        }
+        true
+    }
+
+    /// Draws the find bar, if it's open, over the pages in `area`, and
+    /// returns where the terminal cursor goes if its query is focused.
+    fn draw_find(&self, frame: &Buffer, area: Rect, keymap: &Keymap) -> Option<(u32, u32)> {
+        let find = self.find.as_ref()?;
+        let (x, width) = Pages::find_area(area);
+        find.bar
+            .draw(frame, (x, area.y, width), find.current, keymap)
     }
 }
 
@@ -855,6 +1454,27 @@ impl Render {
             && part.y <= other.y
             && other.x + other.width <= part.x + part.width
             && other.y + other.height <= part.y + part.height
+    }
+}
+
+/// Highlights `rect` of a page, in points, on `rgba`, rendered by `job`:
+/// as a highlighter would, taking `color` from each pixel's.
+fn highlight(rgba: &mut [u8], job: &Job<Render>, rect: kurbo::Rect, color: [u8; 3]) {
+    let (width, height) = job.size;
+    let pixels = |from: f64, to: f64, scale: f64, offset: f64, most: u32| {
+        let start = (from * scale - offset).floor().clamp(0.0, most as f64) as usize;
+        let end = (to * scale - offset).ceil().clamp(0.0, most as f64) as usize;
+        start..end
+    };
+    let columns = pixels(rect.x0, rect.x1, job.scale.0, job.from.0, width);
+    for y in pixels(rect.y0, rect.y1, job.scale.1, job.from.1, height) {
+        let row = y * width as usize * 4;
+        for x in columns.clone() {
+            let at = row + x * 4;
+            for (channel, tint) in rgba[at..at + 3].iter_mut().zip(color) {
+                *channel = (*channel as u16 * tint as u16 / 255) as u8;
+            }
+        }
     }
 }
 
@@ -1582,6 +2202,123 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    /// A PDF with a page 100 x 100 points for each of `texts`, with it in
+    /// a line near the top.
+    fn pages_with(texts: &[&str]) -> Pages {
+        let content: Vec<_> = texts
+            .iter()
+            .map(|text| format!("BT /F1 10 Tf 10 85 Td ({text}) Tj ET"))
+            .collect();
+        let content: Vec<_> = content.iter().map(|c| ((100, 100), c.as_str())).collect();
+        Pages::new(Pdf::open(crate::pdf::test_pdf(&content)).unwrap())
+    }
+
+    /// Waits for all of the pages' text to be read.
+    fn read_all(pages: &mut Pages) {
+        let start = Instant::now();
+        while pages.texts.iter().any(Option::is_none) {
+            assert!(start.elapsed().as_secs() < 10, "text not read");
+            std::thread::sleep(Duration::from_millis(5));
+            pages.poll();
+        }
+    }
+
+    #[test]
+    fn finding_goes_through_the_matches_page_by_page() {
+        let _serial = crate::test_serial();
+        let mut pages = pages_with(&["alpha", "beta", "gamma beta", "delta"]);
+        // A page a screen.
+        let area = area(50, 20);
+        pages.area.set(area);
+        let memory = find::Memory::default();
+        pages.show_find(&memory);
+        assert!(pages.find_focused());
+        pages.find_bar_mut().unwrap().edit(Edit::Insert("beta"));
+        pages.sync_find();
+        read_all(&mut pages);
+        let find = pages.find.as_ref().unwrap();
+        let rows: Vec<_> = find.bar.matches.iter().map(|m| m.row).collect();
+        assert_eq!(rows, [1, 2]);
+        assert_eq!(find.bar.matches[1].bytes, 6..10);
+        // The first from the page on screen, scrolled to.
+        assert_eq!(find.current, Some(0));
+        assert_eq!(pages.current(CELL, area), 1);
+
+        let memory = pages.find.as_ref().unwrap().bar.memory.clone();
+        pages.find_step(&memory, true);
+        assert_eq!(pages.find.as_ref().unwrap().current, Some(1));
+        assert_eq!(pages.current(CELL, area), 2);
+        // Around past the last, and back.
+        pages.find_step(&memory, true);
+        assert_eq!(pages.find.as_ref().unwrap().current, Some(0));
+        pages.find_step(&memory, false);
+        assert_eq!(pages.find.as_ref().unwrap().current, Some(1));
+
+        // Esc on the pages closes it, staying there.
+        pages.run(Command::ClearSelection, CELL, area);
+        assert!(pages.find.is_none());
+        assert_eq!(pages.current(CELL, area), 2);
+
+        // Stepping with it closed finds the last query, from the page on
+        // screen, keeping the keyboard on the pages.
+        pages.find_step(&memory, false);
+        let find = pages.find.as_ref().unwrap();
+        assert!(!pages.find_focused());
+        assert_eq!(find.current, Some(1));
+    }
+
+    #[test]
+    fn a_new_query_waits_for_the_pages_text_to_go_to_a_match() {
+        let _serial = crate::test_serial();
+        let mut pages = pages_with(&["alpha", "beta", "beta"]);
+        let area = area(50, 20);
+        pages.area.set(area);
+        pages.run(Command::DocumentEnd, CELL, area);
+        assert_eq!(pages.current(CELL, area), 2);
+        pages.show_find(&find::Memory::default());
+        pages.find_bar_mut().unwrap().edit(Edit::Insert("alpha"));
+        pages.sync_find();
+        read_all(&mut pages);
+        // Before the page it started on, once there's nothing after it.
+        assert_eq!(pages.find.as_ref().unwrap().current, Some(0));
+        assert_eq!(pages.current(CELL, area), 0);
+        // An invalid regex finds nothing, and says why.
+        pages.find_bar_mut().unwrap().toggle(Toggle::Regex);
+        pages.find_bar_mut().unwrap().edit(Edit::Insert("("));
+        pages.sync_find();
+        assert!(pages.find.as_ref().unwrap().bar.matches.is_empty());
+        let status = pages.status(0, CELL, area);
+        assert!(
+            matches!(status, Status::Message { error: true, .. }),
+            "{status:?}"
+        );
+    }
+
+    #[test]
+    fn what_is_found_is_highlighted() {
+        // Two pixels a point, from 10 points in.
+        let job = Job {
+            tag: Render::whole(0, (2, 1), CELL),
+            page: 0,
+            scale: (2.0, 2.0),
+            from: (10.0, 10.0),
+            size: (20, 20),
+        };
+        let mut rgba = vec![255; 20 * 20 * 4];
+        let rect = kurbo::Rect::new(10.0, 10.0, 12.0, 11.5);
+        highlight(&mut rgba, &job, rect, [255, 128, 0]);
+        let pixel = |x: usize, y: usize| rgba[(y * 20 + x) * 4..][..4].to_vec();
+        assert_eq!(pixel(10, 10), [255, 128, 0, 255]);
+        assert_eq!(pixel(13, 12), [255, 128, 0, 255]);
+        for (x, y) in [(9, 10), (14, 10), (10, 9), (10, 13)] {
+            assert_eq!(pixel(x, y), [255; 4], "{x}, {y}");
+        }
+        // Past the edges is left out.
+        let rect = kurbo::Rect::new(0.0, 0.0, 100.0, 100.0);
+        highlight(&mut rgba, &job, rect, [0, 0, 0]);
+        assert!(rgba.chunks(4).all(|pixel| pixel == [0, 0, 0, 255]));
+    }
+
     #[test]
     fn what_was_rendered_is_drawn_until_rendered_again() {
         let _serial = crate::test_serial();
@@ -1589,7 +2326,12 @@ mod tests {
         let image = Rc::new(Image::from_rgba(1, 1, &[255; 4]).unwrap());
         for page in [0, 2] {
             let renders = Renders {
-                whole: Some((Render::whole(page, (10, 10), CELL), image.clone())),
+                whole: Some(Shot {
+                    render: Render::whole(page, (10, 10), CELL),
+                    image: image.clone(),
+                    rgba: None,
+                    marked: RefCell::default(),
+                }),
                 part: None,
             };
             old.rendered.get_mut().insert(page, renders);
