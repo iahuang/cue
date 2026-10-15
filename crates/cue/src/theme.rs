@@ -243,6 +243,8 @@ pub struct Colors {
     pub error_bg: Rgba,
     /// The cursor's line's number.
     pub line_number_current: Rgba,
+    /// Behind the cursor's line, with nothing selected.
+    pub line_highlight: Rgba,
     /// The terminal's cursor. The terminal's own color in Terminal.
     pub cursor: Rgba,
     /// Over a panel's drop target, blended.
@@ -609,6 +611,7 @@ enum Role {
     Error,
     ErrorBg,
     LineNumberCurrent,
+    LineHighlight,
     Cursor,
 }
 
@@ -665,7 +668,7 @@ fn derive(name: &'static str, base: &Base, ui: &[(Role, u32)], syntax: &[(&str, 
         surface_inactive: set(Role::SurfaceInactive).unwrap_or(tint(0.05)),
         selected: set(Role::Selected).unwrap_or(mix(bg, accent, 0.3)),
         selected_unfocused: set(Role::SelectedUnfocused).unwrap_or(surface),
-        selection: set(Role::Selection).unwrap_or(mix(bg, accent, 0.3)),
+        selection: at_least(bg, fg, set(Role::Selection).unwrap_or(mix(bg, accent, 0.4)), 0.25),
         accent,
         on_accent: legible_on(accent, bg, fg),
         match_bg: set(Role::MatchBg).unwrap_or(mix(bg, ansi[3], 0.3)),
@@ -674,6 +677,7 @@ fn derive(name: &'static str, base: &Base, ui: &[(Role, u32)], syntax: &[(&str, 
         error: set(Role::Error).unwrap_or(ansi[1]),
         error_bg: set(Role::ErrorBg).unwrap_or(mix(bg, ansi[1], 0.55)),
         line_number_current: set(Role::LineNumberCurrent).unwrap_or(fg),
+        line_highlight: set(Role::LineHighlight).unwrap_or(tint(0.07)),
         cursor: set(Role::Cursor).unwrap_or(fg),
         drop_tint: with_alpha(accent, 56),
         terminal: None,
@@ -684,6 +688,29 @@ fn derive(name: &'static str, base: &Base, ui: &[(Role, u32)], syntax: &[(&str, 
 
 fn hex(rgb: u32) -> Rgba {
     Rgba::rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+}
+
+/// `color`, or if it's nearer `bg` than `share` of the way to `fg`, taken
+/// further from `bg` in the same direction until it isn't, as RGB.
+fn at_least(bg: Rgba, fg: Rgba, color: Rgba, share: f32) -> Rgba {
+    let distance = |a: Rgba, b: Rgba| {
+        let d = |a: u8, b: u8| (a as f32 - b as f32).powi(2);
+        (d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b())).sqrt()
+    };
+    let (near, wanted) = (distance(bg, color), distance(bg, fg) * share);
+    if near == 0.0 || near >= wanted {
+        return color;
+    }
+    let channel = |a: u8, b: u8| {
+        (a as f32 + (b as f32 - a as f32) * wanted / near)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Rgba::rgb(
+        channel(bg.r(), color.r()),
+        channel(bg.g(), color.g()),
+        channel(bg.b(), color.b()),
+    )
 }
 
 /// `a` with `share` of `b` mixed in, as RGB.
@@ -1794,6 +1821,21 @@ mod tests {
         assert_eq!(names.len(), BUILTIN.len() + 1);
         for name in &names {
             assert_eq!(ThemeId::named(name).map(ThemeId::name), Some(*name));
+        }
+    }
+
+    #[test]
+    fn selections_stand_out_from_the_background() {
+        let kanagawa = ThemeId::named("Kanagawa").unwrap();
+        let colors = kanagawa.colors(&TerminalColors::default());
+        assert_ne!(colors.selection, hex(0x223249), "too faint as Kanagawa has it");
+        let cue = ThemeId::named("Cue Dark").unwrap();
+        let colors = cue.colors(&TerminalColors::default());
+        assert_eq!(colors.selection, hex(0x225090), "already clear enough");
+        for id in ThemeId::all() {
+            let c = id.colors(&TerminalColors::default());
+            let again = at_least(c.bg, c.text, c.selection, 0.249);
+            assert_eq!(again, c.selection, "{}", id.name());
         }
     }
 

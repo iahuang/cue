@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Highlight the cursor's line in the focused editor while nothing is selected, and make faint selections easier to see
+
 ## v0.4.3 — 2026-10-14
 
 - Mark terminals whose bell rings or that send a notification (OSC 9 or 777), with a status bar badge that goes to them (`a3bff59`)

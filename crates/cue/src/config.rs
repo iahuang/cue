@@ -34,6 +34,9 @@ pub struct Config {
     pub indent: Indent,
     /// `editor.indent_guides`: whether to show indentation guides.
     pub indent_guides: bool,
+    /// `editor.line_highlight`: whether to highlight the cursor's line
+    /// while nothing is selected.
+    pub line_highlight: bool,
     /// `editor.wrap`: whether long lines wrap, at first.
     pub wrap: bool,
     /// `editor.scroll_margin`: the part of the view, up to half, kept
@@ -79,6 +82,7 @@ impl Default for Config {
             tab_width: 4,
             indent: Indent::Spaces(4),
             indent_guides: true,
+            line_highlight: true,
             wrap: true,
             scroll_margin: 0.15,
             scroll_lines: 2,
@@ -108,6 +112,7 @@ pub const TEMPLATE: &str = r#"# Uncomment settings to customize. Save in cue or 
 # tab_width = 4
 # indent = 4                  # Fallback indentation: spaces or "tabs".
 # indent_guides = true
+# line_highlight = true       # Highlight the cursor's line.
 # wrap = true
 # scroll_margin = 0.15        # Cursor margin as a fraction of the view (0–0.5).
 
@@ -260,6 +265,9 @@ impl Config {
             "editor.wrap" => self.wrap = value.as_bool().ok_or("true or false")?,
             "editor.indent_guides" => {
                 self.indent_guides = value.as_bool().ok_or("true or false")?
+            }
+            "editor.line_highlight" => {
+                self.line_highlight = value.as_bool().ok_or("true or false")?
             }
             "editor.scroll_margin" => {
                 const EXPECTED: &str = "a number from 0 to 0.5";
@@ -616,6 +624,7 @@ mod tests {
             tab_width = 8
             indent = "tabs"
             indent_guides = false
+            line_highlight = false
             wrap = false
             scroll_margin = 0
             [ui]
@@ -641,6 +650,7 @@ mod tests {
                 tab_width: 8,
                 indent: Indent::Tabs,
                 indent_guides: false,
+                line_highlight: false,
                 wrap: false,
                 scroll_margin: 0.0,
                 scroll_lines: 5,

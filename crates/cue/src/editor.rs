@@ -1050,8 +1050,9 @@ impl Editor {
 
     /// Draws the editor in its area and returns the terminal cursor
     /// position (0-based column, row), if it's in view. The keymap labels
-    /// the find bar's buttons.
-    pub fn draw(&self, frame: &Buffer, keymap: &Keymap) -> Option<(u32, u32)> {
+    /// the find bar's buttons. Only an `active` editor highlights its
+    /// cursor's line.
+    pub fn draw(&self, frame: &Buffer, keymap: &Keymap, active: bool) -> Option<(u32, u32)> {
         if let Some(diff) = &self.diff {
             diff.draw(frame, self.x, self.y);
             return None;
@@ -1065,6 +1066,9 @@ impl Editor {
         self.sync_syntax();
         let (gutter, _, _) = self.text_area();
         let text_x = self.x + gutter;
+        if active {
+            self.draw_line_highlight(frame);
+        }
         frame.draw_editor_view(&self.view, text_x as i32, self.y as i32);
         self.draw_indent_guides(frame, text_x);
         self.draw_line_numbers(frame, gutter);
@@ -1106,6 +1110,22 @@ impl Editor {
         let lines = self.view.visible_lines();
         if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
             highlighter.sync(&self.buffer, first.line..last.line + 1);
+        }
+    }
+
+    /// Shades every row of the cursor's line, gutter included, while
+    /// nothing is selected. Drawn first, so the text and find's matches
+    /// go over it.
+    fn draw_line_highlight(&self, frame: &Buffer) {
+        if !config::get().line_highlight || self.has_selection() {
+            return;
+        }
+        let (current, _) = self.cursor();
+        let bg = theme::colors().line_highlight;
+        for (y, row) in self.view.visible_lines().iter().enumerate() {
+            if row.line == current {
+                frame.fill_rect(self.x, self.y + y as u32, self.width, 1, bg);
+            }
         }
     }
 
@@ -2871,7 +2891,7 @@ mod tests {
     /// Draws `editor` on a cleared `screen`, as the app does.
     fn draw(editor: &Editor, screen: &OwnedBuffer) -> Option<(u32, u32)> {
         screen.clear(Rgba::terminal_default([0, 0, 0]));
-        editor.draw(screen, &Keymap::default())
+        editor.draw(screen, &Keymap::default(), true)
     }
 
     fn theme() -> Rc<Theme> {
@@ -3330,6 +3350,24 @@ mod tests {
         editor.doc.set_language(None);
         ctrl(&mut editor, '/');
         assert_eq!(eb.text(), "  café();\n\n  next();\nlast();");
+    }
+
+    #[test]
+    fn the_cursor_line_is_highlighted_without_a_selection() {
+        let _serial = serial();
+        let bg = theme::colors().line_highlight;
+        let (_eb, editor) = editor_of("one\ntwo three");
+        let screen = OwnedBuffer::new(40, 4, false, WidthMethod::Unicode, "line").unwrap();
+        let highlighted = |row| (0..40).all(|x| screen.bg_at(x, row) == Some(bg));
+        draw(&editor, &screen);
+        assert!(highlighted(0), "gutter, text, and past it");
+        assert!(!highlighted(1));
+        screen.clear(Rgba::terminal_default([0, 0, 0]));
+        editor.draw(&screen, &Keymap::default(), false);
+        assert!(!highlighted(0), "only in the active panel");
+        editor.view.set_selection(0, 2, selection_colors());
+        draw(&editor, &screen);
+        assert!((0..40).all(|x| screen.bg_at(x, 0) != Some(bg)));
     }
 
     #[test]

@@ -187,7 +187,7 @@ impl QuickLook {
         frame.with_clip(body.x, body.y, body.width, body.height, || {
             match &self.body {
                 Body::Text(editor) => {
-                    editor.draw(frame, keymap);
+                    editor.draw(frame, keymap, false);
                 }
                 Body::Image(image) => {
                     image.draw(frame, body, false, keymap);

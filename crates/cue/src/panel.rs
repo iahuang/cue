@@ -779,7 +779,7 @@ impl Panel {
             }
             match self.editor() {
                 // Reader mode has no cursor.
-                Some(editor) => editor.draw(frame, keymap),
+                Some(editor) => editor.draw(frame, keymap, active),
                 None => {
                     self.draw_empty(frame, keymap);
                     None
