@@ -6873,12 +6873,12 @@ impl App {
             });
             items.push(item(Paste, "Paste"));
             if editor.path().is_some() {
-                items.push(item(CopyReference, "Copy Reference"));
+                items.push(item(CopyReference, "Copy Line Reference"));
             }
             items.push(MenuItem::Separator);
             let comments = doc.language.get().and_then(|l| l.line_comment());
             if comments.is_some() {
-                items.push(item(ToggleComment, "Toggle Line Comment"));
+                items.push(item(ToggleComment, "Toggle Comment"));
             }
             items.push(item(SelectAll, "Select All"));
         }
@@ -12672,7 +12672,7 @@ mod tests {
         for label in [
             "Go to Definition",
             "Go to Symbol",
-            "Toggle Line Comment",
+            "Toggle Comment",
             "Select All",
         ] {
             assert!(text.contains(label), "{label} in\n{text}");
@@ -12687,7 +12687,12 @@ mod tests {
         right_click(&mut app, call.0, call.1);
         let text = tall_screen(&app);
         assert!(!text.contains("Go to Definition"), "at the end\n{text}");
-        assert!(!text.contains("Copy Line"), "{text}");
+        assert!(
+            !text
+                .replace("Copy Line Reference", "")
+                .contains("Copy Line"),
+            "{text}"
+        );
         click_item(&mut app, "Copy");
         assert_eq!(app.clipboard.as_deref(), Some(MENU_RS));
 
@@ -12708,7 +12713,7 @@ mod tests {
 
         let helper = tall_find(&app, "fn helper");
         right_click(&mut app, helper.0, helper.1);
-        click_item(&mut app, "Toggle Line Comment");
+        click_item(&mut app, "Toggle Comment");
         assert!(app.ed().text().starts_with("\n// fn helper() {}"));
     }
 

@@ -81,7 +81,7 @@ commands! {
     Undo => "editor:undo", "Undo";
     Redo => "editor:redo", "Redo";
     Copy => "editor:copy", "Copy";
-    CopyReference => "editor:copy-reference", "Copy Reference";
+    CopyReference => "editor:copy-reference", "Copy Line Reference";
     Cut => "editor:cut", "Cut";
     Paste => "editor:paste", "Paste";
     SelectAll => "editor:select-all", "Select All";
@@ -96,7 +96,7 @@ commands! {
     NewLine => "editor:newline", "Insert Line Break";
     InsertTab => "editor:insert-tab", "Insert Tab";
     Indent => "editor:indent", "Indent Lines";
-    ToggleComment => "editor:toggle-comment", "Toggle Line Comment";
+    ToggleComment => "editor:toggle-comment", "Toggle Comment";
     Outdent => "editor:outdent", "Outdent Lines";
     DeleteBackward => "editor:delete-backward", "Delete Backward";
     DeleteForward => "editor:delete-forward", "Delete Forward";
