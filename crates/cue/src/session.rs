@@ -10,8 +10,8 @@
 //! it exits, and the session waits on disk, dormant, for its shells to start
 //! again in their folders, below what they showed. End Session lets it go.
 //!
-//! `cue` in a folder of exactly one session's workspace goes back to it;
-//! `cue --resume` lists those to choose from, and `cue --list` all of them.
+//! `cue --resume` lists the sessions of the folder it's run in to choose
+//! from, and `cue --list` all of them.
 //!
 //! Each session is a folder in `$XDG_STATE_HOME/cue/sessions`, or
 //! `~/.local/state/cue/sessions`: `session.toml`, unsaved text in `docs/`,

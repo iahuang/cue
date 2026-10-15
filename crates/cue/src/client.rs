@@ -2,10 +2,8 @@
 //! show, a session of the folder it's run in or a new cue, starts the
 //! server for it or finds the one running it, and waits on it.
 //!
-//! `cue` in a folder of exactly one session's workspace goes back to it,
-//! unless a file is named, or it runs in a cue terminal; `--fresh` starts
-//! a new cue regardless. `--resume` lists the folder's sessions to choose
-//! from, or with `--all` every one (see [`crate::resume`]), `--list`
+//! `cue` starts a new cue. `--resume` lists the folder's sessions to
+//! choose from, or with `--all` every one (see [`crate::resume`]), `--list`
 //! prints every session, and `--end` ends one.
 
 use std::ffi::OsString;
@@ -31,8 +29,6 @@ pub struct Args {
     pub resume: bool,
     /// Choose among every session.
     pub all: bool,
-    /// Start a new cue even if the folder has a session.
-    pub fresh: bool,
 }
 
 /// Opens what `args` say, in a server, and waits on it.
@@ -41,13 +37,6 @@ pub fn run(args: Args) -> ExitCode {
     let folder = match folder(&args.paths) {
         Ok(folder) => folder,
         Err(err) => return fail(&err.to_string()),
-    };
-    let names_file = args.paths.iter().any(|path| !path.is_dir());
-    // A cue run in a cue terminal is its own, unless asked.
-    let nested = std::env::var_os(attach::PID_VARIABLE).is_some();
-    let found = match &sessions {
-        Some(sessions) if !args.fresh && !names_file => session::matching(sessions, &folder),
-        _ => Vec::new(),
     };
     let target = if args.resume {
         let all = sessions.as_deref().map(session::list).unwrap_or_default();
@@ -61,8 +50,6 @@ pub fn run(args: Args) -> ExitCode {
             Ok(None) => return ExitCode::SUCCESS,
             Err(err) => return fail(&format!("can't list sessions: {err}")),
         }
-    } else if found.len() == 1 && !nested {
-        found.into_iter().next()
     } else {
         None
     };

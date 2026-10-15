@@ -151,14 +151,14 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "usage: cue [FOLDER]... [FILE[:LINE[:COLUMN]]]
-       cue --resume [--all] | --fresh [FOLDER]...
+       cue --resume [--all] [FOLDER]
        cue --list | --end [SESSION]";
 
 /// Usage and every command with its shortcut.
 fn help() -> String {
     let keymap = Keymap::new(&config::load().0.keys);
     let mut help = format!(
-        "{USAGE}\n\nOpens the specified folders, or the current folder if none are specified.\nOpens FILE, or a new unnamed buffer if no file is specified.\nAppend :LINE or :LINE:COLUMN to a file path, for example src/main.rs:12:5.\nHold Shift while moving the cursor, or drag with the mouse, to select text.\nSettings are stored in {}. Use Open Settings in the command palette to create the file.\n\nSessions preserve tabs, files, unsaved changes, and terminals.\nUse Keep Session to create a session. Quitting with unsaved changes or running\nprograms also creates one. When you quit, programs in session terminals continue\nrunning in the background. Use End Session to end the session.\nWithout FILE, cue resumes the folder's session if exactly one exists.\n\n  -r, --resume   choose a session for the folder\n  -a, --all      choose from all sessions (implies --resume)\n      --fresh    start a new cue instance\n  -l, --list     list all sessions\n      --end      end SESSION (an ID or name), or the folder's session\n\n",
+        "{USAGE}\n\nOpens the specified folders, or the current folder if none are specified.\nOpens FILE, or a new unnamed buffer if no file is specified.\nAppend :LINE or :LINE:COLUMN to a file path, for example src/main.rs:12:5.\nHold Shift while moving the cursor, or drag with the mouse, to select text.\nSettings are stored in {}. Use Open Settings in the command palette to create the file.\n\nSessions preserve tabs, files, unsaved changes, and terminals.\nUse Keep Session to create a session. Quitting with unsaved changes or running\nprograms also creates one. When you quit, programs in session terminals continue\nrunning in the background. Use End Session to end the session.\n\n  -r, --resume   choose a session for the folder\n  -a, --all      choose from all sessions (implies --resume)\n  -l, --list     list all sessions\n      --end      end SESSION (an ID or name), or the folder's session\n\n",
         config::path().map_or("~/.config/cue/config.toml".into(), |path| path.display().to_string())
     );
     let key = |command| {
@@ -242,7 +242,6 @@ fn parse_args() -> Result<Mode, ExitCode> {
                 client.resume = true;
                 client.all = true;
             }
-            Some("--fresh") => client.fresh = true,
             Some("-l" | "--list") => return Ok(Mode::List),
             Some("--end") => {
                 let id = args.next().map(|id| id.to_string_lossy().into_owned());
@@ -298,9 +297,6 @@ fn serve(start: Start) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     app.warn_about_config(&config_warnings);
-    if let Some(note) = background_sessions(&app) {
-        app.show_message_now(note, false);
-    }
     if let Some(note) = crashes() {
         app.show_message_now(note, true);
     }
@@ -465,36 +461,6 @@ fn resume(
     let mut app = App::new(Workspace::new(roots)?, None, width, height)?;
     app.restore_session(session, state, adopted)?;
     Ok(app)
-}
-
-/// A note of the sessions running in the background but `app`'s own, so
-/// that none is forgotten, if there are any.
-fn background_sessions(app: &App) -> Option<String> {
-    let own = app.session().map(Session::id);
-    let running: Vec<String> = session::list(&session::default_dir()?)
-        .into_iter()
-        .filter(|listing| listing.live && !listing.state.attached)
-        .filter(|listing| Some(listing.id.as_str()) != own)
-        .map(|listing| {
-            let folder = listing.state.roots.first().map(|root| client::tilde(root));
-            let folder = listing.state.name.clone().or(folder).unwrap_or_default();
-            match listing.state.programs().as_slice() {
-                [] => folder,
-                programs => format!("{folder} ({})", programs.join(", ")),
-            }
-        })
-        .collect();
-    match running.len() {
-        0 => None,
-        1 => Some(format!(
-            "One session is running in the background: {}. Run `cue --list` for details.",
-            running[0]
-        )),
-        n => Some(format!(
-            "{n} sessions are running in the background: {}. Run `cue --list` for details.",
-            running.join(", ")
-        )),
-    }
 }
 
 /// Where the crash reports not said yet are, if there are any.

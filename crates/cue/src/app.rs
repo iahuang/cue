@@ -4883,7 +4883,7 @@ impl App {
                 }
                 self.recovery.discard();
                 if announce {
-                    self.show_message("Session saved. Run `cue` to resume after quitting.", false);
+                    self.show_message("Session saved. Run `cue --resume` to resume after quitting.", false);
                 }
                 true
             }
