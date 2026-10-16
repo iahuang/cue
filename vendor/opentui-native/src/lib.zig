@@ -358,6 +358,15 @@ export fn embeddedTerminalSetDefaultColors(
     return 0;
 }
 
+/// Draws `bg` behind cells without a background of their own, unless the
+/// program set its own, or with null, the default background again (cue
+/// patch).
+export fn embeddedTerminalSetDefaultBackground(handle: NativeHandle, bg: ?[*]const u16) i32 {
+    const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
+    terminal_value.setDefaultBackground(optionalPtrToRGBA(bg));
+    return 0;
+}
+
 export fn embeddedTerminalScrollToBottom(handle: NativeHandle) i32 {
     const terminal_value = acquireEmbeddedTerminal(handle) orelse return EmbeddedTerminalStatus.invalid;
     terminal_value.scrollToBottom();

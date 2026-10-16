@@ -167,13 +167,20 @@ pub fn draw_zoom_frame(frame: &Buffer, area: Rect) {
     }
 }
 
-/// Every panel in `tabs`, on screen or not.
-pub fn all_panels(tabs: &[Tab]) -> impl Iterator<Item = &Panel> {
-    tabs.iter().flat_map(|tab| &tab.panels)
+/// Every panel in `tabs`, on screen or not, and the scratchpad's.
+pub fn all_panels<'a>(tabs: &'a [Tab], scratch: &'a Panel) -> impl Iterator<Item = &'a Panel> {
+    tabs.iter()
+        .flat_map(|tab| &tab.panels)
+        .chain(std::iter::once(scratch))
 }
 
-pub fn all_panels_mut(tabs: &mut [Tab]) -> impl Iterator<Item = &mut Panel> {
-    tabs.iter_mut().flat_map(|tab| &mut tab.panels)
+pub fn all_panels_mut<'a>(
+    tabs: &'a mut [Tab],
+    scratch: &'a mut Panel,
+) -> impl Iterator<Item = &'a mut Panel> {
+    tabs.iter_mut()
+        .flat_map(|tab| &mut tab.panels)
+        .chain(std::iter::once(scratch))
 }
 
 /// Something in the tab bar.

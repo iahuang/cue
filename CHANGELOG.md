@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Scratchpad: Ctrl+; floats a panel of its own over every tab, which takes what you open while it's out, hides with Esc or a click outside it, resizes by its frame or in layout mode, and keeps its contents in sessions
+
 ## v0.4.4 — 2026-10-16
 
 - Highlight the cursor's line in the focused editor while nothing is selected, and make faint selections easier to see (`8ac3695`)

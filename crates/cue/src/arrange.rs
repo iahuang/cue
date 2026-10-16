@@ -17,6 +17,11 @@
 //! clipboard lasts after the mode is off. Undo
 //! takes back resizing, swapping, evening out, flipping, and zooming,
 //! one change at a time, back to splitting, closing, or pasting.
+//!
+//! With the scratchpad out (see [`crate::scratch`]), the arrows resize it
+//! instead, and `=` puts it back to the size it starts at. Cut, copy, and
+//! paste work on it as on a panel; cutting it leaves it empty, and puts it
+//! away, to paste over the tab's panels.
 
 use opentui::{Attributes, Buffer};
 
@@ -64,6 +69,16 @@ const HINTS: &[(&str, &str)] = &[
     ("t", "new tab"),
     ("[ ]", "tabs"),
     ("u", "undo"),
+    ("esc", "done"),
+];
+
+/// What the status bar lists with the scratchpad out, which only resizes.
+const SCRATCH_HINTS: &[(&str, &str)] = &[
+    ("←↓↑→", "resize"),
+    ("=", "reset size"),
+    ("x c v", "cut copy paste"),
+    ("t", "new tab"),
+    ("[ ]", "tabs"),
     ("esc", "done"),
 ];
 
@@ -198,8 +213,8 @@ impl Arranging {
 
 /// Draws layout mode's keys across the status bar at row `y`, `width`
 /// wide, and what's cut or copied, as `clip` says (see
-/// [`PanelClip::label`]).
-pub fn draw_hints(frame: &Buffer, y: u32, width: u32, clip: Option<&str>) {
+/// [`PanelClip::label`]), or with the `scratchpad` out, its keys.
+pub fn draw_hints(frame: &Buffer, y: u32, width: u32, clip: Option<&str>, scratchpad: bool) {
     let colors = theme::colors();
     frame.fill_rect(0, y, width, 1, colors.surface);
     let label = " LAYOUT ";
@@ -227,7 +242,11 @@ pub fn draw_hints(frame: &Buffer, y: u32, width: u32, clip: Option<&str>) {
             x += 2;
         }
     }
-    for (key, does) in HINTS {
+    let hints = match scratchpad {
+        true => SCRATCH_HINTS,
+        false => HINTS,
+    };
+    for (key, does) in hints {
         let (at, key) = (x, format!("{key} "));
         if !fits(&format!("{key}{does}"), &mut x) {
             break;

@@ -34,7 +34,7 @@ use std::time::Instant;
 
 use opentui::{
     Anchor, Buffer, EmbeddedTerminal, KeyEvent, KeyMods, LineAt, MouseAction,
-    MouseButton as TermButton, MouseEvent,
+    MouseButton as TermButton, MouseEvent, Rgba,
 };
 
 use crate::config;
@@ -82,6 +82,9 @@ pub struct Terminal {
     epoch: u64,
     /// What the program asked to tell the user, until they come to it.
     notification: Option<Notification>,
+    /// What's behind its cells without a background of their own, if not
+    /// the default background (see [`Terminal::set_background`]).
+    background: Option<Rgba>,
 }
 
 /// A terminal asking for attention: its bell rang, or the program sent a
@@ -138,6 +141,16 @@ impl Terminal {
     /// Puts the theme in use.
     pub fn restyle(&mut self) {
         restyle(&mut self.vt);
+    }
+
+    /// Draws `background` behind its cells without a background of their
+    /// own, where the default background would be, as in the scratchpad, or
+    /// with `None`, the default again. A background the program sets wins.
+    pub fn set_background(&mut self, background: Option<Rgba>) {
+        if self.background != background {
+            self.background = background;
+            self.vt.set_default_background(background);
+        }
     }
 
     /// Starts a shell in `cwd`, on a screen the size of `area`.
@@ -231,6 +244,7 @@ impl Terminal {
             find: None,
             epoch: 0,
             notification: None,
+            background: None,
         }
     }
 

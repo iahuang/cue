@@ -19,6 +19,9 @@ pub const Options = struct {
     /// Default and palette colors as the host terminal's own; see
     /// `EmbeddedTerminal.setHostPalette`.
     host_palette: bool = false,
+    /// Drawn in place of the default background (cue patch; see
+    /// `EmbeddedTerminal.setDefaultBackground`).
+    default_background: ?buffer.RGBA = null,
     search: SearchColors = .{},
 };
 
@@ -37,7 +40,9 @@ pub fn compose(
         ansi.defaultColor(state.colors.foreground.r, state.colors.foreground.g, state.colors.foreground.b, 255)
     else
         color(state.colors.foreground);
-    const default_bg = if (options.transparent_background or options.host_palette)
+    const default_bg = if (options.default_background) |background|
+        background
+    else if (options.transparent_background or options.host_palette)
         ansi.defaultColor(state.colors.background.r, state.colors.background.g, state.colors.background.b, 255)
     else
         color(state.colors.background);

@@ -43,6 +43,7 @@ mod reader;
 mod recovery;
 mod relocate;
 mod resume;
+mod scratch;
 mod scroller;
 mod search;
 mod search_modal;

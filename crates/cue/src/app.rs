@@ -57,6 +57,10 @@
 //! moves to the tab it's shown in. Closing a tab closes what its panels
 //! show, as closing each of them would.
 //!
+//! The scratchpad (see [`crate::scratch`]) is a panel of its own, no tab's,
+//! that Ctrl+; floats over whichever tab is on screen. While it's out, it's
+//! the active panel.
+//!
 //! A cue can be a session (see [`crate::session`]), kept to come back to:
 //! Keep Session makes it one, as does quitting with unsaved changes or
 //! programs running and answering Keep Session, or the terminal going away
@@ -105,6 +109,7 @@ use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::quick_look::QuickLook;
 use crate::recovery::{self, Orphan, Recovery};
+use crate::scratch::{self, Scratch};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::session::{self, Session, Shown};
@@ -334,6 +339,8 @@ enum MouseTarget {
     NewTab,
     /// Quick Look, floating over the rest.
     QuickLook,
+    /// The scratchpad's frame, which drags these edges of it.
+    ScratchFrame(scratch::Edges),
 }
 
 /// A panel's header being dragged. A header with a panel above it is also
@@ -399,6 +406,10 @@ pub struct App {
     next_tab: TabId,
     /// The id for the next new panel, in any tab.
     next_panel: PanelId,
+    /// The scratchpad, over whichever tab is on screen while it's out.
+    /// Then it's the active panel: the keyboard and what's opened go to
+    /// it, whether or not the sidebar has the keyboard.
+    scratch: Scratch,
     /// The box asking for a new name, while it's open.
     input: Option<(InputBox, Naming)>,
     /// Messages, over the bottom right of the screen.
@@ -738,6 +749,7 @@ impl App {
             tab: 0,
             next_tab: 1,
             next_panel: 1,
+            scratch: Scratch::new(),
             input: None,
             toasts: Toasts::default(),
             clipboard: None,
@@ -862,7 +874,7 @@ impl App {
             .and_then(|switcher| switcher.shows_in(now));
         let drag = self
             .dragged_panel()
-            .and_then(|id| self.tab().panels.iter().find(|panel| panel.id == id))
+            .and_then(|id| self.panel(id))
             .and_then(|panel| panel.drag_scrolls_in(now));
         switcher.into_iter().chain(drag).min()
     }
@@ -1248,6 +1260,16 @@ impl App {
             Command::ClosePanel => self.close_panel(),
             Command::ToggleZoom => self.toggle_zoom(),
             Command::ArrangePanels => self.toggle_arranging(),
+            Command::ToggleScratchpad => self.toggle_scratch(),
+            // Esc puts the scratchpad away, when what it shows has no use
+            // for it.
+            Command::ClearSelection
+                if self.scratch.open
+                    && self.focus == Focus::Editor
+                    && !self.active_panel().takes_escape() =>
+            {
+                self.hide_scratch()
+            }
             Command::Pop => self.pop(),
             Command::GoBack => self.go_jumps(true),
             Command::GoForward => self.go_jumps(false),
@@ -1439,11 +1461,11 @@ impl App {
             }
             Command::TreeContextMenu => self.show_tree_menu(),
             Command::PanelContextMenu => {
-                let id = self.tab().active;
+                let id = self.active_id();
                 self.open_panel_menu(id, None);
             }
             Command::EditorContextMenu => {
-                let id = self.tab().active;
+                let id = self.active_id();
                 match self.active_panel().editor() {
                     Some(_) => self.open_editor_menu(id, None),
                     None => self.open_panel_menu(id, None),
@@ -1510,7 +1532,8 @@ impl App {
                 return self.commit_outcome(outcome);
             }
             command => {
-                let Some(editor) = self.tabs[self.tab].active_panel_mut().editor_mut() else {
+                let panel = active_in(&mut self.tabs, self.tab, &mut self.scratch);
+                let Some(editor) = panel.editor_mut() else {
                     return AppAction::Continue;
                 };
                 let action = editor.run(command, select, &mut self.clipboard);
@@ -1617,6 +1640,13 @@ impl App {
             MouseTarget::QuickLook => {
                 if let Some(look) = &mut self.quick_look {
                     look.handle_mouse(mouse, now);
+                }
+            }
+            MouseTarget::ScratchFrame(edges) => {
+                if let MouseKind::Drag(MouseButton::Left) = mouse.kind {
+                    let area = self.main_area();
+                    self.scratch.drag(area, edges, mouse.x, mouse.y);
+                    self.layout();
                 }
             }
             MouseTarget::Status(button) => {
@@ -1816,7 +1846,7 @@ impl App {
                     return AppAction::Continue;
                 }
                 // The wheel scrolls any panel; the rest goes to the active one.
-                let link = self.tab_mut().panel_mut(id).and_then(|panel| {
+                let link = self.panel_mut(id).and_then(|panel| {
                     panel.handle_mouse(mouse, now);
                     panel.take_link()
                 });
@@ -1863,6 +1893,15 @@ impl App {
             return Some(MouseTarget::QuickLook);
         }
         let area = self.main_area();
+        if self.scratch.open && self.scratch.outer(area).contains(x, y) {
+            if let Some(edges) = self.scratch.edges_at(area, x, y) {
+                return Some(MouseTarget::ScratchFrame(edges));
+            }
+            return Some(match y == self.scratch.panel.area().y {
+                true => MouseTarget::Header(scratch::ID),
+                false => MouseTarget::Panel(scratch::ID),
+            });
+        }
         if y >= area.bottom() {
             if self.height > 1 && y == self.height - 1 && x < self.width {
                 let status = self.active_panel().status();
@@ -1943,7 +1982,6 @@ impl App {
             MouseKind::Press(MouseButton::Left) => {
                 self.activate(id);
                 let button = self
-                    .tab_mut()
                     .panel_mut(id)
                     .and_then(|panel| panel.header_button(mouse.x));
                 if let Some(button) = button {
@@ -1957,6 +1995,14 @@ impl App {
                         HeaderButton::Diff => {
                             self.run(Command::ToggleDiff, false);
                         }
+                    }
+                    return;
+                }
+                // The scratchpad's header doesn't drag: a click on the name
+                // goes to files or terminals, as at once on a panel's.
+                if id == scratch::ID {
+                    if self.scratch.panel.on_name(mouse.x) {
+                        self.run(self.name_command(), false);
                     }
                     return;
                 }
@@ -2028,19 +2074,24 @@ impl App {
                 let clicked = drag.on_name && !drag.moving && !drag.resizing && mouse.y == drag.y;
                 let panels = &self.tab().panels;
                 if clicked && panels.iter().any(|p| p.id == id && p.on_name(mouse.x)) {
-                    let command = match self.active_terminal() {
-                        Some(_) => Command::GoToTerminal,
-                        None => Command::GoToFile,
-                    };
-                    self.run(command, false);
+                    self.run(self.name_command(), false);
                 }
             }
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
-                if let Some(panel) = self.tab_mut().panel_mut(id) {
+                if let Some(panel) = self.panel_mut(id) {
                     panel.handle_mouse(mouse, now);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// What a click on the active panel's name in its header runs: a
+    /// terminal's goes to terminals, as the title does in VS Code.
+    fn name_command(&self) -> Command {
+        match self.active_terminal() {
+            Some(_) => Command::GoToTerminal,
+            None => Command::GoToFile,
         }
     }
 
@@ -2132,7 +2183,7 @@ impl App {
         for doc in &self.documents {
             doc.follow_edits();
         }
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             panel.note_jump();
         }
         self.follow_jumps();
@@ -2144,12 +2195,13 @@ impl App {
         self.feed_picker();
         self.follow_settings();
         self.follow_quick_look();
+        self.set_terminal_backgrounds();
     }
 
     /// Finds again in readers whose text was laid out again, as when it
     /// was edited in another panel or on disk.
     fn refresh_finds(&mut self) {
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             panel.editors_mut().for_each(Editor::refresh_find);
         }
     }
@@ -2193,6 +2245,8 @@ impl App {
                 continue;
             }
             let preview = panel.document().is_some_and(|doc| self.is_preview(doc));
+            // Under the scratchpad, none is.
+            let active = active && !self.scratch.open;
             let at = panel.draw(frame, &self.keymap, &self.workspace, active, preview);
             if active {
                 cursor = at;
@@ -2203,7 +2257,8 @@ impl App {
         }
         if self.arranging.is_some() && self.height > 1 {
             let clip = self.panel_clip.as_ref().map(PanelClip::label);
-            arrange::draw_hints(frame, self.height - 1, self.width, clip.as_deref());
+            let (y, width, scratch) = (self.height - 1, self.width, self.scratch.open);
+            arrange::draw_hints(frame, y, width, clip.as_deref(), scratch);
         } else if self.height > 1 {
             let status = self.active_panel().status();
             let y = self.height - 1;
@@ -2241,6 +2296,15 @@ impl App {
             let rect = drop.rect;
             frame.fill_rect(rect.x, rect.y, rect.width, rect.height, colors.drop_tint);
         }
+        if self.scratch.open {
+            let panel = &self.scratch.panel;
+            let preview = panel.document().is_some_and(|doc| self.is_preview(doc));
+            let (keymap, workspace) = (&self.keymap, &self.workspace);
+            cursor = self.scratch.draw(frame, main, keymap, workspace, preview);
+            if message_cursor.is_some() {
+                cursor = message_cursor;
+            }
+        }
         if let Some(look) = &self.quick_look {
             look.draw(frame, &self.keymap);
         }
@@ -2264,6 +2328,10 @@ impl App {
     /// Marks the active panel's header in the accent color, in layout
     /// mode.
     fn draw_arranging(&self, frame: &Buffer) {
+        // The scratchpad's frame marks it already.
+        if self.scratch.open {
+            return;
+        }
         let tab = self.tab();
         let areas = tab.panel_areas(self.main_area());
         let active = areas.iter().find(|&&(id, _)| id == tab.active);
@@ -2318,7 +2386,7 @@ impl App {
             height: 1,
         };
         match self.target_at(x, y)? {
-            MouseTarget::QuickLook => None,
+            MouseTarget::QuickLook | MouseTarget::ScratchFrame(_) => None,
             MouseTarget::Tree => {
                 let width = self.visible_tree_width();
                 let columns = match self.sidebar {
@@ -2378,7 +2446,7 @@ impl App {
                 Some(span(columns.start + offset..columns.end + offset))
             }
             MouseTarget::Panel(id) => {
-                let panel = self.tab().panels.iter().find(|panel| panel.id == id)?;
+                let panel = self.panel(id)?;
                 if let Some(terminal) = panel.terminal() {
                     terminal.borrow().hover_find(x, y)
                 } else if let Some(image) = panel.image() {
@@ -2462,7 +2530,7 @@ impl App {
         let mut changed = self.toasts.expire(now);
         // A thread finished something to show, such as a PDF's page.
         changed |= wake::take();
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             if let Some(image) = panel.image_mut() {
                 changed |= image.poll();
             }
@@ -2473,7 +2541,6 @@ impl App {
             .is_some_and(|switcher| switcher.reveal(now));
         if let Some(id) = self.dragged_panel() {
             let scrolled = self
-                .tab_mut()
                 .panel_mut(id)
                 .is_some_and(|panel| panel.drag_scroll(now));
             if scrolled {
@@ -2625,7 +2692,7 @@ impl App {
             .filter_map(|doc| doc.path()?.parent().map(Path::to_path_buf))
             .collect();
         files.extend(
-            tab::all_panels(&self.tabs)
+            tab::all_panels(&self.tabs, &self.scratch.panel)
                 .filter_map(|panel| panel.image()?.path().parent().map(Path::to_path_buf)),
         );
         files.extend(self.git.repos().iter().map(|repo| repo.git_dir.clone()));
@@ -2662,7 +2729,7 @@ impl App {
                     .any(|changed| path.starts_with(changed))
         };
         let mut changed = listed;
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             if let Some(image) = panel.image_mut() {
                 if touched(image.path()) {
                     changed |= image.reload();
@@ -2711,6 +2778,10 @@ impl App {
     /// Splits the active panel, with a new, empty one right of it or below
     /// it, which becomes active.
     fn split(&mut self, axis: Axis) {
+        if self.scratch.open {
+            self.show_message("The scratchpad can't be split.", false);
+            return;
+        }
         // Where it is in the layout, zoomed or not.
         let tab = self.tab();
         let area = tab
@@ -2751,7 +2822,7 @@ impl App {
             return;
         }
         let doc = editor.document().clone();
-        let here = self.tab().active;
+        let here = self.active_id();
         let Some(anchor) = self.editor_mut().map(|editor| {
             editor.set_reading(false);
             editor.scroll_anchor()
@@ -2763,8 +2834,8 @@ impl App {
         });
         if !shown {
             self.split(Axis::Horizontal);
-            if self.tab().active == here {
-                // There wasn't room.
+            if self.active_id() == here {
+                // There wasn't room, or it's the scratchpad.
                 return;
             }
             if let Err(err) = self.active_panel_mut().show(&doc) {
@@ -2791,7 +2862,11 @@ impl App {
     /// and a reader of it side by side keep to the same place. Views in
     /// the same mode are left alone, to show different places.
     fn sync_scroll(&mut self) {
-        let leader = self.input_panel.take().unwrap_or(self.tab().active);
+        let leader = self.input_panel.take().unwrap_or(self.active_id());
+        // The scratchpad keeps to itself, over the tab.
+        if leader == scratch::ID {
+            return;
+        }
         let tab = &mut self.tabs[self.tab];
         // Moving the cursor around doesn't move the others; scrolling,
         // editing, and switching modes do.
@@ -2818,6 +2893,10 @@ impl App {
     /// closes the tab, unless it's the only one. Files it showed before
     /// stay open.
     fn close_panel(&mut self) {
+        if self.scratch.open {
+            self.close_scratch();
+            return;
+        }
         let tab = self.tab();
         if tab.panels.len() == 1 && tab.active_panel().is_empty() && self.tabs.len() > 1 {
             self.close_tab(self.tab);
@@ -2843,6 +2922,48 @@ impl App {
         self.prune_terminals();
     }
 
+    /// Shows the scratchpad over the tab, with the keyboard, or puts it
+    /// away, giving the keyboard back to the tab's active panel, unless the
+    /// sidebar has it.
+    fn toggle_scratch(&mut self) {
+        match self.scratch.open {
+            true => self.hide_scratch(),
+            false => {
+                self.scratch.open = true;
+                self.focus = Focus::Editor;
+                self.layout();
+                self.show_active_in_tree();
+            }
+        }
+    }
+
+    /// Puts the scratchpad away, if it's out.
+    fn hide_scratch(&mut self) {
+        if !self.scratch.open {
+            return;
+        }
+        self.scratch.open = false;
+        // Under it, the panel may have scrolled with the wheel.
+        self.input_panel = None;
+        self.show_active_in_tree();
+    }
+
+    /// Closes what the scratchpad shows, as closing a tab's last panel
+    /// does, leaving it empty; empty, it's put away.
+    fn close_scratch(&mut self) {
+        if self.scratch.panel.is_empty() {
+            self.hide_scratch();
+            return;
+        }
+        if !self.close_shown(Redo::Run(Command::ClosePanel)) {
+            return;
+        }
+        self.scratch.panel.clear();
+        self.show_active_in_tree();
+        self.prune_documents();
+        self.prune_terminals();
+    }
+
     /// Goes into layout mode (see [`crate::arrange`]), or comes out of it.
     fn toggle_arranging(&mut self) {
         if self.arranging.take().is_some() {
@@ -2856,6 +2977,9 @@ impl App {
     /// Does what a key in layout mode says to.
     fn arrange(&mut self, action: arrange::Action) {
         use arrange::Action;
+        if self.scratch.open {
+            return self.arrange_scratch(action);
+        }
         match action {
             Action::Leave => self.arranging = None,
             Action::Focus(direction) => {
@@ -2903,6 +3027,40 @@ impl App {
             Action::Paste => self.paste_panel(),
             Action::Undo => self.undo_arranging(),
         }
+    }
+
+    /// Does what a key in layout mode says to with the scratchpad out: the
+    /// arrows resize it, and `=` puts it back to its first size. What it
+    /// shows is cut, copied, and pasted as a panel's is, and tabs still
+    /// come and go; the rest is for arranging the tab's panels.
+    fn arrange_scratch(&mut self, action: arrange::Action) {
+        use arrange::Action;
+        let area = self.main_area();
+        match action {
+            Action::Leave => self.arranging = None,
+            Action::Focus(direction) | Action::Resize(direction) => {
+                let cells = arrange::RESIZE_CELLS;
+                self.scratch.nudge(area, direction, cells);
+            }
+            Action::Equalize => self.scratch.reset_size(),
+            Action::NewTab => self.new_tab(),
+            Action::PreviousTab => {
+                self.run(Command::PreviousTab, false);
+            }
+            Action::NextTab => {
+                self.run(Command::NextTab, false);
+            }
+            Action::Cut => self.cut_scratch(),
+            Action::Copy => self.copy_panel(),
+            Action::Paste => self.paste_panel(),
+            Action::Swap(_)
+            | Action::Flip
+            | Action::Split(_)
+            | Action::Zoom
+            | Action::Close
+            | Action::Undo => {}
+        }
+        self.layout();
     }
 
     /// Changes the tab on screen with `change`, given the panels' area,
@@ -2990,6 +3148,27 @@ impl App {
         self.prune_terminals();
     }
 
+    /// Takes what the scratchpad shows, and its history, out of it, as a
+    /// panel of its own to paste over another (see [`App::cut_panel`]),
+    /// leaving it empty, and puts it away, for the tab's panels to paste
+    /// over.
+    fn cut_scratch(&mut self) {
+        if self.scratch.panel.is_empty() {
+            self.show_message("Nothing to cut.", false);
+            return;
+        }
+        let mut panel = std::mem::replace(&mut self.scratch.panel, Panel::new(scratch::ID));
+        panel.id = self.next_panel;
+        self.next_panel += 1;
+        panel.set_framed(false);
+        self.panel_clip = Some(PanelClip::Cut(panel));
+        self.forget_arranging();
+        self.hide_scratch();
+        self.layout();
+        self.prune_documents();
+        self.prune_terminals();
+    }
+
     /// Keeps what the active panel shows, and its history, to paste over
     /// other panels (see [`App::paste_panel`]). A terminal shows in one
     /// panel at a time, so pasting one moves it, leaving the panel it was
@@ -3017,6 +3196,16 @@ impl App {
     fn paste_panel(&mut self) {
         match self.panel_clip.take() {
             None => {}
+            // Into the scratchpad, it's the scratchpad's panel from now on.
+            Some(PanelClip::Cut(mut panel)) if self.scratch.open => {
+                panel.id = scratch::ID;
+                let old = std::mem::replace(&mut self.scratch.panel, panel);
+                self.scratch.panel.absorb(old);
+                self.focus = Focus::Editor;
+                self.layout();
+                self.show_active_in_tree();
+                self.prune_terminals();
+            }
             Some(PanelClip::Cut(mut panel)) => {
                 let id = panel.id;
                 let tab = self.tab_mut();
@@ -3065,6 +3254,9 @@ impl App {
     /// Zooms the active panel to fill the tab, framed, hiding the others,
     /// or zooms back out. A lone panel has nothing to hide.
     fn toggle_zoom(&mut self) {
+        if self.scratch.open {
+            return;
+        }
         let tab = self.tab_mut();
         if tab.panels.len() == 1 {
             return;
@@ -3088,7 +3280,7 @@ impl App {
         }
         if let Some(visit) = &visit {
             self.active_panel_mut().drop_visit(visit);
-            self.jumps.drop_visit(self.tab().active, visit);
+            self.jumps.drop_visit(self.active_id(), visit);
         }
         if !self.step_history(true) {
             self.show_active_in_tree();
@@ -3100,16 +3292,30 @@ impl App {
     }
 
     /// Catches the places to go back to across panels up with where the
-    /// keyboard is now (see [`Jumps::follow`]).
+    /// keyboard is now (see [`Jumps::follow`]). The scratchpad keeps out of
+    /// them: its own history has where it's been, and while it's out,
+    /// they wait for it to go.
     fn follow_jumps(&mut self) {
+        self.scratch.panel.take_left();
+        if self.scratch.open {
+            return;
+        }
         let active = self.tab().active;
         let before = self
             .jumps
             .at()
             .filter(|&at| at != active)
-            .and_then(|at| tab::all_panels(&self.tabs).find(|panel| panel.id == at))
+            .and_then(|at| {
+                self.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panels)
+                    .find(|p| p.id == at)
+            })
             .and_then(Panel::visit);
-        let left = tab::all_panels_mut(&mut self.tabs)
+        let left = self
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| &mut tab.panels)
             .flat_map(|panel| {
                 let id = panel.id;
                 let left = panel.take_left();
@@ -3122,8 +3328,13 @@ impl App {
 
     /// Goes back to where the keyboard was before, in whichever panel and
     /// tab, or with `back` false, to where it went back from. Closed files
-    /// open again; closed terminals are skipped.
+    /// open again; closed terminals are skipped. In the scratchpad, it goes
+    /// through the scratchpad's history instead.
     fn go_jumps(&mut self, back: bool) {
+        if self.scratch.open {
+            self.step_history(back);
+            return;
+        }
         self.follow_jumps();
         let active = self.tab().active;
         let here = self.active_panel().visit().map(|visit| Jump {
@@ -3137,7 +3348,7 @@ impl App {
         };
         self.go_to_place(jump.panel, &jump.visit, false);
         // Going back isn't going somewhere new.
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             panel.take_left();
         }
         self.jumps.settle(self.tab().active);
@@ -3158,9 +3369,8 @@ impl App {
         let elsewhere = self.terminals_elsewhere();
         let (documents, terminals) = (&self.documents, &self.terminals);
         let usable = |visit: &Visit| visit_usable(visit, documents, terminals, &elsewhere);
-        let Some(visit) = self.tabs[self.tab]
-            .active_panel_mut()
-            .step_history(back, usable)
+        let Some(visit) =
+            active_in(&mut self.tabs, self.tab, &mut self.scratch).step_history(back, usable)
         else {
             return false;
         };
@@ -3171,8 +3381,8 @@ impl App {
     /// The terminals panels other than the active one show, which it
     /// can't go back to.
     fn terminals_elsewhere(&self) -> Vec<u32> {
-        let active = self.tab().active;
-        tab::all_panels(&self.tabs)
+        let active = self.active_id();
+        tab::all_panels(&self.tabs, &self.scratch.panel)
             .filter(|panel| panel.id != active)
             .filter_map(Panel::terminal)
             .map(|terminal| terminal.borrow().id())
@@ -3275,7 +3485,7 @@ impl App {
         let Some(switcher) = self.switcher.take() else {
             return;
         };
-        let Some(index) = back.filter(|_| self.tab().active == switcher.panel) else {
+        let Some(index) = back.filter(|_| self.active_id() == switcher.panel) else {
             return;
         };
         if let Some(visit) = self.active_panel_mut().step_history_to(true, index) {
@@ -3366,7 +3576,7 @@ impl App {
     fn go_to_place(&mut self, id: PanelId, visit: &Visit, as_jump: bool) {
         let mut panel = id;
         if let Visit::Terminal(terminal) = visit {
-            let showing = tab::all_panels(&self.tabs).find(|panel| {
+            let showing = tab::all_panels(&self.tabs, &self.scratch.panel).find(|panel| {
                 panel
                     .terminal()
                     .is_some_and(|shown| shown.borrow().id() == *terminal)
@@ -3383,6 +3593,8 @@ impl App {
             if tab != self.tab {
                 self.switch_tab(tab);
             }
+            self.activate(panel);
+        } else if panel == scratch::ID {
             self.activate(panel);
         }
         let active = self.active_panel();
@@ -3455,8 +3667,13 @@ impl App {
             }
             return;
         }
+        // Nothing's beside the scratchpad, over the panels, but the tree.
         let tab = self.tab();
-        match tab.layout.neighbor(self.main_area(), tab.active, direction) {
+        let beside = match self.scratch.open {
+            true => None,
+            false => tab.layout.neighbor(self.main_area(), tab.active, direction),
+        };
+        match beside {
             Some(id) => self.activate(id),
             None if direction == Direction::Left => {
                 self.run(Command::FocusTree, false);
@@ -3465,9 +3682,17 @@ impl App {
         }
     }
 
-    /// Gives the keyboard to panel `id`.
+    /// Gives the keyboard to panel `id`. Any but the scratchpad puts the
+    /// scratchpad away.
     fn activate(&mut self, id: PanelId) {
         self.focus = Focus::Editor;
+        if id == scratch::ID {
+            if !self.scratch.open {
+                self.toggle_scratch();
+            }
+            return;
+        }
+        self.hide_scratch();
         let tab = self.tab_mut();
         if tab.active != id {
             let active = tab.active;
@@ -3531,13 +3756,15 @@ impl App {
         let Some(closing) = self.tabs.get(index) else {
             return;
         };
-        // What its panels show, except files panels in other tabs show too.
+        // What its panels show, except files panels in other tabs, or the
+        // scratchpad, show too.
         let elsewhere = |doc: &Rc<Document>| {
             self.tabs
                 .iter()
                 .enumerate()
                 .filter(|&(i, _)| i != index)
                 .flat_map(|(_, tab)| &tab.panels)
+                .chain(std::iter::once(&self.scratch.panel))
                 .any(|panel| panel.shows(doc))
         };
         let mut documents: Vec<Rc<Document>> = Vec::new();
@@ -3927,7 +4154,7 @@ impl App {
             return;
         };
         let underlined = bytes.is_some().then_some(id);
-        if let Some(editor) = self.tab_mut().panel_mut(id).and_then(Panel::editor_mut) {
+        if let Some(editor) = self.panel_mut(id).and_then(Panel::editor_mut) {
             editor.underline(bytes);
             self.underlined = underlined;
         }
@@ -3936,7 +4163,7 @@ impl App {
     /// The bytes of the name at screen column `x`, row `y`, in panel `id`'s
     /// editor, if it has a definition to go to.
     fn reference_under(&mut self, id: PanelId, x: u32, y: u32) -> Option<std::ops::Range<usize>> {
-        let editor = self.tab().panels.iter().find(|p| p.id == id)?.editor()?;
+        let editor = self.panel(id)?.editor()?;
         let doc = Rc::clone(editor.document());
         let reference = reference_in(&doc, |text| editor.byte_at(x, y, text), false)?;
         if editor.underlined() == Some(&reference.bytes) {
@@ -3954,7 +4181,8 @@ impl App {
         let Some(id) = self.underlined.take() else {
             return;
         };
-        let panel = tab::all_panels_mut(&mut self.tabs).find(|panel| panel.id == id);
+        let panel = tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel)
+            .find(|panel| panel.id == id);
         if let Some(editor) = panel.and_then(Panel::editor_mut) {
             editor.underline(None);
         }
@@ -4111,14 +4339,16 @@ impl App {
                 _ => None,
             };
             let replaced = replaced
-                .filter(|old| !tab::all_panels(&self.tabs).any(|panel| panel.shows(old)))
+                .filter(|old| {
+                    !tab::all_panels(&self.tabs, &self.scratch.panel).any(|panel| panel.shows(old))
+                })
                 .and_then(|old| {
                     let index = self.documents.iter().position(|d| Rc::ptr_eq(d, &old))?;
                     Some((index, old))
                 });
             match replaced {
                 Some((index, old)) => {
-                    for panel in tab::all_panels_mut(&mut self.tabs) {
+                    for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
                         panel.forget(&old);
                     }
                     self.documents[index] = doc.clone();
@@ -4186,7 +4416,7 @@ impl App {
     /// Stops showing images of `path`, or of files in it if it's a folder,
     /// in every panel.
     fn close_images(&mut self, path: &Path) {
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             if panel
                 .image()
                 .is_some_and(|image| image.path().starts_with(path))
@@ -4208,10 +4438,13 @@ impl App {
     /// Closes unnamed files that were never typed in and no panel has, in
     /// any tab.
     fn prune_documents(&mut self) {
-        let tabs = &self.tabs;
+        let (tabs, scratch) = (&self.tabs, &self.scratch.panel);
         let cut = self.panel_clip.as_ref().and_then(PanelClip::cut);
         self.documents.retain(|doc| {
-            !doc.is_blank() || tab::all_panels(tabs).chain(cut).any(|panel| panel.has(doc))
+            !doc.is_blank()
+                || tab::all_panels(tabs, scratch)
+                    .chain(cut)
+                    .any(|panel| panel.has(doc))
         });
         let documents = &self.documents;
         self.recent.retain(|recent| match recent {
@@ -4252,7 +4485,7 @@ impl App {
         let preview = doc.is_some_and(|doc| self.is_preview(doc));
         self.tree.set_active(path.as_deref(), preview);
         self.changes.set_active(path.as_deref(), preview);
-        let commit = self.tabs[self.tab].active_panel().commit();
+        let commit = active_of(&self.tabs, self.tab, &self.scratch).commit();
         for view in &mut self.commit_views {
             view.set_active(path.as_deref(), preview);
             let stashed = commit
@@ -4399,8 +4632,10 @@ impl App {
         let Some(doc) = self.active_panel().document().cloned() else {
             return true;
         };
-        let active = self.tab().active;
-        if tab::all_panels(&self.tabs).any(|panel| panel.id != active && panel.shows(&doc)) {
+        let active = self.active_id();
+        if tab::all_panels(&self.tabs, &self.scratch.panel)
+            .any(|panel| panel.id != active && panel.shows(&doc))
+        {
             self.active_panel_mut().forget(&doc);
             return true;
         }
@@ -4665,7 +4900,7 @@ impl App {
 
     /// Closes `doc`, wherever it's shown, dropping its unsaved changes.
     fn destroy_document(&mut self, doc: &Rc<Document>) {
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             panel.forget(doc);
         }
         self.documents.retain(|open| !Rc::ptr_eq(open, doc));
@@ -4837,7 +5072,7 @@ impl App {
                 doc.buffer.set_tab_width(new.tab_width as u8);
             }
         }
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             for editor in panel.editors_mut() {
                 editor.follow_settings(&old, &new);
             }
@@ -4903,7 +5138,8 @@ impl App {
         for terminal in &self.terminals {
             terminal.borrow_mut().restyle();
         }
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        self.set_terminal_backgrounds();
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             for editor in panel.editors_mut() {
                 editor.restyle();
             }
@@ -5389,33 +5625,14 @@ impl App {
                 layout: tab.layout.clone(),
                 active: tab.active,
                 zoomed: tab.zoomed,
-                panels: tab
-                    .panels
-                    .iter()
-                    .map(|panel| {
-                        let (back, forward) = panel.history();
-                        session::PanelState {
-                            id: panel.id,
-                            shows: panel.visit().as_ref().and_then(visit_shown),
-                            places: panel
-                                .places()
-                                .filter_map(|(doc, (row, col, top), reading)| {
-                                    Some(session::Place {
-                                        doc: doc_shown(doc)?,
-                                        row,
-                                        col,
-                                        top,
-                                        reading,
-                                    })
-                                })
-                                .collect(),
-                            back: back.iter().filter_map(visited).collect(),
-                            forward: forward.iter().filter_map(visited).collect(),
-                        }
-                    })
-                    .collect(),
+                panels: tab.panels.iter().map(panel_state).collect(),
             })
             .collect();
+        // Put away, as it comes back.
+        let scratch = session::ScratchState {
+            panel: panel_state(&self.scratch.panel),
+            size: self.scratch.size(),
+        };
         let recent = self
             .recent
             .iter()
@@ -5435,6 +5652,7 @@ impl App {
             changes_shown: self.sidebar != Sidebar::Files,
             tab: self.tab,
             tabs,
+            scratch: Some(scratch),
             documents,
             terminals,
             recent,
@@ -5475,7 +5693,7 @@ impl App {
         }
 
         // Files.
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             panel.clear();
         }
         self.documents.clear();
@@ -5616,7 +5834,7 @@ impl App {
         }
         self.tab = state.tab.min(self.tabs.len() - 1);
         self.next_tab = self.tabs.len() as TabId;
-        self.next_panel = tab::all_panels(&self.tabs)
+        self.next_panel = (self.tabs.iter().flat_map(|tab| &tab.panels))
             .map(|panel| panel.id + 1)
             .max()
             .unwrap_or(0);
@@ -5624,6 +5842,7 @@ impl App {
         for tab in &mut self.tabs {
             tab.set_area(area);
         }
+        self.scratch.set_area(area);
         let visit = |visited: &session::Visited| {
             let shown = &visited.shown;
             let doc = find_doc(shown);
@@ -5644,45 +5863,53 @@ impl App {
                 Shown::Image(path) => Some(Visit::Image(path.clone())),
             }
         };
-        for (tab, saved) in self.tabs.iter_mut().zip(&state.tabs) {
-            for saved in &saved.panels {
-                let Some(panel) = tab.panel_mut(saved.id) else {
+        let terminals = &self.terminals;
+        let restore = |panel: &mut Panel, saved: &session::PanelState| {
+            for place in &saved.places {
+                let Some(doc) = find_doc(&place.doc) else {
                     continue;
                 };
-                for place in &saved.places {
-                    let Some(doc) = find_doc(&place.doc) else {
-                        continue;
-                    };
-                    if panel.show(&doc).is_ok() {
-                        if let Some(editor) = panel.editor_mut() {
-                            editor.set_place(place.row, place.col, place.top);
-                            if let Some(line) = place.reading {
-                                editor.read_from(line);
-                            }
+                if panel.show(&doc).is_ok() {
+                    if let Some(editor) = panel.editor_mut() {
+                        editor.set_place(place.row, place.col, place.top);
+                        if let Some(line) = place.reading {
+                            editor.read_from(line);
                         }
                     }
                 }
-                let shown = match &saved.shows {
-                    Some(Shown::Terminal(id)) => self
-                        .terminals
-                        .iter()
-                        .find(|terminal| terminal.borrow().id() == *id)
-                        .map(|terminal| panel.show_terminal(terminal.clone()))
-                        .is_some(),
-                    Some(Shown::Image(path)) => ImageView::open(path)
-                        .map(|image| panel.show_image(image))
-                        .is_ok(),
-                    Some(doc) => find_doc(doc).is_some_and(|doc| panel.show(&doc).is_ok()),
-                    None => false,
-                };
-                if !shown {
-                    panel.show_nothing();
-                }
-                panel.set_history(
-                    saved.back.iter().filter_map(visit).collect(),
-                    saved.forward.iter().filter_map(visit).collect(),
-                );
             }
+            let shown = match &saved.shows {
+                Some(Shown::Terminal(id)) => terminals
+                    .iter()
+                    .find(|terminal| terminal.borrow().id() == *id)
+                    .map(|terminal| panel.show_terminal(terminal.clone()))
+                    .is_some(),
+                Some(Shown::Image(path)) => ImageView::open(path)
+                    .map(|image| panel.show_image(image))
+                    .is_ok(),
+                Some(doc) => find_doc(doc).is_some_and(|doc| panel.show(&doc).is_ok()),
+                None => false,
+            };
+            if !shown {
+                panel.show_nothing();
+            }
+            panel.set_history(
+                saved.back.iter().filter_map(visit).collect(),
+                saved.forward.iter().filter_map(visit).collect(),
+            );
+        };
+        for (tab, saved) in self.tabs.iter_mut().zip(&state.tabs) {
+            for saved in &saved.panels {
+                if let Some(panel) = tab.panel_mut(saved.id) {
+                    restore(panel, saved);
+                }
+            }
+        }
+        // It comes back put away, as it was or as it was last left.
+        self.scratch.open = false;
+        if let Some(saved) = &state.scratch {
+            restore(&mut self.scratch.panel, &saved.panel);
+            self.scratch.set_size(saved.size);
         }
         self.mark = state.mark.as_ref().and_then(|mark| {
             Some(Mark {
@@ -5703,7 +5930,7 @@ impl App {
         self.jumps
             .set(jumps(&state.jumps_back), jumps(&state.jumps_forward));
         // Panels shown again left nowhere.
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             panel.take_left();
         }
 
@@ -5726,6 +5953,7 @@ impl App {
         self.recovery.discard();
         self.layout();
         self.show_active_in_tree();
+        self.set_terminal_backgrounds();
         self.watching = None;
         self.watch_folders();
         Ok(())
@@ -5748,7 +5976,7 @@ impl App {
         // Nothing else holds the terminals then.
         self.close_popups();
         self.focused_terminal = None;
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             panel.hide_terminal();
         }
         let mut adopted = Vec::new();
@@ -7108,7 +7336,7 @@ impl App {
     /// header, or from the keyboard, below the header's start.
     fn open_panel_menu(&mut self, id: PanelId, at: Option<(u32, u32)>) {
         use Command::*;
-        let Some(panel) = self.tab().panels.iter().find(|panel| panel.id == id) else {
+        let Some(panel) = self.panel(id) else {
             return;
         };
         let item = |command, label: &str| MenuItem::Command(command, label.to_string());
@@ -7161,21 +7389,30 @@ impl App {
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
-        items.extend([
-            item(SplitRight, "Split Right"),
-            item(SplitDown, "Split Down"),
-        ]);
-        match self.tab().zoomed {
-            true => items.push(item(ToggleZoom, "Unzoom")),
-            false if self.tab().panels.len() > 1 => items.push(item(ToggleZoom, "Zoom")),
-            false => {}
+        let scratchpad = id == scratch::ID;
+        if !scratchpad {
+            items.extend([
+                item(SplitRight, "Split Right"),
+                item(SplitDown, "Split Down"),
+            ]);
+            match self.tab().zoomed {
+                true => items.push(item(ToggleZoom, "Unzoom")),
+                false if self.tab().panels.len() > 1 => items.push(item(ToggleZoom, "Zoom")),
+                false => {}
+            }
         }
-        items.push(item(ArrangePanels, "Arrange Panels"));
+        items.push(match scratchpad {
+            true => item(ArrangePanels, "Resize Scratchpad"),
+            false => item(ArrangePanels, "Arrange Panels"),
+        });
         items.push(MenuItem::Separator);
         if panel.editor().is_some() || panel.image().is_some() || panel.commit().is_some() {
             items.push(item(CloseFile, "Close File"));
         }
-        items.push(item(ClosePanel, "Close Panel"));
+        items.push(match scratchpad {
+            true => item(ToggleScratchpad, "Hide Scratchpad"),
+            false => item(ClosePanel, "Close Panel"),
+        });
         let area = panel.area();
         let (x, y) = at.unwrap_or((area.x, area.y));
         let menu = ContextMenu::new(
@@ -7195,7 +7432,7 @@ impl App {
     /// editor's text, it opens the editor's context menu there, and returns
     /// `true`. Terminals, and the rest, have the click.
     fn right_click_editor(&mut self, id: PanelId, x: u32, y: u32) -> bool {
-        let editor = self.tab_mut().panel_mut(id).and_then(Panel::editor_mut);
+        let editor = self.panel_mut(id).and_then(Panel::editor_mut);
         if !editor.is_some_and(|editor| editor.right_click(x, y)) {
             return false;
         }
@@ -7209,7 +7446,7 @@ impl App {
     /// would do nothing, such as Go to Definition off a name, are left out.
     fn open_editor_menu(&mut self, id: PanelId, at: Option<(u32, u32)>) {
         use Command::*;
-        let Some(panel) = self.tab().panels.iter().find(|panel| panel.id == id) else {
+        let Some(panel) = self.panel(id) else {
             return;
         };
         let Some(editor) = panel.editor() else {
@@ -7308,6 +7545,14 @@ impl App {
         }
         match command {
             Command::TreeOpen if !target.is_dir => {
+                if self.open(&target.path, false) {
+                    self.focus = Focus::Editor;
+                }
+            }
+            // Nothing's beside the scratchpad: it opens in the tab, which
+            // the scratchpad goes away for.
+            Command::TreeOpenToSide if !target.is_dir && self.scratch.open => {
+                self.hide_scratch();
                 if self.open(&target.path, false) {
                     self.focus = Focus::Editor;
                 }
@@ -7484,7 +7729,7 @@ impl App {
                 doc.rename(path);
             }
         }
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             if let Some(image) = panel.image_mut() {
                 if let Some(path) = moved(image.path()) {
                     image.rename(path);
@@ -7683,6 +7928,19 @@ impl App {
     /// before, unless it shows a terminal too, or else another that
     /// doesn't, or else a new one to its right.
     fn open_beside_terminal(&mut self, path: &Path, position: Option<Position>) {
+        let go = |editor: &mut Editor| {
+            if let Some(position) = position {
+                editor.go_to(position);
+            }
+        };
+        // The scratchpad has nothing beside it: the file takes the
+        // terminal's place there, as it does without room to split.
+        if self.scratch.open {
+            if self.open_and(path, go) {
+                self.focus = Focus::Editor;
+            }
+            return;
+        }
         let tab = self.tab();
         let usable = |panel: &&Panel| panel.id != tab.active && panel.terminal().is_none();
         let beside = tab
@@ -7697,11 +7955,6 @@ impl App {
             // the terminal keeps running.
             None => self.split(Axis::Horizontal),
         }
-        let go = |editor: &mut Editor| {
-            if let Some(position) = position {
-                editor.go_to(position);
-            }
-        };
         if self.open_and(path, go) {
             self.focus = Focus::Editor;
         }
@@ -7731,7 +7984,7 @@ impl App {
     /// leaves any other panel showing it, in any tab, since its pty has one
     /// size.
     fn show_terminal(&mut self, terminal: Rc<RefCell<Terminal>>) {
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             if panel
                 .terminal()
                 .is_some_and(|shown| Rc::ptr_eq(shown, &terminal))
@@ -7751,7 +8004,7 @@ impl App {
     /// Closes `terminal`, hanging up on its shell and whatever it's
     /// running. A panel showing it is left empty.
     fn destroy_terminal(&mut self, terminal: &Rc<RefCell<Terminal>>) {
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             if panel
                 .terminal()
                 .is_some_and(|shown| Rc::ptr_eq(shown, terminal))
@@ -7761,6 +8014,20 @@ impl App {
         }
         self.terminals.retain(|t| !Rc::ptr_eq(t, terminal));
         self.prune_terminals();
+    }
+
+    /// Gives the scratchpad's terminal, if it shows one, the scratchpad's
+    /// background where the default background would be, and the others
+    /// the default.
+    fn set_terminal_backgrounds(&self) {
+        let set_apart = theme::colors().surface_inactive;
+        let scratch = self.scratch.panel.terminal();
+        for terminal in &self.terminals {
+            let in_scratch = scratch.is_some_and(|shown| Rc::ptr_eq(shown, terminal));
+            terminal
+                .borrow_mut()
+                .set_background(in_scratch.then_some(set_apart));
+        }
     }
 
     /// The terminal in the active panel, if any.
@@ -7858,11 +8125,11 @@ impl App {
     /// Closes terminals whose shell exited and that no panel shows, in any
     /// tab.
     fn prune_terminals(&mut self) {
-        let tabs = &self.tabs;
+        let (tabs, scratch) = (&self.tabs, &self.scratch.panel);
         let cut = self.panel_clip.as_ref().and_then(PanelClip::cut);
         self.terminals.retain(|terminal| {
             terminal.borrow().exit().is_none()
-                || tab::all_panels(tabs).chain(cut).any(|panel| {
+                || tab::all_panels(tabs, scratch).chain(cut).any(|panel| {
                     panel
                         .terminal()
                         .is_some_and(|shown| Rc::ptr_eq(shown, terminal))
@@ -7916,15 +8183,15 @@ impl App {
             return;
         };
         terminal.borrow_mut().clear_notification();
+        let shows = |panel: &Panel| panel.terminal().is_some_and(|t| Rc::ptr_eq(t, &terminal));
         let shown = self.tabs.iter().enumerate().find_map(|(index, tab)| {
-            tab.panels
-                .iter()
-                .find(|panel| panel.terminal().is_some_and(|t| Rc::ptr_eq(t, &terminal)))
-                .map(|panel| (index, panel.id))
+            let panel = tab.panels.iter().find(|panel| shows(panel))?;
+            Some((Some(index), panel.id))
         });
+        let shown = shown.or_else(|| shows(&self.scratch.panel).then_some((None, scratch::ID)));
         match shown {
             Some((index, id)) => {
-                if index != self.tab {
+                if let Some(index) = index.filter(|&index| index != self.tab) {
                     self.switch_tab(index);
                 }
                 self.activate(id);
@@ -8083,8 +8350,9 @@ impl App {
         // Tabs off screen are laid out when they come back.
         let area = self.main_area();
         self.tab_mut().set_area(area);
+        self.scratch.set_area(area);
         if let Some(switcher) = &mut self.switcher {
-            let header = header_of(self.tabs[self.tab].active_panel().area());
+            let header = header_of(active_of(&self.tabs, self.tab, &self.scratch).area());
             switcher.set_size(self.width, self.height, header);
         }
     }
@@ -8166,12 +8434,34 @@ impl App {
         &mut self.tabs[self.tab]
     }
 
+    /// The panel keys go to, unless the sidebar has them, and files open
+    /// in: the scratchpad while it's out, or else the tab's active panel.
     fn active_panel(&self) -> &Panel {
-        self.tab().active_panel()
+        active_of(&self.tabs, self.tab, &self.scratch)
     }
 
     fn active_panel_mut(&mut self) -> &mut Panel {
-        self.tab_mut().active_panel_mut()
+        active_in(&mut self.tabs, self.tab, &mut self.scratch)
+    }
+
+    /// The active panel's id (see [`App::active_panel`]).
+    fn active_id(&self) -> PanelId {
+        self.active_panel().id
+    }
+
+    /// Panel `id`, on screen: the scratchpad's, or one in the tab.
+    fn panel(&self, id: PanelId) -> Option<&Panel> {
+        match id {
+            scratch::ID => Some(&self.scratch.panel),
+            _ => self.tab().panels.iter().find(|panel| panel.id == id),
+        }
+    }
+
+    fn panel_mut(&mut self, id: PanelId) -> Option<&mut Panel> {
+        match id {
+            scratch::ID => Some(&mut self.scratch.panel),
+            _ => self.tab_mut().panel_mut(id),
+        }
     }
 
     /// The active panel's editor, if it isn't empty.
@@ -8193,7 +8483,7 @@ impl App {
     /// Shows what the editors said to as toasts.
     fn take_messages(&mut self) {
         let now = Instant::now();
-        for panel in tab::all_panels_mut(&mut self.tabs) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             for (text, error) in panel.take_messages() {
                 self.toasts.push(text, error, now);
             }
@@ -8206,6 +8496,22 @@ impl App {
             Some(key) => key.to_string(),
             None => command.id().to_string(),
         }
+    }
+}
+
+/// The active panel (see [`App::active_panel`]), of the tab at `tab`, or the
+/// scratchpad's while it's out, borrowing only these.
+fn active_of<'a>(tabs: &'a [Tab], tab: usize, scratch: &'a Scratch) -> &'a Panel {
+    match scratch.open {
+        true => &scratch.panel,
+        false => tabs[tab].active_panel(),
+    }
+}
+
+fn active_in<'a>(tabs: &'a mut [Tab], tab: usize, scratch: &'a mut Scratch) -> &'a mut Panel {
+    match scratch.open {
+        true => &mut scratch.panel,
+        false => tabs[tab].active_panel_mut(),
     }
 }
 
@@ -8279,6 +8585,30 @@ fn visited(visit: &Visit) -> Option<session::Visited> {
         shown: visit_shown(visit)?,
         at,
     })
+}
+
+/// What a session keeps of `panel`: what it shows, where it was in each
+/// file, and its history.
+fn panel_state(panel: &Panel) -> session::PanelState {
+    let (back, forward) = panel.history();
+    session::PanelState {
+        id: panel.id,
+        shows: panel.visit().as_ref().and_then(visit_shown),
+        places: panel
+            .places()
+            .filter_map(|(doc, (row, col, top), reading)| {
+                Some(session::Place {
+                    doc: doc_shown(doc)?,
+                    row,
+                    col,
+                    top,
+                    reading,
+                })
+            })
+            .collect(),
+        back: back.iter().filter_map(visited).collect(),
+        forward: forward.iter().filter_map(visited).collect(),
+    }
 }
 
 /// What a session keeps of the places in `list` to go back or forward to.
@@ -13960,6 +14290,323 @@ mod tests {
         assert_eq!(*config::get(), Config::default());
         assert!(app.visible_tree_width() > 0);
         assert!(screen(&app).contains("b.txt"));
+    }
+
+    // --- scratchpad -----------------------------------------------------------------
+
+    /// The file the tab's active panel shows, by name, under the scratchpad.
+    fn tab_shown_name(app: &App) -> Option<String> {
+        let panel = app.tab().active_panel();
+        panel
+            .editor()
+            .and_then(Editor::path)
+            .map(|path| file_name(&path))
+    }
+
+    #[test]
+    fn the_scratchpad_floats_over_every_tab_and_takes_what_opens() {
+        let _serial = crate::test_serial();
+        let files = [("a.txt", "alpha"), ("b.txt", "beta"), ("c.txt", "gamma")];
+        let root = fixture("scratchpad", &files);
+        let mut app = app(&root, Some("a.txt"));
+        app.resize(100, 30);
+
+        ctrl(&mut app, ';');
+        assert!(app.scratch.open);
+        assert_eq!(app.active_id(), scratch::ID);
+        assert!(app.active_panel().is_empty());
+        // Its header is in its frame's top edge.
+        let text = screen_of(&app, 100, 30);
+        assert!(text.contains("╭─ No file ─"), "{text}");
+        assert!(text.contains("─ <  >  × ──╮"), "{text}");
+
+        // What's opened goes in it, and the tab keeps what it shows.
+        assert!(app.open(&root.join("b.txt"), false));
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        assert_eq!(tab_shown_name(&app).as_deref(), Some("a.txt"));
+        // From the sidebar too, while it has the keyboard.
+        app.run(Command::FocusTree, false);
+        assert_eq!(app.focus, Focus::Tree);
+        app.tree_action(TreeAction::Open {
+            path: root.join("c.txt"),
+            focus: false,
+            preview: false,
+        });
+        assert!(app.scratch.open);
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
+        assert_eq!(tab_shown_name(&app).as_deref(), Some("a.txt"));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Editor);
+
+        // It can't be split or zoomed.
+        ctrl(&mut app, '\\');
+        assert_eq!(app.tab().panels.len(), 1);
+        assert!(screen_of(&app, 100, 30).contains("can't be split"));
+
+        // It goes along to another tab, and back.
+        ctrl(&mut app, 't');
+        assert!(app.scratch.open);
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
+        ctrl(&mut app, ';');
+        assert!(!app.scratch.open);
+        assert!(app.active_panel().is_empty(), "the new tab's");
+        ctrl(&mut app, ';');
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
+
+        // Ctrl+- goes back through its own history, and it stays out.
+        ctrl(&mut app, '-');
+        assert!(app.scratch.open);
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        ctrl(&mut app, '=');
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
+
+        // A click on the panel under it, outside it, puts it away.
+        let main = app.main_area();
+        left_click(&mut app, main.x + 1, main.y + 2);
+        assert!(!app.scratch.open);
+        assert_ne!(app.active_id(), scratch::ID);
+        // And going back from there doesn't bring it out.
+        ctrl(&mut app, '-');
+        assert!(!app.scratch.open);
+
+        // Closing what it shows leaves it empty, and closing it then puts
+        // it away.
+        ctrl(&mut app, ';');
+        ctrl(&mut app, 'w');
+        assert!(app.scratch.open);
+        assert!(app.active_panel().is_empty());
+        assert!(app.find_document(&root.join("c.txt")).is_none());
+        ctrl(&mut app, 'w');
+        assert!(!app.scratch.open);
+        assert_eq!(app.tabs.len(), 2, "no tab closed");
+    }
+
+    #[test]
+    fn escape_puts_the_scratchpad_away_once_nothing_in_it_needs_it() {
+        let _serial = crate::test_serial();
+        let root = fixture("scratchpad-escape", &[("a.txt", "alpha beta")]);
+        let mut app = app(&root, None);
+        app.resize(100, 30);
+        ctrl(&mut app, ';');
+        assert!(app.open(&root.join("a.txt"), false));
+
+        // The selection goes first, then the find bar, then the scratchpad.
+        ctrl(&mut app, 'a');
+        ctrl(&mut app, 'f');
+        app.focus = Focus::Editor;
+        app.ed_mut().blur_find();
+        key(&mut app, KeyCode::Esc);
+        assert!(app.scratch.open);
+        assert!(app.ed().selected_text().is_none());
+        assert!(app.ed().find_open());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.scratch.open);
+        assert!(!app.ed().find_open());
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.scratch.open);
+
+        // Empty, it goes at once; from the sidebar, Esc only comes back to it.
+        ctrl(&mut app, ';');
+        ctrl(&mut app, 'w');
+        app.run(Command::FocusTree, false);
+        key(&mut app, KeyCode::Esc);
+        assert!(app.scratch.open);
+        assert_eq!(app.focus, Focus::Editor);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.scratch.open);
+    }
+
+    #[test]
+    fn the_scratchpad_has_the_background_of_code_blocks() {
+        let _serial = crate::test_serial();
+        let root = fixture("scratchpad-shade", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.resize(100, 30);
+        // A theme of its own, as the terminal's is black.
+        let before = (*theme::colors()).clone();
+        let id = ThemeId::named("Tidepool").unwrap();
+        theme::set(id.colors(&app.terminal_colors));
+        ctrl(&mut app, ';');
+        let frame = OwnedBuffer::new(100, 30, false, WidthMethod::Unicode, "test").unwrap();
+        app.draw(&frame);
+        let outer = app.scratch.outer(app.main_area());
+        let under = frame.bg_at(outer.x - 1, outer.y + 5).unwrap();
+        let bg = theme::colors().bg;
+        assert_eq!((under.r(), under.g(), under.b()), (bg.r(), bg.g(), bg.b()));
+        assert_ne!(theme::colors().surface_inactive, bg);
+        for (x, y) in [(outer.x, outer.y), (outer.x + 5, outer.y + 5)] {
+            let inside = frame.bg_at(x, y);
+            assert_eq!(inside, Some(theme::colors().surface_inactive), "({x}, {y})");
+        }
+
+        // A terminal's default background is the same, there only.
+        let ctrl_shift = Mods {
+            shift: true,
+            ..Mods::CTRL
+        };
+        app.handle_key(Key::new(KeyCode::Char('n'), ctrl_shift));
+        assert!(app.active_terminal().is_some());
+        app.draw(&frame);
+        let body = app.scratch.panel.body();
+        let blank = |frame: &OwnedBuffer, body: Rect| {
+            frame.bg_at(body.x + body.width / 2, body.y + body.height - 1)
+        };
+        assert_eq!(blank(&frame, body), Some(theme::colors().surface_inactive));
+        let edge = frame.bg_at(outer.x + 1, outer.y);
+        assert_eq!(edge, Some(theme::colors().surface_inactive));
+        // Moved to the tab's panel, it has the default again.
+        let terminal = app.terminals[0].clone();
+        ctrl(&mut app, ';');
+        app.show_terminal(terminal);
+        app.after_input();
+        app.draw(&frame);
+        let body = app.active_panel().body();
+        assert_ne!(blank(&frame, body), Some(theme::colors().surface_inactive));
+        theme::set(before);
+    }
+
+    #[test]
+    fn the_scratchpad_resizes_by_its_frame_and_in_layout_mode() {
+        let _serial = crate::test_serial();
+        let root = fixture("scratchpad-resize", &[("a.txt", "alpha")]);
+        let mut app = app(&root, Some("a.txt"));
+        app.resize(100, 30);
+        ctrl(&mut app, ';');
+        let main = app.main_area();
+        let outer = app.scratch.outer(main);
+
+        // Its right edge, dragged right, moves the left one as far left.
+        let right = outer.x + outer.width - 1;
+        let y = outer.y + 3;
+        mouse_at(&mut app, MouseKind::Press(MouseButton::Left), right, y);
+        mouse_at(&mut app, MouseKind::Drag(MouseButton::Left), right + 3, y);
+        mouse_at(
+            &mut app,
+            MouseKind::Release(MouseButton::Left),
+            right + 3,
+            y,
+        );
+        let wider = app.scratch.outer(main);
+        assert_eq!(wider.width, outer.width + 6);
+        assert_eq!(wider.x, outer.x - 3);
+        assert!(app.scratch.open, "a click on its frame keeps it out");
+        let inner = tab::zoomed_area(wider);
+        assert_eq!(
+            app.scratch.panel.area(),
+            Rect {
+                y: wider.y,
+                height: inner.height + 1,
+                ..inner
+            }
+        );
+
+        // In layout mode, the arrows resize it, and = puts it back.
+        ctrl(&mut app, 'j');
+        let text = screen_of(&app, 100, 30);
+        assert!(text.contains("resize"), "{text}");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.scratch.outer(main).height, wider.height + 4);
+        key(&mut app, KeyCode::Char('='));
+        assert_eq!(app.scratch.outer(main), outer);
+        // Nothing else of the mode's touches the tab under it.
+        key(&mut app, KeyCode::Char('\\'));
+        key(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.tab().panels.len(), 1);
+        assert_eq!(tab_shown_name(&app).as_deref(), Some("a.txt"));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.arranging.is_none());
+        assert!(app.scratch.open);
+    }
+
+    #[test]
+    fn layout_mode_cuts_copies_and_pastes_to_and_from_the_scratchpad() {
+        let _serial = crate::test_serial();
+        let files = [("a.txt", "alpha"), ("b.txt", "beta")];
+        let root = fixture("scratchpad-clip", &files);
+        let mut app = app(&root, Some("a.txt"));
+        app.resize(100, 30);
+
+        // A copy of the tab's panel, pasted in the scratchpad.
+        ctrl(&mut app, 'j');
+        key(&mut app, KeyCode::Char('c'));
+        ctrl(&mut app, ';');
+        key(&mut app, KeyCode::Char('v'));
+        assert!(app.scratch.open);
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        assert!(screen_of(&app, 100, 30).contains("cut copy paste"));
+
+        // Cut, it's empty and put away, and pastes over the tab's panel.
+        assert!(app.open(&root.join("b.txt"), false));
+        key(&mut app, KeyCode::Char('x'));
+        assert!(!app.scratch.open);
+        assert!(app.scratch.panel.is_empty());
+        assert!(app.arranging.is_some(), "still arranging");
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        assert_ne!(app.active_id(), scratch::ID);
+        app.go_history(true);
+        assert_eq!(
+            shown_name(&app).as_deref(),
+            Some("a.txt"),
+            "its history came along"
+        );
+        app.go_history(false);
+        // Nothing to cut from it now.
+        ctrl(&mut app, ';');
+        key(&mut app, KeyCode::Char('x'));
+        assert!(app.scratch.open);
+        assert!(app.panel_clip.is_none());
+
+        // A tab's panel cut, pasted in the scratchpad, is the scratchpad's.
+        ctrl(&mut app, ';');
+        ctrl(&mut app, '\\');
+        assert!(app.open(&root.join("a.txt"), false));
+        assert_eq!(app.tab().panels.len(), 2);
+        key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.tab().panels.len(), 1);
+        ctrl(&mut app, ';');
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.scratch.panel.id, scratch::ID);
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        key(&mut app, KeyCode::Esc);
+        ctrl(&mut app, ';');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"), "the tab's");
+        ctrl(&mut app, ';');
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+    }
+
+    #[test]
+    fn sessions_keep_the_scratchpad_put_away() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "scratchpad-session",
+            &[("a.txt", "alpha"), ("b.txt", "beta")],
+        );
+        let mut app = app(&root, Some("a.txt"));
+        app.sessions = Some(sessions_dir("scratchpad"));
+        ctrl(&mut app, ';');
+        assert!(app.open(&root.join("a.txt"), false));
+        assert!(app.open(&root.join("b.txt"), false));
+        app.scratch.set_size((0.5, 0.9));
+        ctrl(&mut app, '\'');
+        assert!(app.keep_session(false));
+
+        let mut app = reopen(app, Vec::new());
+        assert!(!app.scratch.open);
+        assert_eq!(app.scratch.size(), (0.5, 0.9));
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"), "the tab's");
+        ctrl(&mut app, ';');
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        ctrl(&mut app, '-');
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        assert!(app.scratch.open);
+        // The mark set in it goes back to it.
+        ctrl(&mut app, ';');
+        assert!(!app.scratch.open);
+        app.run(Command::JumpToMark, false);
+        assert!(app.scratch.open);
+        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        app.end_session_now();
     }
 
     // --- sessions -------------------------------------------------------------------

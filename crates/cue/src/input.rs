@@ -660,6 +660,15 @@ mod tests {
     }
 
     #[test]
+    fn kitty_ctrl_punctuation() {
+        let mut p = Parser::new();
+        assert_eq!(
+            keys(p.feed(b"\x1b[59;5u\x1b[39;5u")),
+            [ctrl(';'), ctrl('\'')]
+        );
+    }
+
+    #[test]
     fn kitty_key_releases() {
         let mut p = Parser::new();
         let ctrl_shift = Mods {

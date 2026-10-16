@@ -126,6 +126,7 @@ commands! {
     ClosePanel => "panel:close", "Close Panel";
     ToggleZoom => "panel:toggle-zoom", "Zoom or Unzoom Panel";
     ArrangePanels => "panel:arrange", "Arrange Panels";
+    ToggleScratchpad => "scratchpad:toggle", "Show or Hide Scratchpad";
     PanelContextMenu => "panel:context-menu", "Show Panel Menu";
     EditorContextMenu => "editor:context-menu", "Show Editor Context Menu";
     Pop => "panel:pop", "Pop";
@@ -275,14 +276,13 @@ impl Command {
             | OpenFile | GoToFile | GoToUnsaved | GoToLine | GoToSymbol | GoToWorkspaceSymbol
             | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext
             | FindPrevious | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight
-            | SplitDown | ClosePanel | ToggleZoom | ArrangePanels | Pop | GoBack | GoForward
-            | RecentlyViewed | SetMark | JumpToMark | FocusPanelLeft | FocusPanelRight
-            | FocusPanelUp | FocusPanelDown | NewTerminal | GoToWaitingTerminal | NewTab
-            | CloseTab | NextTab | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab
-            | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7
-            | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch | GitPull | GitPush => {
-                Context::Global
-            }
+            | SplitDown | ClosePanel | ToggleZoom | ArrangePanels | ToggleScratchpad | Pop
+            | GoBack | GoForward | RecentlyViewed | SetMark | JumpToMark | FocusPanelLeft
+            | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal
+            | GoToWaitingTerminal | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
+            | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5
+            | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch
+            | GitPull | GitPush => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
@@ -499,6 +499,10 @@ impl Default for Keymap {
         bindings.push((key(Char('\''), Mods::CTRL), SetMark));
         bindings.push((key(Char('\''), CTRL_SHIFT), JumpToMark));
         bindings.push((key(Char('"'), CTRL_SHIFT), JumpToMark));
+        // Beside them, and likewise only with the kitty protocol; there,
+        // the command palette has it.
+        bindings.push((key(Char(';'), Mods::CTRL), ToggleScratchpad));
+        bindings.push((key(Char(';'), SUPER), ToggleScratchpad));
         // As in VS Code and browsers. In a terminal, the shell has them.
         bindings.push((key(PageDown, Mods::CTRL), NextTab));
         bindings.push((key(PageUp, Mods::CTRL), PreviousTab));
@@ -1119,6 +1123,10 @@ mod tests {
             (key('N', false, false, true, false), Command::NewTerminal),
             (key('|', true, false, true, false), Command::SplitDown),
             (key('`', true, false, true, false), Command::NewTerminal),
+            (
+                key(';', false, false, true, false),
+                Command::ToggleScratchpad,
+            ),
             (key('~', true, false, true, false), Command::NewTerminal),
             (key('n', false, true, true, false), Command::CreateFile),
             (

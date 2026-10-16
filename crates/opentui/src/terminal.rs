@@ -237,6 +237,15 @@ impl EmbeddedTerminal {
         };
     }
 
+    /// Draws `bg` behind cells without a background of their own, in place
+    /// of the default background, unless the program set its own, or with
+    /// `None`, the default again. Asking for it still tells the program the
+    /// default.
+    pub fn set_default_background(&mut self, bg: Option<Rgba>) {
+        let bg = bg.as_ref().map_or(std::ptr::null(), |bg| bg.as_ptr());
+        unsafe { sys::embeddedTerminalSetDefaultBackground(self.handle, bg) };
+    }
+
     /// Scrolls the view through the scrollback by `delta` rows, up if
     /// negative.
     pub fn scroll(&mut self, delta: i32) {

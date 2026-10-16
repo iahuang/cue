@@ -108,6 +108,11 @@ impl CommitDiff {
 
     /// Runs an editor command: keys that move the cursor scroll, and
     /// those that edit don't.
+    /// Whether any of it is selected, for Esc to clear.
+    pub fn has_selection(&self) -> bool {
+        self.view.selected_text().is_some()
+    }
+
     pub fn run(&mut self, command: Command) -> Outcome {
         match self.view.run(command) {
             Ran::Done => Outcome::Continue,

@@ -451,6 +451,39 @@ test "embedded terminal starts with the default colors it is given (cue patch)" 
     try std.testing.expect(std.mem.find(u8, reply[0..len], "rgb:2828/2a2a/3636") != null);
 }
 
+test "embedded terminal draws a default background it's given, unless the program sets one (cue patch)" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    var target = try buffer.OptimizedBuffer.init(std.testing.allocator, 4, 1, .{ .pool = pool });
+    defer target.deinit();
+
+    const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 4, .rows = 1 });
+    defer terminal.deinit();
+    terminal.setHostPalette(true);
+    terminal.setDefaultBackground(ansi.rgbColor(0x11, 0x12, 0x13, 255));
+    try terminal.write("a\x1b[41mb\x1b[0m");
+    try terminal.compose(target, 0, 0);
+
+    // Plain text and the row's tail have it; an explicit background keeps its own.
+    try std.testing.expectEqual(@as(u8, 0x11), ansi.red(target.get(0, 0).?.bg));
+    try std.testing.expectEqual(ansi.ColorIntent.rgb, ansi.intent(target.get(0, 0).?.bg));
+    try std.testing.expectEqual(@as(u8, 0x11), ansi.red(target.get(3, 0).?.bg));
+    try std.testing.expectEqual(ansi.ColorIntent.indexed, ansi.intent(target.get(1, 0).?.bg));
+
+    // A background the program sets wins, until it resets it.
+    try terminal.write("\x1b]11;rgb:aa/bb/cc\x07");
+    try terminal.compose(target, 0, 0);
+    try std.testing.expect(ansi.red(target.get(3, 0).?.bg) != 0x11);
+    try terminal.write("\x1b]111\x07");
+    try terminal.compose(target, 0, 0);
+    try std.testing.expectEqual(@as(u8, 0x11), ansi.red(target.get(3, 0).?.bg));
+
+    // Without one, it's the default again.
+    terminal.setDefaultBackground(null);
+    try terminal.compose(target, 0, 0);
+    try std.testing.expectEqual(ansi.ColorIntent.default, ansi.intent(target.get(3, 0).?.bg));
+}
+
 test "embedded terminal composition respects the scissor rect" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

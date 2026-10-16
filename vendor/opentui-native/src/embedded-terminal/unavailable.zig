@@ -87,6 +87,7 @@ pub const EmbeddedTerminal = struct {
     pub fn invalidate(_: *EmbeddedTerminal) void {}
     pub fn setTransparentBackground(_: *EmbeddedTerminal, _: bool) void {}
     pub fn setHostPalette(_: *EmbeddedTerminal, _: bool) void {}
+    pub fn setDefaultBackground(_: *EmbeddedTerminal, _: ?buffer.RGBA) void {}
     pub fn compose(_: *EmbeddedTerminal, _: *buffer.OptimizedBuffer, _: i32, _: i32) Error!void {
         return error.Unsupported;
     }

@@ -180,6 +180,12 @@ pub struct Panel {
     /// included, from the first to past the last: a click there opens the
     /// file picker.
     name_columns: Cell<(u32, u32)>,
+    /// The column past the last of what the header says, left of its
+    /// buttons, when last drawn.
+    title_end: Cell<u32>,
+    /// It's framed, with its header in the frame's top edge, as the
+    /// scratchpad is: its area starts on that edge, inside the corners.
+    framed: bool,
 }
 
 impl Panel {
@@ -195,6 +201,38 @@ impl Panel {
             history: History::default(),
             left: Vec::new(),
             name_columns: Cell::new((0, 0)),
+            title_end: Cell::new(0),
+            framed: false,
+        }
+    }
+
+    /// Makes it framed, or not (see [`Panel::framed`]).
+    pub fn set_framed(&mut self, framed: bool) {
+        self.framed = framed;
+    }
+
+    /// Where its header goes: across its top, or framed, along the
+    /// frame's top edge, with a cell of the edge left of it, and two right.
+    fn header(&self) -> Rect {
+        let area = self.area;
+        match self.framed {
+            true => Rect {
+                x: area.x + 1,
+                y: area.y,
+                width: area.width.saturating_sub(3),
+                height: 1,
+            },
+            false => Rect { height: 1, ..area },
+        }
+    }
+
+    /// The header's background: the frame's, framed.
+    fn header_bg(&self, active: bool) -> opentui::Rgba {
+        let colors = theme::colors();
+        match (self.framed, active) {
+            (true, _) => colors.bg,
+            (false, true) => colors.surface,
+            (false, false) => colors.surface_inactive,
         }
     }
 
@@ -366,6 +404,24 @@ impl Panel {
     }
 
     /// Whether the panel shows nothing.
+    /// Whether Esc has anything to do here: a running terminal's program
+    /// has it, whatever it does with it, and elsewhere it clears the
+    /// selection, or with none, closes the find bar.
+    pub fn takes_escape(&self) -> bool {
+        if let Some(terminal) = &self.terminal {
+            let terminal = terminal.borrow();
+            return terminal.exit().is_none() || terminal.find_open();
+        }
+        if let Some(image) = &self.image {
+            return image.find_open();
+        }
+        if let Some(commit) = &self.commit {
+            return commit.has_selection();
+        }
+        self.editor()
+            .is_some_and(|editor| editor.selected_text().is_some() || editor.find_open())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.current.is_none()
             && self.terminal.is_none()
@@ -821,7 +877,7 @@ impl Panel {
     /// reader mode, or back to editing, first, and a changed file's one to
     /// go to diff mode, or back.
     fn buttons(&self) -> Vec<(HeaderButton, &'static str, u32)> {
-        let area = self.area;
+        let area = self.header();
         if area.width < MIN_BUTTONS_WIDTH {
             return Vec::new();
         }
@@ -868,13 +924,13 @@ impl Panel {
             .iter()
             .map(|(_, label, _)| label_width(label))
             .sum();
-        self.area.width.saturating_sub(buttons)
+        self.header().width.saturating_sub(buttons)
     }
 
     /// Whether screen column `x` of the header is on its name.
     pub fn on_name(&self, x: u32) -> bool {
         let (start, end) = self.name_columns.get();
-        (start..end).contains(&x) && x < self.area.x + self.title_width()
+        (start..end).contains(&x) && x < self.header().x + self.title_width()
     }
 
     /// The interactive area under the pointer, without changing selection.
@@ -898,19 +954,19 @@ impl Panel {
             {
                 return None;
             }
+            let header = self.header();
             return Some(Rect {
-                x: start.max(self.area.x),
-                y: self.area.y,
+                x: start.max(header.x),
+                y: header.y,
                 width: (start + label_width(label))
-                    .min(self.area.x + self.area.width)
-                    .saturating_sub(start.max(self.area.x)),
+                    .min(header.x + header.width)
+                    .saturating_sub(start.max(header.x)),
                 height: 1,
             });
         }
         Some(Rect {
             width: self.title_width(),
-            height: 1,
-            ..self.area
+            ..self.header()
         })
     }
 
@@ -923,17 +979,29 @@ impl Panel {
     }
 
     /// Draws the header's buttons over it, in its color, and dimmer where
-    /// there's nothing to go back or forward to.
+    /// there's nothing to go back or forward to. Framed, the frame's edge
+    /// runs on between what the header says and the buttons.
     fn draw_buttons(&self, frame: &Buffer, active: bool) {
         let colors = theme::colors();
         let fg = if active { colors.text } else { colors.muted };
-        for (button, label, x) in self.buttons() {
+        let header = self.header();
+        let buttons = self.buttons();
+        for &(button, label, x) in &buttons {
             let fg = match button {
                 HeaderButton::Back if !self.can_go(true) => colors.border,
                 HeaderButton::Forward if !self.can_go(false) => colors.border,
                 _ => fg,
             };
-            frame.draw_text(label, x, self.area.y, fg, None, Attributes::NONE);
+            frame.draw_text(label, x, header.y, fg, None, Attributes::NONE);
+        }
+        if self.framed {
+            let start = self.title_end.get() + 1;
+            let end = buttons.first().map_or(header.x + header.width, |b| b.2);
+            if end > start {
+                let rule = "─".repeat((end - start) as usize);
+                let color = colors.accent;
+                frame.draw_text(&rule, start, header.y, color, None, Attributes::NONE);
+            }
         }
     }
 
@@ -942,13 +1010,9 @@ impl Panel {
     /// the shell exited.
     fn draw_terminal_header(&self, frame: &Buffer, terminal: &Terminal, active: bool) {
         let colors = theme::colors();
-        let area = self.area;
-        let (bg, fg) = if active {
-            (colors.surface, colors.text)
-        } else {
-            (colors.surface_inactive, colors.muted)
-        };
-        frame.fill_rect(area.x, area.y, area.width, 1, bg);
+        let area = self.header();
+        let fg = if active { colors.text } else { colors.muted };
+        frame.fill_rect(area.x, area.y, area.width, 1, self.header_bg(active));
         let width = self.title_width();
         let title = terminal.title();
         let name = if !title.trim().is_empty() {
@@ -964,15 +1028,18 @@ impl Panel {
         // Notes go a space apart after the name, while there's room.
         let end = area.x + width;
         let mut x = area.x + 1 + icon + label_width(&name) + 1;
+        self.title_end.set(x - 1);
         if let Some(notification) = terminal.notification() {
             if x + icons::WIDTH < end {
                 x = icons::bell().draw(frame, x, area.y, None);
+                self.title_end.set(x);
                 let room = end.saturating_sub(x + 1) as usize;
                 match &notification.text {
                     Some(text) if room > 1 => {
                         let text = truncate(text, room);
                         frame.draw_text(&text, x, area.y, fg, None, Attributes::NONE);
                         x += label_width(&text) + 1;
+                        self.title_end.set(x - 1);
                     }
                     _ => {}
                 }
@@ -982,6 +1049,7 @@ impl Panel {
             let note = format!("[{}]", terminal::describe_exit(status).to_lowercase());
             if x + 1 + label_width(&note) < end {
                 frame.draw_text(&note, x + 1, area.y, colors.muted, None, Attributes::NONE);
+                self.title_end.set(x + 1 + label_width(&note));
             }
         }
     }
@@ -992,13 +1060,9 @@ impl Panel {
     /// commit changed it the commit after its name.
     fn draw_header(&self, frame: &Buffer, workspace: &Workspace, active: bool, preview: bool) {
         let colors = theme::colors();
-        let area = self.area;
-        let (bg, fg) = if active {
-            (colors.surface, colors.text)
-        } else {
-            (colors.surface_inactive, colors.muted)
-        };
-        frame.fill_rect(area.x, area.y, area.width, 1, bg);
+        let area = self.header();
+        let fg = if active { colors.text } else { colors.muted };
+        frame.fill_rect(area.x, area.y, area.width, 1, self.header_bg(active));
         let width = self.title_width();
         let (path, untitled, notes) = match (&self.commit, &self.image, self.document()) {
             (Some(commit), _, _) => {
@@ -1025,6 +1089,7 @@ impl Panel {
                     Attributes::NONE,
                 );
                 self.set_name_columns(label_width("No file"));
+                self.title_end.set(area.x + label_width(" No file"));
                 return;
             }
         };
@@ -1053,18 +1118,20 @@ impl Panel {
         }
         frame.draw_text(&name, area.x + 1 + icon, area.y, fg, None, attributes);
         self.set_name_columns(icon + label_width(&name));
+        self.title_end.set(area.x + 1 + icon + label_width(&name));
         let used = (1 + icon) as usize + name.chars().count() + 2;
         let room = (width as usize).saturating_sub(used + 1);
         if !folder.is_empty() && room > 1 {
             let folder = truncate_left(&folder, room);
             let x = area.x + used as u32;
             frame.draw_text(&folder, x, area.y, colors.muted, None, Attributes::NONE);
+            self.title_end.set(x + label_width(&folder));
         }
     }
 
     /// Notes that the header's name, icon included, is `width` columns.
     fn set_name_columns(&self, width: u32) {
-        let start = self.area.x + 1;
+        let start = self.header().x + 1;
         self.name_columns.set((start, start + width));
     }
 

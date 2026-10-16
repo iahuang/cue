@@ -84,6 +84,31 @@ impl Buffer {
         unsafe { sys::bufferFillRect(self.handle, x, y, width, height, bg.as_ptr()) }
     }
 
+    /// Changes cell backgrounds to what `f` makes of them, given each cell's
+    /// column and row, without changing text or attributes.
+    pub fn map_background(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        mut f: impl FnMut(u32, u32, Rgba) -> Rgba,
+    ) {
+        let bg = unsafe { sys::bufferGetBgPtr(self.handle) };
+        if bg.is_null() {
+            return;
+        }
+        for row in y..y.saturating_add(height).min(self.height()) {
+            for col in x..x.saturating_add(width).min(self.width()) {
+                let cell = unsafe { bg.add(row as usize * self.width() as usize + col as usize) };
+                let color = f(col, row, Rgba(unsafe { *cell }));
+                unsafe {
+                    *cell = color.0;
+                }
+            }
+        }
+    }
+
     /// Blends a tint into cell backgrounds without changing text or attributes.
     pub fn tint_background(&self, x: u32, y: u32, width: u32, height: u32, tint: Rgba) {
         let bg = unsafe { sys::bufferGetBgPtr(self.handle) };

@@ -56,6 +56,13 @@ pub const EmbeddedTerminal = struct {
     force_redraw: bool = true,
     transparent_background: bool = false,
     host_palette: bool = false,
+    /// What's drawn behind cells without a background of their own, rather
+    /// than the default background, unless the program set its own (cue
+    /// patch; see `setDefaultBackground`).
+    default_background: ?buffer.RGBA = null,
+    /// The background last composed in the default's place, to redraw
+    /// everything when that changes.
+    composed_background: ?buffer.RGBA = null,
     /// Counts changes to the screen's contents, so search results are only
     /// taken for the text they were found in.
     generation: u64 = 0,
@@ -310,6 +317,22 @@ pub const EmbeddedTerminal = struct {
         self.force_redraw = true;
     }
 
+    /// Draws `background` behind cells without a background of their own,
+    /// in place of the default background, or with null, the default again
+    /// (cue patch). A background the program sets (OSC 11) still wins, and
+    /// asking for it still tells the program the default.
+    pub fn setDefaultBackground(self: *EmbeddedTerminal, background: ?buffer.RGBA) void {
+        self.default_background = background;
+    }
+
+    /// Whether the program set a background of its own (OSC 11).
+    fn ownBackground(self: *const EmbeddedTerminal) bool {
+        const background = self.terminal.colors.background;
+        const own = background.override orelse return false;
+        const default = background.default orelse return true;
+        return !std.meta.eql(own, default);
+    }
+
     pub fn compose(self: *EmbeddedTerminal, target: *buffer.OptimizedBuffer, x: i32, y: i32) Error!void {
         self.render_state.update(self.allocator, &self.terminal) catch |err| {
             self.render_state.deinit(self.allocator);
@@ -318,6 +341,11 @@ pub const EmbeddedTerminal = struct {
             return err;
         };
         try self.search.highlight(self.allocator, &self.render_state);
+        const background = if (self.ownBackground()) null else self.default_background;
+        if (!std.meta.eql(background, self.composed_background)) {
+            self.composed_background = background;
+            self.force_redraw = true;
+        }
         if (self.force_redraw) {
             self.render_state.dirty = .full;
             self.force_redraw = false;
@@ -325,6 +353,7 @@ pub const EmbeddedTerminal = struct {
         try compositor.compose(self.allocator, &self.render_state, target, x, y, .{
             .transparent_background = self.transparent_background,
             .host_palette = self.host_palette,
+            .default_background = background,
             .search = self.search_colors,
         });
     }

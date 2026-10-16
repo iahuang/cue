@@ -55,6 +55,7 @@ const KNOWN: &[&str] = &[
     "documents",
     "terminals",
     "tabs",
+    "scratchpad",
     "indents",
 ];
 const LOCK: &str = "lock";
@@ -134,6 +135,14 @@ pub struct TabState {
     pub zoomed: bool,
 }
 
+/// The scratchpad (see [`crate::scratch`]): its panel, and its share of
+/// the panels' area, across and down.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScratchState {
+    pub panel: PanelState,
+    pub size: (f32, f32),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TerminalState {
     pub id: u32,
@@ -165,6 +174,7 @@ pub struct State {
     /// The tab on screen.
     pub tab: usize,
     pub tabs: Vec<TabState>,
+    pub scratch: Option<ScratchState>,
     pub documents: Vec<Doc>,
     pub terminals: Vec<TerminalState>,
     /// What the picker lists first, most recent first.
@@ -797,33 +807,18 @@ pub fn encode(state: &State) -> String {
             table.insert("zoomed".into(), Value::Boolean(true));
         }
         table.insert("layout".into(), layout_value(&tab.layout));
-        let panels = tab.panels.iter().map(|panel| {
-            let mut table = Table::new();
-            table.insert("id".into(), int(panel.id as u64));
-            if let Some(shows) = &panel.shows {
-                table.insert("shows".into(), shown_value(shows));
-            }
-            let places = panel.places.iter().map(|place| {
-                let Value::Table(mut table) = shown_value(&place.doc) else {
-                    unreachable!()
-                };
-                table.insert("row".into(), int(place.row as u64));
-                table.insert("col".into(), int(place.col as u64));
-                table.insert("top".into(), int(place.top as u64));
-                if let Some(line) = place.reading {
-                    table.insert("reading".into(), int(line as u64));
-                }
-                Value::Table(table)
-            });
-            table.insert("places".into(), Value::Array(places.collect()));
-            table.insert("back".into(), visited_list(&panel.back));
-            table.insert("forward".into(), visited_list(&panel.forward));
-            Value::Table(table)
-        });
+        let panels = tab.panels.iter().map(panel_value);
         table.insert("panels".into(), Value::Array(panels.collect()));
         Value::Table(table)
     });
     root.insert("tabs".into(), Value::Array(tabs.collect()));
+    if let Some(scratch) = &state.scratch {
+        let mut table = Table::new();
+        table.insert("width".into(), Value::Float(scratch.size.0 as f64));
+        table.insert("height".into(), Value::Float(scratch.size.1 as f64));
+        table.insert("panel".into(), panel_value(&scratch.panel));
+        root.insert("scratchpad".into(), Value::Table(table));
+    }
     let indents = state.indents.iter().map(|(path, indent)| {
         let mut table = Table::new();
         table.insert("path".into(), path_value(path));
@@ -840,6 +835,31 @@ pub fn encode(state: &State) -> String {
         }
     }
     root.to_string()
+}
+
+fn panel_value(panel: &PanelState) -> Value {
+    let int = |n: u32| Value::Integer(n as i64);
+    let mut table = Table::new();
+    table.insert("id".into(), int(panel.id));
+    if let Some(shows) = &panel.shows {
+        table.insert("shows".into(), shown_value(shows));
+    }
+    let places = panel.places.iter().map(|place| {
+        let Value::Table(mut table) = shown_value(&place.doc) else {
+            unreachable!()
+        };
+        table.insert("row".into(), int(place.row));
+        table.insert("col".into(), int(place.col));
+        table.insert("top".into(), int(place.top));
+        if let Some(line) = place.reading {
+            table.insert("reading".into(), int(line));
+        }
+        Value::Table(table)
+    });
+    table.insert("places".into(), Value::Array(places.collect()));
+    table.insert("back".into(), visited_list(&panel.back));
+    table.insert("forward".into(), visited_list(&panel.forward));
+    Value::Table(table)
 }
 
 fn get_u32(table: &Table, key: &str) -> Option<u32> {
@@ -928,6 +948,29 @@ pub fn decode(text: &str) -> Option<State> {
         Some(Jump {
             panel: get_u32(jump, "panel")?,
             visited: visited_from(jump)?,
+        })
+    };
+    let panel_from = |panel: &Table| {
+        let places = get_array(panel, "places")
+            .filter_map(|place| {
+                Some(Place {
+                    doc: shown_from(place)?,
+                    row: get_u32(place, "row").unwrap_or(0),
+                    col: get_u32(place, "col").unwrap_or(0),
+                    top: get_u32(place, "top").unwrap_or(0),
+                    reading: get_u32(place, "reading"),
+                })
+            })
+            .collect();
+        Some(PanelState {
+            id: get_u32(panel, "id")?,
+            shows: panel
+                .get("shows")
+                .and_then(Value::as_table)
+                .and_then(shown_from),
+            places,
+            back: visited_list(panel, "back"),
+            forward: visited_list(panel, "forward"),
         })
     };
     let jumps = root.get("jumps").and_then(Value::as_table);
@@ -1028,30 +1071,7 @@ pub fn decode(text: &str) -> Option<State> {
             let mut ids = Vec::new();
             layout_panels(&layout, &mut ids);
             let mut panels: Vec<PanelState> = get_array(table, "panels")
-                .filter_map(|panel| {
-                    let id = get_u32(panel, "id")?;
-                    let places = get_array(panel, "places")
-                        .filter_map(|place| {
-                            Some(Place {
-                                doc: shown_from(place)?,
-                                row: get_u32(place, "row").unwrap_or(0),
-                                col: get_u32(place, "col").unwrap_or(0),
-                                top: get_u32(place, "top").unwrap_or(0),
-                                reading: get_u32(place, "reading"),
-                            })
-                        })
-                        .collect();
-                    Some(PanelState {
-                        id,
-                        shows: panel
-                            .get("shows")
-                            .and_then(Value::as_table)
-                            .and_then(shown_from),
-                        places,
-                        back: visited_list(panel, "back"),
-                        forward: visited_list(panel, "forward"),
-                    })
-                })
+                .filter_map(panel_from)
                 .filter(|panel| ids.contains(&panel.id))
                 .collect();
             // Every panel in the layout, once.
@@ -1082,6 +1102,16 @@ pub fn decode(text: &str) -> Option<State> {
             })
         })
         .collect();
+    state.scratch = root
+        .get("scratchpad")
+        .and_then(Value::as_table)
+        .and_then(|table| {
+            let share = |key: &str| table.get(key)?.as_float().map(|n| n as f32);
+            Some(ScratchState {
+                panel: panel_from(table.get("panel")?.as_table()?)?,
+                size: (share("width")?, share("height")?),
+            })
+        });
     Some(state)
 }
 
