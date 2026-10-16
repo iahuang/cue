@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.4 — 2026-10-16
 
 - Highlight the cursor's line in the focused editor while nothing is selected, and make faint selections easier to see (`8ac3695`)
 - Rename the editor menu's Copy Reference to Copy Line Reference, and Toggle Line Comment to Toggle Comment (`2c29d17`)
