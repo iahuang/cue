@@ -124,6 +124,7 @@ commands! {
     SplitRight => "panel:split-right", "Split Panel Right";
     SplitDown => "panel:split-down", "Split Panel Down";
     ClosePanel => "panel:close", "Close Panel";
+    ToggleZoom => "panel:toggle-zoom", "Zoom or Unzoom Panel";
     PanelContextMenu => "panel:context-menu", "Show Panel Menu";
     EditorContextMenu => "editor:context-menu", "Show Editor Context Menu";
     Pop => "panel:pop", "Pop";
@@ -273,12 +274,12 @@ impl Command {
             | OpenFile | GoToFile | GoToUnsaved | GoToLine | GoToSymbol | GoToWorkspaceSymbol
             | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext
             | FindPrevious | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight
-            | SplitDown | ClosePanel | Pop | GoBack | GoForward | RecentlyViewed | SetMark
-            | JumpToMark | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown
-            | NewTerminal | GoToWaitingTerminal | NewTab | CloseTab | NextTab | PreviousTab
-            | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3
-            | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder
-            | RenameSession | GitFetch | GitPull | GitPush => Context::Global,
+            | SplitDown | ClosePanel | ToggleZoom | Pop | GoBack | GoForward | RecentlyViewed
+            | SetMark | JumpToMark | FocusPanelLeft | FocusPanelRight | FocusPanelUp
+            | FocusPanelDown | NewTerminal | GoToWaitingTerminal | NewTab | CloseTab | NextTab
+            | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2
+            | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9
+            | AddFolder | RenameSession | GitFetch | GitPull | GitPush => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
@@ -443,6 +444,10 @@ impl Default for Keymap {
         bindings.push((key(Char('\\'), SUPER_SHIFT), SplitDown));
         bindings.push((key(Char('|'), CTRL_SHIFT), SplitDown));
         bindings.push((key(Char('|'), SUPER_SHIFT), SplitDown));
+        // As Cmd+Shift+Enter zooms a split in Ghostty and iTerm2. Legacy
+        // terminals send it as Enter; there, the command palette has it.
+        bindings.push((key(Enter, CTRL_SHIFT), ToggleZoom));
+        bindings.push((key(Enter, SUPER_SHIFT), ToggleZoom));
         // Legacy terminals send it as Ctrl+N, a new file; there, the command
         // palette has it.
         bindings.push((key(Char('n'), CTRL_SHIFT), NewTerminal));

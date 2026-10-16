@@ -767,6 +767,7 @@ mod tests {
             layout: crate::layout::Layout::Panel(0),
             active: 0,
             panels: Vec::new(),
+            zoomed: false,
         }
     }
 

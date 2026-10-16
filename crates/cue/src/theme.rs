@@ -668,7 +668,12 @@ fn derive(name: &'static str, base: &Base, ui: &[(Role, u32)], syntax: &[(&str, 
         surface_inactive: set(Role::SurfaceInactive).unwrap_or(tint(0.05)),
         selected: set(Role::Selected).unwrap_or(mix(bg, accent, 0.3)),
         selected_unfocused: set(Role::SelectedUnfocused).unwrap_or(surface),
-        selection: at_least(bg, fg, set(Role::Selection).unwrap_or(mix(bg, accent, 0.4)), 0.25),
+        selection: at_least(
+            bg,
+            fg,
+            set(Role::Selection).unwrap_or(mix(bg, accent, 0.4)),
+            0.25,
+        ),
         accent,
         on_accent: legible_on(accent, bg, fg),
         match_bg: set(Role::MatchBg).unwrap_or(mix(bg, ansi[3], 0.3)),
@@ -1828,7 +1833,11 @@ mod tests {
     fn selections_stand_out_from_the_background() {
         let kanagawa = ThemeId::named("Kanagawa").unwrap();
         let colors = kanagawa.colors(&TerminalColors::default());
-        assert_ne!(colors.selection, hex(0x223249), "too faint as Kanagawa has it");
+        assert_ne!(
+            colors.selection,
+            hex(0x223249),
+            "too faint as Kanagawa has it"
+        );
         let cue = ThemeId::named("Cue Dark").unwrap();
         let colors = cue.colors(&TerminalColors::default());
         assert_eq!(colors.selection, hex(0x225090), "already clear enough");

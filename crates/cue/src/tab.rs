@@ -5,6 +5,10 @@
 //! panels keep what they show while it's off screen, and terminals in them
 //! keep running.
 //!
+//! Zoomed, a tab's active panel fills it, framed, and the others are
+//! hidden until it's zoomed out, as tmux's zoomed panes and tiling window
+//! managers' monocle layouts are. Moving to another panel shows that one.
+//!
 //! With more than one tab, a bar across the top of the panels lists them,
 //! numbered, by the name they were given or else by what their active
 //! panel shows, then a `+` for a new one. A dot after a tab's name says a
@@ -12,7 +16,7 @@
 
 use opentui::{Attributes, Buffer};
 
-use crate::layout::{Layout, PanelId, Rect};
+use crate::layout::{self, Handle, Layout, PanelId, Rect};
 use crate::panel::Panel;
 use crate::theme::{self, Hue};
 
@@ -41,6 +45,8 @@ pub struct Tab {
     pub previous: Option<PanelId>,
     /// The name it was given, if it was renamed.
     pub name: Option<String>,
+    /// The active panel fills the tab, and the others are hidden.
+    pub zoomed: bool,
 }
 
 impl Tab {
@@ -53,6 +59,7 @@ impl Tab {
             active: panel,
             previous: None,
             name: None,
+            zoomed: false,
         }
     }
 
@@ -90,13 +97,73 @@ impl Tab {
         })
     }
 
-    /// Lays its panels out to fill `area`.
+    /// Lays its panels out to fill `area`. Zoomed, the active panel fills
+    /// it instead, and the others keep their places for when it's zoomed
+    /// out. A lone panel isn't zoomed.
     pub fn set_area(&mut self, area: Rect) {
+        if self.panels.len() == 1 {
+            self.zoomed = false;
+        }
         for (id, rect) in self.layout.panels(area) {
             if let Some(panel) = self.panel_mut(id) {
                 panel.set_area(rect);
             }
         }
+        // As a panel closes, the active one may be gone until another is.
+        let (active, zoomed) = (self.active, self.zoomed);
+        if let Some(panel) = self.panel_mut(active).filter(|_| zoomed) {
+            panel.set_area(zoomed_area(area));
+        }
+    }
+
+    /// The panels on screen when the tab fills `area`, and where: zoomed,
+    /// only the active one.
+    pub fn panel_areas(&self, area: Rect) -> Vec<(PanelId, Rect)> {
+        match self.zoomed {
+            true => vec![(self.active, zoomed_area(area))],
+            false => self.layout.panels(area),
+        }
+    }
+
+    /// The handles between panels on screen when the tab fills `area`:
+    /// none while zoomed.
+    pub fn handles(&self, area: Rect) -> Vec<Handle> {
+        match self.zoomed {
+            true => Vec::new(),
+            false => self.layout.handles(area),
+        }
+    }
+}
+
+/// Where a zoomed panel goes in `area`: inside a frame a cell wide, if
+/// that leaves room for a panel.
+pub fn zoomed_area(area: Rect) -> Rect {
+    if area.width < layout::MIN_WIDTH + 2 || area.height < layout::MIN_HEIGHT + 2 {
+        return area;
+    }
+    Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width - 2,
+        height: area.height - 2,
+    }
+}
+
+/// Draws the frame around a zoomed panel in `area`, unless there's no
+/// room for one (see [`zoomed_area`]).
+pub fn draw_zoom_frame(frame: &Buffer, area: Rect) {
+    if zoomed_area(area) == area {
+        return;
+    }
+    let color = theme::colors().accent;
+    let draw = |text: &str, x, y| frame.draw_text(text, x, y, color, None, Attributes::NONE);
+    let rule = "─".repeat(area.width as usize - 2);
+    let bottom = area.y + area.height - 1;
+    draw(&format!("╭{rule}╮"), area.x, area.y);
+    draw(&format!("╰{rule}╯"), area.x, bottom);
+    for y in area.y + 1..bottom {
+        draw("│", area.x, y);
+        draw("│", area.x + area.width - 1, y);
     }
 }
 

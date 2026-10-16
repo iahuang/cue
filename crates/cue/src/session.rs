@@ -130,6 +130,8 @@ pub struct TabState {
     pub layout: Layout,
     pub active: PanelId,
     pub panels: Vec<PanelState>,
+    /// The active panel fills the tab.
+    pub zoomed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -791,6 +793,9 @@ pub fn encode(state: &State) -> String {
             table.insert("name".into(), Value::String(name.clone()));
         }
         table.insert("active".into(), int(tab.active as u64));
+        if tab.zoomed {
+            table.insert("zoomed".into(), Value::Boolean(true));
+        }
         table.insert("layout".into(), layout_value(&tab.layout));
         let panels = tab.panels.iter().map(|panel| {
             let mut table = Table::new();
@@ -1070,6 +1075,10 @@ pub fn decode(text: &str) -> Option<State> {
                 layout,
                 active,
                 panels,
+                zoomed: table
+                    .get("zoomed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect();
@@ -1128,6 +1137,7 @@ mod tests {
                             at: Some((0, 5)),
                         }],
                     }],
+                    zoomed: false,
                 },
                 TabState {
                     name: Some("build".into()),
@@ -1149,6 +1159,7 @@ mod tests {
                             ..PanelState::default()
                         },
                     ],
+                    zoomed: true,
                 },
             ],
             documents: vec![

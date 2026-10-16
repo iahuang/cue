@@ -6,7 +6,8 @@
 - Rename the editor menu's Copy Reference to Copy Line Reference, and Toggle Line Comment to Toggle Comment (`2c29d17`)
 - `cue` no longer resumes the folder's session on its own (use `cue --resume`), so `--fresh` is gone, along with the startup note about sessions running in the background (`de4b161`)
 - Filter which files workspace search looks in, with comma-separated globs like `*.tsx, !node_modules`, which can also pick workspace folders by name (Tab switches to the filter) (`07a8941`)
-- Go back and forward with Ctrl+- and Ctrl+= (or the mouse's buttons) through every panel and tab, focusing the panel again, with focus moving between panels counting too; the header's buttons still go through the panel's own history
+- Go back and forward with Ctrl+- and Ctrl+= (or the mouse's buttons) through every panel and tab, focusing the panel again, with focus moving between panels counting too; the header's buttons still go through the panel's own history (`03f9bdc`)
+- Zoom a panel to fill its tab with Ctrl+Shift+Enter or from its header's menu, framed, with the other panels hidden until it's zoomed out; moving to another panel shows that one instead
 
 ## v0.4.3 — 2026-10-14
 

@@ -1227,6 +1227,7 @@ impl App {
             Command::PreviewToSide => self.preview_to_side(),
             Command::SplitDown => self.split(Axis::Vertical),
             Command::ClosePanel => self.close_panel(),
+            Command::ToggleZoom => self.toggle_zoom(),
             Command::Pop => self.pop(),
             Command::GoBack => self.go_jumps(true),
             Command::GoForward => self.go_jumps(false),
@@ -1885,16 +1886,16 @@ impl App {
                 BarItem::New => MouseTarget::NewTab,
             });
         }
-        let layout = &self.tab().layout;
-        if let Some(handle) = layout
+        let tab = self.tab();
+        if let Some(handle) = tab
             .handles(area)
             .into_iter()
             .find(|handle| handle.axis == Axis::Horizontal && handle.rect.contains(x, y))
         {
             return Some(MouseTarget::Handle(handle.path));
         }
-        let (id, rect) = layout
-            .panels(area)
+        let (id, rect) = tab
+            .panel_areas(area)
             .into_iter()
             .find(|(_, rect)| rect.contains(x, y))?;
         Some(if y == rect.y {
@@ -1941,7 +1942,6 @@ impl App {
                 }
                 let handle = self
                     .tab()
-                    .layout
                     .handles(area)
                     .into_iter()
                     .find(|handle| handle.rect.contains(mouse.x, mouse.y))
@@ -1963,6 +1963,10 @@ impl App {
                 });
             }
             MouseKind::Drag(MouseButton::Left) => {
+                // Zoomed, there's nothing beside it to move it to.
+                if self.tab().zoomed {
+                    return;
+                }
                 let Some(drag) = &mut self.header_drag else {
                     return;
                 };
@@ -2165,6 +2169,9 @@ impl App {
         let tab = self.tab();
         for panel in &tab.panels {
             let active = panel.id == tab.active;
+            if tab.zoomed && !active {
+                continue;
+            }
             let preview = panel.document().is_some_and(|doc| self.is_preview(doc));
             let at = panel.draw(frame, &self.keymap, &self.workspace, active, preview);
             if active {
@@ -2193,7 +2200,10 @@ impl App {
                 self.terminal_cue_keys,
             );
         }
-        for handle in tab.layout.handles(main) {
+        if tab.zoomed {
+            tab::draw_zoom_frame(frame, main);
+        }
+        for handle in tab.handles(main) {
             if handle.axis == Axis::Horizontal {
                 let rect = handle.rect;
                 for y in rect.y..rect.y + rect.height {
@@ -2288,7 +2298,6 @@ impl App {
             }),
             MouseTarget::Handle(path) => self
                 .tab()
-                .layout
                 .handles(self.main_area())
                 .into_iter()
                 .find(|handle| handle.path == path)
@@ -2663,7 +2672,14 @@ impl App {
     /// Splits the active panel, with a new, empty one right of it or below
     /// it, which becomes active.
     fn split(&mut self, axis: Axis) {
-        let area = self.active_panel().area();
+        // Where it is in the layout, zoomed or not.
+        let tab = self.tab();
+        let area = tab
+            .layout
+            .panels(self.main_area())
+            .into_iter()
+            .find(|&(id, _)| id == tab.active)
+            .map_or_else(|| self.active_panel().area(), |(_, area)| area);
         let room = match axis {
             Axis::Horizontal => area.width > 2 * layout::MIN_WIDTH,
             Axis::Vertical => area.height >= 2 * layout::MIN_HEIGHT,
@@ -2675,6 +2691,8 @@ impl App {
         let id = self.next_panel;
         self.next_panel += 1;
         let tab = self.tab_mut();
+        // Splitting shows the panels again.
+        tab.zoomed = false;
         tab.layout.split(tab.active, id, axis);
         tab.panels.push(Panel::new(id));
         self.layout();
@@ -2784,6 +2802,17 @@ impl App {
         }
         self.prune_documents();
         self.prune_terminals();
+    }
+
+    /// Zooms the active panel to fill the tab, framed, hiding the others,
+    /// or zooms back out. A lone panel has nothing to hide.
+    fn toggle_zoom(&mut self) {
+        let tab = self.tab_mut();
+        if tab.panels.len() == 1 {
+            return;
+        }
+        tab.zoomed = !tab.zoomed;
+        self.layout();
     }
 
     /// Closes what the active panel shows (see [`App::close_shown`]) and
@@ -3186,6 +3215,10 @@ impl App {
             let active = tab.active;
             tab.previous = Some(active);
             tab.active = id;
+            if tab.zoomed {
+                // It's this panel on screen now.
+                self.layout();
+            }
             self.show_active_in_tree();
         }
     }
@@ -5095,6 +5128,7 @@ impl App {
                 name: tab.name.clone(),
                 layout: tab.layout.clone(),
                 active: tab.active,
+                zoomed: tab.zoomed,
                 panels: tab
                     .panels
                     .iter()
@@ -5316,6 +5350,7 @@ impl App {
                     active: saved.active,
                     previous: None,
                     name: saved.name.clone(),
+                    zoomed: saved.zoomed,
                 })
                 .collect();
         }
@@ -6869,8 +6904,13 @@ impl App {
         items.extend([
             item(SplitRight, "Split Right"),
             item(SplitDown, "Split Down"),
-            MenuItem::Separator,
         ]);
+        match self.tab().zoomed {
+            true => items.push(item(ToggleZoom, "Unzoom")),
+            false if self.tab().panels.len() > 1 => items.push(item(ToggleZoom, "Zoom")),
+            false => {}
+        }
+        items.push(MenuItem::Separator);
         if panel.editor().is_some() || panel.image().is_some() || panel.commit().is_some() {
             items.push(item(CloseFile, "Close File"));
         }
@@ -13063,6 +13103,67 @@ mod tests {
         assert_eq!(cursor_at(&app), "Ln 21, Col 1");
         app.go_to(Position::printed(2, Some(99)));
         assert_eq!(cursor_at(&app), "Ln 2, Col 7");
+    }
+
+    #[test]
+    fn a_zoomed_panel_fills_the_tab_framed_until_zoomed_out() {
+        let _serial = crate::test_serial();
+        let root = fixture("zoom", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        let zoom = |app: &mut App| {
+            app.handle_key(Key::new(KeyCode::Enter, CTRL_SHIFT));
+        };
+        let line = |app: &App, y: u32| screen(app).lines().nth(y as usize).unwrap().to_string();
+        // A lone panel has nothing to hide.
+        zoom(&mut app);
+        assert!(!app.tab().zoomed);
+
+        ctrl(&mut app, '\\');
+        app.open(&root.join("b.txt"), false);
+        let main = app.main_area();
+        zoom(&mut app);
+        assert!(app.tab().zoomed);
+        let shown = screen(&app);
+        assert!(
+            shown.contains("beta") && !shown.contains("alpha"),
+            "{shown}"
+        );
+        assert_eq!(app.active_panel().area(), tab::zoomed_area(main));
+        assert!(line(&app, main.y).contains("╭──"), "framed");
+        assert!(line(&app, main.y + main.height - 1).contains("╰──"));
+        // The frame isn't the panel's.
+        let (x, y) = (main.x, main.y + 3);
+        assert!(app.target_at(x, y).is_none());
+
+        // Moving to another panel shows that one instead.
+        app.run(Command::FocusPanelLeft, false);
+        let shown = screen(&app);
+        assert!(
+            shown.contains("alpha") && !shown.contains("beta"),
+            "{shown}"
+        );
+        assert_eq!(app.active_panel().area(), tab::zoomed_area(main));
+
+        // Zooming out, both are back where they were.
+        zoom(&mut app);
+        let shown = screen(&app);
+        assert!(shown.contains("alpha") && shown.contains("beta"), "{shown}");
+        assert!(!line(&app, main.y).contains("╭──"));
+
+        // Splitting zooms out, but not where there's no room to.
+        zoom(&mut app);
+        ctrl(&mut app, '\\');
+        assert!(app.tab().zoomed, "too narrow to split right");
+        app.run(Command::SplitDown, false);
+        assert!(!app.tab().zoomed);
+        assert_eq!(app.tab().panels.len(), 3);
+
+        // Closing all but one zooms out.
+        zoom(&mut app);
+        ctrl(&mut app, 'w');
+        ctrl(&mut app, 'w');
+        assert_eq!(app.tab().panels.len(), 1);
+        assert!(!app.tab().zoomed);
     }
 
     #[test]
