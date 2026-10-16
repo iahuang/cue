@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::alert::{Alert, AlertAction, Button};
-use crate::arrange::{self, Arranging, PanelClip};
+use crate::arrange::{self, Arranging, Before, PanelClip};
 use crate::changes::ChangesView;
 use crate::commit_diff::{CommitDiff, Outcome};
 use crate::commit_view::{CantCommit, CommitAction, CommitView};
@@ -3022,6 +3022,9 @@ impl App {
             Action::NextTab => {
                 self.run(Command::NextTab, false);
             }
+            Action::MoveTab(direction) => self.move_tab_arranging(direction),
+            Action::CloseTab => self.close_tab(self.tab),
+            Action::GoToTab(index) => self.switch_tab(index),
             Action::Cut => self.cut_panel(),
             Action::Copy => self.copy_panel(),
             Action::Paste => self.paste_panel(),
@@ -3050,6 +3053,9 @@ impl App {
             Action::NextTab => {
                 self.run(Command::NextTab, false);
             }
+            Action::MoveTab(direction) => self.move_tab_arranging(direction),
+            Action::CloseTab => self.close_tab(self.tab),
+            Action::GoToTab(index) => self.switch_tab(index),
             Action::Cut => self.cut_scratch(),
             Action::Copy => self.copy_panel(),
             Action::Paste => self.paste_panel(),
@@ -3090,11 +3096,34 @@ impl App {
         }
     }
 
-    /// Takes back the last layout change, in whichever tab, as long as the
-    /// tab has the same panels still.
-    fn undo_arranging(&mut self) {
-        let Some((id, layout, zoomed)) = self.arranging.as_mut().and_then(Arranging::undo) else {
+    /// Trades the tab on screen with the one `direction` of it, noting the
+    /// order before to undo.
+    fn move_tab_arranging(&mut self, direction: Direction) {
+        let to = match direction {
+            Direction::Left => self.tab.checked_sub(1),
+            Direction::Right => Some(self.tab + 1).filter(|&to| to < self.tabs.len()),
+            Direction::Up | Direction::Down => None,
+        };
+        let Some(to) = to else {
             return;
+        };
+        let order = self.tabs.iter().map(|tab| tab.id).collect();
+        if let Some(arranging) = &mut self.arranging {
+            arranging.before_moving_tab(order);
+        }
+        self.move_tab(self.tab, to);
+    }
+
+    /// Takes back the last layout change, in whichever tab, as long as the
+    /// tab has the same panels still, or puts the tabs back in the order
+    /// they were before a move. Tabs opened since stay where they are.
+    fn undo_arranging(&mut self) {
+        let Some(before) = self.arranging.as_mut().and_then(Arranging::undo) else {
+            return;
+        };
+        let (id, layout, zoomed) = match before {
+            Before::Layout(id, layout, zoomed) => (id, layout, zoomed),
+            Before::Tabs(order) => return self.put_tabs_in(&order),
         };
         let Some(index) = self.tab_index(id) else {
             return;
@@ -3740,6 +3769,25 @@ impl App {
         let current = self.tab().id;
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
+        self.tab = self.tab_index(current).unwrap_or(0);
+    }
+
+    /// Puts the tabs in `order` back in it, in the places they have
+    /// between them, leaving tabs not in it where they are.
+    fn put_tabs_in(&mut self, order: &[TabId]) {
+        let current = self.tab().id;
+        let rank = |tab: &Tab| order.iter().position(|&id| id == tab.id);
+        let places: Vec<usize> = (0..self.tabs.len())
+            .filter(|&i| rank(&self.tabs[i]).is_some())
+            .collect();
+        let mut ordered: Vec<Tab> = Vec::with_capacity(places.len());
+        for &i in places.iter().rev() {
+            ordered.push(self.tabs.remove(i));
+        }
+        ordered.sort_by_key(|tab| rank(tab));
+        for (&i, tab) in places.iter().zip(ordered) {
+            self.tabs.insert(i, tab);
+        }
         self.tab = self.tab_index(current).unwrap_or(0);
     }
 
@@ -13827,6 +13875,42 @@ mod tests {
         assert!(app.panel_clip.is_some());
         key(&mut app, KeyCode::Char('q'));
         assert!(app.ed().document().text().contains('q'), "typing again");
+    }
+
+    #[test]
+    fn layout_mode_moves_switches_and_closes_tabs() {
+        let _serial = crate::test_serial();
+        let root = fixture("arrange-tabs", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = app(&root, Some("a.txt"));
+        ctrl(&mut app, 'b');
+        ctrl(&mut app, 't');
+        assert!(app.open(&root.join("b.txt"), false));
+        ctrl(&mut app, 'j');
+        key(&mut app, KeyCode::Char('t'));
+        assert_eq!(tab_bar(&app), " 1 a.txt  2 b.txt  3 Empty  +");
+
+        // Shift+[ moves the tab left, twice as one change to undo.
+        app.handle_key(Key::new(KeyCode::Char('{'), Mods::SHIFT));
+        app.handle_key(Key::new(KeyCode::Char('['), Mods::SHIFT));
+        assert_eq!(tab_bar(&app), " 1 Empty  2 a.txt  3 b.txt  +");
+        assert_eq!(app.tab, 0);
+        // No further left than the first.
+        key(&mut app, KeyCode::Char('{'));
+        assert_eq!(app.tab, 0);
+
+        // Digits go to that tab; a tab opened meanwhile stays put on undo.
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.tab, 2);
+        key(&mut app, KeyCode::Char('t'));
+        assert_eq!(tab_bar(&app), " 1 Empty  2 a.txt  3 b.txt  4 Empty  +");
+        key(&mut app, KeyCode::Char('u'));
+        assert_eq!(tab_bar(&app), " 1 a.txt  2 b.txt  3 Empty  4 Empty  +");
+        assert_eq!(app.tab, 3, "the same tab stays on screen");
+
+        // W closes the tab, not the panel.
+        key(&mut app, KeyCode::Char('W'));
+        assert_eq!(tab_bar(&app), " 1 a.txt  2 b.txt  3 Empty  +");
+        assert!(app.arranging.is_some());
     }
 
     #[test]

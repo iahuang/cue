@@ -7,6 +7,10 @@
 //! what's that way (see [`Layout::trade`]), and with Alt they move its
 //! edge that way. The status bar lists the rest.
 //!
+//! Tabs go as panels do, one size up: `[` and `]` switch to the tab that
+//! way, with Shift (`{` and `}`) they trade places with it, `W` closes
+//! the tab as `w` does the panel, and `1` to `9` go to that tab.
+//!
 //! Cut takes the active panel out of the layout, to paste over another,
 //! in whichever tab; until then it's gone, so cutting is closing too, but
 //! what it showed stays open. Copy keeps what the panel shows, and its
@@ -15,8 +19,9 @@
 //! something over it: its files stay open behind, and terminals keep
 //! running, but its history is the pasted one's. Cut or copied, the
 //! clipboard lasts after the mode is off. Undo
-//! takes back resizing, swapping, evening out, flipping, and zooming,
-//! one change at a time, back to splitting, closing, or pasting.
+//! takes back resizing, swapping, evening out, flipping, zooming, and
+//! moving tabs, one change at a time, back to splitting, closing, or
+//! pasting.
 //!
 //! With the scratchpad out (see [`crate::scratch`]), the arrows resize it
 //! instead, and `=` puts it back to the size it starts at. Cut, copy, and
@@ -49,6 +54,11 @@ pub enum Action {
     NewTab,
     PreviousTab,
     NextTab,
+    /// Trades the tab on screen with the one before it, or after.
+    MoveTab(Direction),
+    CloseTab,
+    /// Goes to the tab at this index.
+    GoToTab(usize),
     Undo,
 }
 
@@ -66,10 +76,12 @@ const HINTS: &[(&str, &str)] = &[
     ("z", "zoom"),
     ("x c v", "cut copy paste"),
     ("w", "close"),
-    ("t", "new tab"),
-    ("[ ]", "tabs"),
     ("u", "undo"),
     ("esc", "done"),
+    // Tabs last, the first to go when the bar's too narrow.
+    ("t", "new tab"),
+    ("[ ] { }", "tabs, move"),
+    ("W", "close tab"),
 ];
 
 /// What the status bar lists with the scratchpad out, which only resizes.
@@ -78,7 +90,8 @@ const SCRATCH_HINTS: &[(&str, &str)] = &[
     ("=", "reset size"),
     ("x c v", "cut copy paste"),
     ("t", "new tab"),
-    ("[ ]", "tabs"),
+    ("[ ] { }", "tabs, move"),
+    ("W", "close tab"),
     ("esc", "done"),
 ];
 
@@ -131,10 +144,19 @@ pub fn action(key: Key) -> Option<Action> {
         KeyCode::Char('x') => Action::Cut,
         KeyCode::Char('c') => Action::Copy,
         KeyCode::Char('v') => Action::Paste,
+        // Some terminals report Shift+W as `w` with Shift, and Shift+[ as
+        // `[` with Shift, not `W` and `{`.
+        KeyCode::Char('w') if mods.shift => Action::CloseTab,
+        KeyCode::Char('W') => Action::CloseTab,
         KeyCode::Char('w') => Action::Close,
         KeyCode::Char('t') => Action::NewTab,
+        KeyCode::Char('[') if mods.shift => Action::MoveTab(Direction::Left),
+        KeyCode::Char(']') if mods.shift => Action::MoveTab(Direction::Right),
+        KeyCode::Char('{') => Action::MoveTab(Direction::Left),
+        KeyCode::Char('}') => Action::MoveTab(Direction::Right),
         KeyCode::Char('[') => Action::PreviousTab,
         KeyCode::Char(']') => Action::NextTab,
+        KeyCode::Char(c @ '1'..='9') => Action::GoToTab(c as usize - '1' as usize),
         KeyCode::Char('u') => Action::Undo,
         _ => return None,
     })
@@ -177,36 +199,62 @@ impl PanelClip {
     }
 }
 
+/// What a change in layout mode changed from, to undo it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Before {
+    /// A tab's layout, and whether it was zoomed.
+    Layout(TabId, Layout, bool),
+    /// The tabs' order.
+    Tabs(Vec<TabId>),
+}
+
+/// Changes that join the one just before, if it was the same kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Joining {
+    Resize,
+    MoveTab,
+}
+
 /// Layout mode, while it's on.
 #[derive(Debug, Default)]
 pub struct Arranging {
-    /// Each tab's layout, and whether it was zoomed, before each change
-    /// that can be undone, most recent last.
-    undo: Vec<(TabId, Layout, bool)>,
-    /// The last change was a resize, which the next one joins.
-    resizing: bool,
+    /// What was before each change that can be undone, most recent last.
+    undo: Vec<Before>,
+    /// The last change, if the next one of its kind joins it.
+    joining: Option<Joining>,
 }
 
 impl Arranging {
     /// Notes tab `tab`'s layout before a change to it, to undo. Resizes in
     /// a row are one change.
     pub fn before(&mut self, tab: TabId, layout: &Layout, zoomed: bool, resize: bool) {
-        if !(resize && self.resizing) {
-            self.undo.push((tab, layout.clone(), zoomed));
+        let joining = resize.then_some(Joining::Resize);
+        self.note(joining, || Before::Layout(tab, layout.clone(), zoomed));
+    }
+
+    /// Notes the tabs' `order` before moving one, to undo. Moves in a row
+    /// are one change.
+    pub fn before_moving_tab(&mut self, order: Vec<TabId>) {
+        self.note(Some(Joining::MoveTab), || Before::Tabs(order));
+    }
+
+    fn note(&mut self, joining: Option<Joining>, before: impl FnOnce() -> Before) {
+        if joining.is_none() || joining != self.joining {
+            self.undo.push(before());
         }
-        self.resizing = resize;
+        self.joining = joining;
     }
 
     /// Forgets what can be undone, as after a change to which panels
     /// there are, which undoing doesn't take back.
     pub fn forget(&mut self) {
         self.undo.clear();
-        self.resizing = false;
+        self.joining = None;
     }
 
-    /// The last change to undo: the tab, and its layout and zoom before.
-    pub fn undo(&mut self) -> Option<(TabId, Layout, bool)> {
-        self.resizing = false;
+    /// What was before the last change to undo.
+    pub fn undo(&mut self) -> Option<Before> {
+        self.joining = None;
         self.undo.pop()
     }
 }
@@ -314,8 +362,38 @@ mod tests {
         arranging.before(0, &a, false, true);
         arranging.before(0, &b, false, true);
         arranging.before(0, &b, true, false);
-        assert_eq!(arranging.undo().map(|(_, _, zoomed)| zoomed), Some(true));
-        assert_eq!(arranging.undo().map(|(_, layout, _)| layout), Some(a));
+        assert_eq!(arranging.undo(), Some(Before::Layout(0, b, true)));
+        assert_eq!(arranging.undo(), Some(Before::Layout(0, a, false)));
         assert_eq!(arranging.undo(), None);
+    }
+
+    #[test]
+    fn tab_moves_in_a_row_undo_together() {
+        let mut arranging = Arranging::default();
+        arranging.before_moving_tab(vec![0, 1, 2]);
+        arranging.before_moving_tab(vec![1, 0, 2]);
+        arranging.before(1, &Layout::Panel(1), false, true);
+        arranging.before_moving_tab(vec![1, 2, 0]);
+        assert_eq!(arranging.undo(), Some(Before::Tabs(vec![1, 2, 0])));
+        assert!(matches!(arranging.undo(), Some(Before::Layout(..))));
+        assert_eq!(arranging.undo(), Some(Before::Tabs(vec![0, 1, 2])));
+    }
+
+    #[test]
+    fn shifted_brackets_and_w_are_for_tabs() {
+        let left = Some(Action::MoveTab(Direction::Left));
+        assert_eq!(key(KeyCode::Char('{'), Mods::SHIFT), left);
+        assert_eq!(key(KeyCode::Char('['), Mods::SHIFT), left);
+        let right = Some(Action::MoveTab(Direction::Right));
+        assert_eq!(key(KeyCode::Char('}'), Mods::NONE), right);
+        assert_eq!(key(KeyCode::Char(']'), Mods::NONE), Some(Action::NextTab));
+        assert_eq!(key(KeyCode::Char('W'), Mods::SHIFT), Some(Action::CloseTab));
+        assert_eq!(key(KeyCode::Char('w'), Mods::SHIFT), Some(Action::CloseTab));
+        assert_eq!(key(KeyCode::Char('w'), Mods::NONE), Some(Action::Close));
+        assert_eq!(
+            key(KeyCode::Char('3'), Mods::NONE),
+            Some(Action::GoToTab(2))
+        );
+        assert_eq!(key(KeyCode::Char('0'), Mods::NONE), None);
     }
 }
