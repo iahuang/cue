@@ -10934,7 +10934,7 @@ mod tests {
         let text = screen(&app);
         assert!(text.contains("Search"), "{text}");
         assert!(text.contains("src/b.rs"), "{text}");
-        assert!(text.contains("2  ") && text.contains("needle();"), "{text}");
+        assert!(text.contains("1 of 1 in 1 file"), "{text}");
         assert!(!app.ed().is_modified(), "typing doesn't edit");
 
         key(&mut app, KeyCode::Enter);
@@ -10975,7 +10975,7 @@ mod tests {
         wait_for_search(&mut app);
         let text = screen(&app);
         assert!(text.contains("│ two"), "the selection is the query: {text}");
-        assert!(text.contains("a.txt") && text.contains("b.txt"), "{text}");
+        assert!(text.contains("1 of 2 in 2 files"), "{text}");
 
         // Typing replaces the query it started with.
         type_text(&mut app, "one");

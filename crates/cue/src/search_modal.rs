@@ -3,6 +3,8 @@
 //! each file's path, then its matching lines with a couple of lines around
 //! them, syntax highlighted. Up and Down step through the matches, and Enter
 //! opens the file with the match selected. The excerpts are only for reading.
+//! Below the query, a second field filters which files are searched, as
+//! [`Filter`] describes; Tab switches between the two.
 //!
 //! Closing the popup keeps the query and the selected match, so reopening
 //! it searches again and picks up where it left off.
@@ -19,7 +21,7 @@ use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::{self, Caret, Edit};
 use crate::picker::{self, Area};
-use crate::search::{FileMatches, Found, Line, Query, Search, Toggle, CONTEXT_LINES};
+use crate::search::{FileMatches, Filter, Found, Line, Query, Search, Toggle, CONTEXT_LINES};
 use crate::theme;
 use crate::workspace::Workspace;
 
@@ -29,6 +31,11 @@ const MAX_WIDTH: u32 = 160;
 const TAB_WIDTH: usize = 4;
 /// Left of a match scrolled into view sideways, this many columns show.
 const LEAD_COLUMNS: usize = 12;
+/// The results start this many rows down the popup, below the border, the
+/// query, the filter, and the rules under them.
+const BODY: u32 = 5;
+/// The filter's row in the popup.
+const FILES_ROW: u32 = 3;
 
 /// What the app should do after the popup handled input.
 #[derive(Debug, PartialEq, Eq)]
@@ -47,8 +54,17 @@ pub enum SearchAction {
 #[derive(Debug, Clone, Default)]
 pub struct Memory {
     query: Query,
+    files: String,
     /// The selected match: its file, line, and which match in the line.
     selected: Option<(PathBuf, u32, usize)>,
+}
+
+/// A text field of the popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Query,
+    /// The filter of which files to search.
+    Files,
 }
 
 /// A row of the results.
@@ -82,12 +98,17 @@ pub struct SearchModal {
     /// The cursor and selection in the query. The query filled in on
     /// opening is selected, so typing replaces it.
     caret: Caret,
+    /// The filter of which files to search, as in [`Filter::parse`].
+    files_text: String,
+    files_caret: Caret,
+    /// The field typing goes to.
+    focus: Field,
     /// The search in progress, if any.
     search: Option<Search>,
     /// The results are from the previous query, shown until the new search
     /// finds something.
     stale: bool,
-    /// Why the query can't be searched: an invalid regex.
+    /// Why the query can't be searched: an invalid regex or filter.
     error: Option<String>,
     /// Whether the last search stopped before searching everything.
     truncated: bool,
@@ -123,11 +144,14 @@ impl SearchModal {
         width: u32,
         height: u32,
     ) -> SearchModal {
-        let hints = Toggle::ALL
+        let toggles = Toggle::ALL
             .iter()
-            .filter_map(|toggle| {
-                let key = keymap.shortcut(toggle.command())?;
-                Some(format!("{key} {}", toggle.name()))
+            .map(|toggle| (toggle.command(), toggle.name()));
+        let hints = toggles
+            .chain([(Command::SearchSwitchField, "files")])
+            .filter_map(|(command, name)| {
+                let key = keymap.shortcut(command)?;
+                Some(format!("{key} {name}"))
             })
             .collect::<Vec<_>>()
             .join(" · ");
@@ -144,6 +168,9 @@ impl SearchModal {
             unsaved,
             query,
             caret: Caret::default(),
+            files_text: memory.files,
+            files_caret: Caret::default(),
+            focus: Field::Query,
             search: None,
             stale: false,
             error: None,
@@ -173,6 +200,7 @@ impl SearchModal {
         });
         Memory {
             query: self.query.clone(),
+            files: self.files_text.clone(),
             selected: selected.or_else(|| self.restore.clone()),
         }
     }
@@ -193,6 +221,14 @@ impl SearchModal {
             Command::PickerPageDown => self.select_row_step(page as isize),
             Command::PickerAccept => return self.open_selected(),
             Command::PickerClose => return SearchAction::Close,
+            Command::SearchSwitchField => {
+                self.focus = match self.focus {
+                    Field::Query => Field::Files,
+                    Field::Files => Field::Query,
+                };
+                let (text, caret) = self.field_mut();
+                caret.select_all(text);
+            }
             command => {
                 if let Some(toggle) = Toggle::for_command(command) {
                     self.toggle(toggle);
@@ -202,32 +238,53 @@ impl SearchModal {
         SearchAction::Continue
     }
 
-    /// Edits the query: typing, pasting, deleting, or moving the cursor.
+    /// Edits the focused field: typing, pasting, deleting, or moving the
+    /// cursor.
     pub fn edit(&mut self, edit: Edit) {
-        if self.caret.edit(&mut self.query.text, edit) {
+        let (text, caret) = self.field_mut();
+        if caret.edit(text, edit) {
             self.query_changed();
         }
     }
 
-    /// Edits the query with Shift held: moving the cursor selects.
+    /// Edits the focused field with Shift held: moving the cursor selects.
     pub fn edit_selecting(&mut self, edit: Edit) {
-        if self.caret.select(&mut self.query.text, edit) {
+        let (text, caret) = self.field_mut();
+        if caret.select(text, edit) {
             self.query_changed();
         }
     }
 
     pub fn select_all(&mut self) {
-        self.caret.select_all(&self.query.text);
+        let (text, caret) = self.field_mut();
+        caret.select_all(text);
     }
 
-    /// The part of the query selected.
+    /// The part of the focused field selected.
     pub fn selected_text(&self) -> Option<&str> {
-        self.caret.selected_text(&self.query.text)
+        let (text, caret) = self.field();
+        caret.selected_text(text)
+    }
+
+    /// The focused field's text and caret.
+    fn field(&self) -> (&str, &Caret) {
+        match self.focus {
+            Field::Query => (&self.query.text, &self.caret),
+            Field::Files => (&self.files_text, &self.files_caret),
+        }
+    }
+
+    fn field_mut(&mut self) -> (&mut String, &mut Caret) {
+        match self.focus {
+            Field::Query => (&mut self.query.text, &mut self.caret),
+            Field::Files => (&mut self.files_text, &mut self.files_caret),
+        }
     }
 
     /// A click on a line opens the file there, on a toggle flips it; one
-    /// outside the popup closes it. In the query, a click puts the cursor,
-    /// and a drag or a double or triple click selects. The wheel scrolls.
+    /// outside the popup closes it. In the query or the filter, a click puts
+    /// the cursor, and a drag or a double or triple click selects. The wheel
+    /// scrolls.
     pub fn handle_mouse(&mut self, mouse: Mouse, now: Instant) -> SearchAction {
         let area = self.area();
         let inside = area.contains(mouse.x, mouse.y);
@@ -235,11 +292,13 @@ impl SearchModal {
         match mouse.kind {
             MouseKind::Press(_) if !inside => SearchAction::Close,
             MouseKind::Drag(MouseButton::Left) => {
-                self.caret.drag(&self.query.text, column);
+                let (text, caret) = self.field_mut();
+                caret.drag(text, column);
                 SearchAction::Continue
             }
             MouseKind::Release(_) => {
-                self.caret.release(&self.query.text);
+                let (text, caret) = self.field_mut();
+                caret.release(text);
                 SearchAction::Continue
             }
             MouseKind::Press(MouseButton::Left) if mouse.y == area.y + 1 => {
@@ -250,14 +309,20 @@ impl SearchModal {
                 match toggle {
                     Some(&(toggle, _)) => self.toggle(toggle),
                     None if mouse.x < toggles[0].1.start => {
+                        self.focus = Field::Query;
                         self.caret.press(&self.query.text, column, now);
                     }
                     None => {}
                 }
                 SearchAction::Continue
             }
+            MouseKind::Press(MouseButton::Left) if mouse.y == area.y + FILES_ROW => {
+                self.focus = Field::Files;
+                self.files_caret.press(&self.files_text, column, now);
+                SearchAction::Continue
+            }
             MouseKind::Press(MouseButton::Left) => {
-                let body = area.y + 3;
+                let body = area.y + BODY;
                 if mouse.y < body || mouse.y + 1 >= area.y + area.height {
                     return SearchAction::Continue;
                 }
@@ -345,10 +410,10 @@ impl SearchModal {
                 height: 1,
             });
         }
-        if y < area.y + 3 || y + 1 >= area.y + area.height {
+        if y < area.y + BODY || y + 1 >= area.y + area.height {
             return None;
         }
-        match self.rows.get(self.scroll + (y - area.y - 3) as usize) {
+        match self.rows.get(self.scroll + (y - area.y - BODY) as usize) {
             Some(Row::File(_) | Row::Line { .. }) => Some(Area {
                 x: area.x + 1,
                 y,
@@ -398,7 +463,13 @@ impl SearchModal {
             self.layout(false);
             return;
         }
-        match Search::start(&self.workspace, &self.query, self.unsaved.clone()) {
+        let search = Filter::parse(&self.files_text)
+            .map_err(|error| format!("Invalid filter: {error}"))
+            .and_then(|filter| {
+                Search::start(&self.workspace, &self.query, &filter, self.unsaved.clone())
+                    .map_err(|error| format!("Invalid regex: {error}"))
+            });
+        match search {
             Ok(search) => {
                 self.search = Some(search);
                 self.stale = true;
@@ -594,9 +665,9 @@ impl SearchModal {
         self.rows.len().saturating_sub(self.body_rows())
     }
 
-    /// Rows for results: all but the borders, the query, and the rule.
+    /// Rows for results: all but the borders, the fields, and the rule.
     fn body_rows(&self) -> usize {
-        self.area().height.saturating_sub(4) as usize
+        self.area().height.saturating_sub(BODY + 1) as usize
     }
 
     fn area(&self) -> Area {
@@ -635,7 +706,7 @@ impl SearchModal {
     fn draw_popup(&self, frame: &Buffer, area: Area) -> (u32, u32) {
         let colors = theme::colors();
         let Area { x, y, width, .. } = area;
-        picker::draw_frame(frame, area, "Search");
+        picker::draw_frame_with_fields(frame, area, "Search", 2);
         let bottom = area.y + area.height - 1;
         let status = self.status();
         picker::draw_status(frame, area, &status);
@@ -651,28 +722,34 @@ impl SearchModal {
             );
         }
 
-        // The query, the cursor kept in view, and the toggles right of it.
+        // The query, the cursor kept in view, and the toggles right of it;
+        // the filter below.
         let toggles = self.toggles(area);
         let text_x = x + 2;
         let room = toggles[0].1.start.saturating_sub(text_x + 1) as usize;
-        let (shown, column) = self.caret.view(&self.query.text, room);
-        line_edit::draw_selection(frame, &self.caret, &self.query.text, text_x, y + 1, room);
-        frame.draw_text(&shown, text_x, y + 1, colors.text, None, Attributes::NONE);
-        let cursor = (text_x + column as u32, y + 1);
-        if self.query.text.is_empty() {
-            let hint: String = "Search in files"
-                .chars()
-                .take(room.saturating_sub(1))
-                .collect();
-            frame.draw_text(
-                &hint,
-                cursor.0 + 1,
-                y + 1,
-                colors.muted,
-                None,
-                Attributes::NONE,
-            );
-        }
+        let query = draw_field(
+            frame,
+            &self.query.text,
+            &self.caret,
+            "Search in files",
+            text_x,
+            y + 1,
+            room,
+        );
+        let files_room = width.saturating_sub(4) as usize;
+        let files = draw_field(
+            frame,
+            &self.files_text,
+            &self.files_caret,
+            "Files to search, e.g. *.tsx, src/, !node_modules",
+            text_x,
+            y + FILES_ROW,
+            files_room,
+        );
+        let cursor = match self.focus {
+            Field::Query => query,
+            Field::Files => files,
+        };
         for (toggle, columns) in toggles {
             let on = toggle.is_on(&self.query);
             let (fg, bg, attributes) = if on {
@@ -684,7 +761,7 @@ impl SearchModal {
             frame.draw_text(&label, columns.start, y + 1, fg, bg, attributes);
         }
 
-        let body = y + 3;
+        let body = y + BODY;
         let room = width.saturating_sub(4);
         if let Some(message) = self.message() {
             let (text, fg) = message;
@@ -725,7 +802,7 @@ impl SearchModal {
     fn message(&self) -> Option<(String, Rgba)> {
         let colors = theme::colors();
         if let Some(error) = &self.error {
-            return Some((format!("Invalid regex: {error}"), colors.error));
+            return Some((error.clone(), colors.error));
         }
         if !self.files.is_empty() && !self.query.text.is_empty() {
             return None;
@@ -903,6 +980,29 @@ impl SearchModal {
 
 type Style = (Rgba, Option<Rgba>, Attributes);
 
+/// Draws a field's `text` at `x`, `y` in `room` columns, with `caret`'s
+/// selection, or `hint` if it's empty. Returns where its cursor is.
+fn draw_field(
+    frame: &Buffer,
+    text: &str,
+    caret: &Caret,
+    hint: &str,
+    x: u32,
+    y: u32,
+    room: usize,
+) -> (u32, u32) {
+    let colors = theme::colors();
+    let (shown, column) = caret.view(text, room);
+    line_edit::draw_selection(frame, caret, text, x, y, room);
+    frame.draw_text(&shown, x, y, colors.text, None, Attributes::NONE);
+    let cursor = (x + column as u32, y);
+    if text.is_empty() {
+        let hint: String = hint.chars().take(room.saturating_sub(1)).collect();
+        frame.draw_text(&hint, cursor.0 + 1, y, colors.muted, None, Attributes::NONE);
+    }
+    cursor
+}
+
 /// Files sort by path ignoring case, as in the tree and the file picker.
 fn sort_key(display: &str) -> (String, &str) {
     (display.to_lowercase(), display)
@@ -992,7 +1092,7 @@ mod tests {
         wait(&mut modal);
         let text = screen(&modal).join("\n");
         let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
-        let body: Vec<String> = lines[4..17]
+        let body: Vec<String> = lines[6..19]
             .iter()
             .map(|line| {
                 let words: Vec<&str> = line.split_whitespace().collect();
@@ -1072,6 +1172,49 @@ mod tests {
     }
 
     #[test]
+    fn the_files_field_filters_which_files_are_searched() {
+        let root = fixture(
+            "files",
+            &[("a.rs", "x\n"), ("b.txt", "x\n"), ("gen/c.rs", "x\n")],
+        );
+        let mut modal = modal(&root, Memory::default(), Some("x"), 20);
+        wait(&mut modal);
+        assert_eq!(modal.files.len(), 3);
+        let text = screen(&modal).join("\n");
+        assert!(text.contains("│  Files to search, e.g. *.tsx"), "{text}");
+
+        // Tab goes to the filter, and typing there searches again.
+        modal.run(Command::SearchSwitchField);
+        modal.edit(Edit::Insert("*.rs, !gen"));
+        assert_eq!(modal.query.text, "x");
+        wait(&mut modal);
+        let names: Vec<&str> = modal.files.iter().map(|f| f.display.as_str()).collect();
+        assert_eq!(names, ["a.rs"]);
+        let text = screen(&modal).join("\n");
+        assert!(text.contains("│ *.rs, !gen"), "{text}");
+
+        modal.edit(Edit::Insert("["));
+        let text = screen(&modal).join("\n");
+        assert!(text.contains("Invalid filter:"), "{text}");
+
+        // A click on the query focuses it; the filter is remembered.
+        let area = modal.area();
+        modal.handle_mouse(
+            Mouse {
+                kind: MouseKind::Press(MouseButton::Left),
+                x: area.x + 3,
+                y: area.y + 1,
+                mods: Mods::NONE,
+            },
+            Instant::now(),
+        );
+        modal.edit(Edit::End);
+        modal.edit(Edit::Insert("y"));
+        assert_eq!(modal.query.text, "xy");
+        assert_eq!(modal.memory().files, "*.rs, !gen[");
+    }
+
+    #[test]
     fn reopening_searches_again_and_keeps_the_selected_match() {
         let root = fixture("reopen", &[("a.txt", "x\nx\nx\n"), ("b.txt", "x\n")]);
         let mut first = modal(&root, Memory::default(), None, 20);
@@ -1141,7 +1284,7 @@ mod tests {
             )
         };
         let first_line = modal.scroll - 1;
-        let (_, line, _) = opened(click(&mut modal, area.y + 3));
+        let (_, line, _) = opened(click(&mut modal, area.y + BODY));
         assert_eq!(line as usize, first_line, "the file's path is row 0");
         assert_eq!(
             click(&mut modal, area.y + area.height + 1),
@@ -1180,15 +1323,15 @@ mod tests {
         // Kept only from a little before the match.
         let long = format!("{}needle{}", "é".repeat(300), "y".repeat(300));
         let root = fixture("long", &[("a.txt", &wide), ("b.txt", &long)]);
-        let mut modal = modal(&root, Memory::default(), None, 12);
+        let mut modal = modal(&root, Memory::default(), None, 13);
         modal.edit(Edit::Insert("needle"));
         wait(&mut modal);
         let text = screen(&modal).join("\n");
         let lines: Vec<&str> = text.lines().collect();
         let a = format!("│ 1  …{}needleyyy", "x".repeat(LEAD_COLUMNS - 1));
-        assert!(lines[5].contains(&a), "{text}");
-        assert!(lines[5].contains("yyy… │"), "{text}");
-        assert!(lines[8].contains("│ 1  …éé"), "{text}");
-        assert!(lines[8].contains("éneedleyyy"), "{text}");
+        assert!(lines[7].contains(&a), "{text}");
+        assert!(lines[7].contains("yyy… │"), "{text}");
+        assert!(lines[10].contains("│ 1  …éé"), "{text}");
+        assert!(lines[10].contains("éneedleyyy"), "{text}");
     }
 }

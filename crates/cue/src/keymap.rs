@@ -208,6 +208,7 @@ commands! {
     SearchToggleCase => "search:toggle-case", "Search: Match Case";
     SearchToggleWord => "search:toggle-word", "Search: Match Whole Word";
     SearchToggleRegex => "search:toggle-regex", "Search: Use Regular Expression";
+    SearchSwitchField => "search:switch-field", "Search: Switch Between Query and Files";
     DialogParent => "dialog:parent", "File Dialog: Parent Folder";
     DialogComplete => "dialog:complete", "File Dialog: Complete Name";
 }
@@ -288,6 +289,7 @@ impl Command {
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
+            SearchSwitchField => Context::Search,
             DialogParent | DialogComplete => Context::Dialog,
             FindSwitchField | FindClose => Context::Find,
             ClearTerminal | RenameTerminal | ToggleTerminalKeys => Context::Terminal,
@@ -596,6 +598,7 @@ impl Default for Keymap {
             (key(Char('c'), ALT), SearchToggleCase),
             (key(Char('w'), ALT), SearchToggleWord),
             (key(Char('r'), ALT), SearchToggleRegex),
+            (key(Tab, Mods::NONE), SearchSwitchField),
             (key(Esc, Mods::NONE), FindClose),
             (key(Tab, Mods::NONE), FindSwitchField),
             (key(Enter, Mods::NONE), Replace),

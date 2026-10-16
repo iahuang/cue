@@ -4,7 +4,8 @@
 
 - Highlight the cursor's line in the focused editor while nothing is selected, and make faint selections easier to see (`8ac3695`)
 - Rename the editor menu's Copy Reference to Copy Line Reference, and Toggle Line Comment to Toggle Comment (`2c29d17`)
-- `cue` no longer resumes the folder's session on its own (use `cue --resume`), so `--fresh` is gone, along with the startup note about sessions running in the background
+- `cue` no longer resumes the folder's session on its own (use `cue --resume`), so `--fresh` is gone, along with the startup note about sessions running in the background (`de4b161`)
+- Filter which files workspace search looks in, with comma-separated globs like `*.tsx, !node_modules`, which can also pick workspace folders by name (Tab switches to the filter)
 
 ## v0.4.3 — 2026-10-14
 

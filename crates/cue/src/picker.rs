@@ -1255,6 +1255,12 @@ impl Area {
 /// Clears `area` and draws a popup's box around it, with `title`, if any, in
 /// the top border and a rule under the first row, which holds the query.
 pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
+    draw_frame_with_fields(frame, area, title, 1);
+}
+
+/// As [`draw_frame`], with `fields` rows above the rule rather than one,
+/// each with a rule below it.
+pub fn draw_frame_with_fields(frame: &Buffer, area: Area, title: &str, fields: u32) {
     let colors = theme::colors();
     let Area {
         x,
@@ -1276,10 +1282,13 @@ pub fn draw_frame(frame: &Buffer, area: Area, title: &str) {
         );
     };
     border("╭", "╮", y);
-    border("├", "┤", y + 2);
+    let is_rule = |row: u32| row > y && row <= y + 2 * fields && (row - y).is_multiple_of(2);
+    for field in 1..=fields {
+        border("├", "┤", y + 2 * field);
+    }
     border("╰", "╯", y + height - 1);
     for row in y + 1..y + height - 1 {
-        if row != y + 2 {
+        if !is_rule(row) {
             frame.draw_text("│", x, row, colors.border, None, Attributes::NONE);
             frame.draw_text("│", right, row, colors.border, None, Attributes::NONE);
         }

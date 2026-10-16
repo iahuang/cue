@@ -6,6 +6,8 @@
 //! the lines around them, for showing excerpts. Open files with unsaved
 //! changes are searched as they are in the editor, not as saved.
 //!
+//! A [`Filter`] narrows the search to some files, or leaves some out.
+//!
 //! Results arrive a file at a time, in no particular order. Each file's
 //! syntax colors come after it, once the file is parsed, so highlighting
 //! never holds up results. Dropping the [`Search`] stops it.
@@ -18,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
+use globset::{GlobBuilder, GlobMatcher};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
@@ -128,6 +131,99 @@ impl Query {
     }
 }
 
+/// Which files a search looks in: comma-separated glob patterns, such as
+/// `*.tsx, !node_modules`. A file is searched if it matches a pattern, or
+/// any if there are none, and no pattern starting with `!`. A pattern
+/// without a `/` matches a file or folder by name, anywhere: `node_modules`
+/// matches every folder called that, and the files in it. One with a `/`
+/// matches a path as shown, and what's in it if it's a folder: `src/*.rs`,
+/// or `**/tests`. With several workspace folders, paths start with the
+/// folder's name, so `api` or `!docs/` picks folders. `*` doesn't match a
+/// `/`, and `**` does. Case doesn't matter.
+#[derive(Debug, Clone, Default)]
+pub struct Filter {
+    include: Vec<Pattern>,
+    exclude: Vec<Pattern>,
+}
+
+#[derive(Debug, Clone)]
+struct Pattern {
+    glob: GlobMatcher,
+    /// Whether it matches paths, rather than names.
+    path: bool,
+}
+
+impl Filter {
+    /// The filter `text` describes, or why a pattern isn't valid.
+    pub fn parse(text: &str) -> Result<Filter, String> {
+        let mut filter = Filter::default();
+        for pattern in text.split(',') {
+            let pattern = pattern.trim();
+            let (pattern, exclude) = match pattern.strip_prefix('!') {
+                Some(rest) => (rest.trim_start(), true),
+                None => (pattern, false),
+            };
+            let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+            let pattern = pattern.trim_matches('/');
+            if pattern.is_empty() {
+                continue;
+            }
+            let glob = GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .case_insensitive(true)
+                .build()
+                .map_err(|e| e.kind().to_string())?
+                .compile_matcher();
+            let pattern = Pattern {
+                glob,
+                path: pattern.contains('/'),
+            };
+            if exclude {
+                filter.exclude.push(pattern);
+            } else {
+                filter.include.push(pattern);
+            }
+        }
+        Ok(filter)
+    }
+
+    /// Whether the file at `relative`, its path as shown, is searched.
+    pub fn allows(&self, relative: &Path) -> bool {
+        (self.include.is_empty() || matches_any(&self.include, relative))
+            && !self.excludes(relative)
+    }
+
+    /// Whether the file or folder at `relative` is left out, and so is
+    /// everything in it.
+    pub fn excludes(&self, relative: &Path) -> bool {
+        matches_any(&self.exclude, relative)
+    }
+}
+
+/// Whether any of `patterns` matches `relative`, or a folder it's in: by
+/// name, or by path.
+fn matches_any(patterns: &[Pattern], relative: &Path) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let mut path = String::new();
+    for component in relative.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(&name);
+        let hit = patterns.iter().any(|pattern| {
+            let target = if pattern.path { &path } else { &*name };
+            pattern.glob.is_match(target)
+        });
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
 /// One file's matches, with the lines around them.
 #[derive(Debug, Clone)]
 pub struct FileMatches {
@@ -211,12 +307,14 @@ pub struct Search {
 }
 
 impl Search {
-    /// Starts searching `workspace` for `query`. `open` has the text of
-    /// files open with unsaved changes, by path, to search instead of what's
-    /// on disk. Fails with a message if the query isn't a valid regex.
+    /// Starts searching the files of `workspace` that `filter` allows for
+    /// `query`. `open` has the text of files open with unsaved changes, by
+    /// path, to search instead of what's on disk. Fails with a message if
+    /// the query isn't a valid regex.
     pub fn start(
         workspace: &Workspace,
         query: &Query,
+        filter: &Filter,
         open: HashMap<PathBuf, String>,
     ) -> Result<Search, String> {
         let matcher = query.matcher()?;
@@ -230,8 +328,11 @@ impl Search {
             done: false,
         };
         let workspace = workspace.clone();
+        let filter = filter.clone();
         std::thread::spawn(move || {
-            run(&workspace, matcher, open, &dropped, &found, &sender);
+            run(
+                &workspace, matcher, &filter, open, &dropped, &found, &sender,
+            );
             let _ = sender.send(Message::Done);
         });
         Ok(search)
@@ -296,6 +397,7 @@ impl Drop for Search {
 fn run(
     workspace: &Workspace,
     matcher: RegexMatcher,
+    filter: &Filter,
     open: HashMap<PathBuf, String>,
     dropped: &AtomicBool,
     found: &AtomicUsize,
@@ -349,10 +451,17 @@ fn run(
                 let Ok(entry) = entry else {
                     return WalkState::Continue;
                 };
+                let path = entry.path();
+                let relative = filter_path(workspace, path);
                 if !file_index::is_file(&entry) {
+                    if filter.excludes(&relative) {
+                        return WalkState::Skip;
+                    }
                     return WalkState::Continue;
                 }
-                let path = entry.path();
+                if !filter.allows(&relative) {
+                    return WalkState::Continue;
+                }
                 let unsaved = open.get(path);
                 let Some(lines) = search_file(&mut searcher, &matcher, path, unsaved) else {
                     return WalkState::Continue;
@@ -386,6 +495,19 @@ fn run(
         // Searching's done: the coloring threads finish what's queued.
         drop(jobs);
     });
+}
+
+/// The path a [`Filter`] matches: as shown, from the workspace folder,
+/// after the folder's name if there are several.
+fn filter_path<'p>(workspace: &Workspace, path: &'p Path) -> Cow<'p, Path> {
+    let Some(root) = workspace.root_of(path) else {
+        return Cow::Borrowed(path);
+    };
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    match workspace.name(root) {
+        Some(name) if workspace.roots().len() > 1 => Cow::Owned(Path::new(name).join(relative)),
+        _ => Cow::Borrowed(relative),
+    }
 }
 
 /// A file to color.
@@ -596,7 +718,9 @@ mod tests {
     /// The files matching `query`, sorted by path.
     fn search(root: &Path, query: &Query, open: HashMap<PathBuf, String>) -> Vec<FileMatches> {
         let workspace = Workspace::new([root.to_path_buf()]).unwrap();
-        let mut files = Search::start(&workspace, query, open).unwrap().wait();
+        let mut files = Search::start(&workspace, query, &Filter::default(), open)
+            .unwrap()
+            .wait();
         files.sort_by(|a, b| a.display.cmp(&b.display));
         files
     }
@@ -685,10 +809,89 @@ mod tests {
             regex: true,
             ..query("(")
         };
-        let error = Search::start(&workspace, &bad, HashMap::new())
+        let error = Search::start(&workspace, &bad, &Filter::default(), HashMap::new())
             .err()
             .unwrap();
         assert!(!error.contains('\n'), "{error}");
+    }
+
+    #[test]
+    fn filters_pick_files_by_name_or_path() {
+        let root = fixture(
+            "filter",
+            &[
+                ("a.tsx", "x\n"),
+                ("B.TSX", "x\n"),
+                ("a.ts", "x\n"),
+                ("src/c.tsx", "x\n"),
+                ("src/node_modules/d.tsx", "x\n"),
+                ("node_modules", "x\n"),
+                ("lib/node_modules/e.ts", "x\n"),
+            ],
+        );
+        let workspace = Workspace::new([root.clone()]).unwrap();
+        let found = |filter: &str| -> Vec<String> {
+            let filter = Filter::parse(filter).unwrap();
+            let search = Search::start(&workspace, &query("x"), &filter, HashMap::new());
+            let mut names: Vec<String> = search
+                .unwrap()
+                .wait()
+                .into_iter()
+                .map(|f| f.display)
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(found("").len(), 7);
+        assert_eq!(
+            found("*.tsx"),
+            ["B.TSX", "a.tsx", "src/c.tsx", "src/node_modules/d.tsx"]
+        );
+        assert_eq!(
+            found(" *.tsx , !node_modules"),
+            ["B.TSX", "a.tsx", "src/c.tsx"]
+        );
+        assert_eq!(
+            found("node_modules"),
+            [
+                "lib/node_modules/e.ts",
+                "node_modules",
+                "src/node_modules/d.tsx"
+            ]
+        );
+        assert_eq!(found("src/*.tsx"), ["src/c.tsx"]);
+        assert_eq!(found("./src/"), ["src/c.tsx", "src/node_modules/d.tsx"]);
+        assert_eq!(found("**/node_modules/*.ts"), ["lib/node_modules/e.ts"]);
+        assert_eq!(found("!*.tsx, !node_modules,"), ["a.ts"]);
+        assert!(Filter::parse("[a").is_err());
+    }
+
+    #[test]
+    fn filters_pick_workspace_folders_by_name() {
+        let api = fixture("roots/api", &[("src/a.rs", "x\n")]);
+        let web = fixture("roots/web", &[("src/b.rs", "x\n"), ("api.rs", "x\n")]);
+        let workspace = Workspace::new([api, web]).unwrap();
+        let found = |filter: &str| -> Vec<String> {
+            let filter = Filter::parse(filter).unwrap();
+            let search = Search::start(&workspace, &query("x"), &filter, HashMap::new());
+            let mut names: Vec<String> = search
+                .unwrap()
+                .wait()
+                .into_iter()
+                .map(|f| f.display)
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(found("api"), ["api/src/a.rs"]);
+        assert_eq!(found("!api"), ["web/api.rs", "web/src/b.rs"]);
+        assert_eq!(found("web/src"), ["web/src/b.rs"]);
+        assert_eq!(
+            found("src/*.rs"),
+            Vec::<String>::new(),
+            "paths start at the folder"
+        );
+        assert_eq!(found("*/src/*.rs"), ["api/src/a.rs", "web/src/b.rs"]);
     }
 
     #[test]
@@ -760,7 +963,8 @@ mod tests {
         let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (n.as_str(), *t)).collect();
         let root = fixture("many", &files);
         let workspace = Workspace::new([root]).unwrap();
-        let mut search = Search::start(&workspace, &query("x"), HashMap::new()).unwrap();
+        let mut search =
+            Search::start(&workspace, &query("x"), &Filter::default(), HashMap::new()).unwrap();
         let found: usize = search.wait().iter().map(|f| f.match_count).sum();
         assert!(search.truncated());
         assert!((MAX_MATCHES..MAX_MATCHES * 2).contains(&found), "{found}");
