@@ -74,9 +74,10 @@ use std::rc::{Rc, Weak};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use opentui::{Attributes, Buffer};
+use opentui::{Attributes, Buffer, Rgba};
 
 use crate::alert::{Alert, AlertAction, Button};
+use crate::arrange::{self, Arranging, PanelClip};
 use crate::changes::ChangesView;
 use crate::commit_diff::{CommitDiff, Outcome};
 use crate::commit_view::{CantCommit, CommitAction, CommitView};
@@ -470,6 +471,10 @@ pub struct App {
     mark: Option<Mark>,
     /// Where the keyboard was, across panels, to go back to.
     jumps: Jumps,
+    /// Layout mode, while it's on: keys arrange panels.
+    arranging: Option<Arranging>,
+    /// The panel cut or copied in layout mode, to paste.
+    panel_clip: Option<PanelClip>,
     /// Workspace search, while open. Never open with the picker.
     search: Option<SearchModal>,
     /// The file dialog, while open. Never open with the picker or search.
@@ -755,6 +760,8 @@ impl App {
             recent: Vec::new(),
             mark: None,
             jumps: Jumps::default(),
+            arranging: None,
+            panel_clip: None,
             search: None,
             dialog: None,
             saving: None,
@@ -889,6 +896,18 @@ impl App {
                 return AppAction::Continue;
             }
             self.switcher_action(action);
+        }
+        if self.arranging.is_some() && !self.popup_open() {
+            if let Some(action) = arrange::action(key) {
+                self.arrange(action);
+                return AppAction::Continue;
+            }
+            // Shortcuts are cue's, as outside the mode; other keys do
+            // nothing, rather than reach a terminal or an editor.
+            return match self.keymap.lookup(key, Context::Global) {
+                Some((command, select)) => self.run(command, select),
+                None => AppAction::Continue,
+            };
         }
         // While its find bar has the keyboard, keys are the bar's.
         if let Some(terminal) = self
@@ -1228,6 +1247,7 @@ impl App {
             Command::SplitDown => self.split(Axis::Vertical),
             Command::ClosePanel => self.close_panel(),
             Command::ToggleZoom => self.toggle_zoom(),
+            Command::ArrangePanels => self.toggle_arranging(),
             Command::Pop => self.pop(),
             Command::GoBack => self.go_jumps(true),
             Command::GoForward => self.go_jumps(false),
@@ -2181,7 +2201,10 @@ impl App {
         if message_cursor.is_some() {
             cursor = message_cursor;
         }
-        if self.height > 1 {
+        if self.arranging.is_some() && self.height > 1 {
+            let clip = self.panel_clip.as_ref().map(PanelClip::label);
+            arrange::draw_hints(frame, self.height - 1, self.width, clip.as_deref());
+        } else if self.height > 1 {
             let status = self.active_panel().status();
             let y = self.height - 1;
             let session = self.session_label();
@@ -2202,6 +2225,9 @@ impl App {
         }
         if tab.zoomed {
             tab::draw_zoom_frame(frame, main);
+        }
+        if self.arranging.is_some() {
+            self.draw_arranging(frame);
         }
         for handle in tab.handles(main) {
             if handle.axis == Axis::Horizontal {
@@ -2232,6 +2258,19 @@ impl App {
                 self.draw_hover(frame);
                 cursor
             }
+        }
+    }
+
+    /// Marks the active panel's header in the accent color, in layout
+    /// mode.
+    fn draw_arranging(&self, frame: &Buffer) {
+        let tab = self.tab();
+        let areas = tab.panel_areas(self.main_area());
+        let active = areas.iter().find(|&&(id, _)| id == tab.active);
+        if let Some(header) = active.map(|&(_, rect)| header_of(rect)) {
+            let accent = theme::colors().accent;
+            let tint = Rgba::rgba(accent.r(), accent.g(), accent.b(), 110);
+            frame.tint_background(header.x, header.y, header.width, header.height, tint);
         }
     }
 
@@ -2802,6 +2841,225 @@ impl App {
         }
         self.prune_documents();
         self.prune_terminals();
+    }
+
+    /// Goes into layout mode (see [`crate::arrange`]), or comes out of it.
+    fn toggle_arranging(&mut self) {
+        if self.arranging.take().is_some() {
+            return;
+        }
+        self.close_popups();
+        self.focus = Focus::Editor;
+        self.arranging = Some(Arranging::default());
+    }
+
+    /// Does what a key in layout mode says to.
+    fn arrange(&mut self, action: arrange::Action) {
+        use arrange::Action;
+        match action {
+            Action::Leave => self.arranging = None,
+            Action::Focus(direction) => {
+                let tab = self.tab();
+                if let Some(id) = tab.layout.neighbor(self.main_area(), tab.active, direction) {
+                    self.activate(id);
+                }
+            }
+            Action::Swap(direction) => self.change_layout(false, |tab, area| {
+                let active = tab.active;
+                tab.layout.trade(area, active, direction);
+            }),
+            Action::Resize(direction) => self.change_layout(true, |tab, area| {
+                let active = tab.active;
+                tab.layout
+                    .nudge(area, active, direction, arrange::RESIZE_CELLS);
+            }),
+            Action::Equalize => self.change_layout(false, |tab, _| tab.layout.equalize()),
+            Action::Flip => self.change_layout(false, |tab, _| {
+                let active = tab.active;
+                tab.layout.flip(active);
+            }),
+            Action::Zoom => self.change_layout(false, |tab, _| {
+                if tab.panels.len() > 1 {
+                    tab.zoomed = !tab.zoomed;
+                }
+            }),
+            Action::Split(axis) => {
+                self.split(axis);
+                self.forget_arranging();
+            }
+            Action::Close => {
+                self.close_panel();
+                self.forget_arranging();
+            }
+            Action::NewTab => self.new_tab(),
+            Action::PreviousTab => {
+                self.run(Command::PreviousTab, false);
+            }
+            Action::NextTab => {
+                self.run(Command::NextTab, false);
+            }
+            Action::Cut => self.cut_panel(),
+            Action::Copy => self.copy_panel(),
+            Action::Paste => self.paste_panel(),
+            Action::Undo => self.undo_arranging(),
+        }
+    }
+
+    /// Changes the tab on screen with `change`, given the panels' area,
+    /// noting what it was before to undo, if that changed anything. With
+    /// `resize`, it joins a resize just before.
+    fn change_layout(&mut self, resize: bool, change: impl FnOnce(&mut Tab, Rect)) {
+        let area = self.main_area();
+        let tab = self.tab_mut();
+        let (before, zoomed) = (tab.layout.clone(), tab.zoomed);
+        change(tab, area);
+        let changed = tab.layout != before || tab.zoomed != zoomed;
+        let id = tab.id;
+        if !changed {
+            return;
+        }
+        if let Some(arranging) = &mut self.arranging {
+            arranging.before(id, &before, zoomed, resize);
+        }
+        self.layout();
+    }
+
+    /// Forgets the layout changes to undo, once which panels there are
+    /// has changed.
+    fn forget_arranging(&mut self) {
+        if let Some(arranging) = &mut self.arranging {
+            arranging.forget();
+        }
+    }
+
+    /// Takes back the last layout change, in whichever tab, as long as the
+    /// tab has the same panels still.
+    fn undo_arranging(&mut self) {
+        let Some((id, layout, zoomed)) = self.arranging.as_mut().and_then(Arranging::undo) else {
+            return;
+        };
+        let Some(index) = self.tab_index(id) else {
+            return;
+        };
+        let tab = &mut self.tabs[index];
+        let same = tab.panels.len() == layout.panels(Rect::default()).len()
+            && tab.panels.iter().all(|panel| layout.contains(panel.id));
+        if !same {
+            self.forget_arranging();
+            return;
+        }
+        tab.layout = layout;
+        tab.zoomed = zoomed;
+        if index != self.tab {
+            self.switch_tab(index);
+        }
+        self.layout();
+    }
+
+    /// Takes the active panel out of the layout, to paste over another
+    /// (see [`App::paste_panel`]), giving its room to its neighbor; a tab's
+    /// only panel leaves an empty one. What it shows stays open meanwhile.
+    /// A panel cut before and never pasted is gone for good.
+    fn cut_panel(&mut self) {
+        let empty = self.next_panel;
+        let tab = self.tab_mut();
+        let id = tab.active;
+        match tab.layout.remove(id) {
+            Some(next) => tab.active = next,
+            None => {
+                tab.layout = Layout::Panel(empty);
+                tab.panels.push(Panel::new(empty));
+                tab.active = empty;
+            }
+        }
+        let index = tab
+            .panels
+            .iter()
+            .position(|panel| panel.id == id)
+            .expect("the active panel is open");
+        let panel = tab.panels.remove(index);
+        if tab.active == empty {
+            self.next_panel += 1;
+        }
+        self.panel_clip = Some(PanelClip::Cut(panel));
+        self.forget_arranging();
+        self.focus = Focus::Editor;
+        self.layout();
+        self.show_active_in_tree();
+        self.prune_documents();
+        self.prune_terminals();
+    }
+
+    /// Keeps what the active panel shows, and its history, to paste over
+    /// other panels (see [`App::paste_panel`]). A terminal shows in one
+    /// panel at a time, so pasting one moves it, leaving the panel it was
+    /// in empty.
+    fn copy_panel(&mut self) {
+        let panel = self.active_panel();
+        let Some(visit) = panel.visit() else {
+            self.show_message("Nothing to copy.", false);
+            return;
+        };
+        let (back, forward) = panel.history();
+        self.panel_clip = Some(PanelClip::Copy {
+            visit,
+            back: back.to_vec(),
+            forward: forward.to_vec(),
+            title: panel.title().unwrap_or_default(),
+        });
+    }
+
+    /// Pastes the panel cut or copied over the active panel, as opening
+    /// something over it does: what it showed goes off screen, its files
+    /// staying open and its terminal running, but its history is the
+    /// pasted panel's. A cut panel takes its place, and is pasted once; a
+    /// copy shows there what the copied panel did, as often as pasted.
+    fn paste_panel(&mut self) {
+        match self.panel_clip.take() {
+            None => {}
+            Some(PanelClip::Cut(mut panel)) => {
+                let id = panel.id;
+                let tab = self.tab_mut();
+                let target = tab.active;
+                let index = tab
+                    .panels
+                    .iter()
+                    .position(|panel| panel.id == target)
+                    .expect("the active panel is open");
+                panel.absorb(tab.panels.remove(index));
+                tab.layout.replace(target, id);
+                tab.panels.push(panel);
+                tab.active = id;
+                self.focus = Focus::Editor;
+                self.layout();
+                self.show_active_in_tree();
+                self.prune_terminals();
+            }
+            Some(PanelClip::Copy {
+                visit,
+                back,
+                forward,
+                title,
+            }) => {
+                let shown = self.show_place(&visit);
+                if let Visit::File(_, _, Some(spot)) = &visit {
+                    if let Some(editor) = self.editor_mut().filter(|_| shown) {
+                        editor.return_to(spot.at());
+                    }
+                }
+                // Pasted, not gone to: the history is the copy's.
+                self.active_panel_mut().take_left();
+                self.active_panel_mut()
+                    .set_history(back.clone(), forward.clone());
+                self.panel_clip = Some(PanelClip::Copy {
+                    visit,
+                    back,
+                    forward,
+                    title,
+                });
+            }
+        }
+        self.forget_arranging();
     }
 
     /// Zooms the active panel to fill the tab, framed, hiding the others,
@@ -3951,8 +4209,10 @@ impl App {
     /// any tab.
     fn prune_documents(&mut self) {
         let tabs = &self.tabs;
-        self.documents
-            .retain(|doc| !doc.is_blank() || tab::all_panels(tabs).any(|panel| panel.has(doc)));
+        let cut = self.panel_clip.as_ref().and_then(PanelClip::cut);
+        self.documents.retain(|doc| {
+            !doc.is_blank() || tab::all_panels(tabs).chain(cut).any(|panel| panel.has(doc))
+        });
         let documents = &self.documents;
         self.recent.retain(|recent| match recent {
             Recent::Untitled(number) => documents
@@ -6910,6 +7170,7 @@ impl App {
             false if self.tab().panels.len() > 1 => items.push(item(ToggleZoom, "Zoom")),
             false => {}
         }
+        items.push(item(ArrangePanels, "Arrange Panels"));
         items.push(MenuItem::Separator);
         if panel.editor().is_some() || panel.image().is_some() || panel.commit().is_some() {
             items.push(item(CloseFile, "Close File"));
@@ -7598,9 +7859,10 @@ impl App {
     /// tab.
     fn prune_terminals(&mut self) {
         let tabs = &self.tabs;
+        let cut = self.panel_clip.as_ref().and_then(PanelClip::cut);
         self.terminals.retain(|terminal| {
             terminal.borrow().exit().is_none()
-                || tab::all_panels(tabs).any(|panel| {
+                || tab::all_panels(tabs).chain(cut).any(|panel| {
                     panel
                         .terminal()
                         .is_some_and(|shown| Rc::ptr_eq(shown, terminal))
@@ -13103,6 +13365,162 @@ mod tests {
         assert_eq!(cursor_at(&app), "Ln 21, Col 1");
         app.go_to(Position::printed(2, Some(99)));
         assert_eq!(cursor_at(&app), "Ln 2, Col 7");
+    }
+
+    #[test]
+    fn layout_mode_arranges_panels_with_plain_keys() {
+        let _serial = crate::test_serial();
+        let root = fixture("arrange", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let workspace = Workspace::new([root.clone()]).unwrap();
+        let mut app = App::new(workspace, Some(root.join("a.txt")), 160, 30).unwrap();
+        let press = |app: &mut App, code: KeyCode, mods: Mods| {
+            app.handle_key(Key::new(code, mods));
+        };
+        let alt = Mods {
+            alt: true,
+            ..Mods::NONE
+        };
+        let width = |app: &App, id: PanelId| {
+            let panel = app.tab().panels.iter().find(|panel| panel.id == id);
+            panel.unwrap().area().width
+        };
+        let screen = |app: &App| {
+            let frame = OwnedBuffer::new(160, 30, false, WidthMethod::Unicode, "test").unwrap();
+            app.draw(&frame);
+            frame.to_text(true)
+        };
+        let first = app.tab().active;
+        ctrl(&mut app, 'j');
+        assert!(app.arranging.is_some());
+        assert!(screen(&app).contains("LAYOUT"), "the status bar says so");
+
+        // Keys are the mode's: nothing is typed.
+        key(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.ed().document().text(), "alpha");
+
+        // Split, then go back with an arrow and swap with Shift.
+        key(&mut app, KeyCode::Char('\\'));
+        let second = app.tab().active;
+        assert_ne!(second, first);
+        app.open(&root.join("b.txt"), false);
+        key(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.tab().active, first);
+        let left = |app: &App| app.tab().layout.panels(app.main_area())[0].0;
+        press(&mut app, KeyCode::Right, Mods::SHIFT);
+        assert_eq!(left(&app), second, "swapped");
+        assert_eq!(app.tab().active, first, "the keyboard stays with it");
+
+        // Resizing, in steps, undoes at once; evening out evens out.
+        let before = width(&app, first);
+        press(&mut app, KeyCode::Left, alt);
+        press(&mut app, KeyCode::Left, alt);
+        assert_eq!(width(&app, first), before + 2 * arrange::RESIZE_CELLS);
+        key(&mut app, KeyCode::Char('u'));
+        assert_eq!(width(&app, first), before);
+        press(&mut app, KeyCode::Left, alt);
+        key(&mut app, KeyCode::Char('='));
+        assert_eq!(width(&app, first), before);
+
+        // Flipping stacks them.
+        key(&mut app, KeyCode::Char('r'));
+        assert_eq!(
+            app.tab().layout.handles(app.main_area())[0].axis,
+            Axis::Vertical
+        );
+        key(&mut app, KeyCode::Char('u'));
+        assert_eq!(
+            app.tab().layout.handles(app.main_area())[0].axis,
+            Axis::Horizontal
+        );
+
+        // Cut takes the panel out; pasted over a new tab's empty panel,
+        // it's there instead.
+        key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.tab().panels.len(), 1);
+        assert_eq!(app.tab().active, second);
+        assert!(screen(&app).contains("Cut a.txt"), "{}", screen(&app));
+        key(&mut app, KeyCode::Char('t'));
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tab().panels.len(), 1);
+        assert_eq!(app.tab().active, first);
+        assert!(app.ed().path().unwrap().ends_with("a.txt"));
+        assert!(app.panel_clip.is_none(), "pasted once");
+
+        // A tab's only panel leaves an empty one. Pasted over another
+        // panel, what that showed stays open behind it, and the history
+        // is the pasted panel's.
+        key(&mut app, KeyCode::Char('x'));
+        assert!(app.active_panel().is_empty());
+        key(&mut app, KeyCode::Char('['));
+        assert_eq!(app.tab().active, second);
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.tab().panels.len(), 1);
+        assert_eq!(app.tab().active, first);
+        assert!(app.ed().path().unwrap().ends_with("a.txt"));
+        let b = app.find_document(&root.join("b.txt")).unwrap();
+        assert!(app.active_panel().has(&b), "b.txt is still open behind");
+        let shows_b = |visit: &Visit| matches!(visit, Visit::File(_, Some(path), _) if path.ends_with("b.txt"));
+        let (back, forward) = app.active_panel().history();
+        assert!(
+            !back.iter().chain(forward).any(shows_b),
+            "the history is a.txt's panel's"
+        );
+
+        // A copy pastes over as many panels as wanted.
+        key(&mut app, KeyCode::Char('c'));
+        key(&mut app, KeyCode::Char('\\'));
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.tab().panels.len(), 2);
+        assert_ne!(app.tab().active, first);
+        assert!(app.ed().path().unwrap().ends_with("a.txt"));
+        key(&mut app, KeyCode::Char(']'));
+        key(&mut app, KeyCode::Char('v'));
+        assert!(app.ed().path().unwrap().ends_with("a.txt"));
+        assert!(screen(&app).contains("Copied a.txt"));
+
+        // Shortcuts still work; Esc leaves, and the clipboard stays.
+        ctrl(&mut app, '1');
+        assert_eq!(app.tab, 0);
+        key(&mut app, KeyCode::Esc);
+        assert!(app.arranging.is_none());
+        assert!(app.panel_clip.is_some());
+        key(&mut app, KeyCode::Char('q'));
+        assert!(app.ed().document().text().contains('q'), "typing again");
+    }
+
+    #[test]
+    fn layout_mode_takes_keys_from_terminals() {
+        let _serial = crate::test_serial();
+        let root = fixture("arrange-terminal", &[("a.txt", "a")]);
+        let mut app = app(&root, None);
+        app.handle_key(Key::new(KeyCode::Char('n'), CTRL_SHIFT));
+        assert!(app.active_terminal().is_some());
+        ctrl(&mut app, 'j');
+        assert!(app.arranging.is_some());
+        // A copied terminal moves where it's pasted, leaving its panel
+        // empty.
+        let first = app.tab().active;
+        key(&mut app, KeyCode::Char('c'));
+        key(&mut app, KeyCode::Char('\\'));
+        key(&mut app, KeyCode::Char('v'));
+        assert!(app.active_terminal().is_some());
+        assert_ne!(app.tab().active, first);
+        let original = app.tab().panels.iter().find(|panel| panel.id == first);
+        assert!(original.unwrap().is_empty());
+        assert_eq!(app.terminals.len(), 1);
+        // Closing the empty one, the terminal's panel has the keyboard.
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, KeyCode::Char('w'));
+        assert!(app.active_terminal().is_some());
+        // Cut, it keeps running until it's pasted back.
+        key(&mut app, KeyCode::Char('x'));
+        assert!(app.active_panel().is_empty());
+        assert_eq!(app.terminals.len(), 1);
+        key(&mut app, KeyCode::Char('v'));
+        assert!(app.active_terminal().is_some());
+        ctrl(&mut app, 'j');
+        assert!(app.arranging.is_none());
     }
 
     #[test]

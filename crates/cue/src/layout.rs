@@ -154,7 +154,7 @@ impl Layout {
     }
 
     /// Swaps panels `a` and `b`, wherever they are.
-    fn swap(&mut self, a: PanelId, b: PanelId) {
+    pub fn swap(&mut self, a: PanelId, b: PanelId) {
         match self {
             Layout::Panel(id) if *id == a => *id = b,
             Layout::Panel(id) if *id == b => *id = a,
@@ -247,6 +247,248 @@ impl Layout {
             }
             None => first.remove(id).or_else(|| second.remove(id)),
         }
+    }
+
+    /// Puts panel `new` where panel `old` is. Returns false if there's no
+    /// such panel.
+    pub fn replace(&mut self, old: PanelId, new: PanelId) -> bool {
+        match self {
+            Layout::Panel(id) if *id == old => {
+                *id = new;
+                true
+            }
+            Layout::Panel(_) => false,
+            Layout::Split { first, second, .. } => {
+                first.replace(old, new) || second.replace(old, new)
+            }
+        }
+    }
+
+    /// Whether panel `id` is in it.
+    pub fn contains(&self, id: PanelId) -> bool {
+        match self {
+            Layout::Panel(p) => *p == id,
+            Layout::Split { first, second, .. } => first.contains(id) || second.contains(id),
+        }
+    }
+
+    /// Moves an edge of panel `id` `cells` in `direction`, when the layout
+    /// fills `area`, as tmux's `resize-pane` does: the edge on that side,
+    /// growing it, or where it has none, the one on the other side,
+    /// shrinking it. Of the splits there, the innermost moves. Returns
+    /// whether anything moved.
+    pub fn nudge(&mut self, area: Rect, id: PanelId, direction: Direction, cells: u32) -> bool {
+        let (along, forward) = way(direction);
+        // The innermost split along the way with the panel's edge facing
+        // `direction`, and failing that, the innermost along the way.
+        let (mut facing, mut any) = (None, None);
+        let mut path = Vec::new();
+        let mut node = &*self;
+        while let Layout::Split {
+            axis,
+            first,
+            second,
+            ..
+        } = node
+        {
+            let in_second = second.contains(id);
+            if !in_second && !first.contains(id) {
+                return false;
+            }
+            if *axis == along {
+                any = Some(path.clone());
+                if in_second != forward {
+                    facing = Some(path.clone());
+                }
+            }
+            path.push(in_second);
+            node = if in_second { second } else { first };
+        }
+        let Some(path) = facing.or(any) else {
+            return false;
+        };
+        let Some(handle) = self.handles(area).into_iter().find(|h| h.path == path) else {
+            return false;
+        };
+        let Rect { x, y, .. } = handle.rect;
+        let (x, y) = match direction {
+            Direction::Left => (x.saturating_sub(cells), y),
+            Direction::Right => (x + cells, y),
+            Direction::Up => (x, y.saturating_sub(cells)),
+            Direction::Down => (x, y + cells),
+        };
+        let before = self.clone();
+        self.drag(&path, area, x, y);
+        *self != before
+    }
+
+    /// Trades panel `id`'s place with what's beside it in `direction`, when
+    /// the layout fills `area`: what borders it there, as a whole as long
+    /// as it's no longer alongside the panel than the panel is, or else
+    /// the part of it alongside the panel most. Past panels side by side
+    /// that way, it trades with the nearest. A panel that's a whole side
+    /// of a split, trading with the whole other side, keeps its size.
+    /// Returns whether it moved.
+    pub fn trade(&mut self, area: Rect, id: PanelId, direction: Direction) -> bool {
+        let (along, forward) = way(direction);
+        let Some(leaf) = self.path_to(id) else {
+            return false;
+        };
+        // The innermost split that way with the panel on the side facing
+        // `direction`: the first side, going right or down.
+        let Some(depth) = (0..leaf.len()).rev().find(|&depth| {
+            let node = self.node(&leaf[..depth]);
+            matches!(node, Layout::Split { axis, .. } if *axis == along) && leaf[depth] != forward
+        }) else {
+            return false;
+        };
+        // How far a rect goes alongside the way it moves.
+        let alongside = |rect: Rect| match along {
+            Axis::Horizontal => (rect.y, rect.bottom()),
+            Axis::Vertical => (rect.x, rect.right()),
+        };
+        let (start, end) = alongside(self.node_area(area, &leaf));
+        let mut path = leaf[..depth].to_vec();
+        path.push(forward);
+        while let Layout::Split { axis, ratio, .. } = self.node(&path) {
+            if *axis == along {
+                // The side nearer the panel.
+                path.push(!forward);
+                continue;
+            }
+            let rect = self.node_area(area, &path);
+            let (from, to) = alongside(rect);
+            if from >= start && to <= end {
+                break;
+            }
+            let overlap = |rect: Rect| {
+                let (from, to) = alongside(rect);
+                to.min(end).saturating_sub(from.max(start))
+            };
+            let (a, b) = divide(rect, *axis, *ratio);
+            path.push(overlap(b) > overlap(a));
+        }
+        let whole = leaf.len() == depth + 1 && path.len() == depth + 1;
+        let other = self.node(&path).clone();
+        *self.node_mut(&path) = Layout::Panel(id);
+        *self.node_mut(&leaf) = other;
+        if let (true, Layout::Split { ratio, .. }) = (whole, self.node_mut(&leaf[..depth])) {
+            *ratio = 1.0 - *ratio;
+        }
+        true
+    }
+
+    /// The way to panel `id` from the top: `false` for a split's first
+    /// side, `true` for its second.
+    fn path_to(&self, id: PanelId) -> Option<Vec<bool>> {
+        match self {
+            Layout::Panel(p) => (*p == id).then(Vec::new),
+            Layout::Split { first, second, .. } => [(false, first), (true, second)]
+                .into_iter()
+                .find_map(|(side, node)| {
+                    let mut path = node.path_to(id)?;
+                    path.insert(0, side);
+                    Some(path)
+                }),
+        }
+    }
+
+    /// The node at `path`.
+    fn node(&self, path: &[bool]) -> &Layout {
+        match (self, path.split_first()) {
+            (Layout::Split { first, second, .. }, Some((&side, rest))) => match side {
+                false => first.node(rest),
+                true => second.node(rest),
+            },
+            _ => self,
+        }
+    }
+
+    fn node_mut(&mut self, path: &[bool]) -> &mut Layout {
+        match (self, path.split_first()) {
+            (Layout::Split { first, second, .. }, Some((&side, rest))) => match side {
+                false => first.node_mut(rest),
+                true => second.node_mut(rest),
+            },
+            (node, _) => node,
+        }
+    }
+
+    /// The area of the node at `path`, when the layout fills `area`.
+    fn node_area(&self, area: Rect, path: &[bool]) -> Rect {
+        match (self, path.split_first()) {
+            (
+                Layout::Split {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                },
+                Some((&side, rest)),
+            ) => {
+                let (a, b) = divide(area, *axis, *ratio);
+                match side {
+                    false => first.node_area(a, rest),
+                    true => second.node_area(b, rest),
+                }
+            }
+            _ => area,
+        }
+    }
+
+    /// Evens out its splits, so panels side by side are as wide as each
+    /// other and stacked ones as tall.
+    pub fn equalize(&mut self) {
+        if let Layout::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = self
+        {
+            first.equalize();
+            second.equalize();
+            let (a, b) = (first.span(*axis), second.span(*axis));
+            *ratio = a as f32 / (a + b) as f32;
+        }
+    }
+
+    /// How many panels across it is along `axis`, where it's most.
+    fn span(&self, along: Axis) -> u32 {
+        match self {
+            Layout::Panel(_) => 1,
+            Layout::Split {
+                axis,
+                first,
+                second,
+                ..
+            } if *axis == along => first.span(along) + second.span(along),
+            Layout::Split { first, second, .. } => first.span(along).max(second.span(along)),
+        }
+    }
+
+    /// Turns the split panel `id` is directly in the other way: side by
+    /// side to stacked, or back. Returns false if it's the only panel, or
+    /// not there.
+    pub fn flip(&mut self, id: PanelId) -> bool {
+        let Layout::Split {
+            axis,
+            first,
+            second,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let leaf = |node: &Layout| matches!(node, Layout::Panel(p) if *p == id);
+        if leaf(first) || leaf(second) {
+            *axis = match axis {
+                Axis::Horizontal => Axis::Vertical,
+                Axis::Vertical => Axis::Horizontal,
+            };
+            return true;
+        }
+        first.flip(id) || second.flip(id)
     }
 
     fn first(&self) -> PanelId {
@@ -393,6 +635,17 @@ impl Layout {
             })
             .min_by_key(|&(_, gap, alongside)| (gap, std::cmp::Reverse(alongside)))
             .map(|(id, _, _)| id)
+    }
+}
+
+/// The axis splits along `direction` are, and whether it goes from the
+/// first side to the second.
+fn way(direction: Direction) -> (Axis, bool) {
+    match direction {
+        Direction::Left => (Axis::Horizontal, false),
+        Direction::Right => (Axis::Horizontal, true),
+        Direction::Up => (Axis::Vertical, false),
+        Direction::Down => (Axis::Vertical, true),
     }
 }
 
@@ -608,6 +861,135 @@ mod tests {
         // Without 2, 3 is 30 high, and splits.
         let drop = layout.drop_at(narrow, 2, 45, 29).unwrap();
         assert_eq!((drop.target, drop.side), (3, Some(Direction::Down)));
+    }
+
+    #[test]
+    fn nudging_moves_the_edge_facing_that_way_or_else_the_other() {
+        use Direction::*;
+        // 1 | (2 / 3), with the divider at column 50.
+        let mut layout = three();
+        let divider = |layout: &Layout| layout.handles(AREA)[0].rect.x;
+        assert_eq!(divider(&layout), 50);
+        assert!(layout.nudge(AREA, 1, Right, 4));
+        assert_eq!(divider(&layout), 54, "panel 1 grows");
+        assert!(layout.nudge(AREA, 2, Right, 4));
+        assert_eq!(
+            divider(&layout),
+            58,
+            "panel 2 has no right edge: it shrinks"
+        );
+        assert!(layout.nudge(AREA, 3, Left, 8));
+        assert_eq!(divider(&layout), 50);
+        // Panel 1 is as tall as it gets.
+        assert!(!layout.nudge(AREA, 1, Down, 2));
+        let lower = |layout: &Layout| layout.handles(AREA)[1].rect.y;
+        let before = lower(&layout);
+        assert!(layout.nudge(AREA, 2, Down, 2));
+        assert_eq!(lower(&layout), before + 2);
+        // It stops at the panels' minimum size.
+        assert!(layout.nudge(AREA, 1, Right, 1000));
+        assert!(!layout.nudge(AREA, 1, Right, 1));
+    }
+
+    #[test]
+    fn trading_takes_what_borders_the_panel_that_way() {
+        use Direction::*;
+        // 1 | (2 / 3): 1 is the whole left side.
+        let ids = |layout: &Layout| -> Vec<PanelId> {
+            layout.panels(AREA).iter().map(|&(id, _)| id).collect()
+        };
+        let width = |layout: &Layout, id| {
+            let panels = layout.panels(AREA);
+            panels.iter().find(|&&(p, _)| p == id).unwrap().1.width
+        };
+        let mut layout = three();
+        layout.nudge(AREA, 1, Right, 10);
+        let before = width(&layout, 1);
+        assert!(layout.trade(AREA, 1, Right));
+        assert_eq!(ids(&layout), [2, 3, 1], "2 / 3 | 1");
+        assert_eq!(width(&layout, 1), before, "it keeps its size");
+        assert!(!layout.trade(AREA, 1, Right), "nothing further right");
+        // 2 is only part of its side: it swaps with its neighbor.
+        let mut layout = three();
+        assert!(layout.trade(AREA, 2, Left));
+        assert_eq!(ids(&layout), [2, 1, 3], "2 | (1 / 3)");
+        // Within the column, 2 and 3 are whole sides.
+        let mut layout = three();
+        assert!(layout.trade(AREA, 2, Down));
+        assert_eq!(ids(&layout), [1, 3, 2]);
+
+        // (1 / 2) | 3 | 4: 3 trades with the column, which is no taller.
+        let mut layout = Layout::Panel(1);
+        layout.split(1, 3, Axis::Horizontal);
+        layout.split(1, 2, Axis::Vertical);
+        layout.split(3, 4, Axis::Horizontal);
+        assert!(layout.trade(AREA, 3, Left));
+        assert_eq!(ids(&layout), [3, 1, 2, 4], "3 | (1 / 2) | 4");
+        let panels = layout.panels(AREA);
+        assert_eq!(panels[0].1.height, AREA.height, "3 is as tall as it was");
+
+        // (1 / 2) | (3 / 4): 1 trades with 3, alongside it.
+        let mut layout = Layout::Panel(1);
+        layout.split(1, 3, Axis::Horizontal);
+        layout.split(1, 2, Axis::Vertical);
+        layout.split(3, 4, Axis::Vertical);
+        assert!(layout.trade(AREA, 1, Right));
+        assert_eq!(ids(&layout), [3, 2, 1, 4]);
+
+        // 1 | 2 | 3: one step at a time.
+        let mut layout = Layout::Panel(1);
+        layout.split(1, 2, Axis::Horizontal);
+        layout.split(2, 3, Axis::Horizontal);
+        assert!(layout.trade(AREA, 1, Right));
+        assert_eq!(ids(&layout), [2, 1, 3]);
+    }
+
+    #[test]
+    fn equalizing_evens_out_columns_and_rows() {
+        use Direction::*;
+        // 1 | (2 / 3) | 4, but lopsided.
+        let mut layout = Layout::Panel(1);
+        layout.split(1, 2, Axis::Horizontal);
+        layout.split(2, 4, Axis::Horizontal);
+        layout.split(2, 3, Axis::Vertical);
+        layout.nudge(AREA, 1, Right, 30);
+        layout.equalize();
+        let widths: Vec<u32> = layout
+            .panels(AREA)
+            .iter()
+            .filter(|(id, _)| *id != 3)
+            .map(|(_, rect)| rect.width)
+            .collect();
+        assert!(
+            widths.iter().all(|w| w.abs_diff(widths[0]) <= 1),
+            "{widths:?}"
+        );
+        let heights: Vec<u32> = layout
+            .panels(AREA)
+            .iter()
+            .filter(|(id, _)| [2, 3].contains(id))
+            .map(|(_, rect)| rect.height)
+            .collect();
+        assert!(heights[0].abs_diff(heights[1]) <= 1, "{heights:?}");
+    }
+
+    #[test]
+    fn flipping_turns_a_panels_split_the_other_way() {
+        let mut layout = three();
+        assert!(layout.flip(2));
+        let panels = layout.panels(AREA);
+        let rect = |id| panels.iter().find(|(p, _)| *p == id).unwrap().1;
+        assert_eq!(rect(2).y, rect(3).y, "side by side now");
+        assert!(rect(3).x > rect(2).x);
+        assert!(!Layout::Panel(1).flip(1), "nothing to flip");
+    }
+
+    #[test]
+    fn replacing_puts_another_panel_in_its_place() {
+        let mut layout = three();
+        assert!(layout.replace(3, 9));
+        assert!(layout.contains(9) && !layout.contains(3));
+        assert!(!layout.replace(3, 10));
     }
 
     #[test]

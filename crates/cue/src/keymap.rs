@@ -125,6 +125,7 @@ commands! {
     SplitDown => "panel:split-down", "Split Panel Down";
     ClosePanel => "panel:close", "Close Panel";
     ToggleZoom => "panel:toggle-zoom", "Zoom or Unzoom Panel";
+    ArrangePanels => "panel:arrange", "Arrange Panels";
     PanelContextMenu => "panel:context-menu", "Show Panel Menu";
     EditorContextMenu => "editor:context-menu", "Show Editor Context Menu";
     Pop => "panel:pop", "Pop";
@@ -274,12 +275,14 @@ impl Command {
             | OpenFile | GoToFile | GoToUnsaved | GoToLine | GoToSymbol | GoToWorkspaceSymbol
             | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext
             | FindPrevious | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight
-            | SplitDown | ClosePanel | ToggleZoom | Pop | GoBack | GoForward | RecentlyViewed
-            | SetMark | JumpToMark | FocusPanelLeft | FocusPanelRight | FocusPanelUp
-            | FocusPanelDown | NewTerminal | GoToWaitingTerminal | NewTab | CloseTab | NextTab
-            | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2
-            | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9
-            | AddFolder | RenameSession | GitFetch | GitPull | GitPush => Context::Global,
+            | SplitDown | ClosePanel | ToggleZoom | ArrangePanels | Pop | GoBack | GoForward
+            | RecentlyViewed | SetMark | JumpToMark | FocusPanelLeft | FocusPanelRight
+            | FocusPanelUp | FocusPanelDown | NewTerminal | GoToWaitingTerminal | NewTab
+            | CloseTab | NextTab | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab
+            | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7
+            | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch | GitPull | GitPush => {
+                Context::Global
+            }
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
@@ -407,6 +410,8 @@ impl Default for Keymap {
             // Ctrl+\ as in VS Code; Ctrl+W as closing a tab does.
             ('\\', SplitRight),
             ('w', ClosePanel),
+            // Layout mode: J for "juggle", and free in every terminal.
+            ('j', ArrangePanels),
             // As in browsers.
             ('t', NewTab),
             // Legacy terminals send it as itself, unlike most Ctrl+Shift keys.

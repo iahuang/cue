@@ -428,6 +428,22 @@ impl Panel {
             .any(|editor| Rc::ptr_eq(editor.document(), doc))
     }
 
+    /// Takes `other`'s files, behind its own, as if it had shown them
+    /// before what it shows now: their editors stay, as when something is
+    /// opened over a file. What else `other` showed, and its history, go.
+    pub fn absorb(&mut self, other: Panel) {
+        let theirs: Vec<Editor> = other
+            .editors
+            .into_iter()
+            .filter(|editor| !self.has(editor.document()))
+            .collect();
+        let count = theirs.len();
+        self.editors.splice(0..0, theirs);
+        if let Some(current) = &mut self.current {
+            *current += count;
+        }
+    }
+
     /// Shows `doc`, where it was left if it was shown here before. An
     /// unnamed document left behind that was never typed in is dropped.
     pub fn show(&mut self, doc: &Rc<Document>) -> opentui::Result<()> {

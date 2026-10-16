@@ -2,6 +2,7 @@
 
 mod alert;
 mod app;
+mod arrange;
 mod attach;
 mod autoindent;
 mod changes;
