@@ -51,6 +51,7 @@ const KNOWN: &[&str] = &[
     "tab",
     "recent",
     "mark",
+    "jumps",
     "documents",
     "terminals",
     "tabs",
@@ -116,9 +117,9 @@ pub struct Visited {
     pub at: Option<(u32, u32)>,
 }
 
-/// The place in a file to jump back to, and the panel it was marked in.
+/// A place in a panel: the mark, or one to go back or forward to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mark {
+pub struct Jump {
     pub panel: PanelId,
     pub visited: Visited,
 }
@@ -167,7 +168,11 @@ pub struct State {
     /// What the picker lists first, most recent first.
     pub recent: Vec<Shown>,
     /// The place in a file to jump back to, if marked.
-    pub mark: Option<Mark>,
+    pub mark: Option<Jump>,
+    /// The places to go back to across panels, most recent last, and
+    /// forward to.
+    pub jumps_back: Vec<Jump>,
+    pub jumps_forward: Vec<Jump>,
     /// A terminal shows its screen there.
     pub attached: bool,
     /// How files were chosen to indent, by path.
@@ -704,6 +709,18 @@ fn visited_list(list: &[Visited]) -> Value {
     Value::Array(list.iter().map(visited_value).collect())
 }
 
+fn jump_value(jump: &Jump) -> Value {
+    let Value::Table(mut table) = visited_value(&jump.visited) else {
+        unreachable!()
+    };
+    table.insert("panel".into(), Value::Integer(jump.panel as i64));
+    Value::Table(table)
+}
+
+fn jump_list(list: &[Jump]) -> Value {
+    Value::Array(list.iter().map(jump_value).collect())
+}
+
 /// `state` as `session.toml` has it.
 pub fn encode(state: &State) -> String {
     let int = |n: u64| Value::Integer(n.min(i64::MAX as u64) as i64);
@@ -727,11 +744,13 @@ pub fn encode(state: &State) -> String {
     root.insert("tab".into(), int(state.tab as u64));
     root.insert("recent".into(), shown_list(&state.recent));
     if let Some(mark) = &state.mark {
-        let Value::Table(mut table) = visited_value(&mark.visited) else {
-            unreachable!()
-        };
-        table.insert("panel".into(), int(mark.panel as u64));
-        root.insert("mark".into(), Value::Table(table));
+        root.insert("mark".into(), jump_value(mark));
+    }
+    if !state.jumps_back.is_empty() || !state.jumps_forward.is_empty() {
+        let mut jumps = Table::new();
+        jumps.insert("back".into(), jump_list(&state.jumps_back));
+        jumps.insert("forward".into(), jump_list(&state.jumps_forward));
+        root.insert("jumps".into(), Value::Table(jumps));
     }
     let documents = state.documents.iter().map(|doc| {
         let mut table = Table::new();
@@ -900,6 +919,18 @@ pub fn decode(text: &str) -> Option<State> {
     let visited_list = |table: &Table, key: &str| -> Vec<Visited> {
         get_array(table, key).filter_map(visited_from).collect()
     };
+    let jump_from = |jump: &Table| {
+        Some(Jump {
+            panel: get_u32(jump, "panel")?,
+            visited: visited_from(jump)?,
+        })
+    };
+    let jumps = root.get("jumps").and_then(Value::as_table);
+    let jump_list = |key: &str| -> Vec<Jump> {
+        jumps
+            .map(|jumps| get_array(jumps, key).filter_map(jump_from).collect())
+            .unwrap_or_default()
+    };
     let tree = root.get("tree").and_then(Value::as_table);
     let tree_flag = |key: &str| tree.and_then(|tree| tree.get(key)).and_then(Value::as_bool);
     let mut state = State {
@@ -928,12 +959,12 @@ pub fn decode(text: &str) -> Option<State> {
         changes_shown: tree_flag("changes").unwrap_or(false),
         tab: get_u32(&root, "tab").unwrap_or(0) as usize,
         recent: shown_list(&root, "recent"),
-        mark: root.get("mark").and_then(Value::as_table).and_then(|mark| {
-            Some(Mark {
-                panel: get_u32(mark, "panel")?,
-                visited: visited_from(mark)?,
-            })
-        }),
+        mark: root
+            .get("mark")
+            .and_then(Value::as_table)
+            .and_then(jump_from),
+        jumps_back: jump_list("back"),
+        jumps_forward: jump_list("forward"),
         unknown: root
             .iter()
             .filter(|(key, _)| !KNOWN.contains(&key.as_str()))
@@ -1141,13 +1172,27 @@ mod tests {
                 size: (100, 30),
             }],
             recent: vec![Shown::Terminal(2), Shown::File("/w/cue/b.rs".into())],
-            mark: Some(Mark {
+            mark: Some(Jump {
                 panel: 4,
                 visited: Visited {
                     shown: Shown::File("/w/cue/b.rs".into()),
                     at: Some((7, 1)),
                 },
             }),
+            jumps_back: vec![Jump {
+                panel: 4,
+                visited: Visited {
+                    shown: Shown::Terminal(2),
+                    at: None,
+                },
+            }],
+            jumps_forward: vec![Jump {
+                panel: 4,
+                visited: Visited {
+                    shown: Shown::File("/w/cue/b.rs".into()),
+                    at: Some((30, 0)),
+                },
+            }],
             attached: true,
             indents: vec![
                 ("/w/cue/Makefile".into(), Indent::Tabs),

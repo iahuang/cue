@@ -25,6 +25,7 @@ mod image;
 mod indent;
 mod input;
 mod input_box;
+mod jumps;
 mod keymap;
 mod language;
 mod layout;

@@ -13,7 +13,8 @@
 //! something.
 //!
 //! Like a browser tab, a panel keeps a history of what it showed, to go
-//! back and forward through (Ctrl+- and Ctrl+=). Popping (Ctrl+0) closes
+//! back and forward through with the header's buttons. Ctrl+- and Ctrl+=
+//! go through every panel's at once (see [`crate::jumps`]). Popping (Ctrl+0) closes
 //! what it shows and goes back, as from the top of a stack. The history
 //! keeps where in a file the cursor was, and jumps within a file count
 //! too, as in Vim's jump list: going to a line, symbol, or search result,
@@ -110,7 +111,7 @@ fn visit_file(doc: &Rc<Document>, row: u32, col: u32) -> Option<Visit> {
 impl Visit {
     /// Whether it's the same place as `other`: the same file, and near the
     /// same line in it.
-    fn is(&self, other: &Visit) -> bool {
+    pub fn is(&self, other: &Visit) -> bool {
         if !self.shows_same(other) {
             return false;
         }
@@ -172,6 +173,9 @@ pub struct Panel {
     commit: Option<CommitDiff>,
     area: Rect,
     history: History,
+    /// The places it left, as its history noted them, since last taken
+    /// (see [`Panel::take_left`]), oldest first.
+    left: Vec<Visit>,
     /// The columns the header's name took when last drawn, its icon
     /// included, from the first to past the last: a click there opens the
     /// file picker.
@@ -189,6 +193,7 @@ impl Panel {
             commit: None,
             area: Rect::default(),
             history: History::default(),
+            left: Vec::new(),
             name_columns: Cell::new((0, 0)),
         }
     }
@@ -540,6 +545,7 @@ impl Panel {
     /// Notes `visit` as the place to go back to. Going somewhere new,
     /// there's no going forward.
     fn note(&mut self, visit: Visit) {
+        self.left.push(visit.clone());
         let History { back, forward } = &mut self.history;
         forward.clear();
         back.retain(|old| !old.is(&visit));
@@ -614,6 +620,12 @@ impl Panel {
         to.extend(current);
         to.extend(passed.into_iter().rev());
         visit
+    }
+
+    /// The places it left since last asked, as its history noted them,
+    /// oldest first, even while the history was taken out.
+    pub fn take_left(&mut self) -> Vec<Visit> {
+        std::mem::take(&mut self.left)
     }
 
     /// Drops `visit` from the places to go back to, as when it was closed

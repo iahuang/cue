@@ -93,6 +93,7 @@ use crate::image::{self, ImageView};
 use crate::indent::{self, Indent};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
 use crate::input_box::{InputAction, InputBox};
+use crate::jumps::{Jump, Jumps};
 use crate::keymap::{Command, Context, Keymap};
 use crate::language::Language;
 use crate::layout::{self, Axis, Direction, Layout, PanelId, Rect};
@@ -467,6 +468,8 @@ pub struct App {
     recent: Vec<Recent>,
     /// The place in a file to jump back to, once set.
     mark: Option<Mark>,
+    /// Where the keyboard was, across panels, to go back to.
+    jumps: Jumps,
     /// Workspace search, while open. Never open with the picker.
     search: Option<SearchModal>,
     /// The file dialog, while open. Never open with the picker or search.
@@ -751,6 +754,7 @@ impl App {
             picker: None,
             recent: Vec::new(),
             mark: None,
+            jumps: Jumps::default(),
             search: None,
             dialog: None,
             saving: None,
@@ -1224,8 +1228,8 @@ impl App {
             Command::SplitDown => self.split(Axis::Vertical),
             Command::ClosePanel => self.close_panel(),
             Command::Pop => self.pop(),
-            Command::GoBack => self.go_history(true),
-            Command::GoForward => self.go_history(false),
+            Command::GoBack => self.go_jumps(true),
+            Command::GoForward => self.go_jumps(false),
             Command::RecentlyViewed => self.show_recently_viewed(),
             Command::SetMark => self.set_mark(),
             Command::JumpToMark => self.jump_to_mark(),
@@ -1810,8 +1814,8 @@ impl App {
         AppAction::Continue
     }
 
-    /// The mouse's back or forward button: goes back or forward in the
-    /// panel under it, as in a browser, unless a popup is open.
+    /// The mouse's back or forward button: goes back or forward as Ctrl+-
+    /// and Ctrl+= do, unless a popup is open.
     fn history_button(&mut self, mouse: Mouse) {
         let MouseKind::Press(button) = mouse.kind else {
             return;
@@ -1825,12 +1829,7 @@ impl App {
         if popup {
             return;
         }
-        if let Some(MouseTarget::Panel(id) | MouseTarget::Header(id)) =
-            self.target_at(mouse.x, mouse.y)
-        {
-            self.activate(id);
-        }
-        self.go_history(button == MouseButton::Back);
+        self.go_jumps(button == MouseButton::Back);
     }
 
     /// What's at screen cell (`x`, `y`), if anything.
@@ -2112,6 +2111,7 @@ impl App {
         for panel in tab::all_panels_mut(&mut self.tabs) {
             panel.note_jump();
         }
+        self.follow_jumps();
         self.refresh_finds();
         self.sync_scroll();
         self.editor_mut();
@@ -2794,18 +2794,66 @@ impl App {
         if self.active_panel().is_empty() {
             return;
         }
+        self.follow_jumps();
         let visit = self.active_panel().visit();
         if !self.close_shown(Redo::Run(Command::Pop)) {
             return;
         }
         if let Some(visit) = &visit {
             self.active_panel_mut().drop_visit(visit);
+            self.jumps.drop_visit(self.tab().active, visit);
         }
         if !self.step_history(true) {
             self.show_active_in_tree();
         }
+        // What it closed isn't somewhere to go back to.
+        self.active_panel_mut().take_left();
         self.prune_documents();
         self.prune_terminals();
+    }
+
+    /// Catches the places to go back to across panels up with where the
+    /// keyboard is now (see [`Jumps::follow`]).
+    fn follow_jumps(&mut self) {
+        let active = self.tab().active;
+        let before = self
+            .jumps
+            .at()
+            .filter(|&at| at != active)
+            .and_then(|at| tab::all_panels(&self.tabs).find(|panel| panel.id == at))
+            .and_then(Panel::visit);
+        let left = tab::all_panels_mut(&mut self.tabs)
+            .flat_map(|panel| {
+                let id = panel.id;
+                let left = panel.take_left();
+                left.into_iter().map(move |visit| Jump { panel: id, visit })
+            })
+            .collect();
+        let here = self.active_panel().visit();
+        self.jumps.follow(active, here.as_ref(), left, before);
+    }
+
+    /// Goes back to where the keyboard was before, in whichever panel and
+    /// tab, or with `back` false, to where it went back from. Closed files
+    /// open again; closed terminals are skipped.
+    fn go_jumps(&mut self, back: bool) {
+        self.follow_jumps();
+        let active = self.tab().active;
+        let here = self.active_panel().visit().map(|visit| Jump {
+            panel: active,
+            visit,
+        });
+        let (documents, terminals) = (&self.documents, &self.terminals);
+        let usable = |jump: &Jump| visit_usable(&jump.visit, documents, terminals, &[]);
+        let Some(jump) = self.jumps.step(back, here, usable) else {
+            return;
+        };
+        self.go_to_place(jump.panel, &jump.visit, false);
+        // Going back isn't going somewhere new.
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            panel.take_left();
+        }
+        self.jumps.settle(self.tab().active);
     }
 
     /// Shows what the active panel showed before what it shows now, or
@@ -2848,31 +2896,11 @@ impl App {
     /// counting as going somewhere new.
     fn show_visit(&mut self, visit: Visit) {
         let history = self.active_panel_mut().take_history();
-        match visit {
-            Visit::File(doc, path, spot) => {
-                let shown = self.show_file(&doc, path.as_deref());
-                if let Some(editor) = self.editor_mut().filter(|_| shown) {
-                    if let Some(spot) = spot {
-                        editor.return_to(spot.at());
-                    }
-                }
+        let shown = self.show_place(&visit);
+        if let Visit::File(_, _, Some(spot)) = &visit {
+            if let Some(editor) = self.editor_mut().filter(|_| shown) {
+                editor.return_to(spot.at());
             }
-            Visit::Terminal(id) => {
-                let terminal = self.terminals.iter().find(|t| t.borrow().id() == id);
-                if let Some(terminal) = terminal.cloned() {
-                    self.show_terminal(terminal);
-                }
-            }
-            Visit::Image(path) => {
-                if self.open_image(&path) {
-                    self.focus = Focus::Editor;
-                }
-            }
-            Visit::Commit {
-                root,
-                commit,
-                change,
-            } => self.open_commit(&root, commit, change, true),
         }
         self.active_panel_mut().restore_history(history);
     }
@@ -3008,15 +3036,9 @@ impl App {
         }
     }
 
-    /// Goes to the mark in the panel it was marked in, in whichever tab.
-    /// The mark stays put, to go to again; going back comes back.
-    ///
-    /// If the panel shows something else now, it goes back (or forward)
-    /// through its history to the file or terminal, as going back that
-    /// many times would, or failing that, shows it again. If the panel is
-    /// gone, it shows in the active panel instead. A terminal shows in one
-    /// panel at a time: where another shows it now, it's gone to there.
-    /// Going there is somewhere to go back to.
+    /// Goes to the mark in the panel it was marked in, in whichever tab
+    /// (see [`App::go_to_place`]). The mark stays put, to go to again;
+    /// going back comes back.
     fn jump_to_mark(&mut self) {
         let Some(mark) = self.mark.clone() else {
             let message = format!(
@@ -3026,7 +3048,6 @@ impl App {
             self.show_message(message, false);
             return;
         };
-        let mut panel = mark.panel;
         match &mark.visit {
             Visit::File(doc, path, _) => {
                 if !file_usable(&self.documents, doc, path.as_deref()) {
@@ -3041,16 +3062,31 @@ impl App {
                     self.show_message("Marked terminal no longer exists.", false);
                     return;
                 }
-                let showing = tab::all_panels(&self.tabs).find(|panel| {
-                    panel
-                        .terminal()
-                        .is_some_and(|terminal| terminal.borrow().id() == *id)
-                });
-                if let Some(showing) = showing {
-                    panel = showing.id;
-                }
             }
             _ => return,
+        }
+        self.go_to_place(mark.panel, &mark.visit, true);
+    }
+
+    /// Goes to `visit` in panel `id`, in whichever tab.
+    ///
+    /// If the panel shows something else now, it goes back (or forward)
+    /// through its history to it, as going back that many times would, or
+    /// failing that, shows it again. If the panel is gone, it shows in the
+    /// active panel instead. A terminal shows in one panel at a time: where
+    /// another shows it now, it's gone to there. With `as_jump`, moving
+    /// within the file it shows is a jump for the panel's history to note.
+    fn go_to_place(&mut self, id: PanelId, visit: &Visit, as_jump: bool) {
+        let mut panel = id;
+        if let Visit::Terminal(terminal) = visit {
+            let showing = tab::all_panels(&self.tabs).find(|panel| {
+                panel
+                    .terminal()
+                    .is_some_and(|shown| shown.borrow().id() == *terminal)
+            });
+            if let Some(showing) = showing {
+                panel = showing.id;
+            }
         }
         let tab = self
             .tabs
@@ -3063,30 +3099,28 @@ impl App {
             self.activate(panel);
         }
         let active = self.active_panel();
-        let within = active
-            .visit()
-            .is_some_and(|visit| visit.shows_same(&mark.visit));
-        let in_history = (!within && active.id == mark.panel)
-            .then(|| active.find_in_history(&mark.visit))
+        let within = active.visit().is_some_and(|shown| shown.shows_same(visit));
+        let in_history = (!within && active.id == id)
+            .then(|| active.find_in_history(visit))
             .flatten();
         let shown = match in_history {
             Some((back, index)) => {
                 let shown = self.active_panel_mut().step_history_to(back, index);
                 let history = self.active_panel_mut().take_history();
-                // Shows what's marked, which the place in the history is
-                // of, as it was found.
-                let shown = shown.is_some() && self.show_marked(&mark.visit);
+                // Shows `visit`, which the place in the history is of, as
+                // it was found.
+                let shown = shown.is_some() && self.show_place(visit);
                 self.active_panel_mut().restore_history(history);
                 shown
             }
-            None => within || self.show_marked(&mark.visit),
+            None => within || self.show_place(visit),
         };
         self.focus = Focus::Editor;
-        // Within the file, it's a jump for the history to note; to another
+        // Within the file, a jump is for the history to note; to another
         // file, the history has the file it left already.
-        if let Visit::File(_, _, Some(spot)) = &mark.visit {
+        if let Visit::File(_, _, Some(spot)) = visit {
             if let Some(editor) = self.editor_mut().filter(|_| shown) {
-                match within {
+                match within && as_jump {
                     true => editor.jump_to(spot.at()),
                     false => editor.return_to(spot.at()),
                 }
@@ -3094,9 +3128,9 @@ impl App {
         }
     }
 
-    /// Shows the file or terminal `visit` marks in the active panel.
-    /// Returns whether the panel shows it.
-    fn show_marked(&mut self, visit: &Visit) -> bool {
+    /// Shows what `visit` is of in the active panel, without the place in
+    /// a file. Returns whether the panel shows it.
+    fn show_place(&mut self, visit: &Visit) -> bool {
         match visit {
             Visit::File(doc, path, _) => self.show_file(doc, path.as_deref()),
             Visit::Terminal(id) => {
@@ -3107,7 +3141,21 @@ impl App {
                 self.show_terminal(terminal);
                 true
             }
-            _ => false,
+            Visit::Image(path) => {
+                let shown = self.open_image(path);
+                if shown {
+                    self.focus = Focus::Editor;
+                }
+                shown
+            }
+            Visit::Commit {
+                root,
+                commit,
+                change,
+            } => {
+                self.open_commit(root, commit.clone(), change.clone(), true);
+                true
+            }
         }
     }
 
@@ -4883,7 +4931,10 @@ impl App {
                 }
                 self.recovery.discard();
                 if announce {
-                    self.show_message("Session saved. Run `cue --resume` to resume after quitting.", false);
+                    self.show_message(
+                        "Session saved. Run `cue --resume` to resume after quitting.",
+                        false,
+                    );
                 }
                 true
             }
@@ -5094,11 +5145,13 @@ impl App {
             terminals,
             recent,
             mark: self.mark.as_ref().and_then(|mark| {
-                Some(session::Mark {
+                Some(session::Jump {
                     panel: mark.panel,
                     visited: visited(&mark.visit)?,
                 })
             }),
+            jumps_back: saved_jumps(self.jumps.lists().0),
+            jumps_forward: saved_jumps(self.jumps.lists().1),
             attached: self.attached,
             indents: self.saved_indents(),
             // The session's own, which it saves with this.
@@ -5342,6 +5395,22 @@ impl App {
                 visit: visit(&mark.visited)?,
             })
         });
+        let jumps = |list: &[session::Jump]| -> Vec<Jump> {
+            list.iter()
+                .filter_map(|jump| {
+                    Some(Jump {
+                        panel: jump.panel,
+                        visit: visit(&jump.visited)?,
+                    })
+                })
+                .collect()
+        };
+        self.jumps
+            .set(jumps(&state.jumps_back), jumps(&state.jumps_forward));
+        // Panels shown again left nowhere.
+        for panel in tab::all_panels_mut(&mut self.tabs) {
+            panel.take_left();
+        }
 
         self.recent = state
             .recent
@@ -7910,6 +7979,18 @@ fn visited(visit: &Visit) -> Option<session::Visited> {
     })
 }
 
+/// What a session keeps of the places in `list` to go back or forward to.
+fn saved_jumps(list: &[Jump]) -> Vec<session::Jump> {
+    list.iter()
+        .filter_map(|jump| {
+            Some(session::Jump {
+                panel: jump.panel,
+                visited: visited(&jump.visit)?,
+            })
+        })
+        .collect()
+}
+
 /// What a session calls `doc`, unless it's an untitled one never typed in.
 fn doc_shown(doc: &Document) -> Option<Shown> {
     match doc.path() {
@@ -8915,24 +8996,28 @@ mod tests {
         ctrl(&mut app, '-');
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
 
-        // Each panel has its own; a terminal another panel shows now is
-        // skipped.
+        // It goes through every panel: going back goes to the panel the
+        // keyboard was in.
+        let at = |app: &App| (app.tab().active, shown_name(app));
+        let first = at(&app);
         ctrl(&mut app, '\\');
-        assert!(!app.ed_is_shown());
-        ctrl(&mut app, '-');
-        assert!(!app.ed_is_shown(), "nothing to go back to");
         app.open(&root.join("c.txt"), false);
-        let id = app.terminals[0].borrow().id();
-        app.picker_action(PickerAction::Accept(Choice::Terminal(id)));
-        assert!(app.active_terminal().is_some());
-        app.run(Command::FocusPanelLeft, false);
-        let shown = shown_name(&app);
+        let second = at(&app);
+        ctrl(&mut app, '-');
+        assert_eq!(at(&app), first);
         forward(&mut app);
-        assert!(
-            app.active_terminal().is_none(),
-            "the terminal is the other panel's"
-        );
-        assert_eq!(shown_name(&app), shown, "nothing else to go forward to");
+        assert_eq!(at(&app), second);
+        // Focusing another panel counts, in whichever tab.
+        app.handle_key(Key::new(KeyCode::Char('t'), Mods::CTRL));
+        app.open(&root.join("a.txt"), false);
+        ctrl(&mut app, '-');
+        assert_eq!((app.tab, at(&app)), (0, second));
+        ctrl(&mut app, '-');
+        assert_eq!(at(&app), first);
+
+        // Each panel's header goes through its own.
+        app.go_history(true);
+        assert_eq!(at(&app), (first.0, Some("a.txt".into())));
     }
 
     #[test]
@@ -8973,8 +9058,15 @@ mod tests {
             (Some("a.txt"), 200)
         );
 
-        // As Go Back went there, Go Forward comes back a place at a time.
+        // Going back across panels comes back to where it was.
+        ctrl(&mut app, '-');
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
         ctrl(&mut app, '=');
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+
+        // As the list went there, the panel's own forward comes back a
+        // place at a time.
+        app.go_history(false);
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
         // A tap goes back one.
         chord(&mut app, '-', ctrl_shift);
@@ -8988,7 +9080,7 @@ mod tests {
         assert_eq!(listed(&app), None);
 
         // Esc stays; from the palette, it's open until Enter.
-        ctrl(&mut app, '=');
+        app.go_history(false);
         chord(&mut app, '-', ctrl_shift);
         key(&mut app, KeyCode::Esc);
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
@@ -9127,7 +9219,7 @@ mod tests {
         assert_eq!(row(&app), 31);
 
         // From another file, it goes back to the marked one, which going
-        // forward comes back from.
+        // back comes back from.
         app.open(&root.join("b.txt"), false);
         app.after_input();
         jump(&mut app);
@@ -9135,7 +9227,7 @@ mod tests {
             (shown_name(&app).as_deref(), row(&app)),
             (Some("a.txt"), 31)
         );
-        ctrl(&mut app, '=');
+        ctrl(&mut app, '-');
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
 
         // A file closed meanwhile opens again.
@@ -9195,6 +9287,8 @@ mod tests {
         jump(&mut app);
         assert_eq!(at(&app), marked);
         assert_eq!(row(&app), 29);
+        ctrl(&mut app, '-');
+        assert_eq!(at(&app), split, "going back comes back");
 
         // And from another tab.
         app.run(Command::NewTab, false);
@@ -9203,7 +9297,7 @@ mod tests {
         assert_eq!(at(&app), marked);
 
         // Where the panel moved on since, it goes back through its history
-        // to the file, and what it passed over is ahead.
+        // to the file, and what it passed over is ahead in it.
         open(&mut app, "b.txt");
         open(&mut app, "c.txt");
         jump(&mut app);
@@ -9211,15 +9305,15 @@ mod tests {
             (shown_name(&app).as_deref(), row(&app)),
             (Some("a.txt"), 29)
         );
-        ctrl(&mut app, '=');
+        app.go_history(false);
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
-        ctrl(&mut app, '=');
+        app.go_history(false);
         assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
 
         // And again.
         jump(&mut app);
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
-        ctrl(&mut app, '=');
+        app.go_history(false);
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
 
         // With its panel closed, it shows in the active one.
@@ -9270,7 +9364,7 @@ mod tests {
         app.after_input();
         jump(&mut app);
         assert_eq!(shown_terminal(&app), Some(id));
-        ctrl(&mut app, '=');
+        app.go_history(false);
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
 
         // Where another panel shows it now, it goes there.
@@ -13024,6 +13118,10 @@ mod tests {
             .iter()
             .any(|panel| panel.id == terminal_panel && panel.terminal().is_some());
         assert!(terminal_shown);
+        // Going back goes back to the terminal.
+        ctrl(&mut app, '-');
+        assert_eq!(app.tab().active, terminal_panel);
+        assert!(app.active_terminal().is_some());
 
         // Again, into the same panel rather than another.
         app.activate(terminal_panel);

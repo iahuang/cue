@@ -14,8 +14,9 @@
 //! Held open, it shows only after a moment, as Cmd+Tab does, so a tap
 //! doesn't flash it on screen; going to another row shows it at once.
 //!
-//! Going there goes back through the panel's history as Go Back would, so
-//! Go Forward comes back.
+//! Going there goes back through the panel's history as its header's back
+//! button would, so the forward button comes back, and Go Back returns to
+//! where it was.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
