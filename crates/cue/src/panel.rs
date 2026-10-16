@@ -14,7 +14,7 @@
 //!
 //! Like a browser tab, a panel keeps a history of what it showed, to go
 //! back and forward through with the header's buttons. Ctrl+- and Ctrl+=
-//! go through every panel's at once (see [`crate::jumps`]). Popping (Ctrl+0) closes
+//! go through every panel's at once (see [`crate::jumps`]). Popping (Ctrl+Shift+W) closes
 //! what it shows and goes back, as from the top of a stack. The history
 //! keeps where in a file the cursor was, and jumps within a file count
 //! too, as in Vim's jump list: going to a line, symbol, or search result,

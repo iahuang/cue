@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Scratchpad: Ctrl+; floats a panel of its own over every tab, which takes what you open while it's out, hides with Esc or a click outside it, resizes by its frame or in layout mode, and keeps its contents in sessions
+- Scratchpad: Ctrl+; floats a panel of its own over every tab, which takes what you open while it's out, hides with Esc or a click outside it, resizes by its frame or in layout mode, and keeps its contents in sessions (`fc33201`)
+- Pop a panel's content with Ctrl+Shift+W instead of Ctrl+0 (and no longer Cmd+0)
 
 ## v0.4.4 — 2026-10-16
 

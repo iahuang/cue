@@ -514,9 +514,9 @@ impl Default for Keymap {
             bindings.push((key(Char(n), Mods::CTRL), command));
             bindings.push((key(Char(n), SUPER), command));
         }
-        // Next to them, and likewise only with the kitty protocol.
-        bindings.push((key(Char('0'), Mods::CTRL), Pop));
-        bindings.push((key(Char('0'), SUPER), Pop));
+        // Ctrl+W closes the panel; with Shift it pops its content. Likewise
+        // only with the kitty protocol.
+        bindings.push((key(Char('w'), CTRL_SHIFT), Pop));
 
         bindings.extend([
             (key(Esc, Mods::NONE), ClearSelection),
@@ -644,15 +644,16 @@ impl Default for Keymap {
         // In a terminal, Ctrl+C and Ctrl+V are the shell's; as in Linux
         // terminals, Ctrl+Shift copies and pastes. Ctrl+` toggles whether
         // cue's shortcuts or the shell gets Ctrl keys (VS Code's terminal
-        // toggle; shells don't use it). Ctrl+1 to 9 go to tabs, and Ctrl+0
-        // pops, from terminals too: shells don't use them either. Ctrl+Shift+K
+        // toggle; shells don't use it). Ctrl+1 to 9 go to tabs, and
+        // Ctrl+Shift+W pops, from terminals too: shells don't use them
+        // either. Ctrl+Shift+K
         // clears, as Cmd+K does in macOS terminals; legacy terminals send it
         // as Ctrl+K, the command palette.
         let go_to_tab = ('1'..='9')
             .zip(Command::GO_TO_TAB)
             .map(|(n, command)| (key(Char(n), Mods::CTRL), command));
         for (key, command) in go_to_tab.chain([
-            (key(Char('0'), Mods::CTRL), Pop),
+            (key(Char('w'), CTRL_SHIFT), Pop),
             (key(Char('`'), Mods::CTRL), ToggleTerminalKeys),
             (key(Char('k'), CTRL_SHIFT), ClearTerminal),
             (key(Char('c'), CTRL_SHIFT), Copy),

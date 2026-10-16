@@ -8835,6 +8835,16 @@ mod tests {
         app.handle_key(Key::new(KeyCode::Char(c), Mods::CTRL))
     }
 
+    fn pop_key(app: &mut App) -> AppAction {
+        app.handle_key(Key::new(
+            KeyCode::Char('w'),
+            Mods {
+                shift: true,
+                ..Mods::CTRL
+            },
+        ))
+    }
+
     fn type_text(app: &mut App, text: &str) {
         for c in text.chars() {
             key(app, KeyCode::Char(c));
@@ -9540,24 +9550,24 @@ mod tests {
         app.run(Command::NewTerminal, false);
         assert!(app.active_terminal().is_some());
 
-        ctrl(&mut app, '0');
+        pop_key(&mut app);
         // The login shell may be running its own startup.
         if app.alert.is_some() {
             key(&mut app, KeyCode::Char('c'));
         }
         assert!(app.terminals.is_empty());
         assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
-        ctrl(&mut app, '0');
+        pop_key(&mut app);
         assert!(app.find_document(&root.join("b.txt")).is_none());
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         // What was popped isn't gone back to.
         ctrl(&mut app, '-');
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         // The last leaves the panel empty.
-        ctrl(&mut app, '0');
+        pop_key(&mut app);
         assert!(app.active_panel().is_empty());
         assert!(app.documents.is_empty());
-        ctrl(&mut app, '0');
+        pop_key(&mut app);
         assert!(app.active_panel().is_empty());
 
         // A file another panel shows stays open there.
@@ -9565,7 +9575,7 @@ mod tests {
         ctrl(&mut app, '\\');
         app.open(&root.join("a.txt"), false);
         app.open(&root.join("b.txt"), false);
-        ctrl(&mut app, '0');
+        pop_key(&mut app);
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         assert!(app.find_document(&root.join("b.txt")).is_some());
     }
@@ -10303,7 +10313,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Tree);
         app.run(Command::FocusEditor, false);
 
-        // Popping it, with Ctrl+0 even from the terminal, asks first, then
+        // Popping it, with Ctrl+Shift+W even from the terminal, asks first, then
         // hangs up on what it's running, and goes back to the file.
         type_text(&mut app, "sleep 30");
         key(&mut app, KeyCode::Enter);
@@ -10311,7 +10321,7 @@ mod tests {
         wait_until(&mut app, "sleep to run", |app| {
             app.terminals[0].borrow().program().as_deref() == Some("sleep")
         });
-        ctrl(&mut app, '0');
+        pop_key(&mut app);
         assert!(app.active_terminal().is_some());
         assert!(screen(&app).contains("sleep is running in a terminal."));
         key(&mut app, KeyCode::Char('c'));
