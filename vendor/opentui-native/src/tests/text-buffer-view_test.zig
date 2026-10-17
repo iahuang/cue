@@ -11,6 +11,31 @@ const TextBuffer = text_buffer.UnifiedTextBuffer;
 const TextBufferView = text_buffer_view.UnifiedTextBufferView;
 const RGBA = text_buffer.RGBA;
 
+test "TextBufferView keeps no word layouts for big texts" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const links = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+    const tb = try TextBuffer.init(std.testing.allocator, pool, links, .unicode);
+    defer tb.deinit();
+    const view = try TextBufferView.init(std.testing.allocator, tb);
+    defer view.deinit();
+
+    const line = "alpha beta gamma delta epsilon zeta eta\n";
+    const lines = 110_000;
+    const text = try std.testing.allocator.alloc(u8, line.len * lines);
+    defer std.testing.allocator.free(text);
+    for (0..lines) |i| @memcpy(text[i * line.len ..][0..line.len], line);
+    try tb.setText(text);
+    view.setWrapMode(.word);
+    view.setWrapWidth(16);
+    try std.testing.expectEqual(@as(usize, lines * 3 + 1), view.getVirtualLines().len);
+    try std.testing.expectEqual(@as(usize, 0), view.word_layout.layouts.items.len);
+    view.setWrapWidth(24);
+    try std.testing.expectEqual(@as(usize, lines * 2 + 1), view.getVirtualLines().len);
+    try std.testing.expectEqual(@as(usize, 0), view.word_layout.layouts.items.len);
+}
+
 test "TextBufferView first layout retains reusable word metadata" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

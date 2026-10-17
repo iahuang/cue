@@ -210,6 +210,11 @@ pub var skip_fitting_lines = false;
 
 // Width-independent metadata for the current view layout, in rope traversal
 // order. Nothing is attached to chunks or retained by their undo roots.
+/// The most text, by rope weight, that word layouts are kept for (cue
+/// patch: they took 100-300 bytes a line, kept until the next edit, for
+/// laying out again faster when only the width changes).
+const max_word_layout_weight: u32 = 4 << 20;
+
 const WordLayoutStorage = struct {
     arena: std.heap.ArenaAllocator,
     /// Null for chunks laid out without one (see `takeFittingLine`).
@@ -488,12 +493,23 @@ pub const UnifiedTextBufferView = struct {
             .cached_line_vline_counts = &self.cached_line_vline_counts,
         };
 
+        const word_layout: ?*WordLayoutStorage = keep: {
+            if (self.text_buffer.rope().totalWeight() > max_word_layout_weight) {
+                self.word_layout.reset();
+                break :keep null;
+            }
+            // Sized once, as growing it in the arena leaves the old copies.
+            if (self.wrap_mode == .word and self.word_layout.layouts.items.len == 0) {
+                self.word_layout.layouts.ensureTotalCapacity(self.word_layout.arena.allocator(), self.text_buffer.getLineCount()) catch {};
+            }
+            break :keep &self.word_layout;
+        };
         const calculated = if (self.wrap_mode == .none or self.wrap_width == null)
             calculateUnwrappedVirtualLines(virtual_allocator, self.text_buffer, output, null)
         else switch (self.wrap_mode) {
             .none => unreachable,
             .char => calculateVirtualLinesGeneric(.render, .char, virtual_allocator, self.text_buffer, self.wrap_width.?, self.first_line_offset, output, null, null),
-            .word => calculateVirtualLinesGeneric(.render, .word, virtual_allocator, self.text_buffer, self.wrap_width.?, self.first_line_offset, output, &self.word_layout, null),
+            .word => calculateVirtualLinesGeneric(.render, .word, virtual_allocator, self.text_buffer, self.wrap_width.?, self.first_line_offset, output, word_layout, null),
         };
         if (!calculated) {
             // Builders append to parallel arrays; discard partial output as a unit

@@ -8,6 +8,13 @@ const Segment = seg_mod.Segment;
 const UnifiedRope = seg_mod.UnifiedRope;
 const TextChunk = seg_mod.TextChunk;
 
+test "rope nodes keep only the metrics they need" {
+    // A branch keeps its total, not its left child's too, and line breaks
+    // and starts are counted once, in the segment's metrics. Each line
+    // takes about six nodes.
+    try testing.expect(@sizeOf(UnifiedRope.Node) <= 56);
+}
+
 test "TextChunk keeps cold cache state out of rope leaves" {
     try testing.expect(@sizeOf(TextChunk) <= 24);
 }

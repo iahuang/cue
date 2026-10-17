@@ -71,6 +71,17 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
   `undoSteps` and `redoSteps` (`editBufferUndoSteps`, `editBufferRedoSteps`)
   undo or redo several snapshots, restoring the cursor, which lays out,
   only after the last. `editBufferGetLineEndOffset` gives a line's end.
+- `src/rope.zig`, `src/text-buffer-segment.zig`,
+  `src/text-buffer-iterators.zig`: rope nodes are 56 bytes instead of 104,
+  about six of them a line. A branch no longer keeps its left child's
+  metrics (`left.metrics()` gives them), and when `T.Metrics` has
+  `markerCount`, the rope reads marker counts from it instead of counting
+  them again (`Metrics.markerCount`); `Segment.Metrics` already counted line
+  breaks and starts.
+- `src/text-buffer-view.zig`: word layouts are kept for relayouts only for
+  texts up to `max_word_layout_weight` (4M), and their list is sized once
+  up front instead of growing inside the arena, which kept every outgrown
+  copy. They took 100-300 bytes a line until the next edit.
 - `src/text-buffer.zig`, `src/text-buffer-view.zig`, `src/edit-buffer.zig`:
   the 255 memory slots of a text buffer no longer run out. Its views share
   one slot for their "..." (`ellipsisMemId`) instead of taking one each and

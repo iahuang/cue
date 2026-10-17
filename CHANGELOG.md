@@ -3,7 +3,8 @@
 ## Unreleased
 
 - Tab switches the sidebar between the files and the changes while it has focus (`a7250c5`)
-- Fast scrolling, typing, and find in big files (a keystroke in a 100k-line file went from about 130 ms to under 1 ms); find highlights now show only in the panel with the find bar, and only near the view
+- Fast scrolling, typing, and find in big files (a keystroke in a 100k-line file went from about 130 ms to under 1 ms); find highlights now show only in the panel with the find bar, and only near the view (`d44f6a8`)
+- Use about half the memory for files with many lines (a 100 MB log with 1M lines went from about 1 GB to 685 MB)
 
 ## v0.4.5 — 2026-10-16
 

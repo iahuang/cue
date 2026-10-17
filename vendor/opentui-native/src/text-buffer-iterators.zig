@@ -183,7 +183,7 @@ fn seek(rope: *const UnifiedRope, comptime by: enum { weight, bytes }, target: u
     while (true) {
         switch (node.*) {
             .branch => |*b| {
-                const left = b.left_metrics;
+                const left = b.left.metrics();
                 const before = if (by == .weight) at.weight else at.bytes;
                 const size = if (by == .weight) left.weight() else plainBytes(left);
                 if (target < before + size) {

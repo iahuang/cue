@@ -457,6 +457,15 @@ pub const Segment = union(enum) {
         pub fn weight(self: *const Metrics) u32 {
             return self.total_width_cols + self.newline_count;
         }
+
+        /// The rope's count of a marker, so it doesn't count them again.
+        pub fn markerCount(self: *const Metrics, tag: std.meta.Tag(Segment)) u32 {
+            return switch (tag) {
+                .brk => self.newline_count,
+                .linestart => self.linestart_count,
+                .text => 0,
+            };
+        }
     };
 
     /// Measure this segment to produce its metrics

@@ -24,6 +24,9 @@ pub fn Rope(comptime T: type) type {
 
         const marker_enabled = @typeInfo(T) == .@"union" and @hasDecl(T, "MarkerTypes");
         const MarkerTagCount = if (marker_enabled) T.MarkerTypes.len else 0;
+        /// Whether `T.Metrics` counts the markers itself (`markerCount`), so
+        /// the rope doesn't count them again (cue patch: smaller nodes).
+        const markers_in_custom = marker_enabled and @hasDecl(T, "Metrics") and @hasDecl(T.Metrics, "markerCount");
 
         const boundary_enabled = @hasDecl(T, "BoundaryAction");
         pub const BoundaryAction = if (boundary_enabled) T.BoundaryAction else struct {
@@ -77,7 +80,7 @@ pub fn Rope(comptime T: type) type {
             depth: u32 = 1,
             custom: if (@hasDecl(T, "Metrics")) T.Metrics else void = if (@hasDecl(T, "Metrics")) .{} else {},
 
-            marker_counts: if (marker_enabled) [MarkerTagCount]u32 else void = if (marker_enabled) [_]u32{0} ** MarkerTagCount else {},
+            marker_counts: if (marker_enabled and !markers_in_custom) [MarkerTagCount]u32 else void = if (marker_enabled and !markers_in_custom) [_]u32{0} ** MarkerTagCount else {},
 
             pub fn add(self: *Metrics, other: Metrics) void {
                 self.count += other.count;
@@ -89,10 +92,22 @@ pub fn Rope(comptime T: type) type {
                     }
                 }
 
-                if (marker_enabled) {
+                if (marker_enabled and !markers_in_custom) {
                     inline for (&self.marker_counts, 0..) |*dst, i| {
                         dst.* += other.marker_counts[i];
                     }
+                }
+            }
+
+            /// How many of the markers `T.MarkerTypes[index]` there are.
+            pub fn markerCount(self: *const Metrics, index: usize) u32 {
+                if (comptime markers_in_custom) {
+                    inline for (T.MarkerTypes, 0..) |mt, i| {
+                        if (i == index) return self.custom.markerCount(mt);
+                    }
+                    return 0;
+                } else {
+                    return self.marker_counts[index];
                 }
             }
 
@@ -106,10 +121,12 @@ pub fn Rope(comptime T: type) type {
             }
         };
 
+        /// Only the total metrics are kept (cue patch: a node's size is a
+        /// branch's, and every leaf paid for the left child's metrics too);
+        /// the left child's are `left.metrics()`.
         pub const Branch = struct {
             left: *const Node,
             right: *const Node,
-            left_metrics: Metrics,
             total_metrics: Metrics,
 
             fn is_balanced(self: *const Branch) bool {
@@ -140,7 +157,7 @@ pub fn Rope(comptime T: type) type {
                     }
                 }
 
-                if (!self.is_sentinel and marker_enabled) {
+                if (marker_enabled and !markers_in_custom and !self.is_sentinel) {
                     const tag = std.meta.activeTag(self.data);
                     inline for (T.MarkerTypes, 0..) |mt, i| {
                         if (tag == mt) {
@@ -209,7 +226,6 @@ pub fn Rope(comptime T: type) type {
                 node.* = .{ .branch = .{
                     .left = left,
                     .right = right,
-                    .left_metrics = left_metrics,
                     .total_metrics = total_metrics,
                 } };
 
@@ -227,7 +243,7 @@ pub fn Rope(comptime T: type) type {
             pub fn get(self: *const Node, index: u32) ?*const T {
                 return switch (self.*) {
                     .branch => |*b| {
-                        const left_count = b.left_metrics.count;
+                        const left_count = b.left.metrics().count;
                         if (index < left_count) {
                             return b.left.get(index);
                         }
@@ -269,7 +285,7 @@ pub fn Rope(comptime T: type) type {
             fn walk_from_internal(self: *const Node, start_index: u32, ctx: *anyopaque, f: WalkerFn, current_index: *u32) WalkerResult {
                 return switch (self.*) {
                     .branch => |*b| {
-                        const left_count = b.left_metrics.count;
+                        const left_count = b.left.metrics().count;
                         if (start_index >= left_count) {
                             return b.right.walk_from_internal(start_index - left_count, ctx, f, current_index);
                         }
@@ -338,7 +354,7 @@ pub fn Rope(comptime T: type) type {
                         }
                     },
                     .branch => |*b| {
-                        const left_count = b.left_metrics.count;
+                        const left_count = b.left.metrics().count;
                         if (index < left_count) {
                             const result = try split_at(b.left, index, allocator, empty_leaf);
                             const new_right = try join_balanced(result.right, b.right, allocator);
@@ -425,7 +441,7 @@ pub fn Rope(comptime T: type) type {
                         return .{ .left = left_node, .right = right_node };
                     },
                     .branch => |*b| {
-                        const left_weight = b.left_metrics.weight();
+                        const left_weight = b.left.metrics().weight();
 
                         if (target_weight < left_weight) {
                             const result = try split_at_weight(b.left, target_weight, allocator, empty_leaf, split_leaf_fn);
@@ -616,7 +632,6 @@ pub fn Rope(comptime T: type) type {
                     total_metrics.depth += 1;
 
                     const mutable = @constCast(branch);
-                    mutable.left_metrics = left_metrics;
                     mutable.total_metrics = total_metrics;
                     break :blk total_metrics;
                 },
@@ -652,7 +667,7 @@ pub fn Rope(comptime T: type) type {
         fn walkFromNode(self: *const Self, node: *const Node, start_index: u32, ctx: *anyopaque, f: Node.WalkerFn, current_index: *u32) Node.WalkerResult {
             return switch (node.*) {
                 .branch => |*b| {
-                    const left_count = b.left_metrics.count;
+                    const left_count = b.left.metrics().count;
                     if (start_index >= left_count) {
                         return self.walkFromNode(b.right, start_index - left_count, ctx, f, current_index);
                     }
@@ -1039,7 +1054,7 @@ pub fn Rope(comptime T: type) type {
         fn findByWeightInNode(self: *const Self, node: *const Node, target_weight: u32, current_weight: u32) ?WeightFindResult {
             return switch (node.*) {
                 .branch => |*b| {
-                    const left_weight = b.left_metrics.weight();
+                    const left_weight = b.left.metrics().weight();
                     if (target_weight < current_weight + left_weight) {
                         return self.findByWeightInNode(b.left, target_weight, current_weight);
                     }
@@ -1067,11 +1082,11 @@ pub fn Rope(comptime T: type) type {
             while (true) {
                 switch (node.*) {
                     .branch => |*b| {
-                        const left_weight = b.left_metrics.weight();
+                        const left_weight = b.left.metrics().weight();
                         if (weight < before + left_weight) {
                             node = b.left;
                         } else {
-                            index += b.left_metrics.count;
+                            index += b.left.metrics().count;
                             before += left_weight;
                             node = b.right;
                         }
@@ -1302,12 +1317,12 @@ pub fn Rope(comptime T: type) type {
 
             // Create every list up front (so the pointers stay valid during the
             // walk) and size it from the root's marker counts.
-            const marker_counts = self.root.metrics().marker_counts;
+            const root_metrics = self.root.metrics();
             var lists: [MarkerTagCount]*PositionList = undefined;
             inline for (T.MarkerTypes, 0..) |mt, i| {
                 const gop = try self.marker_cache.positions.getOrPut(mt);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
-                try gop.value_ptr.ensureTotalCapacity(self.marker_cache.allocator, marker_counts[i]);
+                try gop.value_ptr.ensureTotalCapacity(self.marker_cache.allocator, root_metrics.markerCount(i));
                 lists[i] = gop.value_ptr;
             }
 
@@ -1320,7 +1335,7 @@ pub fn Rope(comptime T: type) type {
         pub fn markerCount(self: *Self, tag: std.meta.Tag(T)) u32 {
             if (!marker_enabled) return 0;
             const index = markerTagIndex(tag) orelse return 0;
-            return self.root.metrics().marker_counts[index];
+            return self.root.metrics().markerCount(index);
         }
 
         /// The `occurrence`th marker of type `tag`. From the cache while it's
@@ -1357,7 +1372,7 @@ pub fn Rope(comptime T: type) type {
         /// Finds a marker by its branches' marker counts, without the cache.
         fn findMarker(self: *const Self, tag: std.meta.Tag(T), occurrence: u32) ?MarkerPosition {
             const index = markerTagIndex(tag) orelse return null;
-            if (occurrence >= self.root.metrics().marker_counts[index]) return null;
+            if (occurrence >= self.root.metrics().markerCount(index)) return null;
             var node = self.root;
             var nth = occurrence;
             var leaf_index: u32 = 0;
@@ -1365,13 +1380,13 @@ pub fn Rope(comptime T: type) type {
             while (true) {
                 switch (node.*) {
                     .branch => |*b| {
-                        const left = b.left_metrics.marker_counts[index];
+                        const left = b.left.metrics().markerCount(index);
                         if (nth < left) {
                             node = b.left;
                         } else {
                             nth -= left;
-                            leaf_index += b.left_metrics.count;
-                            weight += b.left_metrics.weight();
+                            leaf_index += b.left.metrics().count;
+                            weight += b.left.metrics().weight();
                             node = b.right;
                         }
                     },
