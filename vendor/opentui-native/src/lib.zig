@@ -2918,6 +2918,34 @@ export fn editBufferBytesToCursors(edit_handle: NativeHandle, bytesPtr: [*]const
     }
 }
 
+pub const ExternalTextChange = extern struct {
+    start: u32,
+    old_end: u32,
+    new_end: u32,
+};
+
+/// Writes up to `capacity` changes made to the text since content epoch
+/// `epoch`, oldest first, as byte ranges of the text as `editBufferGetText`
+/// writes it, and returns how many. -1 if they aren't all known, or there
+/// are more than `capacity`.
+export fn editBufferGetChangesSince(edit_handle: NativeHandle, epoch: u64, outPtr: [*]ExternalTextChange, capacity: u32) i64 {
+    const object_ptr = acquireEditBuffer(edit_handle) orelse return -1;
+    const changes = globalAllocator.alloc(text_buffer.TextChange, capacity) catch return -1;
+    defer globalAllocator.free(changes);
+    const count = object_ptr.getTextBuffer().changesSince(epoch, changes) orelse return -1;
+    for (changes[0..count], 0..) |change, i| {
+        outPtr[i] = .{ .start = change.start, .old_end = change.old_end, .new_end = change.new_end };
+    }
+    return @intCast(count);
+}
+
+/// The byte of the text, as `editBufferGetText` writes it, at cursor offset
+/// `offset`.
+export fn editBufferOffsetToByte(edit_handle: NativeHandle, offset: u32) u32 {
+    const object_ptr = acquireEditBuffer(edit_handle) orelse return 0;
+    return object_ptr.getTextBuffer().offsetToByte(offset);
+}
+
 export fn editBufferSetTabWidth(edit_handle: NativeHandle, width: u8) void {
     const object_ptr = acquireEditBuffer(edit_handle) orelse return;
     object_ptr.setTabWidth(width);
@@ -3050,6 +3078,14 @@ export fn editBufferPositionToOffset(edit_handle: NativeHandle, row: u32, col: u
     return text_buffer_iterators.coordsToOffset(object_ptr.tb.rope(), row, col) orelse 0;
 }
 
+/// The cursor offset at the end of line `row`, before its line break.
+export fn editBufferGetLineEndOffset(edit_handle: NativeHandle, row: u32) u32 {
+    const object_ptr = acquireEditBuffer(edit_handle) orelse return 0;
+    const text_rope = object_ptr.getTextBuffer().rope();
+    const width = text_buffer_iterators.lineWidthAt(text_rope, row);
+    return text_buffer_iterators.coordsToOffset(text_rope, row, width) orelse 0;
+}
+
 export fn editBufferGetLineStartOffset(edit_handle: NativeHandle, row: u32) u32 {
     const object_ptr = acquireEditBuffer(edit_handle) orelse return 0;
     return text_buffer_iterators.coordsToOffset(object_ptr.tb.rope(), row, 0) orelse 0;
@@ -3171,6 +3207,25 @@ export fn editBufferRedo(edit_handle: NativeHandle, outPtr: ?[*]u8, maxLen: u32)
     const copyLen = @min(next_meta.len, @as(usize, maxLen));
     @memcpy(out[0..copyLen], next_meta[0..copyLen]);
     return @intCast(copyLen);
+}
+
+/// Undoes up to `steps` snapshots, restoring the cursor after the last
+/// only, and returns how many it undid.
+export fn editBufferUndoSteps(edit_handle: NativeHandle, steps: u32) u32 {
+    const object_ptr = acquireEditBuffer(edit_handle) orelse return 0;
+    if (steps == 0) return 0;
+    var done: u32 = 0;
+    _ = object_ptr.undoSteps(steps, &done) catch return done;
+    return done;
+}
+
+/// Redoes up to `steps` snapshots, as `editBufferUndoSteps` undoes them.
+export fn editBufferRedoSteps(edit_handle: NativeHandle, steps: u32) u32 {
+    const object_ptr = acquireEditBuffer(edit_handle) orelse return 0;
+    if (steps == 0) return 0;
+    var done: u32 = 0;
+    _ = object_ptr.redoSteps(steps, &done) catch return done;
+    return done;
 }
 
 export fn editBufferCanUndo(edit_handle: NativeHandle) bool {

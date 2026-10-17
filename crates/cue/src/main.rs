@@ -800,6 +800,10 @@ fn attached(
                     Vec::new()
                 };
                 changed |= app.poll();
+                // Only with no input waiting, which goes first.
+                if bytes.is_empty() && events.is_empty() && !parser.has_pending() {
+                    changed |= app.idle();
+                }
                 if let Some(text) = app.take_copied() {
                     renderer.copy_to_clipboard(&text);
                 }

@@ -77,7 +77,7 @@ test "TextBufferView CJK cache survives a failed sibling layout" {
     try std.testing.expectEqual(@as(u32, 14), healthy.getVirtualLineCount());
     const chunk = tb.rope().get(4).?.asText().?;
     const cached = chunk.getCachedLayoutInfo(tb.tabWidth(), tb.widthMethod()).?;
-    try std.testing.expectEqual(cached.cjk_breaks.ptr, healthy.word_layout.layouts.items[1].cjk_breaks.ptr);
+    try std.testing.expectEqual(cached.cjk_breaks.ptr, healthy.word_layout.layouts.items[1].?.cjk_breaks.ptr);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const sibling = try TextBufferView.init(failing.allocator(), tb);

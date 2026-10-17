@@ -204,13 +204,8 @@ impl Buffer {
     /// The buffer's characters as text, one row per line if `line_breaks`.
     pub fn to_text(&self, line_breaks: bool) -> String {
         let cells = self.width() as usize * self.height() as usize;
-        read_native_string(cells * 4 + self.height() as usize, |out| unsafe {
-            sys::bufferWriteResolvedChars(
-                self.handle,
-                out.as_mut_ptr(),
-                ffi_len(out.len(), "output"),
-                line_breaks,
-            )
+        read_native_string(cells * 4 + self.height() as usize, |out, len| unsafe {
+            sys::bufferWriteResolvedChars(self.handle, out, len, line_breaks)
         })
     }
 

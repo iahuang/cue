@@ -29,6 +29,46 @@ pub fn walkLinesAndSegments(
     segment_callback: *const fn (ctx: *anyopaque, line_idx: u32, chunk: *const TextChunk, chunk_idx_in_line: u32) void,
     line_end_callback: *const fn (ctx: *anyopaque, line_info: LineInfo) void,
 ) void {
+    walkLines(rope, null, ctx, segment_callback, line_end_callback);
+}
+
+/// Lines `first` to `last` (inclusive) of a text, and where the first starts.
+pub const LineRange = struct {
+    first: u32,
+    last: u32,
+    /// The rope weight before line `first`.
+    start_weight: u32,
+    /// The index of line `first`'s linestart marker.
+    leaf_index: u32,
+};
+
+/// Lines `first` to `last` of `rope`, for `walkLineRange`. Null if there's
+/// no line `first`.
+pub fn findLineRange(rope: *UnifiedRope, first: u32, last: u32) ?LineRange {
+    const marker = rope.getMarker(.linestart, first) orelse return null;
+    return .{ .first = first, .last = last, .start_weight = marker.global_weight, .leaf_index = marker.leaf_index };
+}
+
+/// Like `walkLinesAndSegments`, for the lines of `range` only, walking just
+/// their segments. Line infos' `seg_start` and `seg_end` count from the
+/// first line's start.
+pub fn walkLineRange(
+    rope: *const UnifiedRope,
+    range: LineRange,
+    ctx: *anyopaque,
+    segment_callback: *const fn (ctx: *anyopaque, line_idx: u32, chunk: *const TextChunk, chunk_idx_in_line: u32) void,
+    line_end_callback: *const fn (ctx: *anyopaque, line_info: LineInfo) void,
+) void {
+    walkLines(rope, range, ctx, segment_callback, line_end_callback);
+}
+
+fn walkLines(
+    rope: *const UnifiedRope,
+    range: ?LineRange,
+    ctx: *anyopaque,
+    segment_callback: *const fn (ctx: *anyopaque, line_idx: u32, chunk: *const TextChunk, chunk_idx_in_line: u32) void,
+    line_end_callback: *const fn (ctx: *anyopaque, line_info: LineInfo) void,
+) void {
     if (rope.count() == 0) {
         return;
     }
@@ -43,6 +83,9 @@ pub fn walkLinesAndSegments(
         current_seg_idx: u32 = 0,
         line_width_cols: u32 = 0,
         chunk_idx_in_line: u32 = 0,
+        /// The last line to walk, when walking a range.
+        last_line: ?u32 = null,
+        done: bool = false,
 
         fn walker(walk_ctx_ptr: *anyopaque, seg: *const Segment, idx: u32) UnifiedRope.Node.WalkerResult {
             const walk_ctx = @as(*@This(), @ptrCast(@alignCast(walk_ctx_ptr)));
@@ -60,6 +103,10 @@ pub fn walkLinesAndSegments(
                     .seg_end = idx, // Don't include the break
                 });
 
+                if (walk_ctx.last_line == walk_ctx.current_line_idx) {
+                    walk_ctx.done = true;
+                    return .{ .keep_walking = false };
+                }
                 walk_ctx.current_line_idx += 1;
                 walk_ctx.current_col_offset += walk_ctx.line_width_cols + 1;
                 walk_ctx.line_start_seg = idx + 1;
@@ -77,7 +124,15 @@ pub fn walkLinesAndSegments(
         .seg_callback = segment_callback,
         .line_callback = line_end_callback,
     };
-    rope.walk(&walk_ctx, WalkContext.walker) catch {};
+    if (range) |lines| {
+        walk_ctx.current_line_idx = lines.first;
+        walk_ctx.current_col_offset = lines.start_weight;
+        walk_ctx.last_line = lines.last;
+        rope.walk_from(lines.leaf_index, &walk_ctx, WalkContext.walker) catch {};
+    } else {
+        rope.walk(&walk_ctx, WalkContext.walker) catch {};
+    }
+    if (walk_ctx.done) return;
 
     // Emit final line if we have content after last break OR if we had at least one break
     // (A trailing break creates an empty final line)
@@ -92,6 +147,64 @@ pub fn walkLinesAndSegments(
             .seg_start = walk_ctx.line_start_seg,
             .seg_end = walk_ctx.current_seg_idx,
         });
+    }
+}
+
+/// A leaf of the rope, and what comes before it.
+pub const LeafStart = struct {
+    segment: *const Segment,
+    index: u32,
+    /// The rope weight before it.
+    weight: u32,
+    /// The plain text's bytes before it (lines joined by `\n`).
+    bytes: u32,
+    /// The line it's on.
+    row: u32,
+};
+
+fn plainBytes(metrics: anytype) u32 {
+    return metrics.custom.total_bytes + metrics.custom.newline_count;
+}
+
+/// The leaf that rope weight `weight` falls in, past leaves without weight.
+/// Null past the end.
+pub fn seekWeight(rope: *const UnifiedRope, weight: u32) ?LeafStart {
+    return seek(rope, .weight, weight);
+}
+
+/// The leaf that byte `byte` of the plain text falls in. Null past the end.
+pub fn seekByte(rope: *const UnifiedRope, byte: u32) ?LeafStart {
+    return seek(rope, .bytes, byte);
+}
+
+fn seek(rope: *const UnifiedRope, comptime by: enum { weight, bytes }, target: u32) ?LeafStart {
+    var node = rope.root;
+    var at: LeafStart = .{ .segment = undefined, .index = 0, .weight = 0, .bytes = 0, .row = 0 };
+    while (true) {
+        switch (node.*) {
+            .branch => |*b| {
+                const left = b.left_metrics;
+                const before = if (by == .weight) at.weight else at.bytes;
+                const size = if (by == .weight) left.weight() else plainBytes(left);
+                if (target < before + size) {
+                    node = b.left;
+                } else {
+                    at.index += left.count;
+                    at.weight += left.weight();
+                    at.bytes += plainBytes(left);
+                    at.row += left.custom.newline_count;
+                    node = b.right;
+                }
+            },
+            .leaf => |*l| {
+                const metrics = node.metrics();
+                const before = if (by == .weight) at.weight else at.bytes;
+                const size = if (by == .weight) metrics.weight() else plainBytes(metrics);
+                if (target >= before + size) return null;
+                at.segment = &l.data;
+                return at;
+            },
+        }
     }
 }
 
@@ -328,6 +441,8 @@ pub fn getPrevGraphemeWidth(rope: *UnifiedRope, mem_registry: *const MemRegistry
 /// - start_offset excludes graphemes that start before it
 /// - end_offset includes graphemes that start before it
 /// Returns number of bytes written to out_buffer
+/// Walks only the segments from the one `start_offset` falls in to the one
+/// `end_offset` does, rather than the whole rope.
 pub fn extractTextBetweenOffsets(
     rope: *const UnifiedRope,
     mem_registry: *const MemRegistry,
@@ -340,36 +455,45 @@ pub fn extractTextBetweenOffsets(
     if (start_offset >= end_offset) return 0;
     if (out_buffer.len == 0) return 0;
 
-    const line_count = rope.root.metrics().custom.linestart_count;
-
-    var out_index: usize = 0;
-    var col_offset: u32 = 0;
+    const first = rope.findIndexByWeight(start_offset) orelse return 0;
 
     const Context = struct {
-        rope: *const UnifiedRope,
         mem_registry: *const MemRegistry,
         tab_width: u8,
         out_buffer: []u8,
-        out_index: *usize,
-        col_offset: *u32,
+        out_index: usize = 0,
+        col_offset: u32,
         start: u32,
         end: u32,
-        line_count: u32,
         width_method: utf8.WidthMethod,
 
-        fn segment_callback(ctx_ptr: *anyopaque, line_idx: u32, chunk: *const TextChunk, chunk_idx_in_line: u32) void {
-            _ = line_idx;
-            _ = chunk_idx_in_line;
+        fn walker(ctx_ptr: *anyopaque, seg: *const Segment, idx: u32) UnifiedRope.Node.WalkerResult {
+            _ = idx;
             const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
+            if (ctx.col_offset >= ctx.end or ctx.out_index >= ctx.out_buffer.len) return .{ .keep_walking = false };
 
-            const chunk_start_offset = ctx.col_offset.*;
+            if (seg.asText()) |chunk| {
+                ctx.text(chunk);
+            } else if (seg.isBreak()) {
+                // A break is only ever followed by another line, so the
+                // newline is in the text when its offset is in the range,
+                // even for empty logical lines.
+                if (ctx.col_offset >= ctx.start) {
+                    ctx.out_buffer[ctx.out_index] = '\n';
+                    ctx.out_index += 1;
+                }
+                ctx.col_offset += 1;
+            }
+            return .{};
+        }
+
+        fn text(ctx: *@This(), chunk: *const TextChunk) void {
+            const chunk_start_offset = ctx.col_offset;
             const chunk_end_offset = chunk_start_offset + chunk.width_cols;
+            ctx.col_offset = chunk_end_offset;
 
             // Skip chunk if it's entirely outside range
-            if (chunk_end_offset <= ctx.start or chunk_start_offset >= ctx.end) {
-                ctx.col_offset.* = chunk_end_offset;
-                return;
-            }
+            if (chunk_end_offset <= ctx.start or chunk_start_offset >= ctx.end) return;
 
             const chunk_bytes = chunk.getBytes(ctx.mem_registry);
             const is_ascii_only = (chunk.flags & TextChunk.Flags.ASCII_ONLY) != 0;
@@ -393,47 +517,27 @@ pub fn extractTextBetweenOffsets(
             if (byte_start < byte_end and byte_start < chunk_bytes.len) {
                 const actual_end = @min(byte_end, @as(u32, @intCast(chunk_bytes.len)));
                 const selected_bytes = chunk_bytes[byte_start..actual_end];
-                const copy_len = @min(selected_bytes.len, ctx.out_buffer.len - ctx.out_index.*);
+                const copy_len = @min(selected_bytes.len, ctx.out_buffer.len - ctx.out_index);
 
                 if (copy_len > 0) {
-                    @memcpy(ctx.out_buffer[ctx.out_index.* .. ctx.out_index.* + copy_len], selected_bytes[0..copy_len]);
-                    ctx.out_index.* += copy_len;
+                    @memcpy(ctx.out_buffer[ctx.out_index .. ctx.out_index + copy_len], selected_bytes[0..copy_len]);
+                    ctx.out_index += copy_len;
                 }
             }
-
-            ctx.col_offset.* = chunk_end_offset;
-        }
-
-        fn line_end_callback(ctx_ptr: *anyopaque, line_info: LineInfo) void {
-            const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
-
-            // Add newline when the newline offset is inside the selected range,
-            // even for empty logical lines.
-            const newline_offset = ctx.col_offset.*;
-            if (line_info.line_idx < ctx.line_count - 1 and newline_offset >= ctx.start and newline_offset < ctx.end and ctx.out_index.* < ctx.out_buffer.len) {
-                ctx.out_buffer[ctx.out_index.*] = '\n';
-                ctx.out_index.* += 1;
-            }
-
-            // Account for newline in display offset
-            ctx.col_offset.* += 1;
         }
     };
 
     var ctx: Context = .{
-        .rope = rope,
         .mem_registry = mem_registry,
         .tab_width = tab_width,
         .out_buffer = out_buffer,
-        .out_index = &out_index,
-        .col_offset = &col_offset,
+        .col_offset = first.start_weight,
         .start = start_offset,
         .end = end_offset,
-        .line_count = line_count,
         .width_method = width_method,
     };
 
-    walkLinesAndSegments(rope, &ctx, Context.segment_callback, Context.line_end_callback);
+    rope.walk_from(first.index, &ctx, Context.walker) catch {};
 
-    return out_index;
+    return ctx.out_index;
 }

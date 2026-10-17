@@ -22,12 +22,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use opentui::{EditBuffer, Highlight};
+use opentui::{EditBuffer, Highlight, TextChange};
 use tree_sitter::{
     InputEdit, Node, ParseOptions, ParseState, Parser, Point, Query, QueryCursor,
     StreamingIterator, Tree,
 };
 
+use crate::document;
 use crate::language::{self, Language};
 use crate::theme::{SyntaxColor, SyntaxStyles, Theme};
 
@@ -39,6 +40,13 @@ const MAX_BYTES: usize = 8 << 20;
 /// hold up the editor. So does parsing the text injected into the lines on
 /// screen, which leaves what's left of it the colors of the text it's in.
 const PARSE_BUDGET: Duration = Duration::from_millis(300);
+/// Edits are drawn before the text is parsed again, with the tree moved
+/// along with them meanwhile, if parsing took longer than this last time:
+/// it's parsed again once the editor is idle.
+const DEFERRED_PARSE: Duration = Duration::from_millis(4);
+/// Texts larger than this are drawn plain until they're parsed, which
+/// waits for the editor to be idle.
+const DEFERRED_FIRST_PARSE: usize = 1 << 20;
 /// How deep injections nest: Markdown's inline markup is one deep, HTML in
 /// it two, and a script in that three.
 const MAX_INJECTION_DEPTH: u32 = 3;
@@ -795,6 +803,12 @@ pub struct Highlighter {
     painted: Vec<Range<u32>>,
     /// The text was too big, or took too long to parse; it stays plain.
     gave_up: bool,
+    /// The tree isn't of the text as it is: edits since were drawn with it
+    /// moved along with them, or it's yet to be parsed at all (see
+    /// [`Highlighter::idle`]).
+    stale: bool,
+    /// How long parsing took last time.
+    parse_time: Duration,
 }
 
 impl Highlighter {
@@ -814,13 +828,15 @@ impl Highlighter {
             epoch: None,
             painted: Vec::new(),
             gave_up: false,
+            stale: false,
+            parse_time: Duration::ZERO,
         })
     }
 
     /// Highlights `buffer`'s lines `visible`, and a screen's worth either
     /// side, reparsing first if its text changed.
     pub fn sync(&mut self, buffer: &EditBuffer, visible: Range<u32>) {
-        if visible.is_empty() || !self.catch_up(buffer) {
+        if visible.is_empty() || !self.catch_up(buffer, true) {
             return;
         }
         if let Some(i) = self
@@ -857,76 +873,201 @@ impl Highlighter {
         buffer.replace_highlights(HIGHLIGHTS, &highlights);
     }
 
-    /// The text as the tree has it, and what's at each byte of it, brought
-    /// up to date with `buffer` first. `None` if it isn't parsed.
+    /// The text as the tree has it, where line `row` starts in it, and
+    /// what's at each byte of it, brought up to date with `buffer` first.
+    /// `None` if it isn't parsed.
     pub fn regions<'a>(
         &'a mut self,
         buffer: &EditBuffer,
-    ) -> Option<(&'a str, impl Fn(usize) -> Region + 'a)> {
-        if !self.catch_up(buffer) {
+        row: u32,
+    ) -> Option<(&'a str, usize, impl Fn(usize) -> Region + 'a)> {
+        if !self.catch_up(buffer, false) {
             return None;
         }
+        let line_start = self.line_start(row);
         let tree = self.tree.as_ref()?;
-        Some((self.text.as_str(), |byte| region_at(tree, byte)))
+        Some((self.text.as_str(), line_start, |byte| region_at(tree, byte)))
     }
 
     /// The text as the tree has it, and the tree, brought up to date with
     /// `buffer` first. `None` if it isn't parsed.
     pub fn tree(&mut self, buffer: &EditBuffer) -> Option<(&str, &Tree)> {
-        if !self.catch_up(buffer) {
+        if !self.catch_up(buffer, false) {
             return None;
         }
         Some((self.text.as_str(), self.tree.as_ref()?))
     }
 
-    /// Reparses `buffer`'s text if it changed since. False, leaving it
-    /// plain, if it's given up on.
-    fn catch_up(&mut self, buffer: &EditBuffer) -> bool {
-        if self.gave_up {
+    /// Whether parsing again waits for [`Highlighter::idle`].
+    pub fn is_stale(&self) -> bool {
+        self.stale && !self.gave_up
+    }
+
+    /// Parses the text again, if edits were drawn before it was, or it's
+    /// yet to be parsed at all. Says whether it was, for the text to be
+    /// drawn again.
+    pub fn idle(&mut self, buffer: &EditBuffer) -> bool {
+        if !self.is_stale() {
             return false;
         }
-        let epoch = buffer.content_epoch();
-        if self.epoch != Some(epoch) {
-            self.epoch = Some(epoch);
-            self.painted.clear();
-            if !self.reparse(buffer.text()) {
-                self.gave_up = true;
-                self.tree = None;
-                self.text = String::new();
-                self.line_starts = vec![0];
-                buffer.remove_highlights(HIGHLIGHTS);
-                return false;
-            }
+        self.painted.clear();
+        if !self.parse_again() {
+            self.give_up(buffer);
         }
         true
     }
 
+    /// Reparses `buffer`'s text if it changed since. To `defer` it is to
+    /// leave it for [`Highlighter::idle`] when parsing is slow, with the
+    /// tree moved along with the edits meanwhile. False, leaving it plain,
+    /// if it's given up on.
+    fn catch_up(&mut self, buffer: &EditBuffer, defer: bool) -> bool {
+        if self.gave_up {
+            return false;
+        }
+        let epoch = buffer.content_epoch();
+        if self.epoch == Some(epoch) {
+            return defer || self.parse_again() || self.give_up(buffer);
+        }
+        let since = self.epoch.replace(epoch);
+        self.painted.clear();
+        if buffer.text_len() > MAX_BYTES {
+            return self.give_up(buffer);
+        }
+        // Edits since are made to the copy of the text, unless they aren't
+        // known: then the text is taken again and compared.
+        let edit = since
+            .filter(|_| self.tree.is_some())
+            .and_then(|since| self.apply(buffer, since));
+        match edit {
+            Some(edit) => self.edit_tree(edit),
+            None => {
+                let first = self.tree.is_none();
+                if !self.retake(buffer.text()) {
+                    return true;
+                }
+                // A big text shows plain until it's parsed.
+                if first && defer && self.text.len() > DEFERRED_FIRST_PARSE {
+                    return true;
+                }
+            }
+        }
+        if defer && self.parse_time > DEFERRED_PARSE {
+            return true;
+        }
+        self.parse_again() || self.give_up(buffer)
+    }
+
+    /// Leaves the text plain from now on.
+    fn give_up(&mut self, buffer: &EditBuffer) -> bool {
+        self.gave_up = true;
+        self.tree = None;
+        self.text = String::new();
+        self.line_starts = vec![0];
+        buffer.remove_highlights(HIGHLIGHTS);
+        false
+    }
+
+    /// Makes the copy of the text what `buffer`'s is now, from the edits
+    /// made to it since content epoch `since`, when it was taken, and
+    /// returns the edit that does. `None` if the edits aren't known.
+    fn apply(&mut self, buffer: &EditBuffer, since: u64) -> Option<Option<InputEdit>> {
+        let Some(change) = document::follow_text(buffer, &mut self.text, since)? else {
+            return Some(None);
+        };
+        let TextChange {
+            start,
+            old_end,
+            new_end,
+        } = change;
+        let inserted = &self.text[start..new_end];
+        let start_position = point(&self.line_starts, start);
+        let old_end_position = point(&self.line_starts, old_end);
+        let new_end_position = match memchr::memrchr(b'\n', inserted.as_bytes()) {
+            Some(last) => Point {
+                row: start_position.row + memchr::memchr_iter(b'\n', inserted.as_bytes()).count(),
+                column: inserted.len() - last - 1,
+            },
+            None => Point {
+                row: start_position.row,
+                column: start_position.column + inserted.len(),
+            },
+        };
+        // The lines starting in what was replaced go, those in what replaced
+        // it come, and those after move along.
+        let first = self.line_starts.partition_point(|&line| line <= start);
+        let after = self.line_starts.partition_point(|&line| line <= old_end);
+        for line in &mut self.line_starts[after..] {
+            *line = *line - old_end + new_end;
+        }
+        let added = memchr::memchr_iter(b'\n', inserted.as_bytes()).map(|i| start + i + 1);
+        self.line_starts.splice(first..after, added);
+        Some(Some(InputEdit {
+            start_byte: start,
+            old_end_byte: old_end,
+            new_end_byte: new_end,
+            start_position,
+            old_end_position,
+            new_end_position,
+        }))
+    }
+
     /// Parses `text`, reusing the tree of the text before for what didn't
     /// change. False if the text is too big or took too long to parse.
+    #[cfg(test)]
     fn reparse(&mut self, text: String) -> bool {
         if text.len() > MAX_BYTES {
             return false;
         }
+        self.retake(text);
+        self.parse_again()
+    }
+
+    /// Takes `text` as the text, moving the tree along with what changed,
+    /// to be parsed again. False if it's the same text, which needs no
+    /// parsing.
+    fn retake(&mut self, text: String) -> bool {
         let line_starts = line_starts(&text);
-        if let Some(tree) = &mut self.tree {
-            match edit(&self.text, &self.line_starts, &text, &line_starts) {
-                Some(edit) => {
-                    tree.edit(&edit);
-                    self.colorer.edit(&edit);
-                }
-                None => return true,
-            }
+        let edit = edit(&self.text, &self.line_starts, &text, &line_starts);
+        if edit.is_none() && self.tree.is_some() {
+            return false;
         }
-        let never = AtomicBool::new(false);
-        self.tree = parse(
-            &mut self.parser,
-            &text,
-            self.tree.as_ref(),
-            Some(Instant::now() + PARSE_BUDGET),
-            &never,
-        );
         self.text = text;
         self.line_starts = line_starts;
+        self.edit_tree(edit);
+        self.stale = true;
+        true
+    }
+
+    /// Moves the tree along with `edit`, made to the text, to be parsed
+    /// again.
+    fn edit_tree(&mut self, edit: Option<InputEdit>) {
+        if let Some(edit) = &edit {
+            if let Some(tree) = &mut self.tree {
+                tree.edit(edit);
+                self.colorer.edit(edit);
+            }
+            self.stale = true;
+        }
+    }
+
+    /// Parses the text, if the tree isn't of it, reusing the tree for what
+    /// didn't change. False if it took too long.
+    fn parse_again(&mut self) -> bool {
+        if !self.stale {
+            return true;
+        }
+        let never = AtomicBool::new(false);
+        let started = Instant::now();
+        self.tree = parse(
+            &mut self.parser,
+            &self.text,
+            self.tree.as_ref(),
+            Some(started + PARSE_BUDGET),
+            &never,
+        );
+        self.parse_time = started.elapsed();
+        self.stale = false;
         self.tree.is_some()
     }
 
@@ -1800,6 +1941,151 @@ mod tests {
     }
 
     #[test]
+    fn edits_to_the_copy_match_the_text() {
+        let _serial = crate::test_serial();
+        let theme = Theme::new().unwrap();
+        let mut highlighter = Highlighter::new(rust(), &theme).unwrap();
+        let buffer = EditBuffer::new(opentui::WidthMethod::Unicode).unwrap();
+        buffer.set_text("fn main() {\n    let s = \"é\";\n}\n\nstruct S { a: u32 }\n");
+        assert!(highlighter.catch_up(&buffer, false));
+        let mut parser = Parser::new();
+        parser.set_language(&highlighter.grammar.language).unwrap();
+        let snippets = [
+            "x",
+            "\n",
+            " /* ",
+            "*/",
+            "\"",
+            "fn f() {}\n",
+            "世界",
+            "\t",
+            "",
+        ];
+        let mut seed = 7u64;
+        let mut random = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % n.max(1)) as u32
+        };
+        for step in 0..400 {
+            let row = random(buffer.line_count() as u64);
+            let at = |col| (row, col);
+            match random(6) {
+                0..=2 => {
+                    buffer.set_cursor(row, random(40));
+                    buffer.insert_text(snippets[random(snippets.len() as u64) as usize]);
+                }
+                3 => {
+                    let other = random(buffer.line_count() as u64);
+                    let (from, to) = if other < row {
+                        ((other, 0), at(3))
+                    } else {
+                        (at(0), (other, 2))
+                    };
+                    buffer.delete_range(from, to);
+                }
+                4 => {
+                    buffer.undo();
+                }
+                _ => {
+                    buffer.redo();
+                }
+            }
+            // Several edits sometimes come before a draw.
+            if random(3) == 0 {
+                continue;
+            }
+            // As catching up does, checking the edit's positions.
+            let old_lines = highlighter.line_starts.clone();
+            let edit = highlighter
+                .apply(&buffer, highlighter.epoch.unwrap())
+                .expect("the changes are known");
+            if let Some(edit) = &edit {
+                assert_eq!(edit.start_position, point(&old_lines, edit.start_byte));
+                assert_eq!(edit.old_end_position, point(&old_lines, edit.old_end_byte));
+                assert_eq!(
+                    edit.new_end_position,
+                    point(&highlighter.line_starts, edit.new_end_byte)
+                );
+            }
+            highlighter.edit_tree(edit);
+            assert!(highlighter.parse_again());
+            highlighter.epoch = Some(buffer.content_epoch());
+            let text = buffer.text();
+            assert_eq!(highlighter.text, text, "step {step}");
+            assert_eq!(highlighter.line_starts, line_starts(&text), "step {step}");
+            let fresh = parser.parse(&text, None).unwrap();
+            assert_eq!(
+                highlighter.tree.as_ref().unwrap().root_node().to_sexp(),
+                fresh.root_node().to_sexp(),
+                "step {step}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slow_parses_wait_for_idle_time() {
+        let _serial = crate::test_serial();
+        let theme = Theme::new().unwrap();
+        let mut highlighter = Highlighter::new(rust(), &theme).unwrap();
+        let buffer = EditBuffer::new(opentui::WidthMethod::Unicode).unwrap();
+        buffer.set_text("fn main() {}\nfn other() {}\n");
+        highlighter.sync(&buffer, 0..2);
+        assert!(!highlighter.is_stale(), "fast parses happen at once");
+        let sexp =
+            |highlighter: &Highlighter| highlighter.tree.as_ref().unwrap().root_node().to_sexp();
+        let fresh = |text: &str| {
+            let mut parser = Parser::new();
+            parser.set_language(&highlighter_language()).unwrap();
+            parser.parse(text, None).unwrap().root_node().to_sexp()
+        };
+
+        // As if parsing were slow: the edit is drawn with the tree moved
+        // along with it, and parsed when idle.
+        highlighter.parse_time = DEFERRED_PARSE * 2;
+        buffer.set_cursor(1, 0);
+        buffer.insert_text("struct S;\n");
+        highlighter.sync(&buffer, 0..3);
+        assert!(highlighter.is_stale());
+        assert_eq!(highlighter.text, buffer.text());
+        let other = highlighter
+            .tree
+            .as_ref()
+            .unwrap()
+            .root_node()
+            .child(1)
+            .unwrap();
+        assert_eq!(other.start_position().row, 2, "moved down a line");
+        assert!(highlighter.idle(&buffer));
+        assert!(!highlighter.is_stale());
+        assert!(!highlighter.idle(&buffer), "nothing left to do");
+        assert_eq!(sexp(&highlighter), fresh(&buffer.text()));
+
+        // What needs the tree as it is parses at once.
+        highlighter.parse_time = DEFERRED_PARSE * 2;
+        buffer.insert_text("// x\n");
+        highlighter.sync(&buffer, 0..3);
+        assert!(highlighter.is_stale());
+        assert!(highlighter.tree(&buffer).is_some());
+        assert!(!highlighter.is_stale());
+        assert_eq!(sexp(&highlighter), fresh(&buffer.text()));
+
+        // A big text shows plain until it's parsed when idle.
+        let mut big = Highlighter::new(rust(), &theme).unwrap();
+        buffer.set_text(&"fn f() {}\n".repeat(DEFERRED_FIRST_PARSE / 10 + 1));
+        big.sync(&buffer, 0..10);
+        assert!(big.is_stale() && big.tree.is_none());
+        // (In a debug build, parsing it may well run out of time.)
+        assert!(big.idle(&buffer));
+        assert!(!big.is_stale());
+    }
+
+    fn highlighter_language() -> tree_sitter::Language {
+        (rust().syntax.as_ref().unwrap().grammar)()
+    }
+
+    #[test]
     fn injected_text_highlights_the_same_after_edits() {
         let _serial = crate::test_serial();
         let theme = Theme::new().unwrap();
@@ -1939,7 +2225,9 @@ mod tests {
         let _serial = crate::test_serial();
         let theme = Theme::new().unwrap();
         let mut highlighter = Highlighter::new(rust(), &theme).unwrap();
-        let huge = "// comment\n".repeat(MAX_BYTES / 10);
-        assert!(!highlighter.reparse(huge));
+        let buffer = EditBuffer::new(opentui::WidthMethod::Unicode).unwrap();
+        buffer.set_text(&"// comment\n".repeat(MAX_BYTES / 10));
+        assert!(!highlighter.catch_up(&buffer, false));
+        assert!(!highlighter.reparse("fn f() {}".to_string()) || highlighter.gave_up);
     }
 }

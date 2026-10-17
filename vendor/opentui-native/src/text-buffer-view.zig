@@ -205,11 +205,15 @@ pub const LocalSelection = struct {
 
 pub const TextBufferView = UnifiedTextBufferView;
 
+/// For tests: lays out lines that fit as wrapping would, the long way.
+pub var skip_fitting_lines = false;
+
 // Width-independent metadata for the current view layout, in rope traversal
 // order. Nothing is attached to chunks or retained by their undo roots.
 const WordLayoutStorage = struct {
     arena: std.heap.ArenaAllocator,
-    layouts: std.ArrayListUnmanaged(utf8.ChunkLayoutInfo) = .empty,
+    /// Null for chunks laid out without one (see `takeFittingLine`).
+    layouts: std.ArrayListUnmanaged(?utf8.ChunkLayoutInfo) = .empty,
 
     fn reset(self: *WordLayoutStorage) void {
         _ = self.arena.reset(.free_all);
@@ -266,6 +270,11 @@ pub const UnifiedTextBufferView = struct {
     global_allocator: Allocator,
     virtual_lines_arena: *std.heap.ArenaAllocator,
     word_layout: WordLayoutStorage,
+    /// The rope's weight as last laid out, to move the lines after an edit
+    /// by the change in it.
+    layout_weight: u32 = 0,
+    /// Lines laid out again after edits since everything was last laid out.
+    relaid_vlines: u32 = 0,
 
     /// Persistent arena for measureForDimensions. Each call resets it with
     /// retain_capacity to avoid mmap/munmap churn during streaming.
@@ -297,8 +306,7 @@ pub const UnifiedTextBufferView = struct {
 
         const view_id = text_buffer.registerView() catch return TextBufferViewError.OutOfMemory;
 
-        const ellipsis_text = "...";
-        const mem_id = text_buffer.registerMemBuffer(ellipsis_text, false) catch return TextBufferViewError.OutOfMemory;
+        const mem_id = text_buffer.ellipsisMemId() catch return TextBufferViewError.OutOfMemory;
         const ellipsis_chunk = text_buffer.createChunk(mem_id, 0, 3);
 
         self.* = .{
@@ -456,6 +464,16 @@ pub const UnifiedTextBufferView = struct {
         if (!self.virtual_lines_dirty and !buffer_dirty) return;
 
         if (buffer_dirty or self.wrap_mode != .word or self.wrap_width == null) self.word_layout.reset();
+        if (!self.virtual_lines_dirty) {
+            if (self.text_buffer.getViewLineChange(self.view_id)) |change| {
+                if (self.updateChangedVirtualLines(change)) {
+                    self.layout_weight = self.text_buffer.rope().totalWeight();
+                    self.text_buffer.clearViewDirty(self.view_id);
+                    return;
+                }
+            }
+        }
+        self.relaid_vlines = 0;
         self.resetVirtualLineStorage(if (!buffer_dirty and self.wrap_mode == .word) .retain_capacity else .free_all);
         const virtual_allocator = self.virtual_lines_arena.allocator();
 
@@ -471,11 +489,11 @@ pub const UnifiedTextBufferView = struct {
         };
 
         const calculated = if (self.wrap_mode == .none or self.wrap_width == null)
-            calculateUnwrappedVirtualLines(virtual_allocator, self.text_buffer, output)
+            calculateUnwrappedVirtualLines(virtual_allocator, self.text_buffer, output, null)
         else switch (self.wrap_mode) {
             .none => unreachable,
-            .char => calculateVirtualLinesGeneric(.render, .char, virtual_allocator, self.text_buffer, self.wrap_width.?, self.first_line_offset, output, null),
-            .word => calculateVirtualLinesGeneric(.render, .word, virtual_allocator, self.text_buffer, self.wrap_width.?, self.first_line_offset, output, &self.word_layout),
+            .char => calculateVirtualLinesGeneric(.render, .char, virtual_allocator, self.text_buffer, self.wrap_width.?, self.first_line_offset, output, null, null),
+            .word => calculateVirtualLinesGeneric(.render, .word, virtual_allocator, self.text_buffer, self.wrap_width.?, self.first_line_offset, output, &self.word_layout, null),
         };
         if (!calculated) {
             // Builders append to parallel arrays; discard partial output as a unit
@@ -487,7 +505,107 @@ pub const UnifiedTextBufferView = struct {
         }
 
         self.virtual_lines_dirty = false;
+        self.layout_weight = self.text_buffer.rope().totalWeight();
         self.text_buffer.clearViewDirty(self.view_id);
+    }
+
+    /// Lays out again only the lines `change` says were edited since the
+    /// last layout, splicing them into it, and moves the lines after them
+    /// along. False, leaving the layout as it was, when it can't: then
+    /// everything is laid out again.
+    fn updateChangedVirtualLines(self: *Self, change: tb.LineChange) bool {
+        // Truncation rewrites the lines in place.
+        if (self.truncate) return false;
+        const old_line_count = self.cached_line_first_vline.items.len;
+        const line_count = self.text_buffer.getLineCount();
+        if (old_line_count == 0 or change.start > change.old_end or change.start > change.new_end) return false;
+        if (change.old_end >= old_line_count or change.new_end >= line_count) return false;
+        if (@as(i64, line_count) - @as(i64, @intCast(old_line_count)) != @as(i64, change.new_end) - change.old_end) return false;
+
+        const allocator = self.virtual_lines_arena.allocator();
+        // Replaced lines' chunks stay in the arena until everything is laid
+        // out again, so that happens once they add up to the document.
+        const changed_lines = change.new_end - change.start + 1;
+        if (self.relaid_vlines + changed_lines > @max(line_count, 4096)) return false;
+
+        const range = iter_mod.findLineRange(self.text_buffer.rope(), change.start, change.new_end) orelse return false;
+        var virtual_lines: std.ArrayListUnmanaged(VirtualLine) = .empty;
+        var line_starts: std.ArrayListUnmanaged(u32) = .empty;
+        var line_widths: std.ArrayListUnmanaged(u32) = .empty;
+        var line_sources: std.ArrayListUnmanaged(u32) = .empty;
+        var line_wrap_indices: std.ArrayListUnmanaged(u32) = .empty;
+        var line_first_vline: std.ArrayListUnmanaged(u32) = .empty;
+        var line_vline_counts: std.ArrayListUnmanaged(u32) = .empty;
+        const output: VirtualLineOutput = .{
+            .virtual_lines = &virtual_lines,
+            .cached_line_starts = &line_starts,
+            .cached_line_widths = &line_widths,
+            .cached_line_sources = &line_sources,
+            .cached_line_wrap_indices = &line_wrap_indices,
+            .cached_line_first_vline = &line_first_vline,
+            .cached_line_vline_counts = &line_vline_counts,
+        };
+        const calculated = if (self.wrap_mode == .none or self.wrap_width == null)
+            calculateUnwrappedVirtualLines(allocator, self.text_buffer, output, range)
+        else switch (self.wrap_mode) {
+            .none => unreachable,
+            .char => calculateVirtualLinesGeneric(.render, .char, allocator, self.text_buffer, self.wrap_width.?, self.first_line_offset, output, null, range),
+            .word => calculateVirtualLinesGeneric(.render, .word, allocator, self.text_buffer, self.wrap_width.?, self.first_line_offset, output, null, range),
+        };
+        if (!calculated or line_first_vline.items.len != changed_lines) return false;
+
+        // The virtual lines replaced, and how much the rest move.
+        const vline_start = self.cached_line_first_vline.items[change.start];
+        const vline_end = self.cached_line_first_vline.items[change.old_end] + self.cached_line_vline_counts.items[change.old_end];
+        const old_vlines = vline_end - vline_start;
+        const new_vlines: u32 = @intCast(virtual_lines.items.len);
+        const vline_delta = @as(i64, new_vlines) - old_vlines;
+        const line_delta = @as(i64, change.new_end) - change.old_end;
+        const weight_delta = @as(i64, self.text_buffer.rope().totalWeight()) - self.layout_weight;
+
+        // Splice within the arrays' capacity: growing them in the arena
+        // would strand the old ones there.
+        if (vline_delta > 0) {
+            const grow: usize = @intCast(vline_delta);
+            if (self.virtual_lines.items.len + grow > self.virtual_lines.capacity) return false;
+            inline for (.{ &self.cached_line_starts, &self.cached_line_widths, &self.cached_line_sources, &self.cached_line_wrap_indices }) |list| {
+                if (list.items.len + grow > list.capacity) return false;
+            }
+        }
+        if (line_delta > 0) {
+            const grow: usize = @intCast(line_delta);
+            if (old_line_count + grow > self.cached_line_first_vline.capacity) return false;
+            if (old_line_count + grow > self.cached_line_vline_counts.capacity) return false;
+        }
+
+        for (line_first_vline.items) |*first| first.* += vline_start;
+        const old_lines = change.old_end - change.start + 1;
+        self.virtual_lines.replaceRangeAssumeCapacity(vline_start, old_vlines, virtual_lines.items);
+        self.cached_line_starts.replaceRangeAssumeCapacity(vline_start, old_vlines, line_starts.items);
+        self.cached_line_widths.replaceRangeAssumeCapacity(vline_start, old_vlines, line_widths.items);
+        self.cached_line_sources.replaceRangeAssumeCapacity(vline_start, old_vlines, line_sources.items);
+        self.cached_line_wrap_indices.replaceRangeAssumeCapacity(vline_start, old_vlines, line_wrap_indices.items);
+        self.cached_line_first_vline.replaceRangeAssumeCapacity(change.start, old_lines, line_first_vline.items);
+        self.cached_line_vline_counts.replaceRangeAssumeCapacity(change.start, old_lines, line_vline_counts.items);
+
+        const after = vline_start + new_vlines;
+        if (weight_delta != 0 or line_delta != 0) {
+            for (self.virtual_lines.items[after..], self.cached_line_starts.items[after..], self.cached_line_sources.items[after..]) |*vline, *start, *source| {
+                vline.document_cell_offset = @intCast(@as(i64, vline.document_cell_offset) + weight_delta);
+                vline.source_line = @intCast(@as(i64, @intCast(vline.source_line)) + line_delta);
+                start.* = vline.document_cell_offset;
+                source.* = @intCast(vline.source_line);
+            }
+        }
+        if (vline_delta != 0) {
+            for (self.cached_line_first_vline.items[change.new_end + 1 ..]) |*first| {
+                first.* = @intCast(@as(i64, first.*) + vline_delta);
+            }
+        }
+
+        self.relaid_vlines += changed_lines;
+        self.truncation_applied = false;
+        return true;
     }
 
     pub fn getVirtualLineCount(self: *Self) u32 {
@@ -1497,8 +1615,8 @@ pub const UnifiedTextBufferView = struct {
         var result: MeasureResult = .{ .line_count = 0, .width_cols_max = 0 };
         const calculated = switch (self.wrap_mode) {
             .none => unreachable,
-            .char => calculateVirtualLinesGeneric(.measure, .char, measure_allocator, self.text_buffer, width, self.first_line_offset, &result, null),
-            .word => calculateVirtualLinesGeneric(.measure, .word, measure_allocator, self.text_buffer, width, self.first_line_offset, &result, null),
+            .char => calculateVirtualLinesGeneric(.measure, .char, measure_allocator, self.text_buffer, width, self.first_line_offset, &result, null, null),
+            .word => calculateVirtualLinesGeneric(.measure, .word, measure_allocator, self.text_buffer, width, self.first_line_offset, &result, null, null),
         };
         if (!calculated) return TextBufferViewError.OutOfMemory;
 
@@ -1514,10 +1632,12 @@ pub const UnifiedTextBufferView = struct {
 
     const CalculationMode = enum { render, measure };
 
+    /// Lays out `range`'s lines, or with none, all of them.
     fn calculateUnwrappedVirtualLines(
         allocator: Allocator,
         text_buffer: *UnifiedTextBuffer,
         output: VirtualLineOutput,
+        range: ?iter_mod.LineRange,
     ) bool {
         // No wrapping - create 1:1 mapping to real lines
         const Context = struct {
@@ -1597,8 +1717,12 @@ pub const UnifiedTextBufferView = struct {
             .current_vline = VirtualLine.init(),
         };
 
-        output.reserveLines(allocator, text_buffer.getLineCount());
-        text_buffer.walkLinesAndSegments(&ctx, Context.segment_callback, Context.line_end_callback);
+        if (range) |lines| {
+            iter_mod.walkLineRange(text_buffer.rope(), lines, &ctx, Context.segment_callback, Context.line_end_callback);
+        } else {
+            output.reserveLines(allocator, text_buffer.getLineCount());
+            text_buffer.walkLinesAndSegments(&ctx, Context.segment_callback, Context.line_end_callback);
+        }
         return !ctx.failed;
     }
 
@@ -1612,6 +1736,8 @@ pub const UnifiedTextBufferView = struct {
         first_line_offset: u32,
         result: if (calculation == .render) VirtualLineOutput else *MeasureResult,
         word_layout: ?*WordLayoutStorage,
+        /// Lays out only these lines (when rendering), else all of them.
+        range: ?iter_mod.LineRange,
     ) bool {
         comptime std.debug.assert(wrap_mode != .none);
 
@@ -1640,6 +1766,8 @@ pub const UnifiedTextBufferView = struct {
             source_line_cjk_breaks: if (wrap_mode == .word) bool else void = if (wrap_mode == .word) true else {},
             source_line_has_non_whitespace: if (wrap_mode == .word) bool else void = if (wrap_mode == .word) false else {},
             word_chunk: if (wrap_mode == .word) ?*const TextChunk else void = if (wrap_mode == .word) null else {},
+            /// A line's first chunk, held until the next or the line's end.
+            char_line_first_chunk: if (wrap_mode == .char and calculation == .render) ?*const TextChunk else void = if (wrap_mode == .char and calculation == .render) null else {},
             word_chunk_col_start: if (wrap_mode == .word) u32 else void = if (wrap_mode == .word) 0 else {},
             word_chunk_byte_start: if (wrap_mode == .word) u32 else void = if (wrap_mode == .word) 0 else {},
             logical_measure_line_count: if (wrap_mode == .word and calculation == .measure) u32 else void = if (wrap_mode == .word and calculation == .measure) 0 else {},
@@ -2049,7 +2177,7 @@ pub const UnifiedTextBufferView = struct {
                 if (wctx.word_layout) |storage| {
                     const index = wctx.word_layout_index;
                     wctx.word_layout_index += 1;
-                    if (index < storage.layouts.items.len) {
+                    if (index < storage.layouts.items.len and storage.layouts.items[index] != null) {
                         layout = storage.layouts.items[index];
                     } else {
                         const saved = save: {
@@ -2059,7 +2187,11 @@ pub const UnifiedTextBufferView = struct {
                                 const classes = utf8.findChunkLayoutInfo(layout_allocator, chunk_bytes, wctx.text_buffer.tabWidth(), chunk.isAsciiOnly(), wctx.text_buffer.widthMethod(), &breaks) catch break :save false;
                                 layout = .{ .wrap_breaks = breaks.toOwnedSlice(layout_allocator) catch break :save false, .word_classes = classes };
                             }
-                            storage.layouts.append(layout_allocator, layout.?) catch break :save false;
+                            if (index < storage.layouts.items.len) {
+                                storage.layouts.items[index] = layout.?;
+                            } else {
+                                storage.layouts.append(layout_allocator, layout.?) catch break :save false;
+                            }
                             break :save true;
                         };
                         if (!saved) {
@@ -2209,15 +2341,15 @@ pub const UnifiedTextBufferView = struct {
                     // Printable ASCII cannot join graphemes across chunks. Stream it,
                     // retaining the single-chunk measurement-summary shortcut.
                     if (!wctx.word_line_preflight) {
-                        if (comptime calculation == .measure) {
-                            if (wctx.word_line_first_chunk) |first| {
-                                processWordChunk(wctx, first);
-                                wctx.word_line_first_chunk = null;
-                                if (wctx.failed) return;
-                            } else if (chunk_idx_in_line == 0) {
-                                wctx.word_line_first_chunk = chunk;
-                                return;
-                            }
+                        // A line's first chunk waits for the next: alone, it
+                        // may fit (see `takeFittingLine`).
+                        if (wctx.word_line_first_chunk) |first| {
+                            processWordChunk(wctx, first);
+                            wctx.word_line_first_chunk = null;
+                            if (wctx.failed) return;
+                        } else if (chunk_idx_in_line == 0) {
+                            wctx.word_line_first_chunk = chunk;
+                            return;
                         }
                         processWordChunk(wctx, chunk);
                         return;
@@ -2252,13 +2384,59 @@ pub const UnifiedTextBufferView = struct {
                         wctx.word_line_last_cp = utf8.chunkWordClassEdges(bytes).last_cp;
                     }
                 } else {
-                    const process_result = switch (wctx.text_buffer.widthMethod()) {
-                        inline else => |width_method| processCharChunk(width_method, wctx, chunk),
-                    };
-                    process_result catch {
-                        wctx.failed = true;
-                    };
+                    if (comptime calculation == .render) {
+                        // As for words, a first chunk alone may fit.
+                        if (wctx.char_line_first_chunk) |first| {
+                            wctx.char_line_first_chunk = null;
+                            processCharChunkSticky(wctx, first);
+                            if (wctx.failed) return;
+                        } else if (chunk_idx_in_line == 0) {
+                            wctx.char_line_first_chunk = chunk;
+                            return;
+                        }
+                    }
+                    processCharChunkSticky(wctx, chunk);
                 }
+            }
+
+            fn processCharChunkSticky(wctx: *@This(), chunk: *const TextChunk) void {
+                const process_result = switch (wctx.text_buffer.widthMethod()) {
+                    inline else => |width_method| processCharChunk(width_method, wctx, chunk),
+                };
+                process_result catch {
+                    wctx.failed = true;
+                };
+            }
+
+            /// Lays out a line that's one chunk, which fits, as one visual
+            /// line holding all of it, which is what wrapping it comes to,
+            /// without looking for where it could wrap. False otherwise.
+            fn takeFittingLine(wctx: *@This(), chunk: *const TextChunk) bool {
+                if (comptime calculation != .render) return false;
+                if (skip_fitting_lines) return false;
+                if (comptime wrap_mode == .word) {
+                    if (wctx.word_line_chunks.items.len > 0 or wctx.pending_word_width_cols > 0) return false;
+                }
+                if (wctx.current_vline_width_cols > 0 or chunk.width_cols == 0 or chunk.width_cols > wctx.lineWrapWidth()) return false;
+                if (comptime wrap_mode == .word) {
+                    // Its place in the layouts kept for the next pass, which
+                    // may need them.
+                    if (wctx.word_layout) |storage| {
+                        const index = wctx.word_layout_index;
+                        wctx.word_layout_index += 1;
+                        if (index >= storage.layouts.items.len) {
+                            storage.layouts.append(storage.arena.allocator(), null) catch {
+                                storage.reset();
+                                wctx.word_layout = null;
+                            };
+                        }
+                    }
+                }
+                // What's cached of how it breaks is kept, as for a chunk that
+                // was broken, for when it doesn't fit.
+                if (chunk.cold) |cold| cold.layout_used = true;
+                const byte_len = chunk.byte_end - chunk.byte_start;
+                return addVirtualChunkSticky(wctx, chunk, 0, byte_len, 0, chunk.width_cols);
             }
 
             fn line_end_callback(ctx_ptr: *anyopaque, line_info: iter_mod.LineInfo) void {
@@ -2291,7 +2469,7 @@ pub const UnifiedTextBufferView = struct {
                 if (comptime wrap_mode == .word) {
                     if (!used_measure_cache) {
                         if (wctx.word_line_first_chunk) |chunk| {
-                            processWordChunk(wctx, chunk);
+                            if (!wctx.takeFittingLine(chunk)) processWordChunk(wctx, chunk);
                             if (wctx.failed) return;
                         }
                         for (wctx.word_line_chunks.items) |chunk| {
@@ -2303,6 +2481,14 @@ pub const UnifiedTextBufferView = struct {
                     clearPendingWord(wctx);
                     wctx.word_line_first_chunk = null;
                     wctx.word_line_chunks.clearRetainingCapacity();
+                }
+
+                if (comptime wrap_mode == .char and calculation == .render) {
+                    if (wctx.char_line_first_chunk) |chunk| {
+                        wctx.char_line_first_chunk = null;
+                        if (!wctx.takeFittingLine(chunk)) processCharChunkSticky(wctx, chunk);
+                        if (wctx.failed) return;
+                    }
                 }
 
                 const has_content = if (comptime calculation == .render)
@@ -2399,6 +2585,15 @@ pub const UnifiedTextBufferView = struct {
         };
 
         defer if (comptime wrap_mode == .word) wrap_ctx.word_line_chunks.deinit(allocator);
+        if (range) |lines| {
+            if (comptime calculation != .render) unreachable;
+            wrap_ctx.document_cell_offset = lines.start_weight;
+            wrap_ctx.current_vline.document_cell_offset = lines.start_weight;
+            wrap_ctx.line_idx = lines.first;
+            if (lines.first > 0) wrap_ctx.current_wrap_width = wrap_w;
+            iter_mod.walkLineRange(text_buffer.rope(), lines, &wrap_ctx, WrapContext.segment_callback, WrapContext.line_end_callback);
+            return !wrap_ctx.failed;
+        }
         // Retain unchanged chunks and reclaim layouts detached by incremental edits.
         if (comptime calculation == .render) result.reserveLines(allocator, text_buffer.getLineCount());
         if (comptime calculation == .render and wrap_mode == .word) text_buffer.layout_cache.beginLayout();

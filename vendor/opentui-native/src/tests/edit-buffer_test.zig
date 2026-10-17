@@ -1940,3 +1940,57 @@ test "EditBuffer - setText resets add_buffer" {
     len = eb.getText(&buffer);
     try std.testing.expectEqualStrings("Reset More", buffer[0..len]);
 }
+
+test "EditBuffer - views share one memory slot for their ellipsis" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    const eb = try EditBuffer.init(std.testing.allocator, pool, link_pool, .wcwidth, null);
+    defer eb.deinit();
+    try eb.setText("hello");
+
+    var kept = try TextBufferView.init(std.testing.allocator, eb.tb);
+    defer kept.deinit();
+    const used = eb.tb.mem_registry.getUsedSlots();
+    for (0..400) |_| {
+        var view = try TextBufferView.init(std.testing.allocator, eb.tb);
+        view.deinit();
+    }
+    try std.testing.expectEqual(used, eb.tb.mem_registry.getUsedSlots());
+}
+
+test "EditBuffer - setText frees the slots of earlier texts and add buffers" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    const eb = try EditBuffer.init(std.testing.allocator, pool, link_pool, .wcwidth, null);
+    defer eb.deinit();
+
+    // Outgrowing the 64 KiB add buffer registers a bigger one.
+    const big = try std.testing.allocator.alloc(u8, 100_000);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+
+    var buf: [64]u8 = undefined;
+    var out: [64]u8 = undefined;
+    for (0..400) |i| {
+        try eb.insertText(big);
+        try eb.replaceText("replaced");
+        _ = try eb.undo();
+        const text = try std.fmt.bufPrint(&buf, "text {d}", .{i});
+        try eb.setText(text);
+        try std.testing.expectEqualStrings(text, out[0..eb.getText(&out)]);
+        // Just the text and the add buffer.
+        try std.testing.expectEqual(@as(usize, 2), eb.tb.mem_registry.getUsedSlots());
+    }
+    // Undo and redo still work after the slots before them were freed.
+    try eb.insertText("more ");
+    _ = try eb.undo();
+    try std.testing.expectEqualStrings("text 399", out[0..eb.getText(&out)]);
+    _ = try eb.redo();
+    try std.testing.expectEqualStrings("more text 399", out[0..eb.getText(&out)]);
+}

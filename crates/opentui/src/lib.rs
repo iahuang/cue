@@ -46,7 +46,7 @@ pub use buffer::{Buffer, FrameBuffer, OwnedBuffer};
 pub use color::{Attributes, Rgba};
 pub use edit::{
     EditBuffer, EditorView, Highlight, LogicalCursor, SelectionBehavior, SelectionColors,
-    SelectionOccupancy, Viewport, VisibleLine, VisualCursor,
+    SelectionOccupancy, TextChange, Viewport, VisibleLine, VisualCursor,
 };
 pub use error::{Error, Result};
 pub use image::Image;
@@ -68,17 +68,21 @@ fn ffi_len(len: usize, what: &str) -> u32 {
 }
 
 /// Reads a native string through a copy-into-caller-buffer function, growing
-/// the buffer until the result fits. `write` returns the number of bytes
-/// written, and 0 when the buffer is too small.
-fn read_native_string(initial: usize, mut write: impl FnMut(&mut [u8]) -> u32) -> String {
-    let mut capacity = initial.max(64);
+/// the buffer until the result fits. `write` gets the buffer and its length,
+/// and returns the number of bytes it wrote, at most the length, and 0 when
+/// the buffer is too small. The buffer starts out uninitialized, which for
+/// a whole document's text saves clearing as many bytes again.
+fn read_native_string(initial: usize, mut write: impl FnMut(*mut u8, u32) -> u32) -> String {
+    let mut capacity = initial.clamp(64, u32::MAX as usize);
     loop {
-        let mut buf = vec![0u8; capacity];
-        let written = write(&mut buf) as usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(capacity);
+        let written = (write(buf.as_mut_ptr(), capacity as u32) as usize).min(capacity);
+        // SAFETY: `write` initialized the first `written` bytes.
+        unsafe { buf.set_len(written) };
         // A buffer that is not full is complete; a zero result or a full one may be truncated.
         if (written > 0 && written < capacity) || capacity >= (u32::MAX as usize) {
-            buf.truncate(written);
-            return String::from_utf8_lossy(&buf).into_owned();
+            return String::from_utf8(buf)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         }
         if written == 0 && capacity >= initial.max(64) * 16 {
             return String::new();

@@ -443,12 +443,24 @@ pub fn Rope(comptime T: type) type {
             }
         };
 
+        const history_changes = @typeInfo(T) == .@"union" and @hasDecl(T, "HistoryChange");
+        pub const HistoryChange = if (history_changes) T.HistoryChange else void;
+
+        /// What the edit from root `before` to root `after` changed.
+        pub const RecordedChange = struct {
+            before: *const Node,
+            after: *const Node,
+            change: HistoryChange,
+        };
+
         pub const UndoNode = struct {
             root: *const Node,
             metrics_generation: u64,
             next: ?*UndoNode = null,
             branches: ?*UndoBranch = null,
             meta: []const u8,
+            /// The edit made after this root was stored, if noted.
+            change: ?RecordedChange = null,
         };
 
         pub const UndoBranch = struct {
@@ -467,6 +479,11 @@ pub fn Rope(comptime T: type) type {
         undo_depth: usize = 0,
         version: u64 = 0,
         marker_cache: MarkerCache,
+        /// Markers found by descending the tree since the cache went stale,
+        /// and the version they were found at. Past a point (see
+        /// `getMarker`), the cache is rebuilt instead.
+        stale_marker_lookups: u32 = 0,
+        stale_marker_version: u64 = 0,
 
         pub fn init(allocator: Allocator) error{OutOfMemory}!Self {
             return initWithConfig(allocator, .{});
@@ -1038,6 +1055,37 @@ pub fn Rope(comptime T: type) type {
             };
         }
 
+        pub const WeightIndexResult = struct { index: u32, start_weight: u32 };
+
+        /// The index of the leaf `weight` falls in, and the weight before it,
+        /// for walking from there with `walk_from`. Leaves without weight are
+        /// skipped. `null` past the end.
+        pub fn findIndexByWeight(self: *const Self, weight: u32) ?WeightIndexResult {
+            var node = self.root;
+            var index: u32 = 0;
+            var before: u32 = 0;
+            while (true) {
+                switch (node.*) {
+                    .branch => |*b| {
+                        const left_weight = b.left_metrics.weight();
+                        if (weight < before + left_weight) {
+                            node = b.left;
+                        } else {
+                            index += b.left_metrics.count;
+                            before += left_weight;
+                            node = b.right;
+                        }
+                    },
+                    .leaf => {
+                        if (weight < before + node.metrics().weight()) {
+                            return .{ .index = index, .start_weight = before };
+                        }
+                        return null;
+                    },
+                }
+            }
+        }
+
         /// Undo/Redo operations
         pub fn store_undo(self: *Self, meta: []const u8) !void {
             const undo_node = try self.create_undo_node(self.root, meta);
@@ -1134,6 +1182,28 @@ pub fn Rope(comptime T: type) type {
             self.version += 1;
             self.push_undo(u);
             return h.meta;
+        }
+
+        /// Notes that the edit from root `before` to the current one made
+        /// `change`, on the undo entry that goes back to `before`, so that
+        /// undoing and redoing it can say what they change.
+        pub fn recordChange(self: *Self, before: *const Node, change: HistoryChange) void {
+            const head = self.undo_history orelse return;
+            if (head.root != before) return;
+            head.change = .{ .before = before, .after = self.root, .change = change };
+        }
+
+        /// The change that undoing or redoing an edit made, going from root
+        /// `from` to the current one, if the edit was noted: forward, or
+        /// undone (`undone` true, to be inverted).
+        pub fn restoredChange(self: *const Self, from: *const Node) ?struct { change: HistoryChange, undone: bool } {
+            for ([_]?*UndoNode{ self.curr_history, self.undo_history }) |candidate| {
+                const node = candidate orelse continue;
+                const recorded = node.change orelse continue;
+                if (recorded.before == from and recorded.after == self.root) return .{ .change = recorded.change, .undone = false };
+                if (recorded.after == from and recorded.before == self.root) return .{ .change = recorded.change, .undone = true };
+            }
+            return null;
         }
 
         pub fn can_undo(self: *const Self) bool {
@@ -1249,25 +1319,68 @@ pub fn Rope(comptime T: type) type {
 
         pub fn markerCount(self: *Self, tag: std.meta.Tag(T)) u32 {
             if (!marker_enabled) return 0;
-
-            if (self.marker_cache.version != self.version) {
-                self.rebuildMarkerCache() catch return 0;
-            }
-
-            const list = self.marker_cache.positions.get(tag) orelse return 0;
-            return @intCast(list.items.len);
+            const index = markerTagIndex(tag) orelse return 0;
+            return self.root.metrics().marker_counts[index];
         }
 
+        /// The `occurrence`th marker of type `tag`. From the cache while it's
+        /// current; after an edit, by descending the tree (O(log n)), until
+        /// there have been enough lookups at this version that rebuilding the
+        /// cache (O(n)) is the cheaper way.
         pub fn getMarker(self: *Self, tag: std.meta.Tag(T), occurrence: u32) ?MarkerPosition {
             if (!marker_enabled) return null;
 
             if (self.marker_cache.version != self.version) {
-                self.rebuildMarkerCache() catch return null;
+                if (self.stale_marker_version != self.version) {
+                    self.stale_marker_version = self.version;
+                    self.stale_marker_lookups = 0;
+                }
+                self.stale_marker_lookups += 1;
+                if (@as(u64, self.stale_marker_lookups) * 64 <= self.root.count()) {
+                    return self.findMarker(tag, occurrence);
+                }
+                self.rebuildMarkerCache() catch return self.findMarker(tag, occurrence);
             }
 
             const list = self.marker_cache.positions.get(tag) orelse return null;
             if (occurrence >= list.items.len) return null;
             return list.items[occurrence];
+        }
+
+        fn markerTagIndex(tag: std.meta.Tag(T)) ?usize {
+            inline for (T.MarkerTypes, 0..) |mt, i| {
+                if (tag == mt) return i;
+            }
+            return null;
+        }
+
+        /// Finds a marker by its branches' marker counts, without the cache.
+        fn findMarker(self: *const Self, tag: std.meta.Tag(T), occurrence: u32) ?MarkerPosition {
+            const index = markerTagIndex(tag) orelse return null;
+            if (occurrence >= self.root.metrics().marker_counts[index]) return null;
+            var node = self.root;
+            var nth = occurrence;
+            var leaf_index: u32 = 0;
+            var weight: u32 = 0;
+            while (true) {
+                switch (node.*) {
+                    .branch => |*b| {
+                        const left = b.left_metrics.marker_counts[index];
+                        if (nth < left) {
+                            node = b.left;
+                        } else {
+                            nth -= left;
+                            leaf_index += b.left_metrics.count;
+                            weight += b.left_metrics.weight();
+                            node = b.right;
+                        }
+                    },
+                    .leaf => |*l| {
+                        if (std.meta.activeTag(l.data) != tag) return null;
+                        return .{ .leaf_index = leaf_index, .global_weight = weight };
+                    },
+                }
+            }
         }
     };
 }

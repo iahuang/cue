@@ -165,6 +165,12 @@ pub struct Editor {
     jumped: Option<(u32, u32)>,
     /// Where the cursor was when the find bar opened, while it's open.
     find_start: Option<(u32, u32)>,
+    /// The lines whose find matches are highlighted, if they're up to date:
+    /// only those around the view are, as it's drawn.
+    find_painted: Cell<Option<Range<u32>>>,
+    /// The text the find bar last looked in, and its content epoch, for
+    /// finding in again as the query changes.
+    find_text: Option<(u64, String)>,
     /// The bytes of the name underlined to go to the definition of, if any.
     underlined: Option<Range<usize>>,
 }
@@ -214,6 +220,8 @@ impl Editor {
             seen: Cell::new(None),
             jumped: None,
             find_start: None,
+            find_painted: Cell::new(None),
+            find_text: None,
             underlined: None,
         };
         editor.attach();
@@ -1064,6 +1072,7 @@ impl Editor {
         }
         self.sync_view_size();
         self.sync_syntax();
+        self.paint_find();
         let (gutter, _, _) = self.text_area();
         let text_x = self.x + gutter;
         if active {
@@ -1111,6 +1120,45 @@ impl Editor {
         if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
             highlighter.sync(&self.buffer, first.line..last.line + 1);
         }
+    }
+
+    /// Highlights the find matches on the lines about to be drawn, and a
+    /// screen's worth either side, unless they already are.
+    fn paint_find(&self) {
+        let Some(bar) = &self.find else {
+            return;
+        };
+        let rows = self.view.visible_lines();
+        let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+            return;
+        };
+        let visible = first.line..last.line + 1;
+        let painted = self.find_painted.take();
+        if painted
+            .as_ref()
+            .is_some_and(|p| p.start <= visible.start && visible.end <= p.end)
+        {
+            self.find_painted.set(painted);
+            return;
+        }
+        let margin = visible.len() as u32;
+        let lines = visible.start.saturating_sub(margin)..visible.end + margin;
+        let style = self.doc.theme.find_match;
+        let first = bar.matches.partition_point(|m| m.row < lines.start);
+        let highlights: Vec<Highlight> = bar.matches[first..]
+            .iter()
+            .take_while(|m| m.row < lines.end)
+            .map(|m| Highlight {
+                line: m.row,
+                start: m.cols.start,
+                end: m.cols.end,
+                style,
+                priority: 1,
+                tag: FIND_HIGHLIGHTS,
+            })
+            .collect();
+        self.buffer.replace_highlights(FIND_HIGHLIGHTS, &highlights);
+        self.find_painted.set(Some(lines));
     }
 
     /// Shades every row of the cursor's line, gutter included, while
@@ -1290,12 +1338,11 @@ impl Editor {
         let cursor = self.buffer.cursor();
         let line_start = self.buffer.position_to_offset(cursor.row, 0);
         let column = self.buffer.text_range(line_start, cursor.offset).len();
-        let line_break = self.with_regions(|text, region| {
-            let at = autoindent::line_start(text, cursor.row) + column;
-            autoindent::line_break(text, at, &indent, colon_opens, region)
+        let (line_break, base) = self.with_regions(cursor.row, 0, |text, line_start, region| {
+            autoindent::line_break(text, line_start + column, &indent, colon_opens, region)
         });
         let eb = &*self.buffer;
-        let replace = &line_break.replace;
+        let replace = line_break.replace.start + base..line_break.replace.end + base;
         let ends = eb.bytes_to_cursors(&[replace.start as u32, replace.end as u32]);
         let steps = eb.delete_range((ends[0].row, ends[0].col), (ends[1].row, ends[1].col))
             + eb.insert_text(&line_break.insert);
@@ -1320,25 +1367,43 @@ impl Editor {
         if before.is_empty() || !before.bytes().all(|b| b == b' ' || b == b'\t') {
             return None;
         }
-        let indent = self.with_regions(|text, region| {
-            let at = autoindent::line_start(text, cursor.row) + before.len();
-            autoindent::closer_indent(text, at, c, region).map(str::to_string)
-        })?;
+        let (indent, _) = self.with_regions(
+            cursor.row,
+            autoindent::MAX_SCAN,
+            |text, line_start, region| {
+                autoindent::closer_indent(text, line_start + before.len(), c, region)
+                    .map(str::to_string)
+            },
+        );
+        let indent = indent?;
         (indent != before).then_some((cursor.row, cursor.col, indent))
     }
 
-    /// Runs `f` on the text and what's at each byte of it, by the syntax
-    /// tree; text that isn't highlighted is all code.
-    fn with_regions<T>(&self, f: impl FnOnce(&str, &dyn Fn(usize) -> Region) -> T) -> T {
+    /// Runs `f` on text around line `row`, from `before` bytes ahead of
+    /// its start to its end (all of it, if it's highlighted), where the
+    /// line starts in it, and what's at each byte of it, by the syntax tree;
+    /// text that isn't highlighted is all code. Returns what `f` does, and
+    /// the byte of the whole text the text it got starts at.
+    fn with_regions<T>(
+        &self,
+        row: u32,
+        before: usize,
+        f: impl FnOnce(&str, usize, &dyn Fn(usize) -> Region) -> T,
+    ) -> (T, usize) {
         let mut syntax = self.doc.syntax.borrow_mut();
-        let result = match syntax
+        if let Some((text, line_start, region)) = syntax
             .as_mut()
-            .and_then(|syntax| syntax.regions(&self.buffer))
+            .and_then(|syntax| syntax.regions(&self.buffer, row))
         {
-            Some((text, region)) => f(text, &region),
-            None => f(&self.buffer.text(), &|_| Region::Code),
-        };
-        result
+            return (f(text, line_start, &region), 0);
+        }
+        drop(syntax);
+        let eb = &*self.buffer;
+        let line_start = eb.offset_to_byte(eb.position_to_offset(row, 0));
+        let from = eb.bytes_to_cursors(&[line_start.saturating_sub(before) as u32])[0].offset;
+        let base = eb.offset_to_byte(from);
+        let text = eb.text_range(from, eb.line_end_offset(row));
+        (f(&text, line_start - base, &|_| Region::Code), base)
     }
 
     /// Tab: inserts a tab, or spaces to the next multiple of the indent
@@ -1626,18 +1691,14 @@ impl Editor {
 
     fn undo(&mut self) {
         let steps = self.history().undo().unwrap_or(0);
-        for _ in 0..steps {
-            self.buffer.undo();
-        }
+        self.buffer.undo_steps(steps);
         self.anchor = None;
         self.view.clear_selection();
     }
 
     fn redo(&mut self) {
         let steps = self.history().redo().unwrap_or(0);
-        for _ in 0..steps {
-            self.buffer.redo();
-        }
+        self.buffer.redo_steps(steps);
         self.anchor = None;
         self.view.clear_selection();
     }
@@ -2099,6 +2160,7 @@ impl Editor {
             reader.clear_find();
         }
         self.find_start = None;
+        self.find_text = None;
         self.buffer.remove_highlights(FIND_HIGHLIGHTS);
         if let Some((start, end)) = self.view.selection().filter(|(s, e)| s != e) {
             self.view.set_selection(start, end, selection_colors());
@@ -2129,15 +2191,25 @@ impl Editor {
         {
             return;
         }
-        let style = self.doc.theme.find_match;
         let Some(bar) = &mut self.find else {
             return;
         };
         // Opening the bar doesn't move the cursor; a new query does.
         let jump = bar.epoch.is_none() && bar.focus == Some(Field::Find);
         bar.epoch = Some(epoch);
-        let text = self.buffer.text();
-        let (ranges, truncated) = match find::find(&text, &bar.memory.query) {
+        // Kept up with edits, or taken again if they aren't known.
+        let text = match self.find_text.take() {
+            Some((at, text)) if at == epoch => Some(text),
+            Some((at, mut text)) => {
+                document::follow_text(&self.buffer, &mut text, at).map(|_| text)
+            }
+            None => None,
+        };
+        let text = &self
+            .find_text
+            .insert((epoch, text.unwrap_or_else(|| self.buffer.text())))
+            .1;
+        let (ranges, truncated) = match find::find(text, &bar.memory.query) {
             Ok(found) => {
                 bar.error = None;
                 found
@@ -2163,19 +2235,8 @@ impl Editor {
                 offsets: ends[0].offset..ends[1].offset,
             })
             .collect();
-        let highlights: Vec<Highlight> = bar
-            .matches
-            .iter()
-            .map(|m| Highlight {
-                line: m.row,
-                start: m.cols.start,
-                end: m.cols.end,
-                style,
-                priority: 1,
-                tag: FIND_HIGHLIGHTS,
-            })
-            .collect();
-        self.buffer.replace_highlights(FIND_HIGHLIGHTS, &highlights);
+        // Highlighted as they're drawn.
+        self.find_painted.set(None);
         if jump {
             let origin = bar.origin;
             match bar.next_from(origin) {
@@ -4379,6 +4440,51 @@ mod tests {
         let (text, others) = row_with_bg(&editor, 100, 6, 0, colors.match_bg);
         assert_eq!(others, "");
         assert!(!text.contains('▸'), "{text}");
+    }
+
+    #[test]
+    fn find_highlights_matches_as_they_scroll_into_view_and_follows_edits() {
+        let colors = theme::colors();
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        let mut lines = vec!["filler"; 300];
+        lines[2] = "a needle";
+        lines[250] = "needle, needle";
+        eb.set_text(&lines.join("\n"));
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 10).unwrap();
+        find_query(&mut editor, "needle");
+        let found = |editor: &Editor| {
+            let bar = editor.find.as_ref().unwrap();
+            bar.matches
+                .iter()
+                .map(|m| (m.row, m.cols.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(found(&editor), [(2, 2..8), (250, 0..6), (250, 8..14)]);
+        let (_, marks) = row_with_bg(&editor, 60, 10, 2, current_match().bg);
+        assert_eq!(marks.trim_start().len(), 6, "{marks:?}");
+
+        // Only what's around the view is highlighted, until it scrolls there.
+        assert!(editor
+            .find_painted
+            .take()
+            .is_some_and(|lines| !lines.contains(&250)));
+        editor.view.scroll_to(0, 246, false);
+        let (text, marks) = row_with_bg(&editor, 60, 10, 4, colors.match_bg);
+        assert!(text.contains("needle, needle"), "{text}");
+        assert_eq!(marks.matches('#').count(), 12, "{marks:?}");
+
+        // Edits made while the bar is open move the matches and find new ones.
+        eb.set_cursor(250, 0);
+        eb.insert_text("needle\n");
+        eb.set_cursor(0, 0);
+        eb.insert_text("x");
+        editor.sync_find();
+        assert_eq!(
+            found(&editor),
+            [(2, 2..8), (250, 0..6), (251, 0..6), (251, 8..14)]
+        );
+        assert_eq!(editor.find_text.as_ref().unwrap().1, eb.text());
     }
 
     #[test]

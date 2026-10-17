@@ -362,6 +362,59 @@ pub const StyleSpan = struct {
     next_col: u32,
 };
 
+/// Lines `start` to `old_end` (inclusive) of a text that are now lines
+/// `start` to `new_end`, the rest unchanged.
+pub const LineChange = struct {
+    start: u32,
+    old_end: u32,
+    new_end: u32,
+
+    /// The lines that `self` and then `next` changed, together.
+    pub fn then(self: LineChange, next: LineChange) LineChange {
+        // Where the end of `self` went in `next`'s text.
+        const end: i64 = if (self.new_end < next.start)
+            self.new_end
+        else if (self.new_end > next.old_end)
+            @as(i64, self.new_end) + next.new_end - next.old_end
+        else
+            next.new_end;
+        const new_end = @max(end, next.new_end);
+        const delta = (@as(i64, self.new_end) - self.old_end) + (@as(i64, next.new_end) - next.old_end);
+        return .{
+            .start = @min(self.start, next.start),
+            .old_end = @intCast(new_end - delta),
+            .new_end = @intCast(new_end),
+        };
+    }
+
+    pub fn inverse(self: LineChange) LineChange {
+        return .{ .start = self.start, .old_end = self.new_end, .new_end = self.old_end };
+    }
+};
+
+/// Bytes `start` to `old_end` of the plain text (lines joined by `\n`)
+/// that are now bytes `start` to `new_end`.
+pub const TextChange = struct {
+    start: u32,
+    old_end: u32,
+    new_end: u32,
+
+    pub fn inverse(self: TextChange) TextChange {
+        return .{ .start = self.start, .old_end = self.new_end, .new_end = self.old_end };
+    }
+};
+
+/// What an edit changed: its lines, for views to lay out again, and its
+/// bytes, for following it.
+pub const Edit = struct {
+    lines: LineChange,
+    bytes: TextChange,
+
+    pub fn inverse(self: Edit) Edit {
+        return .{ .lines = self.lines.inverse(), .bytes = self.bytes.inverse() };
+    }
+};
+
 /// A segment in the unified rope - either text content or a line break marker
 pub const Segment = union(enum) {
     text: TextChunk,
@@ -370,6 +423,9 @@ pub const Segment = union(enum) {
 
     /// Define which union tags are markers (for O(1) line lookup)
     pub const MarkerTypes = &[_]std.meta.Tag(Segment){ .brk, .linestart };
+
+    /// What the rope's undo history notes of each edit.
+    pub const HistoryChange = Edit;
 
     /// Metrics for aggregation in the rope tree
     /// These enable O(log n) row/col coordinate mapping and efficient line queries

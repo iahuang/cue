@@ -21,7 +21,7 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use opentui::{EditBuffer, LogicalCursor, WidthMethod};
+use opentui::{EditBuffer, LogicalCursor, TextChange, WidthMethod};
 
 use crate::config;
 use crate::git::Tracked;
@@ -76,10 +76,15 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
 
 impl Stamp {
     fn new(meta: &fs::Metadata, bytes: &[u8]) -> Stamp {
+        Stamp::hashed(meta, content_hash(bytes))
+    }
+
+    /// Of a file with `meta`, whose contents' [`content_hash`] is `hash`.
+    fn hashed(meta: &fs::Metadata, hash: u64) -> Stamp {
         Stamp {
             modified: meta.modified().ok(),
             len: meta.len(),
-            hash: content_hash(bytes),
+            hash,
         }
     }
 
@@ -136,8 +141,13 @@ struct Saved {
 
 impl Saved {
     fn of(text: &str) -> Saved {
+        Saved::hashed(text, content_hash(text.as_bytes()))
+    }
+
+    /// Of `text`, whose [`content_hash`] is `hash`.
+    fn hashed(text: &str, hash: u64) -> Saved {
         Saved {
-            text: Some((text.len(), content_hash(text.as_bytes()))),
+            text: Some((text.len(), hash)),
             compared: None,
         }
     }
@@ -164,8 +174,8 @@ pub struct Document {
     pub cursor_owner: Cell<Option<u64>>,
     /// The other editors' cursors, by editor, while they wait for it.
     parked: RefCell<HashMap<u64, Parked>>,
-    /// The text the parked cursors point into, and its content epoch.
-    parked_text: RefCell<(u64, String)>,
+    /// The content epoch of the text the parked cursors point into.
+    parked_epoch: Cell<u64>,
     on_disk: RefCell<OnDisk>,
     saved: RefCell<Saved>,
     /// What git says of the file, if it's in a repository, as the app last
@@ -199,20 +209,26 @@ pub struct Spot {
     seen: Cell<(u32, u32)>,
 }
 
+/// The place at `row` and `col` in `buffer`, or as near as the text has:
+/// the last line past the end, and past the end of a line, its start.
+fn place(buffer: &EditBuffer, row: u32, col: u32) -> LogicalCursor {
+    let row = row.min(buffer.line_count().saturating_sub(1));
+    let offset = match buffer.position_to_offset(row, col) {
+        0 => buffer.position_to_offset(row, 0),
+        offset => offset,
+    };
+    buffer.offset_to_position(offset).unwrap_or(LogicalCursor {
+        row,
+        col: 0,
+        offset,
+    })
+}
+
 impl Spot {
     /// The place at `row` and `col` in `doc`, or as near as the text has.
     pub fn new(doc: &Rc<Document>, row: u32, col: u32) -> Spot {
         let id = next_id();
-        let buffer = &doc.buffer;
-        let row = row.min(buffer.line_count().saturating_sub(1));
-        // Past the end of the line, its start.
-        let offset = match buffer.position_to_offset(row, col) {
-            0 => buffer.position_to_offset(row, 0),
-            offset => offset,
-        };
-        if let Some(cursor) = buffer.offset_to_position(offset) {
-            doc.keep(id, cursor);
-        }
+        doc.keep(id, place(&doc.buffer, row, col));
         let seen = doc.parked(id).map_or((row, col), |p| (p.row, p.col));
         Spot {
             doc: Rc::downgrade(doc),
@@ -280,21 +296,21 @@ impl Document {
             line_ending: Default::default(),
         };
         let mut notice = None;
-        let mut stamp = None;
-        if let Some(loaded) = loaded {
-            stamp = loaded.stamp;
-            buffer.set_text(&loaded.text);
-            buffer.set_cursor(0, 0);
-            file.line_ending = loaded.line_ending;
-            if loaded.mixed_endings {
-                notice = Some(format!(
-                    "Mixed line endings; saving will use {}.",
-                    loaded.line_ending.label()
-                ));
-            }
+        let Some(loaded) = loaded else {
+            return Ok((Rc::new(Document::new(buffer, file, theme)), notice));
+        };
+        buffer.set_text(&loaded.text);
+        buffer.set_cursor(0, 0);
+        file.line_ending = loaded.line_ending;
+        if loaded.mixed_endings {
+            notice = Some(format!(
+                "Mixed line endings; saving will use {}.",
+                loaded.line_ending.label()
+            ));
         }
-        let doc = Document::new(buffer, file, theme);
-        doc.on_disk.borrow_mut().stamp = stamp;
+        let saved = Saved::hashed(&loaded.text, loaded.hash);
+        let doc = Document::of_text(buffer, file, theme, &loaded.text, saved);
+        doc.on_disk.borrow_mut().stamp = loaded.stamp;
         Ok((Rc::new(doc), notice))
     }
 
@@ -315,12 +331,24 @@ impl Document {
 
     /// A document of `buffer`'s text, saved to `file`.
     pub fn new(buffer: Rc<EditBuffer>, file: File, theme: Rc<Theme>) -> Document {
+        let text = buffer.text();
+        let saved = Saved::of(&text);
+        Document::of_text(buffer, file, theme, &text, saved)
+    }
+
+    /// A document of `buffer`'s text, `text`, saved to `file` as `saved`.
+    fn of_text(
+        buffer: Rc<EditBuffer>,
+        file: File,
+        theme: Rc<Theme>,
+        text: &str,
+        saved: Saved,
+    ) -> Document {
         buffer.set_syntax_style(Some(theme.syntax_style()));
         buffer.set_default_fg(Some(theme::colors().text));
         let language = detect_language(&buffer, file.path.as_deref());
         let syntax = language.and_then(|language| Highlighter::new(language, &theme));
-        let text = buffer.text();
-        let indent = Indent::infer(&text, language);
+        let indent = Indent::infer(text, language);
         Document {
             buffer,
             file: RefCell::new(file),
@@ -334,9 +362,9 @@ impl Document {
             untitled: Cell::new(0),
             cursor_owner: Cell::new(None),
             parked: RefCell::default(),
-            parked_text: RefCell::default(),
+            parked_epoch: Cell::new(0),
             on_disk: RefCell::default(),
-            saved: RefCell::new(Saved::of(&text)),
+            saved: RefCell::new(saved),
             tracked: RefCell::default(),
             outline: RefCell::default(),
         }
@@ -367,12 +395,8 @@ impl Document {
     fn keep(&self, id: u64, cursor: LogicalCursor) {
         self.follow_edits();
         let epoch = self.buffer.content_epoch();
-        let mut snapshot = self.parked_text.borrow_mut();
-        if snapshot.0 != epoch || self.parked.borrow().is_empty() {
-            *snapshot = (epoch, self.buffer.text());
-        }
         let parked = Parked {
-            byte: self.buffer.text_range(0, cursor.offset).len(),
+            byte: self.buffer.offset_to_byte(cursor.offset),
             row: cursor.row,
             col: cursor.col,
             epoch,
@@ -394,29 +418,33 @@ impl Document {
 
     /// Moves the parked cursors along with the edits made since they were
     /// last moved, so they stay on the same text. An edit before one moves
-    /// it; one after doesn't. What changed is taken to be one stretch of
-    /// text, as an edit, undo, or moving lines changes: a cursor inside a
-    /// stretch changed several edits apart goes to its start.
+    /// it; one after doesn't; one around it puts it at the edit's start. If
+    /// what changed isn't known, as when the whole text was replaced, they
+    /// keep their lines and columns, as near as the text has them.
     pub fn follow_edits(&self) {
         let mut parked = self.parked.borrow_mut();
         let epoch = self.buffer.content_epoch();
-        let mut snapshot = self.parked_text.borrow_mut();
-        if parked.is_empty() || snapshot.0 == epoch {
+        let since = self.parked_epoch.replace(epoch);
+        if parked.is_empty() || since == epoch {
             return;
         }
-        let text = self.buffer.text();
-        let old = &snapshot.1;
-        let prefix = common_prefix(old, &text);
-        let suffix = common_suffix(&old[prefix..], &text[prefix..]);
-        let (old_end, new_end) = (old.len() - suffix, text.len() - suffix);
+        let Some(changes) = self.buffer.changes_since(since) else {
+            for parked in parked.values_mut() {
+                let cursor = place(&self.buffer, parked.row, parked.col);
+                parked.byte = self.buffer.offset_to_byte(cursor.offset);
+                parked.row = cursor.row;
+                parked.col = cursor.col;
+            }
+            return;
+        };
         let mut moved: Vec<(u64, usize)> = parked
             .iter()
             .map(|(&id, parked)| {
-                let byte = match parked.byte {
-                    byte if byte <= prefix => byte,
-                    byte if byte >= old_end => byte - old_end + new_end,
-                    _ => prefix,
-                };
+                let byte = changes.iter().fold(parked.byte, |byte, change| match byte {
+                    byte if byte <= change.start => byte,
+                    byte if byte >= change.old_end => byte - change.old_end + change.new_end,
+                    _ => change.start,
+                });
                 (id, byte)
             })
             .collect();
@@ -429,7 +457,6 @@ impl Document {
                 parked.col = cursor.col;
             }
         }
-        *snapshot = (epoch, text);
     }
 
     /// Forgets editor `id`, which is closing.
@@ -482,8 +509,8 @@ impl Document {
         if let Some((_, differs)) = saved.compared.filter(|&(at, _)| at == epoch) {
             return differs;
         }
-        let text = self.buffer.text();
-        let differs = text.len() != len || content_hash(text.as_bytes()) != hash;
+        let differs =
+            self.buffer.text_len() != len || content_hash(self.buffer.text().as_bytes()) != hash;
         saved.compared = Some((epoch, differs));
         differs
     }
@@ -660,7 +687,7 @@ impl Document {
         if took {
             history.record_reload(steps, join);
             self.file.borrow_mut().line_ending = loaded.line_ending;
-            *self.saved.borrow_mut() = Saved::of(&loaded.text);
+            *self.saved.borrow_mut() = Saved::hashed(&loaded.text, loaded.hash);
             *self.on_disk.borrow_mut() = OnDisk {
                 stamp: loaded.stamp,
                 disk: Disk::Same,
@@ -723,36 +750,15 @@ pub fn untitled_name(number: u32) -> String {
     format!("Untitled-{number}")
 }
 
-/// The length in bytes of what `a` and `b` start with alike, ending on a
-/// character boundary.
-fn common_prefix(a: &str, b: &str) -> usize {
-    let bytes = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
-    (0..=bytes)
-        .rev()
-        .find(|&i| a.is_char_boundary(i))
-        .unwrap_or(0)
-}
-
-/// The length in bytes of what `a` and `b` end with alike, starting on a
-/// character boundary.
-fn common_suffix(a: &str, b: &str) -> usize {
-    let bytes = a
-        .bytes()
-        .rev()
-        .zip(b.bytes().rev())
-        .take_while(|(x, y)| x == y)
-        .count();
-    (0..=bytes)
-        .rev()
-        .find(|&i| a.is_char_boundary(a.len() - i))
-        .unwrap_or(0)
-}
-
 /// The language of the file at `path`, holding `buffer`'s text.
 fn detect_language(buffer: &EditBuffer, path: Option<&Path>) -> Option<&'static Language> {
     language::detect(path, || {
-        let text = buffer.text();
-        text.lines().next().unwrap_or_default().to_string()
+        // The first line, or enough of it for a shebang or a modeline.
+        let end = match buffer.position_to_offset(1, 0) {
+            0 => u32::MAX,
+            next_line => next_line - 1,
+        };
+        buffer.text_range(0, end.min(4096))
     })
 }
 
@@ -765,27 +771,89 @@ pub struct Loaded {
     pub mixed_endings: bool,
     /// `None` if there was no file.
     pub stamp: Option<Stamp>,
+    /// The [`content_hash`] of `text`.
+    pub hash: u64,
+}
+
+/// Makes `copy`, `buffer`'s text as of content epoch `since`, what the
+/// text is now, from the edits made since, and returns them as one change:
+/// `None` if there were none. `None` if they aren't known, or don't fit
+/// the copy, which is then as it was.
+pub fn follow_text(
+    buffer: &EditBuffer,
+    copy: &mut String,
+    since: u64,
+) -> Option<Option<TextChange>> {
+    let Some(change) = buffer.changes_since(since)?.into_iter().reduce(merge) else {
+        return Some(None);
+    };
+    let TextChange {
+        start,
+        old_end,
+        new_end,
+    } = change;
+    if old_end > copy.len() || !copy.is_char_boundary(start) || !copy.is_char_boundary(old_end) {
+        return None;
+    }
+    let ends = buffer.bytes_to_cursors(&[start as u32, new_end as u32]);
+    let inserted = buffer.text_range(ends[0].offset, ends[1].offset);
+    if inserted.len() != new_end - start {
+        return None;
+    }
+    copy.replace_range(start..old_end, &inserted);
+    Some(Some(change))
+}
+
+/// The change that `a` and then `b` make together.
+fn merge(a: TextChange, b: TextChange) -> TextChange {
+    // Where the end of `a` went in `b`'s text.
+    let end = if a.new_end < b.start {
+        a.new_end
+    } else if a.new_end > b.old_end {
+        a.new_end - b.old_end + b.new_end
+    } else {
+        b.new_end
+    };
+    let new_end = end.max(b.new_end);
+    let start = a.start.min(b.start);
+    let delta =
+        (a.new_end as isize - a.old_end as isize) + (b.new_end as isize - b.old_end as isize);
+    TextChange {
+        start,
+        old_end: (new_end as isize - delta) as usize,
+        new_end,
+    }
 }
 
 /// Reads `path`. A missing file loads as empty, to be created on save.
 pub fn load(path: &Path) -> io::Result<Loaded> {
-    let (bytes, stamp) = match fs::File::open(path) {
+    let (bytes, meta) = match fs::File::open(path) {
         Ok(mut file) => {
             let meta = file.metadata()?;
-            let mut bytes = Vec::new();
+            let mut bytes = Vec::with_capacity(meta.len() as usize);
             file.read_to_end(&mut bytes)?;
-            let stamp = Stamp::new(&meta, &bytes);
-            (bytes, Some(stamp))
+            (bytes, Some(meta))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => (Vec::new(), None),
         Err(e) => return Err(e),
     };
     let text = String::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not valid UTF-8"))?;
+    let hash = content_hash(text.as_bytes());
+    let stamp = meta.map(|meta| Stamp::hashed(&meta, hash));
 
+    let cr = memchr::memchr_iter(b'\r', text.as_bytes()).count();
+    if cr == 0 {
+        return Ok(Loaded {
+            text,
+            line_ending: LineEnding::Lf,
+            mixed_endings: false,
+            stamp,
+            hash,
+        });
+    }
     let crlf = text.matches("\r\n").count();
-    let cr = text.matches('\r').count();
-    let lf = text.matches('\n').count();
+    let lf = memchr::memchr_iter(b'\n', text.as_bytes()).count();
     let line_ending = if crlf > 0 && crlf * 2 >= lf {
         LineEnding::CrLf
     } else {
@@ -795,11 +863,13 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
     let mixed_endings = cr != crlf || (crlf > 0 && crlf != lf);
 
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let hash = content_hash(text.as_bytes());
     Ok(Loaded {
         text,
         line_ending,
         mixed_endings,
         stamp,
+        hash,
     })
 }
 
@@ -936,12 +1006,23 @@ mod tests {
     }
 
     #[test]
-    fn common_ends_stop_at_character_boundaries() {
-        // "é" and "è" share their first byte.
-        assert_eq!(common_prefix("aé", "aè"), 1);
-        assert_eq!(common_suffix("éa", "èa"), 1);
-        assert_eq!(common_prefix("abc", "abd"), 2);
-        assert_eq!(common_suffix("", "x"), 0);
+    fn merged_changes_cover_both() {
+        let change = |start, old_end, new_end| TextChange {
+            start,
+            old_end,
+            new_end,
+        };
+        // Typing two characters.
+        assert_eq!(merge(change(5, 5, 6), change(6, 6, 7)), change(5, 5, 7));
+        // An edit, then one earlier that removes a line.
+        assert_eq!(merge(change(10, 10, 12), change(2, 5, 2)), change(2, 10, 9));
+        // An edit, then one later.
+        assert_eq!(
+            merge(change(2, 5, 2), change(10, 10, 12)),
+            change(2, 13, 12)
+        );
+        // Typing, then deleting what was typed and more.
+        assert_eq!(merge(change(5, 5, 8), change(4, 8, 4)), change(4, 5, 4));
     }
 
     fn temp_dir(name: &str) -> PathBuf {

@@ -499,23 +499,17 @@ pub fn find(text: &str, query: &Query) -> Result<(Vec<Range<usize>>, bool), Stri
     if query.text.is_empty() {
         return Ok((Vec::new(), false));
     }
-    let matcher = query.matcher()?;
+    let matcher = query.text_matcher()?;
     let mut matches = Vec::new();
-    let mut start = 0;
-    for line in text.split('\n') {
-        let _ = matcher.find_iter(line.as_bytes(), |m| {
-            if !m.is_empty() {
-                matches.push(start + m.start()..start + m.end());
-            }
-            matches.len() <= MAX_MATCHES
-        });
-        if matches.len() > MAX_MATCHES {
-            matches.truncate(MAX_MATCHES);
-            return Ok((matches, true));
+    let _ = matcher.find_iter(text.as_bytes(), |m| {
+        if !m.is_empty() {
+            matches.push(m.start()..m.end());
         }
-        start += line.len() + 1;
-    }
-    Ok((matches, false))
+        matches.len() <= MAX_MATCHES
+    });
+    let truncated = matches.len() > MAX_MATCHES;
+    matches.truncate(MAX_MATCHES);
+    Ok((matches, truncated))
 }
 
 /// Makes the text that replaces each match.
@@ -603,6 +597,20 @@ mod tests {
             ["F", "f", "f"],
             "per line; no empty"
         );
+        let ends = Query {
+            regex: true,
+            ..query(r"o\s*$")
+        };
+        assert_eq!(
+            found(text, &ends),
+            ["o", "o"],
+            "at each line's end, not across lines"
+        );
+        let spaces = Query {
+            regex: true,
+            ..query(r"\s+")
+        };
+        assert_eq!(found(text, &spaces), [" "], "line breaks aren't matched");
         assert!(find(text, &query("")).unwrap().0.is_empty());
         let bad = Query {
             regex: true,

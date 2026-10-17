@@ -39,6 +39,51 @@ Not upstreamed. Check each still applies (or was fixed upstream) after a pull.
 - `src/rope.zig`: `rebuildMarkerCache` looks up each marker list once and
   presizes it from the root's marker counts, instead of a hash lookup per
   marker.
+  `getMarker` finds markers by descending the tree by its branches' marker
+  counts while the cache is stale, rebuilding it only once lookups at a
+  version would cost more than that; `markerCount` takes the root's counts.
+  An edit no longer walks the whole rope to rebuild the cache.
+  `findIndexByWeight` gives the leaf index for a weight, for `walk_from`.
+- `src/text-buffer-iterators.zig`: `extractTextBetweenOffsets`
+  (`getTextRange`) walks from the leaf its start is in until its end,
+  instead of the whole rope. `findLineRange` and `walkLineRange` walk only
+  some lines; `seekWeight` and `seekByte` find a leaf by weight or by byte
+  of the plain text.
+- `src/text-buffer-view.zig`, `src/text-buffer.zig`, `src/edit-buffer.zig`,
+  `src/text-buffer-segment.zig`: after an edit, views lay out again only
+  the lines it changed and splice them in, moving the lines after along
+  (`updateChangedVirtualLines`), instead of laying out the whole text.
+  `insertText` and `deleteRange` say which lines and bytes they changed
+  (`noteEdit`), and the text buffer keeps, per view, the lines changed since
+  its last layout (`LineChange`, merged across edits; `getViewLineChange`).
+  Any other change lays everything out again, as do truncation, a change of
+  wrap width or mode, and replaced lines adding up to the document (their
+  chunks stay in the layout arena until then).
+  The undo history notes each edit's change on the entry that undoes it
+  (`Rope.recordChange`, `restoredChange`), so undo and redo say what they
+  change too, and views lay out only those lines then; an undo or redo that
+  restores the same root does nothing. The text buffer keeps the byte
+  changes of the last 256 content epochs (`changesSince`,
+  `editBufferGetChangesSince`), for cue to follow edits without comparing
+  whole texts. `offsetToByte` (`editBufferOffsetToByte`) and
+  `byteOffsetsToPositions` seek instead of walking from the start, and the
+  latter walks only between offsets that are close together.
+  `undoSteps` and `redoSteps` (`editBufferUndoSteps`, `editBufferRedoSteps`)
+  undo or redo several snapshots, restoring the cursor, which lays out,
+  only after the last. `editBufferGetLineEndOffset` gives a line's end.
+- `src/text-buffer.zig`, `src/text-buffer-view.zig`, `src/edit-buffer.zig`:
+  the 255 memory slots of a text buffer no longer run out. Its views share
+  one slot for their "..." (`ellipsisMemId`) instead of taking one each and
+  never giving it back, and `setText`, once it has cleared the undo history,
+  frees the slots of earlier texts (`setText`, `replaceText`) and outgrown
+  add buffers (`stale_mem_ids`).
+- `src/text-buffer-view.zig`: wrapping lays out a line that's one chunk and
+  fits as one visual line, without finding where it could break
+  (`takeFittingLine`), which is most of the work for most lines; the word
+  layouts kept for relayouts hold a null for such chunks, to stay in step.
+  `skip_fitting_lines` turns it off, for tests to compare.
+- `src/editor-view.zig`: `setWrapMode` doesn't lay out the old way first to
+  find the line at the top when the view is at the top.
 - `src/text-buffer.zig`, `src/lib.zig`: `editBufferBytesToCursors` converts
   byte offsets into the text to cursor positions in one pass, for placing
   regex matches (tabs and wide characters make columns differ from bytes).

@@ -78,7 +78,7 @@ use std::rc::{Rc, Weak};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use opentui::{Attributes, Buffer, Rgba};
+use opentui::{Attributes, Buffer, EditBuffer, Rgba};
 
 use crate::alert::{Alert, AlertAction, Button};
 use crate::arrange::{self, Arranging, Before, PanelClip};
@@ -116,6 +116,7 @@ use crate::session::{self, Session, Shown};
 use crate::status::{self, GitBadge, NoticeBadge, StatusButton};
 use crate::switcher::{Switcher, SwitcherAction};
 use crate::symbols::{self, Symbol, SymbolIndex};
+use crate::syntax::Highlighter;
 use crate::tab::{self, BarItem, Tab, TabId};
 use crate::terminal::Terminal;
 use crate::theme::{self, TerminalColors, Theme, ThemeId, ThemeSetting};
@@ -876,7 +877,39 @@ impl App {
             .dragged_panel()
             .and_then(|id| self.panel(id))
             .and_then(|panel| panel.drag_scrolls_in(now));
-        switcher.into_iter().chain(drag).min()
+        // As soon as there's nothing else to do.
+        let idle = self
+            .shown_highlighters(|syntax, _| syntax.is_stale())
+            .then_some(Duration::ZERO);
+        switcher.into_iter().chain(drag).chain(idle).min()
+    }
+
+    /// Does what waits for the user to stop typing: parsing the text on
+    /// screen again, for highlighting it, where edits were drawn first.
+    /// Returns whether the screen needs drawing again.
+    pub fn idle(&mut self) -> bool {
+        let mut parsed = false;
+        self.shown_highlighters(|syntax, buffer| {
+            parsed |= syntax.idle(buffer);
+            false
+        });
+        parsed
+    }
+
+    /// Calls `f` on the highlighter of each document on screen, and its
+    /// buffer, until it returns true. Returns whether it did.
+    fn shown_highlighters(&self, mut f: impl FnMut(&mut Highlighter, &EditBuffer) -> bool) -> bool {
+        let scratch = self.scratch.open.then_some(&self.scratch.panel);
+        self.tab()
+            .panels
+            .iter()
+            .chain(scratch)
+            .filter_map(Panel::editor)
+            .any(|editor| {
+                let doc = editor.document();
+                let mut syntax = doc.syntax.borrow_mut();
+                syntax.as_mut().is_some_and(|syntax| f(syntax, &doc.buffer))
+            })
     }
 
     /// The panel a left drag in it is selecting in, if any.
@@ -8820,6 +8853,10 @@ fn reference_in(
             .and_then(|byte| definition::reference_at(tree, text, byte))
     })
 }
+
+#[cfg(test)]
+#[path = "bench.rs"]
+mod bench;
 
 #[cfg(test)]
 mod tests {

@@ -52,8 +52,19 @@ pub const StyledChunk = extern struct {
     link_len: usize = 0,
 };
 
+pub const LineChange = seg_mod.LineChange;
+pub const TextChange = seg_mod.TextChange;
+pub const Edit = seg_mod.Edit;
+
 pub const UnifiedTextBuffer = struct {
     const Self = UnifiedTextBuffer;
+
+    const change_log_size = 256;
+    const LoggedChange = struct {
+        epoch: u64,
+        /// Null if what changed isn't known.
+        change: ?TextChange,
+    };
 
     mem_registry: MemRegistry,
     default_fg: ?RGBA,
@@ -75,12 +86,19 @@ pub const UnifiedTextBuffer = struct {
     width_method: utf8.WidthMethod,
 
     view_dirty_flags: std.ArrayListUnmanaged(bool),
+    /// For each dirty view, the lines changed since its last layout, if
+    /// only edits of known lines changed it (see `markViewsDirtyLines`).
+    view_line_changes: std.ArrayListUnmanaged(?LineChange),
     next_view_id: u32,
     free_view_ids: std.ArrayListUnmanaged(u32),
 
     /// Monotonic counter that increments on every content change. Views use this
     /// to detect stale caches even after clearViewDirty() runs.
     content_epoch: u64,
+    /// What the latest content changes did to the text, a ring by epoch, so
+    /// that what follows the text can catch up without comparing it all.
+    change_log: [change_log_size]LoggedChange = undefined,
+    change_log_len: u32 = 0,
 
     // Per-line highlight cache (invalidated on edits)
     // Maps line_idx to highlights for that line
@@ -92,6 +110,9 @@ pub const UnifiedTextBuffer = struct {
 
     styled_text_mem_id: ?u8,
     styled_buffer: ?[]u8,
+    /// The memory slot holding "...", shared by every view (cue patch: one
+    /// per view used up the registry's 255 slots).
+    ellipsis_mem_id: ?u8 = null,
     styled_capacity: usize,
 
     tab_width: u8,
@@ -145,16 +166,62 @@ pub const UnifiedTextBuffer = struct {
 
     /// Restore an undo root with metrics valid for the current tab width.
     pub fn undo(self: *Self, meta: []const u8) ![]const u8 {
+        const from = self._rope.root;
         const previous_meta = try self._rope.undo(meta);
-        self.refreshTabWidthMetrics();
+        self.noteRestored(from);
         return previous_meta;
     }
 
     /// Restore a redo root with metrics valid for the current tab width.
     pub fn redo(self: *Self) ![]const u8 {
+        const from = self._rope.root;
         const next_meta = try self._rope.redo();
-        self.refreshTabWidthMetrics();
+        self.noteRestored(from);
         return next_meta;
+    }
+
+    /// Marks views dirty after an undo or redo from root `from`, with the
+    /// lines and bytes it changed if the edit it undid or redid was noted.
+    fn noteRestored(self: *Self, from: *const UnifiedRope.Node) void {
+        const remeasured = self.refreshTabWidthMetrics();
+        if (!remeasured) {
+            if (from == self._rope.root) return;
+            if (self._rope.restoredChange(from)) |restored| {
+                const edit = if (restored.undone) restored.change.inverse() else restored.change;
+                self.markViewsDirtyLines(edit.lines, edit.bytes);
+                return;
+            }
+        }
+        self.markAllViewsDirty();
+    }
+
+    /// Marks views dirty after an edit from root `before` that made `edit`,
+    /// and notes it in the undo history, for undoing it to say the same.
+    pub fn noteEdit(self: *Self, before: *const UnifiedRope.Node, edit: Edit) void {
+        self._rope.recordChange(before, edit);
+        self.markViewsDirtyLines(edit.lines, edit.bytes);
+    }
+
+    fn logChange(self: *Self, change: ?TextChange) void {
+        self.change_log[@intCast(self.content_epoch % change_log_size)] = .{ .epoch = self.content_epoch, .change = change };
+        self.change_log_len = @min(self.change_log_len + 1, change_log_size);
+    }
+
+    /// The changes made to the text since content epoch `epoch`, in order,
+    /// into `out`. Null if they aren't all known or don't fit.
+    pub fn changesSince(self: *const Self, epoch: u64, out: []TextChange) ?usize {
+        if (epoch > self.content_epoch) return null;
+        const count = self.content_epoch - epoch;
+        if (count > self.change_log_len or count > out.len) return null;
+        var n: usize = 0;
+        var at = epoch + 1;
+        while (at <= self.content_epoch) : (at += 1) {
+            const logged = self.change_log[@intCast(at % change_log_size)];
+            if (logged.epoch != at) return null;
+            out[n] = logged.change orelse return null;
+            n += 1;
+        }
+        return n;
     }
 
     /// Accessor: get line width at a given row.
@@ -247,6 +314,9 @@ pub const UnifiedTextBuffer = struct {
         var view_dirty_flags: std.ArrayListUnmanaged(bool) = .empty;
         errdefer view_dirty_flags.deinit(global_allocator);
 
+        var view_line_changes: std.ArrayListUnmanaged(?LineChange) = .empty;
+        errdefer view_line_changes.deinit(global_allocator);
+
         var free_view_ids: std.ArrayListUnmanaged(u32) = .empty;
         errdefer free_view_ids.deinit(global_allocator);
 
@@ -272,6 +342,7 @@ pub const UnifiedTextBuffer = struct {
             .link_tracker = null,
             .width_method = width_method,
             .view_dirty_flags = view_dirty_flags,
+            .view_line_changes = view_line_changes,
             .next_view_id = 0,
             .free_view_ids = free_view_ids,
             .content_epoch = 0,
@@ -299,6 +370,7 @@ pub const UnifiedTextBuffer = struct {
         }
 
         self.view_dirty_flags.deinit(self.global_allocator);
+        self.view_line_changes.deinit(self.global_allocator);
         self.free_view_ids.deinit(self.global_allocator);
 
         // Free highlight/span caches
@@ -337,12 +409,15 @@ pub const UnifiedTextBuffer = struct {
             const id = self.free_view_ids.items[self.free_view_ids.items.len - 1];
             _ = self.free_view_ids.pop();
             self.view_dirty_flags.items[id] = true;
+            self.view_line_changes.items[id] = null;
             return id;
         }
 
         const id = self.next_view_id;
-        self.next_view_id += 1;
+        try self.view_line_changes.append(self.global_allocator, null);
+        errdefer _ = self.view_line_changes.pop();
         try self.view_dirty_flags.append(self.global_allocator, true);
+        self.next_view_id += 1;
         return id;
     }
 
@@ -362,7 +437,17 @@ pub const UnifiedTextBuffer = struct {
     pub fn clearViewDirty(self: *Self, view_id: u32) void {
         if (view_id < self.view_dirty_flags.items.len) {
             self.view_dirty_flags.items[view_id] = false;
+            self.view_line_changes.items[view_id] = null;
         }
+    }
+
+    /// The lines changed since view `view_id` was last laid out, if it's
+    /// dirty only from edits of known lines.
+    pub fn getViewLineChange(self: *const Self, view_id: u32) ?LineChange {
+        if (view_id < self.view_dirty_flags.items.len and self.view_dirty_flags.items[view_id]) {
+            return self.view_line_changes.items[view_id];
+        }
+        return null;
     }
 
     /// Returns the current content epoch. Use this to detect buffer changes
@@ -376,74 +461,146 @@ pub const UnifiedTextBuffer = struct {
     pub const Position = struct { row: u32, col: u32, offset: u32 };
 
     /// Converts byte offsets into the plain text (lines joined by `\n`, as
-    /// `getPlainTextIntoBuffer` writes it) to positions, in one pass. `bytes`
-    /// must not decrease. An offset inside a grapheme counts the whole
-    /// grapheme, and offsets past the end map to the end of the text.
+    /// `getPlainTextIntoBuffer` writes it) to positions. `bytes` must not
+    /// decrease. An offset inside a grapheme counts the whole grapheme, and
+    /// offsets past the end map to the end of the text. Walks the text from
+    /// the first offset to the last, finding its way down the rope instead
+    /// across long stretches without any.
     pub fn byteOffsetsToPositions(self: *const Self, bytes: []const u32, out: []Position) void {
+        const text_rope = @constCast(&self._rope);
         const Context = struct {
             buffer: *const Self,
             bytes: []const u32,
             out: []Position,
-            next: usize = 0,
+            next: usize,
             /// Bytes before the current chunk or line break.
-            byte_pos: u32 = 0,
+            byte_pos: u32,
             /// The cursor offset of the current line's start.
-            line_offset: u32 = 0,
+            line_offset: u32,
+            row: u32,
             /// Columns before the current chunk, in its line.
-            col: u32 = 0,
-            /// The end of the text, as far as the walk has got.
-            end: Position = .{ .row = 0, .col = 0, .offset = 0 },
+            col: u32,
 
-            fn emit(ctx: *@This(), row: u32, col: u32) void {
-                ctx.out[ctx.next] = .{ .row = row, .col = col, .offset = ctx.line_offset + col };
+            /// How far ahead an offset is worth walking to rather than seeking.
+            const max_walk = 1 << 16;
+
+            fn emit(ctx: *@This(), col: u32) void {
+                ctx.out[ctx.next] = .{ .row = ctx.row, .col = col, .offset = ctx.line_offset + col };
                 ctx.next += 1;
             }
 
-            fn segment(ctx_ptr: *anyopaque, line_idx: u32, chunk: *const TextChunk, _: u32) void {
+            fn walker(ctx_ptr: *anyopaque, seg: *const Segment, _: u32) UnifiedRope.Node.WalkerResult {
                 const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
-                const chunk_bytes = chunk.getBytes(&ctx.buffer.mem_registry);
-                const chunk_end = ctx.byte_pos + @as(u32, @intCast(chunk_bytes.len));
-                var widths: utf8.TextWidthCursor = .{
-                    .text = chunk_bytes,
-                    .tab_width = ctx.buffer.tab_width,
-                    .width_method = ctx.buffer.width_method,
-                };
-                while (ctx.next < ctx.bytes.len and ctx.bytes[ctx.next] < chunk_end) {
-                    const local = ctx.bytes[ctx.next] -| ctx.byte_pos;
-                    ctx.emit(line_idx, ctx.col + widths.advanceTo(local));
+                if (seg.asText()) |chunk| {
+                    const chunk_bytes = chunk.getBytes(&ctx.buffer.mem_registry);
+                    const chunk_end = ctx.byte_pos + @as(u32, @intCast(chunk_bytes.len));
+                    var widths: utf8.TextWidthCursor = .{
+                        .text = chunk_bytes,
+                        .tab_width = ctx.buffer.tab_width,
+                        .width_method = ctx.buffer.width_method,
+                    };
+                    while (ctx.next < ctx.bytes.len and ctx.bytes[ctx.next] < chunk_end) {
+                        const local = ctx.bytes[ctx.next] -| ctx.byte_pos;
+                        ctx.emit(ctx.col + widths.advanceTo(local));
+                    }
+                    ctx.byte_pos = chunk_end;
+                    ctx.col += chunk.width_cols;
+                } else if (seg.isBreak()) {
+                    // Offsets at the line break.
+                    while (ctx.next < ctx.bytes.len and ctx.bytes[ctx.next] <= ctx.byte_pos) {
+                        ctx.emit(ctx.col);
+                    }
+                    ctx.byte_pos += 1;
+                    ctx.line_offset += ctx.col + 1;
+                    ctx.col = 0;
+                    ctx.row += 1;
                 }
-                ctx.byte_pos = chunk_end;
-                ctx.col += chunk.width_cols;
-            }
-
-            fn lineEnd(ctx_ptr: *anyopaque, info: LineInfo) void {
-                const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
-                // Offsets at the line break.
-                while (ctx.next < ctx.bytes.len and ctx.bytes[ctx.next] <= ctx.byte_pos) {
-                    ctx.emit(info.line_idx, ctx.col);
-                }
-                ctx.end = .{ .row = info.line_idx, .col = ctx.col, .offset = ctx.line_offset + ctx.col };
-                ctx.byte_pos += 1;
-                ctx.line_offset += ctx.col + 1;
-                ctx.col = 0;
+                const keep_walking = ctx.next < ctx.bytes.len and ctx.bytes[ctx.next] -| ctx.byte_pos < max_walk;
+                return .{ .keep_walking = keep_walking };
             }
         };
 
         const count = @min(bytes.len, out.len);
-        var ctx: Context = .{ .buffer = self, .bytes = bytes[0..count], .out = out[0..count] };
-        self.walkLinesAndSegments(&ctx, Context.segment, Context.lineEnd);
-        while (ctx.next < count) : (ctx.next += 1) {
-            ctx.out[ctx.next] = ctx.end;
+        var ctx: Context = .{
+            .buffer = self,
+            .bytes = bytes[0..count],
+            .out = out[0..count],
+            .next = 0,
+            .byte_pos = 0,
+            .line_offset = 0,
+            .row = 0,
+            .col = 0,
+        };
+        while (ctx.next < count) {
+            const leaf = iter_mod.seekByte(text_rope, ctx.bytes[ctx.next]) orelse break;
+            const line_start = text_rope.getMarker(.linestart, leaf.row) orelse break;
+            ctx.byte_pos = leaf.bytes;
+            ctx.row = leaf.row;
+            ctx.line_offset = line_start.global_weight;
+            ctx.col = leaf.weight - line_start.global_weight;
+            const before = ctx.next;
+            text_rope.walk_from(leaf.index, &ctx, Context.walker) catch break;
+            if (ctx.next == before) break;
+        }
+        if (ctx.next < count) {
+            // Past the end.
+            const last_row = self.lineCount() -| 1;
+            const col = iter_mod.lineWidthAt(text_rope, last_row);
+            const end: Position = .{ .row = last_row, .col = col, .offset = text_rope.totalWeight() };
+            for (ctx.out[ctx.next..]) |*position| position.* = end;
         }
     }
 
+    /// The size of the plain text (lines joined by `\n`) in bytes.
+    pub fn plainByteSize(self: *const Self) u32 {
+        const metrics = self._rope.root.metrics().custom;
+        return metrics.total_bytes + metrics.newline_count;
+    }
+
+    /// The byte of the plain text (lines joined by `\n`) at cursor offset
+    /// `offset`, which is on a grapheme's boundary.
+    pub fn offsetToByte(self: *const Self, offset: u32) u32 {
+        const leaf = iter_mod.seekWeight(&self._rope, offset) orelse return self.plainByteSize();
+        const cols = offset - leaf.weight;
+        if (cols == 0) return leaf.bytes;
+        const chunk = leaf.segment.asText() orelse return leaf.bytes;
+        const chunk_bytes = chunk.getBytes(&self.mem_registry);
+        const pos = utf8.findPosByWidth(chunk_bytes, cols, self.tab_width, chunk.isAsciiOnly(), false, self.width_method);
+        return leaf.bytes + pos.byte_offset;
+    }
+
     fn markAllViewsDirty(self: *Self) void {
+        self.markAllViewsDirtyAfter(null);
+    }
+
+    /// Marks every view dirty, after a change to the text that's `change`,
+    /// or isn't known with none.
+    fn markAllViewsDirtyAfter(self: *Self, change: ?TextChange) void {
         self._rope.setMetricsGeneration(self.tab_metrics_generation);
         // Increment epoch first so views see the new value when checking caches.
         // Use wrapping add for safety, though u64 won't overflow in practice.
         self.content_epoch +%= 1;
-        for (self.view_dirty_flags.items) |*flag| {
+        self.logChange(change);
+        for (self.view_dirty_flags.items, self.view_line_changes.items) |*flag, *line_change| {
             flag.* = true;
+            line_change.* = null;
+        }
+    }
+
+    /// Marks views dirty after an edit that changed only `lines` (and
+    /// `bytes`), so views can lay out just those lines again. The text
+    /// outside them must be as it was, chunk for chunk.
+    fn markViewsDirtyLines(self: *Self, edit: LineChange, bytes: TextChange) void {
+        self._rope.setMetricsGeneration(self.tab_metrics_generation);
+        self.content_epoch +%= 1;
+        self.logChange(bytes);
+        for (self.view_dirty_flags.items, self.view_line_changes.items) |*flag, *change| {
+            if (!flag.*) {
+                flag.* = true;
+                change.* = edit;
+            } else if (change.*) |earlier| {
+                change.* = earlier.then(edit);
+            }
         }
     }
 
@@ -514,6 +671,7 @@ pub const UnifiedTextBuffer = struct {
         _ = self.arena.reset(if (self.arena.queryCapacity() > 0) .retain_capacity else .free_all);
 
         self.mem_registry.clear();
+        self.ellipsis_mem_id = null;
 
         self._rope = UnifiedRope.init(self.allocator) catch return;
 
@@ -744,6 +902,15 @@ pub const UnifiedTextBuffer = struct {
 
     pub fn clearMemRegistry(self: *Self) void {
         self.mem_registry.clear();
+        self.ellipsis_mem_id = null;
+    }
+
+    /// The memory slot holding "...", for views to truncate lines with.
+    pub fn ellipsisMemId(self: *Self) TextBufferError!u8 {
+        if (self.ellipsis_mem_id) |id| return id;
+        const id = try self.mem_registry.register("...", false);
+        self.ellipsis_mem_id = id;
+        return id;
     }
 
     pub fn getMemBuffer(self: *const Self, mem_id: u8) ?[]const u8 {
@@ -1390,21 +1557,23 @@ pub const UnifiedTextBuffer = struct {
         self.tab_width = new_width;
         self.tab_metrics_generation +%= 1;
 
-        self.refreshTabWidthMetrics();
-        self.markAllViewsDirty();
+        _ = self.refreshTabWidthMetrics();
+        // Widths changed, but not the text.
+        self.markAllViewsDirtyAfter(.{ .start = 0, .old_end = 0, .new_end = 0 });
     }
 
     /// Bring the active persistent root to the current tab-width generation.
     /// Widths and branch aggregates are derived state, so this deliberately
     /// updates shared const nodes; stale history roots are repaired when restored.
-    fn refreshTabWidthMetrics(self: *Self) void {
-        if (self._rope.metricsGeneration() == self.tab_metrics_generation) return;
+    /// Whether it changed any widths.
+    fn refreshTabWidthMetrics(self: *Self) bool {
+        if (self._rope.metricsGeneration() == self.tab_metrics_generation) return false;
 
         // Tab presence is content-derived, so even a stale persistent root can
         // use this aggregate to prove that its widths remain valid.
         if (!self._rope.root.metrics().custom.has_tabs) {
             self._rope.setMetricsGeneration(self.tab_metrics_generation);
-            return;
+            return false;
         }
 
         const RefreshContext = struct {
@@ -1430,6 +1599,7 @@ pub const UnifiedTextBuffer = struct {
         self._rope.walk(&refresh_ctx, RefreshContext.refresh) catch {};
         self._rope.remeasure();
         self._rope.setMetricsGeneration(self.tab_metrics_generation);
+        return true;
     }
 
     /// Debug log the rope structure using rope.toText

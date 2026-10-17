@@ -591,13 +591,16 @@ pub const EditorView = struct {
         var vp = old_vp.?;
 
         // The viewport's rows are virtual lines, which rewrapping renumbers:
-        // keep the text at the top of the viewport there.
-        view.updateVirtualLines();
-        const old_vlines = view.virtual_lines.items;
-        const top: ?struct { row: u32, col: u32 } = if (vp.y < old_vlines.len) .{
-            .row = @intCast(old_vlines[vp.y].source_line),
-            .col = old_vlines[vp.y].source_col_start,
-        } else null;
+        // keep the text at the top of the viewport there. At the top, that's
+        // the start, without laying out the old way first.
+        const top: ?struct { row: u32, col: u32 } = if (vp.y == 0) null else top: {
+            view.updateVirtualLines();
+            const old_vlines = view.virtual_lines.items;
+            break :top if (vp.y < old_vlines.len) .{
+                .row = @intCast(old_vlines[vp.y].source_line),
+                .col = old_vlines[vp.y].source_col_start,
+            } else null;
+        };
 
         view.setWrapMode(mode);
 

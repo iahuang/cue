@@ -16,7 +16,7 @@ use std::ops::Range;
 use crate::syntax::Region;
 
 /// Bracket scans give up past this many bytes back.
-const MAX_SCAN: usize = 1 << 20;
+pub const MAX_SCAN: usize = 1 << 20;
 
 /// A line break, as text to put in place of some of the line.
 #[derive(Debug, PartialEq, Eq)]
@@ -125,17 +125,6 @@ pub fn closer_indent(
         }
     }
     None
-}
-
-/// The byte line `row` of `text` starts at.
-pub fn line_start(text: &str, row: u32) -> usize {
-    match row {
-        0 => 0,
-        row => text
-            .match_indices('\n')
-            .nth(row as usize - 1)
-            .map_or(text.len(), |(i, _)| i + 1),
-    }
 }
 
 fn closer_of(opener: u8) -> u8 {

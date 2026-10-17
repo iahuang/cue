@@ -65,8 +65,8 @@ impl TextBuffer {
             return String::new();
         }
         // +1 so a complete result never fills the buffer exactly.
-        read_native_string(size + 1, |out| unsafe {
-            sys::textBufferGetPlainText(self.handle, out.as_mut_ptr(), ffi_len(out.len(), "output"))
+        read_native_string(size + 1, |out, len| unsafe {
+            sys::textBufferGetPlainText(self.handle, out, len)
         })
     }
 

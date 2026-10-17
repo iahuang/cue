@@ -199,6 +199,15 @@ impl From<sys::ExternalVisualCursor> for VisualCursor {
 /// Highlights style ranges of lines with a [`SyntaxStyle`]'s styles. They
 /// belong to lines by index and don't move with edits, so callers redo them
 /// when the text changes (see [`content_epoch`](Self::content_epoch)).
+/// An edit to an [`EditBuffer`]'s text: bytes `start..old_end` of the text
+/// before it are bytes `start..new_end` of the text after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextChange {
+    pub start: usize,
+    pub old_end: usize,
+    pub new_end: usize,
+}
+
 pub struct EditBuffer {
     handle: sys::Handle,
     /// Kept alive while the native buffer points at it.
@@ -229,8 +238,9 @@ impl EditBuffer {
     /// the start. Returns the undo snapshots recorded: none if it failed.
     ///
     /// Each call keeps a copy of the text for undo in one of the buffer's
-    /// 255 memory slots, which are never freed; after about 250 calls it
-    /// fails. [`replace_changed_lines`](Self::replace_changed_lines) doesn't.
+    /// 255 memory slots, freed only by [`set_text`](Self::set_text); after
+    /// about 250 calls in between it fails.
+    /// [`replace_changed_lines`](Self::replace_changed_lines) doesn't.
     pub fn replace_text(&self, text: &str) -> u32 {
         let replaced = unsafe {
             sys::editBufferReplaceText(self.handle, text.as_ptr(), ffi_len(text.len(), "text"))
@@ -259,6 +269,52 @@ impl EditBuffer {
     /// A number that changes whenever the text does.
     pub fn content_epoch(&self) -> u64 {
         unsafe { sys::editBufferGetContentEpoch(self.handle) }
+    }
+
+    /// The changes made to [`text`](Self::text) since
+    /// [`content_epoch`](Self::content_epoch) was `epoch`, oldest first,
+    /// each in the text as the ones before it left it. `None` if they aren't
+    /// all known: after the whole text was replaced, or too many edits ago.
+    pub fn changes_since(&self, epoch: u64) -> Option<Vec<TextChange>> {
+        let count = self.content_epoch().checked_sub(epoch)?;
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        // The native buffer remembers the last 256.
+        if count > 256 {
+            return None;
+        }
+        let empty = sys::ExternalTextChange {
+            start: 0,
+            old_end: 0,
+            new_end: 0,
+        };
+        let mut out = vec![empty; count as usize];
+        let written = unsafe {
+            sys::editBufferGetChangesSince(self.handle, epoch, out.as_mut_ptr(), count as u32)
+        };
+        let written = usize::try_from(written).ok()?;
+        out.truncate(written);
+        Some(
+            out.into_iter()
+                .map(|c| TextChange {
+                    start: c.start as usize,
+                    old_end: c.old_end as usize,
+                    new_end: c.new_end as usize,
+                })
+                .collect(),
+        )
+    }
+
+    /// The byte of [`text`](Self::text) at an offset (see
+    /// [`LogicalCursor::offset`]).
+    pub fn offset_to_byte(&self, offset: u32) -> usize {
+        unsafe { sys::editBufferOffsetToByte(self.handle, offset) as usize }
+    }
+
+    /// The length of [`text`](Self::text) in bytes, without making it.
+    pub fn text_len(&self) -> usize {
+        self.byte_size() as usize
     }
 
     /// The positions of byte offsets into [`text`](Self::text), which must
@@ -342,8 +398,8 @@ impl EditBuffer {
         if size == 0 {
             return String::new();
         }
-        read_native_string(size + 1, |out| unsafe {
-            sys::editBufferGetText(self.handle, out.as_mut_ptr(), ffi_len(out.len(), "output"))
+        read_native_string(size + 1, |out, len| unsafe {
+            sys::editBufferGetText(self.handle, out, len)
         })
     }
 
@@ -408,6 +464,18 @@ impl EditBuffer {
         true
     }
 
+    /// Undoes up to `steps` snapshots, as [`undo`](Self::undo) does each,
+    /// restoring the cursor once, after the last. Returns how many it undid.
+    pub fn undo_steps(&self, steps: u32) -> u32 {
+        unsafe { sys::editBufferUndoSteps(self.handle, steps) }
+    }
+
+    /// Redoes up to `steps` snapshots, as [`undo_steps`](Self::undo_steps)
+    /// undoes them. Returns how many it redid.
+    pub fn redo_steps(&self, steps: u32) -> u32 {
+        unsafe { sys::editBufferRedoSteps(self.handle, steps) }
+    }
+
     pub fn can_undo(&self) -> bool {
         unsafe { sys::editBufferCanUndo(self.handle) }
     }
@@ -467,6 +535,11 @@ impl EditBuffer {
         unsafe { sys::editBufferPositionToOffset(self.handle, row, col) }
     }
 
+    /// The offset of the end of line `row`, before its line break.
+    pub fn line_end_offset(&self, row: u32) -> u32 {
+        unsafe { sys::editBufferGetLineEndOffset(self.handle, row) }
+    }
+
     /// The line and display column of an offset, if it is inside the text.
     pub fn offset_to_position(&self, offset: u32) -> Option<LogicalCursor> {
         let mut out = sys::ExternalLogicalCursor {
@@ -490,14 +563,8 @@ impl EditBuffer {
         }
         // Offsets count columns; a column holds at most one grapheme, which
         // rarely exceeds 16 bytes.
-        read_native_string((end - start) as usize * 16 + 1, |out| unsafe {
-            sys::editBufferGetTextRange(
-                self.handle,
-                start,
-                end,
-                out.as_mut_ptr(),
-                ffi_len(out.len(), "output"),
-            )
+        read_native_string((end - start) as usize * 16 + 1, |out, len| unsafe {
+            sys::editBufferGetTextRange(self.handle, start, end, out, len)
         })
     }
 
@@ -733,12 +800,8 @@ impl EditorView<'_> {
         }
         let size =
             unsafe { sys::textBufferGetByteSize(sys::editBufferGetTextBuffer(self.edit_buffer)) };
-        read_native_string(size as usize + 1, |out| unsafe {
-            sys::editorViewGetSelectedTextBytes(
-                self.handle,
-                out.as_mut_ptr(),
-                ffi_len(out.len(), "output"),
-            )
+        read_native_string(size as usize + 1, |out, len| unsafe {
+            sys::editorViewGetSelectedTextBytes(self.handle, out, len)
         })
     }
 

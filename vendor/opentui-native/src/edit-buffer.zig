@@ -153,6 +153,11 @@ pub const EditBuffer = struct {
     /// several views of a buffer, the others keep their own scroll position
     /// as the cursor moves. Null: every view follows the cursor.
     cursor_owner: ?*const anyopaque = null,
+    /// Memory slots this buffer registered that nothing will refer to once
+    /// `setTextFromMemId` clears the undo history: whole texts set or
+    /// replaced, and outgrown add buffers. Freed then, but for the text it
+    /// sets (cue patch: they used up the registry's 255 slots).
+    stale_mem_ids: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(
         allocator: Allocator,
@@ -200,6 +205,7 @@ pub const EditBuffer = struct {
         self.events.deinit();
         self.tb.deinit();
         self.cursors.deinit(self.allocator);
+        self.stale_mem_ids.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -309,7 +315,11 @@ pub const EditBuffer = struct {
     }
 
     fn ensureAddCapacity(self: *EditBuffer, need: usize) !void {
+        const old_mem_id = self.add_buffer.mem_id;
         try self.add_buffer.ensureCapacity(self.tb, need);
+        if (self.add_buffer.mem_id != old_mem_id) {
+            self.stale_mem_ids.append(self.allocator, old_mem_id) catch {};
+        }
     }
 
     /// TODO: This method should live in text-buffer-segment.zig and the Rope should take it as comptime param
@@ -388,6 +398,11 @@ pub const EditBuffer = struct {
 
         const insert_offset = iter_mod.coordsToOffset(self.tb.rope(), cursor.row, cursor.col) orelse return EditBufferError.InvalidCursor;
 
+        const before = self.tb.rope().root;
+        // Splitting the rope there rounds as this does.
+        const start_byte = self.tb.offsetToByte(insert_offset);
+        const old_size = self.tb.plainByteSize();
+
         const chunk_ref = self.add_buffer.append(bytes);
         const base_mem_id = chunk_ref.mem_id;
         const base_start = chunk_ref.start;
@@ -433,7 +448,10 @@ pub const EditBuffer = struct {
             };
         }
 
-        self.tb.markViewsDirty();
+        self.tb.noteEdit(before, .{
+            .lines = .{ .start = cursor.row, .old_end = cursor.row, .new_end = self.cursors.items[0].row },
+            .bytes = .{ .start = start_byte, .old_end = start_byte, .new_end = start_byte + (self.tb.plainByteSize() - old_size) },
+        });
         self.events.emit(.cursorChanged);
         self.emitNativeEvent("cursor-changed");
         self.emitNativeEvent("content-changed");
@@ -457,9 +475,16 @@ pub const EditBuffer = struct {
 
         if (start_offset >= end_offset) return;
 
+        const before = self.tb.rope().root;
+        // Splitting the rope there rounds as this does.
+        const start_byte = self.tb.offsetToByte(start_offset);
+        const old_size = self.tb.plainByteSize();
         try self.tb.rope().deleteRangeByWeight(start_offset, end_offset, &self.segment_splitter);
 
-        self.tb.markViewsDirty();
+        self.tb.noteEdit(before, .{
+            .lines = .{ .start = start.row, .old_end = end.row, .new_end = start.row },
+            .bytes = .{ .start = start_byte, .old_end = start_byte + (old_size - self.tb.plainByteSize()), .new_end = start_byte },
+        });
 
         if (self.cursors.items.len > 0) {
             const line_count = self.tb.lineCount();
@@ -619,7 +644,12 @@ pub const EditBuffer = struct {
     /// Set text and completely reset the buffer state (clears history, resets add_buffer)
     pub fn setText(self: *EditBuffer, text: []const u8) !void {
         const owned_text = try self.allocator.dupe(u8, text);
-        const mem_id = try self.tb.registerMemBuffer(owned_text, true);
+        // Once registered, the registry owns it.
+        const mem_id = self.tb.registerMemBuffer(owned_text, true) catch |err| {
+            self.allocator.free(owned_text);
+            return err;
+        };
+        self.stale_mem_ids.append(self.allocator, mem_id) catch {};
         try self.setTextFromMemId(mem_id);
     }
 
@@ -629,6 +659,16 @@ pub const EditBuffer = struct {
         self.add_buffer.len = 0;
 
         try self.tb.setTextFromMemId(mem_id);
+        var kept: usize = 0;
+        for (self.stale_mem_ids.items) |stale| {
+            if (stale == mem_id) {
+                self.stale_mem_ids.items[kept] = stale;
+                kept += 1;
+            } else {
+                self.tb.mem_registry.unregister(stale) catch {};
+            }
+        }
+        self.stale_mem_ids.shrinkRetainingCapacity(kept);
         try self.setCursor(0, 0);
 
         self.emitNativeEvent("content-changed");
@@ -642,6 +682,7 @@ pub const EditBuffer = struct {
             self.allocator.free(owned_text);
             return err;
         };
+        self.stale_mem_ids.append(self.allocator, mem_id) catch {};
         try self.replaceTextFromMemId(mem_id);
     }
 
@@ -756,9 +797,21 @@ pub const EditBuffer = struct {
     }
 
     pub fn undo(self: *EditBuffer) ![]const u8 {
+        return self.undoSteps(1, null);
+    }
+
+    /// Undoes up to `steps` snapshots, restoring the cursor once, after the
+    /// last, so that views lay out again only then. Says in `done` how many
+    /// it undid; fails if it undid none.
+    pub fn undoSteps(self: *EditBuffer, steps: u32, done: ?*u32) ![]const u8 {
         var current_meta_buffer: [64]u8 = undefined;
         const current_meta = try self.encodeCurrentCursorMeta(current_meta_buffer[0..]);
-        const prev_meta = try self.tb.undo(current_meta);
+        var prev_meta = try self.tb.undo(current_meta);
+        var undone: u32 = 1;
+        while (undone < steps) : (undone += 1) {
+            prev_meta = self.tb.undo(current_meta) catch break;
+        }
+        if (done) |count| count.* = undone;
 
         const restored = try self.restoreCursorFromMeta(prev_meta);
 
@@ -767,7 +820,6 @@ pub const EditBuffer = struct {
             try self.setCursor(cursor.row, cursor.col);
         }
 
-        self.tb.markViewsDirty();
         self.events.emit(.cursorChanged);
         self.emitNativeEvent("cursorChanged");
 
@@ -775,7 +827,17 @@ pub const EditBuffer = struct {
     }
 
     pub fn redo(self: *EditBuffer) ![]const u8 {
-        const next_meta = try self.tb.redo();
+        return self.redoSteps(1, null);
+    }
+
+    /// Redoes up to `steps` snapshots, as `undoSteps` undoes them.
+    pub fn redoSteps(self: *EditBuffer, steps: u32, done: ?*u32) ![]const u8 {
+        var next_meta = try self.tb.redo();
+        var redone: u32 = 1;
+        while (redone < steps) : (redone += 1) {
+            next_meta = self.tb.redo() catch break;
+        }
+        if (done) |count| count.* = redone;
 
         const restored = try self.restoreCursorFromMeta(next_meta);
 
@@ -784,7 +846,6 @@ pub const EditBuffer = struct {
             try self.setCursor(cursor.row, cursor.col);
         }
 
-        self.tb.markViewsDirty();
         self.events.emit(.cursorChanged);
         self.emitNativeEvent("cursorChanged");
 

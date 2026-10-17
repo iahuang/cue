@@ -113,7 +113,18 @@ impl Query {
     /// A matcher for the query, or why it isn't a valid regex. A match never
     /// spans lines.
     pub fn matcher(&self) -> Result<RegexMatcher, String> {
+        self.build_matcher(false)
+    }
+
+    /// A matcher for the query in a whole text at once, where `^` and `$`
+    /// match at the start and end of each line. A match never spans lines.
+    pub fn text_matcher(&self) -> Result<RegexMatcher, String> {
+        self.build_matcher(true)
+    }
+
+    fn build_matcher(&self, multi_line: bool) -> Result<RegexMatcher, String> {
         RegexMatcherBuilder::new()
+            .multi_line(multi_line)
             .case_insensitive(!self.case_sensitive)
             .word(self.whole_word)
             .fixed_strings(!self.regex)
