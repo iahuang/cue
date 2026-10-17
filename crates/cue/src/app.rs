@@ -1487,6 +1487,7 @@ impl App {
             }
             Command::TreeRefresh if self.sidebar != Sidebar::Files => self.git.refresh(),
             Command::TreeQuickLook => self.toggle_quick_look(),
+            Command::TreeSwitchView => self.toggle_changes(),
             Command::GitCommit
                 if self.sidebar == Sidebar::Commit && self.visible_tree_width() > 0 =>
             {
@@ -10425,6 +10426,28 @@ mod tests {
     fn wait_for_git(app: &mut App) {
         app.git.wait();
         app.git_changed();
+    }
+
+    #[test]
+    fn tab_switches_the_sidebar_between_files_and_changes() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-tab-sidebar");
+        let mut app = app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+        app.run(Command::FocusTree, false);
+        assert_eq!(app.sidebar, Sidebar::Files);
+
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.sidebar, Sidebar::Changes);
+        assert_eq!(app.focus, Focus::Tree);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.sidebar, Sidebar::Files);
+
+        // In the editor, Tab is still a tab.
+        app.focus = Focus::Editor;
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.sidebar, Sidebar::Files);
+        assert_ne!(app.ed().text(), "a\n", "indented");
     }
 
     #[test]

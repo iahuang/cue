@@ -172,6 +172,7 @@ commands! {
     TreePageUp => "tree:page-up", "File Tree: Page Up";
     TreePageDown => "tree:page-down", "File Tree: Page Down";
     TreeRefresh => "tree:refresh", "File Tree: Refresh";
+    TreeSwitchView => "tree:switch-view", "Sidebar: Switch Between Files and Changes";
     TreeContextMenu => "tree:context-menu", "File Tree: Show Context Menu";
     TreeOpenToSide => "tree:open-to-side", "File Tree: Open to the Side";
     TreeNewFile => "tree:new-file", "File Tree: New File…";
@@ -285,11 +286,12 @@ impl Command {
             | GitPull | GitPush => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
-            | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder | TreeRename
-            | TreeDuplicate | TreeTrash | TreeCopyPath | TreeCopyRelativePath | TreeReveal
-            | TreeOpenInTerminal | TreeRemoveFolder | TreeToggleStaged | TreeCommit | TreeStash
-            | TreeApplyStash | TreePopStash | TreeDropStash | TreeOpenFile | TreeCopyHash
-            | TreeCopyMessage | TreeCheckOut | TreeNewBranch | TreeRevert => Context::Tree,
+            | TreeSwitchView | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder
+            | TreeRename | TreeDuplicate | TreeTrash | TreeCopyPath | TreeCopyRelativePath
+            | TreeReveal | TreeOpenInTerminal | TreeRemoveFolder | TreeToggleStaged
+            | TreeCommit | TreeStash | TreeApplyStash | TreePopStash | TreeDropStash
+            | TreeOpenFile | TreeCopyHash | TreeCopyMessage | TreeCheckOut | TreeNewBranch
+            | TreeRevert => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
@@ -582,6 +584,7 @@ impl Default for Keymap {
             (key(PageDown, Mods::NONE), TreePageDown),
             (key(Char('r'), Mods::CTRL), TreeRefresh),
             (key(Char('r'), SUPER), TreeRefresh),
+            (key(Tab, Mods::NONE), TreeSwitchView),
             // As in VS Code.
             (key(Enter, Mods::CTRL), TreeOpenToSide),
             (key(Enter, SUPER), TreeOpenToSide),
