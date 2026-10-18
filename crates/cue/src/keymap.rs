@@ -67,6 +67,7 @@ commands! {
     GoToSymbol => "editor:go-to-symbol", "Go to Symbol in File…";
     GoToWorkspaceSymbol => "search:symbols", "Go to Symbol in Workspace…";
     GoToDefinition => "editor:go-to-definition", "Go to Definition";
+    Complete => "editor:complete", "Show Completions";
     GoToTerminal => "terminal:go-to", "Go to Terminal…";
     RecoverUnsaved => "file:recover", "Recover Unsaved Changes…";
     SearchWorkspace => "search:workspace", "Search in Workspace";
@@ -531,6 +532,9 @@ impl Default for Keymap {
             (key(Esc, Mods::NONE), ClearSelection),
             // As in VS Code; Ctrl+click goes there too.
             (key(F(12), Mods::NONE), GoToDefinition),
+            // As in VS Code. Legacy terminals send it as NUL, which reads
+            // as Ctrl+Space too.
+            (key(Char(' '), Mods::CTRL), Complete),
             (key(Enter, Mods::NONE), NewLine),
             (key(Tab, Mods::NONE), InsertTab),
             (key(Tab, SHIFT), Outdent),

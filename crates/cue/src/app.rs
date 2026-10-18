@@ -85,6 +85,7 @@ use crate::arrange::{self, Arranging, Before, PanelClip};
 use crate::changes::ChangesView;
 use crate::commit_diff::{CommitDiff, Outcome};
 use crate::commit_view::{CantCommit, CommitAction, CommitView};
+use crate::complete::{self, Completer, Completion};
 use crate::config::{self, Config, MIN_TREE_WIDTH};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
 use crate::definition::{self, Found, Reference};
@@ -470,6 +471,10 @@ pub struct App {
     index_symbols_after_listing: bool,
     /// Go to Definition, waiting for the workspace's symbols.
     pending_definition: Option<PendingDefinition>,
+    /// The words that may finish the one typed, while they pop up.
+    completion: Option<Completion>,
+    /// What completing keeps from one popup to the next.
+    completer: Completer,
     /// The panel whose editor underlines a name, with Ctrl held, to go to
     /// the definition of.
     underlined: Option<PanelId>,
@@ -724,6 +729,8 @@ impl App {
         let mut app = App {
             files: FileIndex::new(&workspace),
             symbols: SymbolIndex::new(&workspace),
+            completion: None,
+            completer: Completer::new(),
             git: Git::new(workspace.roots()),
             changes: ChangesView::new(),
             log: None,
@@ -848,6 +855,7 @@ impl App {
         let action = self.dispatch_key(key);
         self.pressed = Mods::NONE;
         self.after_input();
+        self.sync_completion(Some(key));
         action
     }
 
@@ -995,6 +1003,9 @@ impl App {
         }
         if self.writing_message() {
             return self.message_key(key);
+        }
+        if self.completion_key(key) {
+            return AppAction::Continue;
         }
         let context = match self.focus {
             // Its keys are the picker's.
@@ -1279,6 +1290,7 @@ impl App {
             Command::GoToSymbol => self.show_picker(Mode::Symbols),
             Command::GoToWorkspaceSymbol => self.show_picker(Mode::WorkspaceSymbols),
             Command::GoToDefinition => self.go_to_definition(),
+            Command::Complete => self.show_completion(true),
             Command::CopyReference => return self.copy_reference(),
             Command::GoToTerminal => self.show_picker(Mode::Terminals),
             Command::Palette => self.show_picker(Mode::Commands),
@@ -1609,8 +1621,13 @@ impl App {
             // Motion only updates appearance; it cannot focus or select anything.
             return AppAction::Continue;
         }
+        if self.completion_mouse(mouse) {
+            self.after_input();
+            return AppAction::Continue;
+        }
         let action = self.dispatch_mouse(mouse, now);
         self.after_input();
+        self.sync_completion(None);
         action
     }
 
@@ -2227,6 +2244,7 @@ impl App {
             self.keep_if_edited();
         }
         self.after_input();
+        self.sync_completion(None);
     }
 
     /// Catches up after input: keeps an edited preview, remembers the find
@@ -2369,6 +2387,7 @@ impl App {
         if let Some(look) = &self.quick_look {
             look.draw(frame, &self.keymap);
         }
+        self.draw_completion(frame);
         // Under the popups, which they don't take clicks from.
         self.toasts.draw(frame, self.toast_area());
         let cursor = self.draw_popups(frame, cursor);
@@ -4300,6 +4319,194 @@ impl App {
         if let Some(editor) = panel.and_then(Panel::editor_mut) {
             editor.underline(None);
         }
+    }
+
+    // --- completion -------------------------------------------------------------
+
+    /// Pops up the words that may finish the one typed in the active
+    /// editor (see [`complete`]): with `asked`, as Show Completions does,
+    /// even with nothing typed yet, or in a comment or string.
+    fn show_completion(&mut self, asked: bool) {
+        self.completion = None;
+        if self.focus != Focus::Editor || self.popup_open() {
+            return;
+        }
+        let Some(editor) = self.editor() else {
+            return;
+        };
+        let Some(typed) = editor.typed_word() else {
+            return;
+        };
+        let doc = Rc::clone(editor.document());
+        let mut local = Vec::new();
+        if doc.buffer.line_count() <= complete::MAX_LINES {
+            let text = doc.text();
+            if let Some(cursor) = editor.cursor_byte(&text) {
+                let after = text[cursor..]
+                    .find(|c: char| !complete::is_word_char(c))
+                    .unwrap_or(text.len() - cursor);
+                let word = cursor.saturating_sub(typed.word.len())..cursor + after;
+                let prefix = doc.language.get().and_then(|l| l.command_prefix());
+                local = complete::words(&text, word, Some(typed.row), prefix);
+            }
+        }
+        // The other open files in the language, or plain text.
+        let language = doc.language.get();
+        let family_of = |doc: &Document| doc.language.get().map(|l| definition::family(l.name));
+        let family = family_of(&doc);
+        let documents = self.documents.clone();
+        for other in documents.iter().filter(|other| !Rc::ptr_eq(other, &doc)) {
+            if family_of(other) == family {
+                let words = self.completer.words_of(other, &documents);
+                local.extend(words.iter().cloned());
+            }
+        }
+        if let Some(language) = language {
+            local.extend(complete::keyword_entries(language));
+        }
+        let workspace = match (language.filter(|language| tagged(language)), family) {
+            (Some(_), Some(family)) => {
+                // Indexed for next time, if it never was.
+                if !self.symbols.started() {
+                    self.index_symbols();
+                }
+                self.completer.vocabulary(&self.symbols, family)
+            }
+            _ => Rc::default(),
+        };
+        let mut completion = Completion::new(Rc::downgrade(&doc), &typed, local, workspace, asked);
+        completion.filter(&typed.word, &mut self.completer);
+        if asked && !completion.is_shown() {
+            self.show_message("No completions.", false);
+            return;
+        }
+        self.completion = Some(completion);
+    }
+
+    /// Keeps the completions up with what's typed: matches them to the
+    /// word as it is now, or closes them once the cursor leaves it. After
+    /// `key`, a word character typed, pops them up once the word is long
+    /// enough, if they aren't up already.
+    fn sync_completion(&mut self, key: Option<Key>) {
+        let typed = self
+            .editor()
+            .filter(|_| self.focus == Focus::Editor && !self.popup_open())
+            .filter(|_| self.arranging.is_none())
+            .and_then(|editor| Some((Rc::clone(editor.document()), editor.typed_word()?)));
+        if let Some(completion) = &mut self.completion {
+            let same = typed.as_ref().is_some_and(|(doc, typed)| {
+                completion
+                    .doc
+                    .upgrade()
+                    .is_some_and(|d| Rc::ptr_eq(&d, doc))
+                    && (typed.row, typed.start) == (completion.row, completion.start)
+                    && (completion.asked || !typed.word.is_empty())
+                    // Put away before a word, it's not put away for one.
+                    && !(completion.is_dismissed() && completion.typed().is_empty())
+            });
+            if let (true, Some((_, typed))) = (same, &typed) {
+                if typed.word != completion.typed() {
+                    completion.filter(&typed.word, &mut self.completer);
+                }
+                return;
+            }
+            self.completion = None;
+        }
+        let word_char = key.is_some_and(|key| {
+            key.mods.is_plain() && matches!(key.code, KeyCode::Char(c) if complete::is_word_char(c))
+        });
+        let Some((_, typed)) = typed.filter(|_| word_char && config::get().autocomplete) else {
+            return;
+        };
+        if typed.in_code && !typed.word_after && typed.word.chars().count() >= complete::MIN_TYPED {
+            self.show_completion(false);
+        }
+    }
+
+    /// Up and Down, Page Up and Page Down, Tab, and Esc, while completions
+    /// show: they move through them, take one, or close them. Returns
+    /// whether the key was theirs.
+    fn completion_key(&mut self, key: Key) -> bool {
+        let shown = self.completion.as_ref().is_some_and(Completion::is_shown);
+        if !shown || self.focus != Focus::Editor || key.mods != Mods::NONE {
+            return false;
+        }
+        match key.code {
+            KeyCode::Tab => self.accept_completion(),
+            KeyCode::Esc => {
+                if let Some(completion) = &mut self.completion {
+                    completion.dismiss();
+                }
+            }
+            code => {
+                let Some(completion) = &mut self.completion else {
+                    return false;
+                };
+                match code {
+                    KeyCode::Up => completion.step(-1),
+                    KeyCode::Down => completion.step(1),
+                    KeyCode::PageUp => completion.page(false),
+                    KeyCode::PageDown => completion.page(true),
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// Replaces the word typed with the completion selected.
+    fn accept_completion(&mut self) {
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        let Some(word) = completion.selected().map(str::to_string) else {
+            return;
+        };
+        self.completer.completed(&word);
+        if let Some(editor) = self.editor_mut() {
+            if let Some(typed) = editor.typed_word() {
+                editor.complete(typed.word.chars().count(), &word);
+            }
+        }
+        self.keep_if_edited();
+    }
+
+    /// A mouse event while completions show: a click on one takes it, and
+    /// the wheel over them scrolls them; other clicks and scrolls close
+    /// them and go on as usual. Returns whether the event was theirs.
+    fn completion_mouse(&mut self, mouse: Mouse) -> bool {
+        let Some(completion) = self.completion.as_mut().filter(|c| c.is_shown()) else {
+            return false;
+        };
+        match completion.handle_mouse(mouse) {
+            complete::MouseAction::Continue => true,
+            complete::MouseAction::Accept => {
+                self.accept_completion();
+                true
+            }
+            complete::MouseAction::Pass => false,
+            complete::MouseAction::CloseAndPass => {
+                self.completion = None;
+                false
+            }
+        }
+    }
+
+    /// Draws the completions under the word typed, while they show.
+    fn draw_completion(&self, frame: &Buffer) {
+        let Some(completion) = self.completion.as_ref().filter(|c| c.is_shown()) else {
+            return;
+        };
+        let cell = self
+            .editor()
+            .filter(|_| self.focus == Focus::Editor && !self.popup_open())
+            .and_then(Editor::cursor_cell);
+        let Some((x, y)) = cell else {
+            completion.hide();
+            return;
+        };
+        let x = x.saturating_sub(completion.typed().chars().count() as u32);
+        completion.draw(frame, (x, y), self.width, self.height.saturating_sub(1));
     }
 
     /// Whether a popup is open over the panels.
@@ -15648,6 +15855,117 @@ fn helper() {}
         assert_eq!(path, &root.join("src/a.rs"));
         key(&mut app, KeyCode::Enter);
         assert_eq!(shown_name(&app).as_deref(), Some("a.rs"));
+    }
+
+    fn line_text(app: &App, row: u32) -> String {
+        app.ed()
+            .text()
+            .lines()
+            .nth(row as usize)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn completions(app: &App) -> Option<&str> {
+        app.completion
+            .as_ref()
+            .filter(|completion| completion.is_shown())
+            .and_then(Completion::selected)
+    }
+
+    #[test]
+    fn completions_pop_up_as_words_are_typed() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "completion",
+            &[
+                (
+                    "src/main.rs",
+                    "fn main() {\n    let total_width = 1;\n    \n    // \n}\n",
+                ),
+                ("src/shapes.rs", "pub fn area_of_circle() {}\n"),
+            ],
+        );
+        let mut app = app(&root, Some("src/main.rs"));
+        app.index_symbols();
+        wait_until(&mut app, "the symbols", |app| !app.symbols.indexing());
+
+        // A word of the file, from two characters on; Tab takes it.
+        cursor_to(&mut app, 3, 5);
+        type_text(&mut app, "t");
+        assert_eq!(completions(&app), None, "not from one character");
+        type_text(&mut app, "o");
+        assert_eq!(completions(&app), Some("total_width"));
+        assert!(
+            screen(&app).matches("total_width").count() >= 2,
+            "{}",
+            screen(&app)
+        );
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(line_text(&app, 2), "    total_width");
+        assert_eq!(completions(&app), None);
+        ctrl(&mut app, 'z');
+        assert_eq!(line_text(&app, 2), "    to", "one undo step");
+
+        // A name another file defines, shown with its kind and file.
+        type_text(&mut app, " + ar");
+        assert_eq!(completions(&app), Some("area_of_circle"));
+        assert!(
+            screen(&app).contains("function shapes.rs"),
+            "{}",
+            screen(&app)
+        );
+        // Esc puts it away for the rest of the word; Enter breaks the line.
+        key(&mut app, KeyCode::Esc);
+        type_text(&mut app, "e");
+        assert_eq!(completions(&app), None);
+        type_text(&mut app, " ar");
+        // The word just typed, the nearest, ranks first.
+        assert_eq!(completions(&app), Some("are"), "the next word");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(completions(&app), None);
+        assert_eq!(line_text(&app, 2), "    to + are ar");
+        // Put away with nothing typed, it pops up for the word typed next.
+        app.handle_key(Key::new(KeyCode::Char(' '), Mods::CTRL));
+        assert!(completions(&app).is_some());
+        key(&mut app, KeyCode::Esc);
+        type_text(&mut app, "to");
+        assert_eq!(completions(&app), Some("total_width"));
+        key(&mut app, KeyCode::Esc);
+
+        // Not in comments, unless asked for.
+        cursor_to(&mut app, 5, 8);
+        type_text(&mut app, "to");
+        assert_eq!(completions(&app), None);
+        app.handle_key(Key::new(KeyCode::Char(' '), Mods::CTRL));
+        assert_eq!(completions(&app), Some("total_width"));
+        // Up and Down are its; moving off the word closes it.
+        key(&mut app, KeyCode::Up);
+        assert!(completions(&app).is_some());
+        key(&mut app, KeyCode::Right);
+        assert_eq!(completions(&app), None);
+    }
+
+    #[test]
+    fn latex_completes_commands_with_their_backslash() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "completion-latex",
+            &[("paper.tex", "\\newcommand{\\vecnorm}{x}\n\n")],
+        );
+        let mut app = app(&root, Some("paper.tex"));
+        cursor_to(&mut app, 2, 0);
+        type_text(&mut app, "\\fr");
+        assert_eq!(completions(&app), Some("\\frac"), "a builtin");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(line_text(&app, 1), "\\frac");
+        type_text(&mut app, " \\vecn");
+        assert_eq!(completions(&app), Some("\\vecnorm"), "one the file defines");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(line_text(&app, 1), "\\frac \\vecnorm");
+        // Without the backslash, prose doesn't complete to commands.
+        type_text(&mut app, " fr");
+        assert_eq!(completions(&app), None);
     }
 
     #[test]

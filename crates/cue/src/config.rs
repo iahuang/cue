@@ -39,6 +39,9 @@ pub struct Config {
     pub line_highlight: bool,
     /// `editor.wrap`: whether long lines wrap, at first.
     pub wrap: bool,
+    /// `editor.autocomplete`: whether completions pop up as a word is
+    /// typed, rather than only with Show Completions.
+    pub autocomplete: bool,
     /// `editor.scroll_margin`: the part of the view, up to half, kept
     /// between the cursor and the view's edges.
     pub scroll_margin: f32,
@@ -88,6 +91,7 @@ impl Default for Config {
             indent_guides: true,
             line_highlight: true,
             wrap: true,
+            autocomplete: true,
             scroll_margin: 0.15,
             scroll_lines: 2,
             theme: ThemeSetting::default(),
@@ -119,6 +123,7 @@ pub const TEMPLATE: &str = r#"# Uncomment settings to customize. Save in cue or 
 # indent_guides = true
 # line_highlight = true       # Highlight the cursor's line.
 # wrap = true
+# autocomplete = true         # Suggest words while typing; Ctrl+Space always does.
 # scroll_margin = 0.15        # Cursor margin as a fraction of the view (0–0.5).
 
 [ui]
@@ -268,6 +273,7 @@ impl Config {
                 };
             }
             "editor.wrap" => self.wrap = value.as_bool().ok_or("true or false")?,
+            "editor.autocomplete" => self.autocomplete = value.as_bool().ok_or("true or false")?,
             "editor.indent_guides" => {
                 self.indent_guides = value.as_bool().ok_or("true or false")?
             }
@@ -632,6 +638,7 @@ mod tests {
             indent_guides = false
             line_highlight = false
             wrap = false
+            autocomplete = false
             scroll_margin = 0
             [ui]
             scroll_lines = 5
@@ -659,6 +666,7 @@ mod tests {
                 indent_guides: false,
                 line_highlight: false,
                 wrap: false,
+                autocomplete: false,
                 scroll_margin: 0.0,
                 scroll_lines: 5,
                 theme: ThemeSetting::one(ThemeId::named("Catppuccin Mocha").unwrap()),

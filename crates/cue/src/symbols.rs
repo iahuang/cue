@@ -296,6 +296,8 @@ pub struct SymbolIndex {
     indexing: Option<Receiver<Message>>,
     /// Files to index once the indexing in progress is done.
     again: Option<Vec<PathBuf>>,
+    /// How many indexings completed, to tell when the symbols changed.
+    generation: u64,
 }
 
 impl SymbolIndex {
@@ -307,6 +309,7 @@ impl SymbolIndex {
             complete: false,
             indexing: None,
             again: None,
+            generation: 0,
         }
     }
 
@@ -339,6 +342,18 @@ impl SymbolIndex {
                     .map(|symbol| (path.clone(), symbol.clone()))
             })
             .collect()
+    }
+
+    /// Each file's symbols, as of the last indexing to complete.
+    pub fn files(&self) -> impl Iterator<Item = (&PathBuf, &[Symbol])> {
+        self.cache
+            .iter()
+            .map(|(path, indexed)| (path, indexed.symbols.as_slice()))
+    }
+
+    /// Changes each time an indexing completes.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Indexes `files` in the background, reading only those that changed
@@ -380,6 +395,7 @@ impl SymbolIndex {
                     self.items = Rc::new(items);
                     self.cache = Arc::new(cache);
                     self.complete = true;
+                    self.generation += 1;
                     changed = true;
                     break;
                 }

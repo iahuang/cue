@@ -57,6 +57,39 @@ impl Language {
         }
     }
 
+    /// What starts a command's name, as part of it: LaTeX's `\`.
+    pub fn command_prefix(&self) -> Option<char> {
+        match self.name {
+            "LaTeX" => Some('\\'),
+            _ => None,
+        }
+    }
+
+    /// Names its grammar doesn't spell out but every file may use, such as
+    /// Rust's `usize` and `Some`, or LaTeX's `\section`, to complete.
+    pub fn builtins(&self) -> impl Iterator<Item = &'static str> {
+        const C: &str = include_str!("../queries/c/builtins.txt");
+        const JAVASCRIPT: &str = include_str!("../queries/javascript/builtins.txt");
+        let lists: &[&str] = match self.name {
+            "Rust" => &[include_str!("../queries/rust/builtins.txt")],
+            "Python" => &[include_str!("../queries/python/builtins.txt")],
+            "JavaScript" => &[JAVASCRIPT],
+            "TypeScript" | "TSX" => &[
+                JAVASCRIPT,
+                include_str!("../queries/typescript/builtins.txt"),
+            ],
+            "Go" => &[include_str!("../queries/go/builtins.txt")],
+            "C" => &[C],
+            "C++" => &[C, include_str!("../queries/cpp/builtins.txt")],
+            "LaTeX" => &[include_str!("../queries/latex/builtins.txt")],
+            _ => &[],
+        };
+        lists
+            .iter()
+            .flat_map(|list| list.lines())
+            .filter(|line| !line.is_empty())
+    }
+
     /// Whether a line ending in `:` opens a block, which goes one level
     /// deeper, as in Python.
     pub fn colon_opens_block(&self) -> bool {

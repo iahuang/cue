@@ -9,6 +9,7 @@ mod changes;
 mod client;
 mod commit_diff;
 mod commit_view;
+mod complete;
 mod config;
 mod context_menu;
 mod crash;
@@ -171,12 +172,7 @@ fn help() -> String {
             .map_or(String::new(), |key| key.to_string())
     };
     let commands = Command::ALL.iter().filter(|command| !command.is_secret());
-    let width = commands
-        .clone()
-        .map(|&c| key(c).len())
-        .max()
-        .unwrap_or(0)
-        + 2;
+    let width = commands.clone().map(|&c| key(c).len()).max().unwrap_or(0) + 2;
     for &command in commands {
         let key = key(command);
         help += &format!("  {key:<width$}{:<30}{}\n", command.id(), command.title());

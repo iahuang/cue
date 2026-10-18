@@ -27,6 +27,7 @@ use opentui::{
 };
 
 use crate::autoindent;
+use crate::complete;
 use crate::config::{self, Config};
 use crate::diff::{self, DiffEvent, DiffView, Hunks, LineMark};
 #[cfg(test)]
@@ -652,6 +653,68 @@ impl Editor {
     /// The bytes of the name underlined, if any.
     pub fn underlined(&self) -> Option<&Range<usize>> {
         self.underlined.as_ref()
+    }
+
+    /// The word being typed, to complete: the word characters just before
+    /// the cursor, which may be none, and the language's command prefix
+    /// before them. `None` with text selected, or in
+    /// reader or diff mode.
+    pub fn typed_word(&self) -> Option<complete::Typed> {
+        if self.reading() || self.diffing() || self.has_selection() {
+            return None;
+        }
+        let eb = &*self.buffer;
+        let cursor = eb.cursor();
+        let line_start = eb.position_to_offset(cursor.row, 0);
+        let before = eb.text_range(line_start, cursor.offset);
+        let after = eb.text_range(cursor.offset, eb.line_end_offset(cursor.row));
+        let start = before
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| complete::is_word_char(c))
+            .last()
+            .map_or(before.len(), |(i, _)| i);
+        // A command's prefix starts its name.
+        let prefix = self.doc.language.get().and_then(|l| l.command_prefix());
+        let start = match prefix.filter(|&p| before[..start].ends_with(p)) {
+            Some(prefix) => start - prefix.len_utf8(),
+            None => start,
+        };
+        let word = &before[start..];
+        if word.starts_with(|c: char| c.is_numeric()) {
+            return None;
+        }
+        // What the word's first character is in, or with no word, what's
+        // just before the cursor.
+        let at = match word.is_empty() {
+            true => before.len().saturating_sub(1),
+            false => start,
+        };
+        let (in_code, _) = self.with_regions(cursor.row, 0, |_, line_start, region| {
+            region(line_start + at) == Region::Code
+        });
+        Some(complete::Typed {
+            row: cursor.row,
+            start,
+            word: word.to_string(),
+            in_code,
+            word_after: after.starts_with(complete::is_word_char),
+        })
+    }
+
+    /// Replaces the `typed` characters before the cursor, the word being
+    /// typed, with `word`, as one undo step.
+    pub fn complete(&mut self, typed: usize, word: &str) {
+        self.attach();
+        self.history().break_group();
+        let eb = &*self.buffer;
+        let mut steps = 0;
+        for _ in 0..typed {
+            steps += eb.delete_char_backward();
+        }
+        steps += eb.insert_text(word);
+        self.history().record(EditKind::Other, steps);
+        self.sync_find();
     }
 
     /// Scrolls the cursor's row a third of the way down if it was off screen
