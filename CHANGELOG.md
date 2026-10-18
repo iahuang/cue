@@ -8,7 +8,7 @@
 - Highlight JSON Lines files (`.jsonl`, `.ndjson`) (`d703ec3`)
 - Port fixes from upstream OpenTUI: fish no longer stalls at startup in cue's terminals, bold or underlined text at a row's right edge no longer leaks into the next row, Kitty images stay put in iTerm2 when they move, reloading a file no longer keeps the old text in memory, Up and Down no longer stop inside a tab or wide character, emoji typed in parts take their right width, and terminals redraw when a program changes their colors (`81719f1`)
 - Show control characters in files as one-cell symbols like `␛` and `␇`, which the cursor stops on, instead of sending them to the terminal, where a log's color codes recolored the screen and text after some controls went missing (`12fa7a5`)
-- Autocomplete as you type (or with Ctrl+Space): words of the file and other open files, the language's keywords and common builtins, LaTeX commands with their `\`, and names the workspace defines; Tab takes one, and `editor.autocomplete = false` keeps it to Ctrl+Space
+- Autocomplete as you type (or with Ctrl+Space): words of the file and other open files, the language's keywords and common builtins, LaTeX commands with their `\`, and names the workspace defines; Tab takes one, and `editor.autocomplete = false` keeps it to Ctrl+Space (`aeb4004`)
 
 ## v0.4.5 — 2026-10-16
 
