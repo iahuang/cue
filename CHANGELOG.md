@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.6 — 2026-10-18
 
 - Tab switches the sidebar between the files and the changes while it has focus (`a7250c5`)
 - Fast scrolling, typing, and find in big files (a keystroke in a 100k-line file went from about 130 ms to under 1 ms); find highlights now show only in the panel with the find bar, and only near the view (`d44f6a8`)
