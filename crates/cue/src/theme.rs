@@ -772,7 +772,7 @@ static BUILTIN: &[Def] = &[
     Def {
         name: "Cue Dark",
         light: false,
-        bg: 0x17171a,
+        bg: 0x16171c,
         fg: 0xdde3f0,
         ansi: [
             0x4a4b4d, 0xeb4056, 0x82d2ce, 0xfad075, 0x4b8dec, 0xeb83e2, 0x2ccce6, 0xe0e1e4,
