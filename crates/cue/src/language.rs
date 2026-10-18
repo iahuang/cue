@@ -165,6 +165,11 @@ static LANGUAGES: &[Language] = &[
             || tree_sitter_json::LANGUAGE.into(),
             &[tree_sitter_json::HIGHLIGHTS_QUERY],
         ),
+    // The JSON grammar takes any number of values, one per line or not.
+    language("JSON Lines", &["jsonl", "ndjson"], &[], &["jsonlines"]).highlighted(
+        || tree_sitter_json::LANGUAGE.into(),
+        &[tree_sitter_json::HIGHLIGHTS_QUERY],
+    ),
     language("Python", &["py", "pyi", "pyw"], &[], &["python"])
         .highlighted(
             || tree_sitter_python::LANGUAGE.into(),
@@ -597,6 +602,7 @@ mod tests {
         assert_eq!(name("requirements.txt", ""), Some("Requirements"));
         assert_eq!(name("kernel.cu", ""), Some("C++"), "CUDA");
         assert_eq!(name("shader.frag", ""), Some("GLSL"));
+        assert_eq!(name("events.jsonl", ""), Some("JSON Lines"));
     }
 
     #[test]

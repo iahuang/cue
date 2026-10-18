@@ -147,7 +147,7 @@ pub fn file(name: &str) -> Icon {
         "rs" => ('\u{e7a8}', PEACH),                         // dev-rust
         "toml" => ('\u{e6b2}', GRAY),                        // custom-toml
         "md" | "markdown" | "mdx" => ('\u{e609}', LAVENDER), // seti-markdown
-        "json" | "jsonc" | "json5" => ('\u{e60b}', YELLOW),  // seti-json
+        "json" | "jsonc" | "json5" | "jsonl" | "ndjson" => ('\u{e60b}', YELLOW), // seti-json
         "py" | "pyi" => ('\u{e606}', YELLOW),                // seti-python
         "js" | "mjs" | "cjs" => ('\u{e60c}', YELLOW),        // seti-javascript
         "ts" | "mts" | "cts" => ('\u{e628}', BLUE),          // seti-typescript
