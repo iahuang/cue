@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Make workspace search's matches easier to see in syntax-colored lines, in find's colors (`HASH`)
+
 ## v0.4.6 — 2026-10-18
 
 - Tab switches the sidebar between the files and the changes while it has focus (`a7250c5`)

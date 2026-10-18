@@ -914,10 +914,14 @@ impl SearchModal {
             while syntax.next_if(|(bytes, _)| bytes.end <= byte).is_some() {}
             let hit = matches.iter().position(|m| m.contains(&byte));
             match hit {
-                Some(index) if Some(index) == selected => {
-                    (colors.on_accent, Some(colors.accent), Attributes::BOLD)
-                }
-                Some(_) => (colors.accent, Some(colors.surface), Attributes::BOLD),
+                // Find's colors, without the syntax colors, so a match stands
+                // out from a busily colored line.
+                Some(index) if Some(index) == selected => (
+                    colors.current_match_fg,
+                    Some(colors.current_match_bg),
+                    Attributes::BOLD,
+                ),
+                Some(_) => (colors.text, Some(colors.match_bg), Attributes::BOLD),
                 None => match syntax.peek() {
                     Some((bytes, color)) if bytes.start <= byte => {
                         (color.fg().unwrap_or(colors.text), None, color.attributes())
