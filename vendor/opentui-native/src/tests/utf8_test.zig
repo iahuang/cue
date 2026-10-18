@@ -1658,7 +1658,7 @@ test "getWidthAt: zero width at start of string" {
 test "getWidthAt: control characters" {
     const text = "a\x00b";
     try testing.expectEqual(@as(u32, 1), utf8.getWidthAt(text, 0, 8, .unicode)); // 'a'
-    try testing.expectEqual(@as(u32, 0), utf8.getWidthAt(text, 1, 8, .unicode)); // null
+    try testing.expectEqual(@as(u32, 1), utf8.getWidthAt(text, 1, 8, .unicode)); // null, shown as a glyph (cue patch)
     try testing.expectEqual(@as(u32, 1), utf8.getWidthAt(text, 2, 8, .unicode)); // 'b'
 }
 
@@ -1983,7 +1983,7 @@ test "calculateTextWidth: tabs and spaces mixed" {
 
 test "calculateTextWidth: control characters" {
     const result = utf8.calculateTextWidth("a\x00b\x1Fc", 4, false, .unicode);
-    try testing.expectEqual(@as(u32, 3), result); // Only printable chars: a, b, c
+    try testing.expectEqual(@as(u32, 5), result); // Controls show as one-cell glyphs (cue patch)
 }
 
 test "calculateTextWidth: combining marks" {
@@ -3559,6 +3559,11 @@ test "calculateTextWidth: validate against unicode-width-map.zon" {
         const str = buf[0..len];
 
         const actual_width = utf8.calculateTextWidth(str, 4, false, .unicode);
+        // The map gives controls no width; cue shows them as one-cell glyphs.
+        if (utf8.isShownControl(code_point)) {
+            try testing.expectEqual(@as(u32, 1), actual_width);
+            continue;
+        }
 
         if (actual_width == expected_width) {
             successes += 1;

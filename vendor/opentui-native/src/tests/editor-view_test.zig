@@ -3861,3 +3861,31 @@ test "EditorView - vertical moves keep the desired column and land on cursor-uni
         }
     }
 }
+
+test "EditorView - controls take one cell that the cursor stops on (cue patch)" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    for ([_]utf8.WidthMethod{ .unicode, .wcwidth }) |method| {
+        var eb = try EditBuffer.init(std.testing.allocator, pool, link_pool, method, null);
+        defer eb.deinit();
+        var ev = try EditorView.init(std.testing.allocator, eb, 20, 2);
+        defer ev.deinit();
+        // Tab keeps its own width; CR and LF still break lines.
+        try eb.setText("A\x07B\x1b\x0c\x7f\u{85}\x00\tC\r\nx");
+        try eb.setCursor(0, 0);
+        const stops = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11 };
+        for (stops) |col| {
+            eb.moveRight();
+            try std.testing.expectEqual(col, eb.getPrimaryCursor().col);
+        }
+        try std.testing.expectEqual(@as(u32, 11), eb.tb.lineWidthAt(0));
+        try std.testing.expectEqual(@as(u32, 2), eb.tb.lineCount());
+        try eb.backspace();
+        try eb.backspace();
+        var out: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("A\x07B\x1b\x0c\x7f\u{85}\x00\nx", out[0..eb.getText(&out)]);
+    }
+}

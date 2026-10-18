@@ -455,7 +455,8 @@ fn append(spans: &mut Vec<Span>, span: Span) {
 fn split_width(text: &str, width: usize) -> (&str, &str) {
     let mut used = 0;
     for (i, c) in text.char_indices() {
-        used += c.width().unwrap_or(0);
+        // As `str::width` does, a control counts one column: it draws as a glyph.
+        used += c.width().unwrap_or(1);
         if used > width {
             return text.split_at(i);
         }
@@ -2232,7 +2233,7 @@ pub fn columns(text: &str, range: Range<usize>) -> &str {
             end = i;
             break;
         }
-        col += c.width().unwrap_or(0);
+        col += c.width().unwrap_or(1);
     }
     if start > end {
         return "";

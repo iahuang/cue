@@ -1001,7 +1001,8 @@ fn cells(segments: &[(bool, &str)], colors: &LineColors, tab: usize) -> Vec<Glyp
                 }
                 c => {
                     cells.push((c, color, changed, Some(c)));
-                    col += c.width().unwrap_or(0);
+                    // A control has no width here but draws as a one-cell glyph.
+                    col += c.width().unwrap_or(1);
                 }
             }
         }
@@ -1021,7 +1022,7 @@ fn push_line(
     let mut chunks: Vec<Vec<Glyph>> = vec![Vec::new()];
     let mut col = 0;
     for cell in cells {
-        let w = cell.0.width().unwrap_or(0);
+        let w = cell.0.width().unwrap_or(1);
         if col + w > width && col > 0 {
             chunks.push(Vec::new());
             col = 0;
@@ -1035,7 +1036,7 @@ fn push_line(
         let mut text = Vec::new();
         for &(c, _, _, source) in &chunk {
             text.extend(source.map(|source| (col, source)));
-            col += c.width().unwrap_or(0);
+            col += c.width().unwrap_or(1);
         }
         rows.push(Row {
             what: What::Line {
@@ -1068,7 +1069,7 @@ fn spans(cells: Vec<Glyph>) -> Vec<Span> {
 }
 
 fn text_width(text: &str) -> usize {
-    text.chars().map(|c| c.width().unwrap_or(0)).sum()
+    text.chars().map(|c| c.width().unwrap_or(1)).sum()
 }
 
 #[cfg(test)]

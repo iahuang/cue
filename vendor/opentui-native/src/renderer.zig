@@ -6,6 +6,7 @@ const ansi = @import("ansi.zig");
 const buf = @import("buffer.zig");
 const gp = @import("grapheme.zig");
 const link = @import("link.zig");
+const utf8 = @import("utf8.zig");
 const split_scrollback = @import("split-scrollback.zig");
 const Terminal = @import("terminal.zig");
 const logger = @import("logger.zig");
@@ -1718,12 +1719,13 @@ pub const CliRenderer = struct {
                     };
 
                     if (bytes.len > 0) {
+                        const shown = utf8.shownGraphemeBytes(bytes, &utf8Buf);
                         const capabilities = self.terminal.getCapabilities();
                         const graphemeWidth = gp.charRightExtent(cell.char) + 1;
                         if (capabilities.explicit_width) {
-                            ansi.ANSI.explicitWidthOutput(writer, graphemeWidth, bytes) catch {};
+                            ansi.ANSI.explicitWidthOutput(writer, graphemeWidth, shown) catch {};
                         } else {
-                            writer.writeAll(bytes) catch {};
+                            writer.writeAll(shown) catch {};
                         }
                     }
                 } else if (gp.isContinuationChar(cell.char)) {
@@ -1732,7 +1734,7 @@ pub const CliRenderer = struct {
                     // spaces, or wide graphemes become one extra column wider in
                     // terminal output and table rows can autowrap unexpectedly.
                 } else {
-                    const len = std.unicode.utf8Encode(@intCast(cell.char), &utf8Buf) catch 1;
+                    const len = std.unicode.utf8Encode(utf8.shownCodepoint(@intCast(cell.char)), &utf8Buf) catch 1;
                     writer.writeAll(utf8Buf[0..len]) catch {};
                 }
             }
@@ -2873,12 +2875,13 @@ pub const CliRenderer = struct {
                             std.debug.panic("Fatal: no grapheme bytes in pool for gid {d}: {}", .{ gid, err });
                         };
                         if (bytes.len > 0) {
+                            const shown = utf8.shownGraphemeBytes(bytes, &utf8Buf);
                             const capabilities = self.terminal.getCapabilities();
                             const graphemeWidth = gp.charRightExtent(cell.char) + 1;
                             if (capabilities.explicit_width) {
-                                ansi.ANSI.explicitWidthOutput(writer, graphemeWidth, bytes) catch {};
+                                ansi.ANSI.explicitWidthOutput(writer, graphemeWidth, shown) catch {};
                             } else {
-                                writer.writeAll(bytes) catch {};
+                                writer.writeAll(shown) catch {};
                                 if (capabilities.explicit_cursor_positioning) {
                                     const nextX = x + graphemeWidth;
                                     if (nextX < self.width) {
@@ -2893,7 +2896,7 @@ pub const CliRenderer = struct {
                         if (cell.char >= 32 and cell.char <= 126) {
                             writer.writeByte(@intCast(cell.char)) catch {};
                         } else {
-                            const len = std.unicode.utf8Encode(@intCast(cell.char), &utf8Buf) catch 1;
+                            const len = std.unicode.utf8Encode(utf8.shownCodepoint(@intCast(cell.char)), &utf8Buf) catch 1;
                             writer.writeAll(utf8Buf[0..len]) catch {};
                         }
                     },
@@ -2979,16 +2982,17 @@ pub const CliRenderer = struct {
                         }
                         if (gp.isGraphemeChar(cell.char)) {
                             if (self.pool.get(gp.graphemeIdFromChar(cell.char))) |bytes| {
+                                const shown = utf8.shownGraphemeBytes(bytes, &utf8Buf);
                                 const capabilities = self.terminal.getCapabilities();
                                 const grapheme_width = gp.charRightExtent(cell.char) + 1;
                                 if (capabilities.explicit_width) {
-                                    ansi.ANSI.explicitWidthOutput(writer, grapheme_width, bytes) catch {};
+                                    ansi.ANSI.explicitWidthOutput(writer, grapheme_width, shown) catch {};
                                 } else {
-                                    writer.writeAll(bytes) catch {};
+                                    writer.writeAll(shown) catch {};
                                 }
                             } else |_| {}
                         } else if (!gp.isContinuationChar(cell.char)) {
-                            const draw_char = if (gp.isImageChar(cell.char)) buf.quadrantChars[gp.imageFallbackFromChar(cell.char)] else cell.char;
+                            const draw_char = if (gp.isImageChar(cell.char)) buf.quadrantChars[gp.imageFallbackFromChar(cell.char)] else utf8.shownCodepoint(@intCast(cell.char));
                             if (std.unicode.utf8Encode(@intCast(draw_char), &utf8Buf)) |len| {
                                 writer.writeAll(utf8Buf[0..len]) catch {};
                             } else |_| {}
@@ -3400,10 +3404,11 @@ pub const CliRenderer = struct {
                     } else if (gp.isGraphemeChar(c.char)) {
                         const gid: u32 = gp.graphemeIdFromChar(c.char);
                         const bytes = self.pool.get(gid) catch &[_]u8{};
-                        if (bytes.len > 0) writer.writeAll(bytes) catch return;
+                        var shown_buf: [4]u8 = undefined;
+                        if (bytes.len > 0) writer.writeAll(utf8.shownGraphemeBytes(bytes, &shown_buf)) catch return;
                     } else {
                         var utf8Buf: [4]u8 = undefined;
-                        const len = std.unicode.utf8Encode(@intCast(c.char), &utf8Buf) catch 1;
+                        const len = std.unicode.utf8Encode(utf8.shownCodepoint(@intCast(c.char)), &utf8Buf) catch 1;
                         writer.writeAll(utf8Buf[0..len]) catch return;
                     }
                 } else {

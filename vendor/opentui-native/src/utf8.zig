@@ -413,11 +413,36 @@ pub inline fn eastAsianWidth(cp: u21) u32 {
     return if (width > 0) @intCast(width) else 0;
 }
 
+/// Whether text shows `cp` as a one-cell glyph instead of controlling the terminal (cue patch):
+/// C0 controls other than tab, LF, and CR, which lay out on their own, and DEL and C1 controls.
+pub inline fn isShownControl(cp: u21) bool {
+    return (cp < 0x20 and cp != '\t' and cp != '\n' and cp != '\r') or (cp >= 0x7F and cp < 0xA0);
+}
+
+/// The glyph that output writes for `cp` (cue patch). A control never reaches the terminal:
+/// C0 shows as its Control Picture (U+2400 + cp), DEL as U+2421, and C1, which has none, as U+FFFD.
+pub inline fn shownCodepoint(cp: u21) u21 {
+    if (cp < 0x20) return 0x2400 + cp;
+    if (cp == 0x7F) return 0x2421;
+    if (cp >= 0x80 and cp < 0xA0) return 0xFFFD;
+    return cp;
+}
+
+/// Grapheme bytes to write for a cell (cue patch): a control is its own grapheme, so a lone
+/// control becomes its glyph, encoded in `buf`; other graphemes are written as they are.
+pub fn shownGraphemeBytes(bytes: []const u8, buf: *[4]u8) []const u8 {
+    if (bytes.len == 0 or bytes.len > 2) return bytes;
+    const cp: u21 = if (bytes.len == 1) bytes[0] else std.unicode.utf8Decode(bytes) catch return bytes;
+    if (cp >= 0x20 and !(cp >= 0x7F and cp < 0xA0)) return bytes;
+    const len = std.unicode.utf8Encode(shownCodepoint(cp), buf) catch unreachable;
+    return buf[0..len];
+}
+
 /// Calculate width from east asian width property and Unicode properties
-/// Returns -1 for control characters (they don't contribute to width)
+/// Returns 1 for controls shown as glyphs, and -1 for tab, LF, and CR, which lay out on their own
 inline fn eawToWidth(cp: u21, eaw: uucode.types.EastAsianWidth) i16 {
-    if (cp == 0) return 0;
-    if (cp < 32 or (cp >= 0x7F and cp < 0xA0)) return -1;
+    if (isShownControl(cp)) return 1;
+    if (cp < 32) return -1;
 
     const gc = uucode.get(.general_category, cp);
     switch (gc) {
@@ -527,7 +552,7 @@ inline fn asciiCharWidth(byte: u8, tab_width: u8) u32 {
     } else if (byte >= 32 and byte <= 126) {
         return 1;
     }
-    return 0;
+    return if (isShownControl(byte)) 1 else 0;
 }
 
 /// Calculate the display width of a character (byte or codepoint) in columns
@@ -542,7 +567,7 @@ inline fn charWidth(byte: u8, codepoint: u21, tab_width: u8) u32 {
         const w = eawToWidth(codepoint, eaw);
         return if (w > 0) @intCast(w) else 0;
     }
-    return 0;
+    return if (isShownControl(byte)) 1 else 0;
 }
 
 /// Check if a codepoint is valid for grapheme break detection

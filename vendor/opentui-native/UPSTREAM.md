@@ -28,4 +28,4 @@ To review: `git log --no-merges 'REVIEWED..main' -- packages/native` in an upstr
 - Perf or refactors that conflict with our big-file work: `ca25b668`, `e535b30e`, `8df82955`, `ff2b969b`, `19869ee1`, `205a48b7`, `ddb7fbd6`
 - `d60641be` combining mark that starts a chunk: needs upstream's rewritten draw loop; rare
 - `acf13584`, `78976e0e` highlight leftovers: cue replaces highlights after each reparse, so these only show until then
-- `542275a3` control characters as notation: needs the new ABI. Here, controls in text reach the terminal raw; see the open issue in cue
+- `542275a3` control characters as caret notation: needs the new ABI. Here instead, controls take one cell and output writes their Control Picture (U+FFFD for C1), so they never reach the terminal (`utf8.isShownControl`, `utf8.shownCodepoint`)

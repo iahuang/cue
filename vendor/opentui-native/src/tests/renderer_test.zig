@@ -5169,3 +5169,38 @@ test "renderer - compact output sends only style and cursor changes (cue patch)"
     try std.testing.expect(std.mem.find(u8, output, "\x1b[1;6H\x1b[0;38;2;0;0;255;49mE\x1b[1;8HG") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "\x1b[0m"));
 }
+
+test "renderer shows controls in text as glyphs instead of sending them (cue patch)" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    var local_link_pool = link.LinkPool.init(std.testing.allocator);
+    defer local_link_pool.deinit();
+
+    const text = "A\x07B\x1b[31mC\x0cD\x7fE\u{9b}F\x00";
+    const shown = "A␇B␛[31mC␌D␡E\u{fffd}F␀";
+    for ([_]bool{ false, true }) |styled| {
+        var tb = try TextBuffer.init(std.testing.allocator, pool, &local_link_pool, .unicode);
+        defer tb.deinit();
+        try tb.setText(text);
+        var view = try TextBufferView.init(std.testing.allocator, tb);
+        defer view.deinit();
+        var test_renderer = try TestRenderer.create(std.testing.allocator, 20, 2, pool);
+        defer test_renderer.deinit();
+        const next = test_renderer.renderer.getNextBuffer();
+        // drawText takes the same text through its own path.
+        if (styled) try next.drawText(text, 0, 0, ansi.rgbColor(255, 255, 255, 255), ansi.rgbColor(0, 0, 0, 255), 0) else next.drawTextBuffer(view, 0, 0);
+        try std.testing.expectEqual(renderer.RenderStatus.rendered, test_renderer.renderer.render(true));
+
+        var terminal: ghostty_vt.vt.Terminal = try .init(std.testing.io, std.testing.allocator, .{ .cols = 20, .rows = 2 });
+        defer terminal.deinit(std.testing.allocator);
+        var stream = terminal.vtStream();
+        defer stream.deinit();
+        stream.nextSlice(test_renderer.memory.bytes.items);
+        const screen = try terminal.plainString(std.testing.allocator);
+        defer std.testing.allocator.free(screen);
+        try std.testing.expectEqualStrings(shown, std.mem.trimEnd(u8, std.mem.trimEnd(u8, screen, "\n "), " "));
+        // The file's own SGR would have colored the cells after it.
+        const pages = &terminal.screens.active.pages;
+        try std.testing.expectEqual(pages.getCell(.{ .active = .{ .x = 0 } }).?.style().fg_color, pages.getCell(.{ .active = .{ .x = 7 } }).?.style().fg_color);
+    }
+}
