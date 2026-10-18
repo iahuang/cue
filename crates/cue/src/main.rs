@@ -39,6 +39,7 @@ mod pdf;
 mod picker;
 mod pty;
 mod quick_look;
+mod rain;
 mod reader;
 mod recovery;
 mod relocate;
@@ -169,13 +170,14 @@ fn help() -> String {
             .shortcut(command)
             .map_or(String::new(), |key| key.to_string())
     };
-    let width = Command::ALL
-        .iter()
+    let commands = Command::ALL.iter().filter(|command| !command.is_secret());
+    let width = commands
+        .clone()
         .map(|&c| key(c).len())
         .max()
         .unwrap_or(0)
         + 2;
-    for &command in Command::ALL {
+    for &command in commands {
         let key = key(command);
         help += &format!("  {key:<width$}{:<30}{}\n", command.id(), command.title());
     }

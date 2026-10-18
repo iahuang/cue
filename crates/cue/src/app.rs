@@ -108,6 +108,7 @@ use crate::log::{LogAction, LogView};
 use crate::panel::{HeaderButton, Panel, Visit};
 use crate::picker::{Choice, Item, Mode, Picker, PickerAction};
 use crate::quick_look::QuickLook;
+use crate::rain::Rain;
 use crate::recovery::{self, Orphan, Recovery};
 use crate::scratch::{self, Scratch};
 use crate::search::Toggle;
@@ -411,6 +412,8 @@ pub struct App {
     /// Then it's the active panel: the keyboard and what's opened go to
     /// it, whether or not the sidebar has the keyboard.
     scratch: Scratch,
+    /// The rain on the window, in rain mode.
+    rain: Option<Rain>,
     /// The box asking for a new name, while it's open.
     input: Option<(InputBox, Naming)>,
     /// Messages, over the bottom right of the screen.
@@ -751,6 +754,7 @@ impl App {
             next_tab: 1,
             next_panel: 1,
             scratch: Scratch::new(),
+            rain: None,
             input: None,
             toasts: Toasts::default(),
             clipboard: None,
@@ -881,7 +885,13 @@ impl App {
         let idle = self
             .shown_highlighters(|syntax, _| syntax.is_stale())
             .then_some(Duration::ZERO);
-        switcher.into_iter().chain(drag).chain(idle).min()
+        let rain = self.rain.as_ref().map(|rain| rain.wakes_in(now));
+        switcher
+            .into_iter()
+            .chain(drag)
+            .chain(idle)
+            .chain(rain)
+            .min()
     }
 
     /// Does what waits for the user to stop typing: parsing the text on
@@ -1201,6 +1211,9 @@ impl App {
 
     /// Runs `command`. With `select`, a cursor movement extends the selection.
     pub fn run(&mut self, command: Command, select: bool) -> AppAction {
+        if command.is_secret() && !config::get().secret_mode {
+            return AppAction::Continue;
+        }
         match command {
             Command::Quit => return self.quit(),
             Command::Restart => return AppAction::Restart,
@@ -1294,6 +1307,12 @@ impl App {
             Command::ToggleZoom => self.toggle_zoom(),
             Command::ArrangePanels => self.toggle_arranging(),
             Command::ToggleScratchpad => self.toggle_scratch(),
+            Command::ToggleRain => {
+                self.rain = match self.rain {
+                    Some(_) => None,
+                    None => Some(Rain::new(Instant::now())),
+                };
+            }
             // Esc puts the scratchpad away, when what it shows has no use
             // for it.
             Command::ClearSelection
@@ -1583,6 +1602,10 @@ impl App {
             .then_some((mouse.x, mouse.y));
         self.underline_reference(mouse);
         if mouse.kind == MouseKind::Move {
+            // Like a finger on the glass.
+            if let Some(rain) = &mut self.rain {
+                rain.wipe(mouse.x, mouse.y);
+            }
             // Motion only updates appearance; it cannot focus or select anything.
             return AppAction::Continue;
         }
@@ -2339,6 +2362,10 @@ impl App {
                 cursor = message_cursor;
             }
         }
+        // Over everything but what pops up.
+        if let Some(rain) = &self.rain {
+            rain.draw(frame);
+        }
         if let Some(look) = &self.quick_look {
             look.draw(frame, &self.keymap);
         }
@@ -2564,6 +2591,9 @@ impl App {
         let mut changed = self.toasts.expire(now);
         // A thread finished something to show, such as a PDF's page.
         changed |= wake::take();
+        if let Some(rain) = &mut self.rain {
+            changed |= rain.step(now, self.width, self.height);
+        }
         for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
             if let Some(image) = panel.image_mut() {
                 changed |= image.poll();
@@ -3917,7 +3947,9 @@ impl App {
                 // session commands as it is one or not.
                 let terminal = self.active_terminal().is_some();
                 let session = self.session.is_some();
+                let secret = config::get().secret_mode;
                 let available = |command: Command| match command {
+                    command if command.is_secret() => secret,
                     Command::KeepSession => !session && self.sessions.is_some(),
                     Command::EndSession | Command::RenameSession => session,
                     Command::Detach => self.sessions.is_some(),
@@ -5158,6 +5190,9 @@ impl App {
             for editor in panel.editors_mut() {
                 editor.follow_settings(&old, &new);
             }
+        }
+        if !new.secret_mode {
+            self.rain = None;
         }
         if new.exclude != old.exclude {
             self.tree.refresh();

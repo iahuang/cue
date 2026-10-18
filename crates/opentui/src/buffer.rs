@@ -109,6 +109,59 @@ impl Buffer {
         }
     }
 
+    /// Changes cell colors to what `f` makes of them, given each cell's
+    /// column and row and its foreground and background, without changing
+    /// text or attributes.
+    pub fn map_colors(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        mut f: impl FnMut(u32, u32, Rgba, Rgba) -> (Rgba, Rgba),
+    ) {
+        let fg = unsafe { sys::bufferGetFgPtr(self.handle) };
+        let bg = unsafe { sys::bufferGetBgPtr(self.handle) };
+        if fg.is_null() || bg.is_null() {
+            return;
+        }
+        let (buffer_width, buffer_height) = (self.width(), self.height());
+        for row in y..y.saturating_add(height).min(buffer_height) {
+            for col in x..x.saturating_add(width).min(buffer_width) {
+                let index = row as usize * buffer_width as usize + col as usize;
+                let (fg_cell, bg_cell) = unsafe { (fg.add(index), bg.add(index)) };
+                let (new_fg, new_bg) = f(
+                    col,
+                    row,
+                    Rgba(unsafe { *fg_cell }),
+                    Rgba(unsafe { *bg_cell }),
+                );
+                unsafe {
+                    *fg_cell = new_fg.0;
+                    *bg_cell = new_bg.0;
+                }
+            }
+        }
+    }
+
+    /// The character in cell (`x`, `y`), if it's a single plain one: not
+    /// part of a grapheme cluster or wide character, nor an image's.
+    pub fn char_at(&self, x: u32, y: u32) -> Option<char> {
+        if x >= self.width() || y >= self.height() {
+            return None;
+        }
+        let index = y as usize * self.width() as usize + x as usize;
+        let chars = unsafe { sys::bufferGetCharPtr(self.handle) };
+        if chars.is_null() {
+            return None;
+        }
+        // The top two bits flag graphemes, their continuations, and images.
+        let raw = unsafe { *chars.add(index) };
+        (raw & 0xC000_0000 == 0)
+            .then(|| char::from_u32(raw))
+            .flatten()
+    }
+
     /// Blends a tint into cell backgrounds without changing text or attributes.
     pub fn tint_background(&self, x: u32, y: u32, width: u32, height: u32, tint: Rgba) {
         let bg = unsafe { sys::bufferGetBgPtr(self.handle) };

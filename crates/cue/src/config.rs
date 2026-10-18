@@ -74,6 +74,10 @@ pub struct Config {
     /// command, or with none, unbinding it (see
     /// [`Keymap::new`](crate::keymap::Keymap::new)).
     pub keys: Vec<(Key, Option<Command>)>,
+    /// `ui.secret_mode`: whether the secret commands (see
+    /// [`Command::is_secret`]) can be run. Left out of the template on
+    /// purpose.
+    pub secret_mode: bool,
 }
 
 impl Default for Config {
@@ -97,6 +101,7 @@ impl Default for Config {
             scrollback: 10 * 1024 * 1024,
             exclude: Vec::new(),
             keys: Vec::new(),
+            secret_mode: false,
         }
     }
 }
@@ -307,6 +312,7 @@ impl Config {
             }
             "ui.cursor_color" => self.cursor_color = value.as_bool().ok_or("true or false")?,
             "ui.nerd_font" => self.nerd_font = value.as_bool().ok_or("true or false")?,
+            "ui.secret_mode" => self.secret_mode = value.as_bool().ok_or("true or false")?,
             "ui.tree" => self.tree = value.as_bool().ok_or("true or false")?,
             "ui.tree_width" => {
                 const EXPECTED: &str = "a number from 12 to 1000";
@@ -636,6 +642,7 @@ mod tests {
             tree = false
             tree_width = 40
             toast_position = "top-left"
+            secret_mode = true
             [terminal]
             shell = "/bin/bash"
             scrollback = "512 KB"
@@ -665,6 +672,7 @@ mod tests {
                 scrollback: 512 * 1024,
                 exclude: vec!["target".to_string()],
                 keys: Vec::new(),
+                secret_mode: true,
             }
         );
         assert_eq!(parse("editor.indent = 2").0.indent, Indent::Spaces(2));

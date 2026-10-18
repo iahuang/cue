@@ -127,6 +127,7 @@ commands! {
     ToggleZoom => "panel:toggle-zoom", "Zoom or Unzoom Panel";
     ArrangePanels => "panel:arrange", "Arrange Panels";
     ToggleScratchpad => "scratchpad:toggle", "Show or Hide Scratchpad";
+    ToggleRain => "app:toggle-rain", "Toggle Rain Mode";
     PanelContextMenu => "panel:context-menu", "Show Panel Menu";
     EditorContextMenu => "editor:context-menu", "Show Editor Context Menu";
     Pop => "panel:pop", "Pop";
@@ -268,6 +269,12 @@ impl Context {
 }
 
 impl Command {
+    /// Whether the command is undocumented, left out of `--help` and run
+    /// only with `ui.secret_mode` on.
+    pub fn is_secret(self) -> bool {
+        matches!(self, Command::ToggleRain)
+    }
+
     /// Where this command's key bindings apply.
     pub fn context(self) -> Context {
         use Command::*;
@@ -277,9 +284,9 @@ impl Command {
             | OpenFile | GoToFile | GoToUnsaved | GoToLine | GoToSymbol | GoToWorkspaceSymbol
             | GoToTerminal | RecoverUnsaved | SearchWorkspace | Find | FindReplace | FindNext
             | FindPrevious | ToggleTree | FocusTree | ToggleChanges | FocusEditor | SplitRight
-            | SplitDown | ClosePanel | ToggleZoom | ArrangePanels | ToggleScratchpad | Pop
-            | GoBack | GoForward | RecentlyViewed | SetMark | JumpToMark | FocusPanelLeft
-            | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal
+            | SplitDown | ClosePanel | ToggleZoom | ArrangePanels | ToggleScratchpad
+            | ToggleRain | Pop | GoBack | GoForward | RecentlyViewed | SetMark | JumpToMark
+            | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal
             | GoToWaitingTerminal | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
             | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5
             | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch
