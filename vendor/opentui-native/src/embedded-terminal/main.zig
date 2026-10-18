@@ -95,6 +95,7 @@ pub const EmbeddedTerminal = struct {
         handler.effects.clipboard_write = &clipboardWrite;
         handler.effects.bell = &bell;
         handler.effects.desktop_notification = &desktopNotification;
+        handler.effects.device_attributes = &deviceAttributes;
         self.stream = .init(.{ .allocator = allocator, .handler = handler });
         return self;
     }
@@ -334,12 +335,16 @@ pub const EmbeddedTerminal = struct {
     }
 
     pub fn compose(self: *EmbeddedTerminal, target: *buffer.OptimizedBuffer, x: i32, y: i32) Error!void {
+        const fg, const bg = .{ self.render_state.colors.foreground, self.render_state.colors.background };
         self.render_state.update(self.allocator, &self.terminal) catch |err| {
             self.render_state.deinit(self.allocator);
             self.render_state = .empty;
             self.force_redraw = true;
             return err;
         };
+        // Ghostty does not dirty rows when OSC 10/11/110/111 or reverse video change the default colors.
+        const colors = &self.render_state.colors;
+        if (!std.meta.eql(fg, colors.foreground) or !std.meta.eql(bg, colors.background)) self.force_redraw = true;
         try self.search.highlight(self.allocator, &self.render_state);
         const background = if (self.ownBackground()) null else self.default_background;
         if (!std.meta.eql(background, self.composed_background)) {
@@ -524,6 +529,10 @@ pub const EmbeddedTerminal = struct {
         self.responses.appendSlice(self.allocator, data) catch {
             self.response_error = error.OutOfMemory;
         };
+    }
+
+    fn deviceAttributes(_: *ghostty.TerminalStream.Handler) ghostty.DeviceAttributes {
+        return .{};
     }
 };
 

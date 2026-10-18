@@ -62,6 +62,38 @@ test "embedded terminal redraws changed rows and clips composition" {
     try std.testing.expectEqual(buffer.DEFAULT_SPACE_CHAR, target.get(0, 1).?.char);
 }
 
+test "embedded terminal redraws every row when default colors change" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    var target = try buffer.OptimizedBuffer.init(std.testing.allocator, 4, 2, .{ .pool = pool });
+    defer target.deinit();
+
+    const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 4, .rows = 2 });
+    defer terminal.deinit();
+    terminal.setDefaultColors(ansi.rgbColor(255, 255, 255, 255), ansi.rgbColor(0, 0, 0, 255), null);
+    try terminal.write("a");
+    try terminal.compose(target, 0, 0);
+
+    // No step writes row 1, so its sentinel survives unless every row is redrawn.
+    const steps = [_]struct { write: []const u8, full: bool }{
+        .{ .write = "\x1b[1;1Hb", .full = false },
+        .{ .write = "\x1b]10;rgb:00/00/ff\x07", .full = true },
+        .{ .write = "\x1b[?5h", .full = true },
+        .{ .write = "\x1b[?5h\x1b[1;1Hc", .full = false },
+        .{ .write = "\x1b[?5l", .full = true },
+        .{ .write = "\x1b]110\x07", .full = true },
+    };
+    for (steps, 0..) |step, index| {
+        errdefer std.debug.print("step {d}\n", .{index});
+        var sentinel = target.get(0, 1).?;
+        sentinel.char = 'Q';
+        target.set(0, 1, sentinel);
+        try terminal.write(step.write);
+        try terminal.compose(target, 0, 0);
+        try std.testing.expectEqual(step.full, target.get(0, 1).?.char != 'Q');
+    }
+}
+
 test "embedded terminal exposes cursor state" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();
@@ -294,16 +326,19 @@ test "embedded terminal drains generated PTY responses incrementally" {
     const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 20, .rows = 4 });
     defer terminal.deinit();
 
-    try terminal.write("\x1b[5n");
-    var first: [2]u8 = undefined;
-    var rest: [16]u8 = undefined;
-    const first_len = try terminal.drainResponses(&first);
-    const rest_len = try terminal.drainResponses(&rest);
-
-    var combined: [18]u8 = undefined;
-    @memcpy(combined[0..first_len], first[0..first_len]);
-    @memcpy(combined[first_len .. first_len + rest_len], rest[0..rest_len]);
-    try std.testing.expectEqualStrings("\x1b[0n", combined[0 .. first_len + rest_len]);
+    const cases = [_]struct { query: []const u8, reply: []const u8 }{
+        .{ .query = "\x1b[5n", .reply = "\x1b[0n" },
+        .{ .query = "\x1b[c", .reply = "\x1b[?62;22c" },
+        .{ .query = "\x1b[>c", .reply = "\x1b[>1;0;0c" },
+        .{ .query = "\x1b[=c", .reply = "\x1bP!|00000000\x1b\\" },
+    };
+    for (cases) |case| {
+        try terminal.write(case.query);
+        var output: [64]u8 = undefined;
+        const first_len = try terminal.drainResponses(output[0..2]);
+        const rest_len = try terminal.drainResponses(output[first_len..]);
+        try std.testing.expectEqualStrings(case.reply, output[0 .. first_len + rest_len]);
+    }
 }
 
 test "embedded terminal preserves queued responses when the bound is reached" {

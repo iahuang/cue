@@ -2,6 +2,8 @@ const vt = @import("../ghostty-vt.zig").vt;
 
 pub const Terminal = vt.Terminal;
 pub const TerminalStream = vt.TerminalStream;
+// lib-vt does not export the device attributes type; take it from the effect's signature.
+pub const DeviceAttributes = @typeInfo(@typeInfo(@typeInfo(@FieldType(TerminalStream.Handler.Effects, "device_attributes")).optional.child).pointer.child).@"fn".return_type.?;
 pub const Coordinate = vt.Coordinate;
 pub const RenderState = vt.RenderState;
 pub const Selection = vt.Selection;

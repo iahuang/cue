@@ -3,6 +3,7 @@ const edit_buffer = @import("../edit-buffer.zig");
 const text_buffer_view = @import("../text-buffer-view.zig");
 const gp = @import("../grapheme.zig");
 const link = @import("../link.zig");
+const utf8 = @import("../utf8.zig");
 const iter_mod = @import("../text-buffer-iterators.zig");
 const seg_mod = @import("../text-buffer-segment.zig");
 
@@ -1993,4 +1994,73 @@ test "EditBuffer - setText frees the slots of earlier texts and add buffers" {
     try std.testing.expectEqualStrings("text 399", out[0..eb.getText(&out)]);
     _ = try eb.redo();
     try std.testing.expectEqualStrings("more text 399", out[0..eb.getText(&out)]);
+}
+
+const Piece = struct { col: ?u32 = null, bytes: []const u8 };
+
+fn insertPieces(pool: *gp.GraphemePool, link_pool: *link.LinkPool, method: utf8.WidthMethod, pieces: []const Piece) !*EditBuffer {
+    const eb = try EditBuffer.init(std.testing.allocator, pool, link_pool, method, null);
+    errdefer eb.deinit();
+    for (pieces) |piece| {
+        if (piece.col) |col| try eb.setCursor(eb.getPrimaryCursor().row, col);
+        try eb.insertText(piece.bytes);
+    }
+    return eb;
+}
+
+test "EditBuffer - text typed in pieces measures and moves like the same text set at once" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+    // `text` defaults to the pieces joined in order; `before` (default `text`) ends where typing leaves the cursor.
+    const Case = struct { pieces: []const Piece, text: ?[]const u8 = null, before: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .pieces = &.{ .{ .bytes = "h" }, .{ .bytes = "e" }, .{ .bytes = "l" }, .{ .bytes = "l" }, .{ .bytes = "o" } } },
+        .{ .pieces = &.{ .{ .bytes = "abc" }, .{ .col = 0, .bytes = "xyz" } }, .text = "xyzabc", .before = "xyz" },
+        .{ .pieces = &.{ .{ .bytes = "ab" }, .{ .bytes = "\n" }, .{ .bytes = "c" }, .{ .bytes = "d" } } },
+        .{ .pieces = &.{ .{ .bytes = "\u{4f60}" }, .{ .bytes = "\u{597d}" } } },
+        // A later piece continues the grapheme that the previous piece ends with.
+        .{ .pieces = &.{ .{ .bytes = "\u{1f44d}" }, .{ .bytes = "\u{1f3fd}" }, .{ .bytes = "bc" } } },
+        .{ .pieces = &.{ .{ .bytes = "\u{1f44d}" }, .{ .bytes = "\u{1f3fd}\nx" } } },
+                .{ .pieces = &.{ .{ .bytes = "X" }, .{ .col = 0, .bytes = "\u{1f44d}" }, .{ .bytes = "\u{1f3fd}" } }, .text = "\u{1f44d}\u{1f3fd}X", .before = "\u{1f44d}\u{1f3fd}" },
+        .{ .pieces = &.{ .{ .bytes = "\u{1f468}" }, .{ .bytes = "\u{200d}" }, .{ .bytes = "\u{1f469}" }, .{ .bytes = "\u{200d}\u{1f467}" } } },
+        .{ .pieces = &.{ .{ .bytes = "\u{1f1fa}" }, .{ .bytes = "\u{1f1f8}" } } },
+        .{ .pieces = &.{ .{ .bytes = "\u{ac01}" }, .{ .bytes = "\u{11a8}" } } },
+        .{ .pieces = &.{ .{ .bytes = "\u{263a}" }, .{ .bytes = "\u{fe0f}" } } },
+        .{ .pieces = &.{ .{ .bytes = "\u{65e5}" }, .{ .bytes = "\u{301}" } } },
+        .{ .pieces = &.{ .{ .bytes = "\u{e01}" }, .{ .bytes = "\u{e35}" } } },
+    };
+    for ([_]utf8.WidthMethod{ .wcwidth, .unicode, .unicode_wide, .no_zwj }) |method| for (cases) |case| {
+        var joined: [64]u8 = undefined;
+        var joined_len: usize = 0;
+        for (case.pieces) |piece| {
+            @memcpy(joined[joined_len..][0..piece.bytes.len], piece.bytes);
+            joined_len += piece.bytes.len;
+        }
+        const text = case.text orelse joined[0..joined_len];
+        const edited = try insertPieces(pool, link_pool, method, case.pieces);
+        defer edited.deinit();
+        const fresh = try EditBuffer.init(std.testing.allocator, pool, link_pool, method, null);
+        defer fresh.deinit();
+        try fresh.setText(case.before orelse text);
+        const last_row = fresh.tb.lineCount() - 1;
+        try fresh.setCursor(last_row, fresh.tb.lineWidthAt(last_row));
+        try std.testing.expectEqualDeep(fresh.getPrimaryCursor(), edited.getPrimaryCursor());
+        try fresh.setText(text);
+        var out: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(text, out[0..edited.getText(&out)]);
+        for (0..edited.tb.rope().count()) |i| {
+            const chunk = edited.tb.rope().get(@intCast(i)).?.asText() orelse continue;
+            try std.testing.expectEqual(edited.tb.measureText(chunk.getBytes(edited.tb.memRegistry())), chunk.width_cols);
+        }
+        // Right stops where it does in the fresh text.
+        try edited.setCursor(0, 0);
+        try fresh.setCursor(0, 0);
+        for (0..text.len + 1) |_| {
+            try std.testing.expectEqualDeep(fresh.getPrimaryCursor(), edited.getPrimaryCursor());
+            edited.moveRight();
+            fresh.moveRight();
+        }
+    };
 }

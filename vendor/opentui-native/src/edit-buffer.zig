@@ -190,7 +190,7 @@ pub const EditBuffer = struct {
             .cursors = cursors,
             .allocator = allocator,
             .events = event_emitter.EventEmitter(EditBufferEvent).init(allocator),
-            .segment_splitter = .{ .ctx = self, .splitFn = splitSegmentCallback },
+            .segment_splitter = .{ .ctx = self, .splitFn = splitSegmentCallback, .mergeFn = mergeSegmentCallback },
             .event_sink = event_sink,
         };
 
@@ -386,6 +386,12 @@ pub const EditBuffer = struct {
         }
     }
 
+    /// A grapheme can continue across the join, so widths do not add; measure the joined bytes.
+    fn mergeSegmentCallback(ctx: ?*anyopaque, left: *const Segment, right: *const Segment) Segment {
+        const edit_buf = @as(*EditBuffer, @ptrCast(@alignCast(ctx.?)));
+        return .{ .text = edit_buf.tb.createChunk(left.text.mem_id, left.text.byte_start, right.text.byte_end) };
+    }
+
     pub fn insertText(self: *EditBuffer, bytes: []const u8) !void {
         if (bytes.len == 0) return;
         if (self.cursors.items.len == 0) return;
@@ -410,8 +416,6 @@ pub const EditBuffer = struct {
         var result = try self.tb.textToSegments(self.allocator, bytes, base_mem_id, base_start, false);
         defer result.segments.deinit(result.allocator);
 
-        const inserted_width_cols = result.total_width_cols;
-
         // Calculate width after last break
         var width_after_last_break: u32 = 0;
         var num_breaks: usize = 0;
@@ -424,9 +428,12 @@ pub const EditBuffer = struct {
             }
         }
 
+        const old_weight = self.tb.rope().totalWeight();
         if (result.segments.items.len > 0) {
             try self.tb.rope().insertSliceByWeight(insert_offset, result.segments.items, &self.segment_splitter);
         }
+        // A merge can change the width before the insert, but the text after it keeps its weight.
+        const end_offset = self.tb.rope().totalWeight() - (old_weight - insert_offset);
         if (num_breaks > 0) {
             const new_row = cursor.row + @as(u32, @intCast(num_breaks));
             const new_col = width_after_last_break;
@@ -438,13 +445,12 @@ pub const EditBuffer = struct {
                 .offset = new_offset,
             };
         } else {
-            const new_col = cursor.col + inserted_width_cols;
-            const new_offset = iter_mod.coordsToOffset(self.tb.rope(), cursor.row, new_col) orelse 0;
+            const new_col = end_offset - (insert_offset - cursor.col);
             self.cursors.items[0] = .{
                 .row = cursor.row,
                 .col = new_col,
                 .desired_col = new_col,
-                .offset = new_offset,
+                .offset = end_offset,
             };
         }
 
@@ -600,45 +606,40 @@ pub const EditBuffer = struct {
 
     pub fn moveUp(self: *EditBuffer) void {
         if (self.cursors.items.len == 0) return;
-        const cursor = &self.cursors.items[0];
-
-        if (cursor.row > 0) {
-            if (cursor.desired_col == 0) {
-                cursor.desired_col = cursor.col;
-            }
-
-            cursor.row -= 1;
-
-            const line_width = iter_mod.lineWidthAt(self.tb.rope(), cursor.row);
-
-            cursor.col = @min(cursor.desired_col, line_width);
-            cursor.offset = iter_mod.coordsToOffset(self.tb.rope(), cursor.row, cursor.col) orelse 0;
-        }
-
+        if (self.cursors.items[0].row > 0) self.moveToRow(self.cursors.items[0].row - 1);
         self.events.emit(.cursorChanged);
         self.emitNativeEvent("cursor-changed");
     }
 
     pub fn moveDown(self: *EditBuffer) void {
         if (self.cursors.items.len == 0) return;
-        const cursor = &self.cursors.items[0];
-
-        const line_count = self.tb.getLineCount();
-        if (cursor.row + 1 < line_count) {
-            if (cursor.desired_col == 0) {
-                cursor.desired_col = cursor.col;
-            }
-
-            cursor.row += 1;
-
-            const line_width = iter_mod.lineWidthAt(self.tb.rope(), cursor.row);
-
-            cursor.col = @min(cursor.desired_col, line_width);
-            cursor.offset = iter_mod.coordsToOffset(self.tb.rope(), cursor.row, cursor.col) orelse 0;
-        }
-
+        if (self.cursors.items[0].row + 1 < self.tb.getLineCount()) self.moveToRow(self.cursors.items[0].row + 1);
         self.events.emit(.cursorChanged);
         self.emitNativeEvent("cursor-changed");
+    }
+
+    /// Keeps the desired column, so a later move can return to it.
+    fn moveToRow(self: *EditBuffer, row: u32) void {
+        const cursor = &self.cursors.items[0];
+        if (cursor.desired_col == 0) cursor.desired_col = cursor.col;
+        cursor.row = row;
+        cursor.col = self.snapColumn(row, @min(cursor.desired_col, iter_mod.lineWidthAt(self.tb.rope(), row)));
+        cursor.offset = iter_mod.coordsToOffset(self.tb.rope(), row, cursor.col) orelse 0;
+    }
+
+    /// Returns the start of the cursor unit (grapheme, code point, or tab) that covers `col`, so a
+    /// cursor does not land on the second cell of a wide unit.
+    pub fn snapColumn(self: *EditBuffer, row: u32, col: u32) u32 {
+        const text = self.tb;
+        const bounds = iter_mod.getCursorUnitBoundsAt(text.rope(), text.memRegistry(), row, col, text.tabWidth(), text.widthMethod());
+        return if (bounds) |unit| unit.start else col;
+    }
+
+    /// Returns the column that the last vertical move asked for: the unsnapped desired column
+    /// when the cursor sits on its snapped start, else the cursor column.
+    pub fn unsnappedColumn(self: *EditBuffer) u32 {
+        const cursor = self.getPrimaryCursor();
+        return if (self.snapColumn(cursor.row, cursor.desired_col) == cursor.col) cursor.desired_col else cursor.col;
     }
 
     /// Set text and completely reset the buffer state (clears history, resets add_buffer)

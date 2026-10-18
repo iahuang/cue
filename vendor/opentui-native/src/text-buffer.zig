@@ -56,6 +56,11 @@ pub const LineChange = seg_mod.LineChange;
 pub const TextChange = seg_mod.TextChange;
 pub const Edit = seg_mod.Edit;
 
+// A static empty document, so releasing a rope never allocates. Every buffer shares
+// these read-only nodes; rope code mutates only branches and counted text leaves.
+const empty_document_line: UnifiedRope.Node = .{ .leaf = .{ .data = .{ .linestart = {} } } };
+const empty_document_sentinel: UnifiedRope.Node = .{ .leaf = .{ .data = Segment.empty(), .is_sentinel = true } };
+
 pub const UnifiedTextBuffer = struct {
     const Self = UnifiedTextBuffer;
 
@@ -633,14 +638,39 @@ pub const UnifiedTextBuffer = struct {
         return utf8.calculateTextWidth(text, self.tab_width, is_ascii, self.width_method);
     }
 
-    /// Clear the text content without resetting arena or memory registry.
-    /// Preserves highlights, memory buffers, and arena allocations.
-    /// Use this for frequent text updates where undo/redo history should be preserved.
+    /// Clear the text content without resetting the memory registry or highlights.
+    /// Without undo history, this releases every node of the previous document.
+    /// With history, old roots stay reachable, so the rope clears in place.
     pub fn clear(self: *Self) void {
         self.clearLinkRefs();
         self.layout_cache.clear();
-        self._rope.clear();
+        if (self._rope.hasHistory()) {
+            self._rope.clear();
+        } else {
+            self.releaseRope();
+        }
         self.markAllViewsDirty();
+    }
+
+    /// Reset the arena and install the static empty document.
+    /// Rope nodes are never freed one at a time, so this is how replaced text releases memory.
+    /// The arena keeps its capacity: a similar document reuses it without allocating,
+    /// and the capacity of the largest document stays until deinit.
+    fn releaseRope(self: *Self) void {
+        std.debug.assert(!self._rope.hasHistory());
+        // Cold layout states belong to chunks in the arena.
+        std.debug.assert(self.layout_cache.first == null);
+        const previous = self._rope;
+        _ = self.arena.reset(.retain_capacity);
+        self._rope = .{
+            .root = &empty_document_line,
+            .allocator = self.allocator,
+            .empty_leaf = &empty_document_sentinel,
+            .config = previous.config,
+            .version = previous.version +% 1,
+            .metrics_generation = previous.metrics_generation,
+            .marker_cache = UnifiedRope.MarkerCache.init(self.allocator),
+        };
     }
 
     pub fn reset(self: *Self) void {
@@ -667,13 +697,10 @@ pub const UnifiedTextBuffer = struct {
         self.styled_text_mem_id = null;
         self.styled_capacity = 0;
 
-        // Now reset the arena (frees all the internal memory)
-        _ = self.arena.reset(if (self.arena.queryCapacity() > 0) .retain_capacity else .free_all);
-
+        self._rope.clear_history();
+        self.releaseRope();
         self.mem_registry.clear();
         self.ellipsis_mem_id = null;
-
-        self._rope = UnifiedRope.init(self.allocator) catch return;
 
         self.markAllViewsDirty();
     }
@@ -1422,12 +1449,10 @@ pub const UnifiedTextBuffer = struct {
             return;
         }
 
+        // Styled text replaces the document and its history, so clear() can release the old rope.
+        self._rope.clear_history();
         self.clear();
         self.clearAllHighlights();
-
-        _ = self.arena.reset(.retain_capacity);
-
-        self._rope = UnifiedRope.init(self.allocator) catch return TextBufferError.OutOfMemory;
 
         if (total_len > self.styled_capacity) {
             const new_buf = self.global_allocator.alloc(u8, total_len) catch return TextBufferError.OutOfMemory;
@@ -1517,7 +1542,7 @@ pub const UnifiedTextBuffer = struct {
     }
 
     /// Load text from a file path (relative to cwd)
-    /// The file content is allocated in the arena and will be freed when the buffer is destroyed
+    /// The memory registry owns the file content; replacing the text does not free it.
     pub fn loadFile(self: *Self, path: []const u8) TextBufferError!void {
         const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
             return switch (err) {
@@ -1533,12 +1558,20 @@ pub const UnifiedTextBuffer = struct {
 
         self.clear();
 
-        const content = self.allocator.alloc(u8, file_size) catch return TextBufferError.OutOfMemory;
-        var read_buffer: [4096]u8 = undefined;
-        var reader = file.reader(io, &read_buffer);
-        const bytes_read = reader.interface.readSliceShort(content) catch return TextBufferError.OutOfMemory;
-        const text = content[0..bytes_read];
-        const mem_id = try self.mem_registry.register(text, false);
+        const text = blk: {
+            var content = self.global_allocator.alloc(u8, file_size) catch return TextBufferError.OutOfMemory;
+            errdefer self.global_allocator.free(content);
+            var read_buffer: [4096]u8 = undefined;
+            var reader = file.reader(io, &read_buffer);
+            const bytes_read = reader.interface.readSliceShort(content) catch return TextBufferError.OutOfMemory;
+            // The registry frees the exact slice it owns.
+            content = self.global_allocator.realloc(content, bytes_read) catch return TextBufferError.OutOfMemory;
+            break :blk content;
+        };
+        const mem_id = self.mem_registry.register(text, true) catch |err| {
+            self.global_allocator.free(text);
+            return err;
+        };
 
         try self.setTextInternal(mem_id, text);
     }

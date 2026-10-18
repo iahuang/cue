@@ -6,6 +6,7 @@
 - Fast scrolling, typing, and find in big files (a keystroke in a 100k-line file went from about 130 ms to under 1 ms); find highlights now show only in the panel with the find bar, and only near the view (`d44f6a8`)
 - Use about half the memory for files with many lines (a 100 MB log with 1M lines went from about 1 GB to 685 MB) (`339ec05`)
 - Highlight JSON Lines files (`.jsonl`, `.ndjson`) (`d703ec3`)
+- Port fixes from upstream OpenTUI: fish no longer stalls at startup in cue's terminals, bold or underlined text at a row's right edge no longer leaks into the next row, Kitty images stay put in iTerm2 when they move, reloading a file no longer keeps the old text in memory, Up and Down no longer stop inside a tab or wide character, emoji typed in parts take their right width, and terminals redraw when a program changes their colors
 
 ## v0.4.5 — 2026-10-16
 

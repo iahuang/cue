@@ -412,6 +412,8 @@ pub fn Rope(comptime T: type) type {
             pub const LeafSplitFn = struct {
                 ctx: ?*anyopaque = null,
                 splitFn: *const fn (allocator: Allocator, ctx: ?*anyopaque, leaf: *const T, weight_in_leaf: u32) error{ OutOfBounds, OutOfMemory }!LeafSplitResult,
+                /// Joins two leaves that `T.canMerge` accepts. Without it, they stay apart.
+                mergeFn: ?*const fn (ctx: ?*anyopaque, left: *const T, right: *const T) T = null,
 
                 pub fn call(self: *const @This(), allocator: Allocator, leaf: *const T, weight: u32) error{ OutOfBounds, OutOfMemory }!LeafSplitResult {
                     return self.splitFn(allocator, self.ctx, leaf, weight);
@@ -720,7 +722,7 @@ pub fn Rope(comptime T: type) type {
         }
 
         pub fn concat(self: *Self, other: *const Self) !void {
-            self.root = try self.joinWithBoundary(self.root, other.root);
+            self.root = try self.joinWithBoundary(self.root, other.root, null);
             self.version += 1;
         }
 
@@ -782,7 +784,7 @@ pub fn Rope(comptime T: type) type {
             const first_split = try Node.split_at(self.root, start, self.allocator, self.empty_leaf);
             const second_split = try Node.split_at(first_split.right, end - start, self.allocator, self.empty_leaf);
 
-            self.root = try self.joinWithBoundary(first_split.left, second_split.right);
+            self.root = try self.joinWithBoundary(first_split.left, second_split.right, null);
 
             self.version += 1;
             try self.applyEndsInvariant();
@@ -795,8 +797,8 @@ pub fn Rope(comptime T: type) type {
 
             const split_result = try Node.split_at(self.root, index, self.allocator, self.empty_leaf);
 
-            const left_joined = try self.joinWithBoundary(split_result.left, insert_rope.root);
-            self.root = try self.joinWithBoundary(left_joined, split_result.right);
+            const left_joined = try self.joinWithBoundary(split_result.left, insert_rope.root, null);
+            self.root = try self.joinWithBoundary(left_joined, split_result.right, null);
 
             self.version += 1;
             try self.applyEndsInvariant();
@@ -941,7 +943,7 @@ pub fn Rope(comptime T: type) type {
             return split_result.left;
         }
 
-        fn joinWithBoundary(self: *Self, left: *const Node, right: *const Node) error{OutOfMemory}!*const Node {
+        fn joinWithBoundary(self: *Self, left: *const Node, right: *const Node, leaf_fn: ?*const Node.LeafSplitFn) error{OutOfMemory}!*const Node {
             if (!boundary_enabled or !@hasDecl(T, "rewriteBoundary")) {
                 return try Node.join_balanced(left, right, self.allocator);
             }
@@ -949,10 +951,10 @@ pub fn Rope(comptime T: type) type {
             const l_last = getLastLeafIn(left);
             const r_first = getFirstLeafIn(right);
 
-            if (@hasDecl(T, "canMerge") and @hasDecl(T, "merge")) {
+            if (@hasDecl(T, "canMerge") and leaf_fn != null and leaf_fn.?.mergeFn != null) {
                 if (l_last != null and r_first != null) {
                     if (T.canMerge(l_last.?, r_first.?)) {
-                        const merged = T.merge(self.allocator, l_last.?, r_first.?);
+                        const merged = leaf_fn.?.mergeFn.?(leaf_fn.?.ctx, l_last.?, r_first.?);
                         const merged_leaf = try Node.new_leaf(self.allocator, merged);
 
                         const L = try dropLast(left, self.allocator, self.empty_leaf);
@@ -1025,7 +1027,7 @@ pub fn Rope(comptime T: type) type {
             const first_split = try Node.split_at_weight(self.root, start, self.allocator, self.empty_leaf, split_leaf_fn);
             const second_split = try Node.split_at_weight(first_split.right, end - start, self.allocator, self.empty_leaf, split_leaf_fn);
 
-            self.root = try self.joinWithBoundary(first_split.left, second_split.right);
+            self.root = try self.joinWithBoundary(first_split.left, second_split.right, split_leaf_fn);
 
             self.version += 1;
             try self.applyEndsInvariant();
@@ -1038,8 +1040,8 @@ pub fn Rope(comptime T: type) type {
 
             const split_result = try Node.split_at_weight(self.root, weight, self.allocator, self.empty_leaf, split_leaf_fn);
 
-            const left_joined = try self.joinWithBoundary(split_result.left, insert_rope.root);
-            self.root = try self.joinWithBoundary(left_joined, split_result.right);
+            const left_joined = try self.joinWithBoundary(split_result.left, insert_rope.root, split_leaf_fn);
+            self.root = try self.joinWithBoundary(left_joined, split_result.right, split_leaf_fn);
 
             self.version += 1;
             try self.applyEndsInvariant();
@@ -1227,6 +1229,11 @@ pub fn Rope(comptime T: type) type {
 
         pub fn can_redo(self: *const Self) bool {
             return self.redo_history != null and self.curr_history != null;
+        }
+
+        /// Returns whether an undo or redo root can still reference replaced nodes.
+        pub fn hasHistory(self: *const Self) bool {
+            return self.undo_history != null or self.redo_history != null or self.curr_history != null;
         }
 
         pub fn clear_history(self: *Self) void {
