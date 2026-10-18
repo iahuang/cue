@@ -161,6 +161,7 @@ commands! {
     GoToWaitingTerminal => "terminal:go-to-waiting", "Go to Waiting Terminal";
     ClearTerminal => "terminal:clear", "Clear Terminal";
     RenameTerminal => "terminal:rename", "Rename Terminal";
+    CleanUpTerminals => "terminal:clean-up", "Clean Up Idle Terminals";
     ToggleTerminalKeys => "terminal:toggle-keys", "Terminal: Toggle Sending Shortcuts to the Shell";
     TreeUp => "tree:up", "File Tree: Select Previous";
     TreeDown => "tree:down", "File Tree: Select Next";
@@ -288,7 +289,7 @@ impl Command {
             | SplitDown | ClosePanel | ToggleZoom | ArrangePanels | ToggleScratchpad
             | ToggleRain | Pop | GoBack | GoForward | RecentlyViewed | SetMark | JumpToMark
             | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal
-            | GoToWaitingTerminal | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
+            | GoToWaitingTerminal | CleanUpTerminals | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
             | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5
             | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch
             | GitPull | GitPush => Context::Global,

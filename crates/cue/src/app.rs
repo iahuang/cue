@@ -1385,6 +1385,7 @@ impl App {
             }
             Command::NewTerminal => self.new_terminal(),
             Command::GoToWaitingTerminal => self.go_to_waiting(),
+            Command::CleanUpTerminals => self.clean_up_terminals(),
             Command::ClearTerminal => {
                 if let Some(terminal) = self.active_terminal() {
                     terminal.borrow_mut().clear();
@@ -8446,6 +8447,29 @@ impl App {
         self.focused_terminal = focused;
     }
 
+    /// Closes terminals that no panel shows, in any tab, and that aren't
+    /// running anything, saying how many.
+    fn clean_up_terminals(&mut self) {
+        let (tabs, scratch) = (&self.tabs, &self.scratch.panel);
+        let cut = self.panel_clip.as_ref().and_then(PanelClip::cut);
+        let before = self.terminals.len();
+        self.terminals.retain(|terminal| {
+            terminal.borrow().is_busy()
+                || tab::all_panels(tabs, scratch).chain(cut).any(|panel| {
+                    panel
+                        .terminal()
+                        .is_some_and(|shown| Rc::ptr_eq(shown, terminal))
+                })
+        });
+        self.prune_terminals();
+        let message = match before - self.terminals.len() {
+            0 => "No idle terminals to close.".to_string(),
+            1 => "Closed 1 idle terminal.".to_string(),
+            closed => format!("Closed {closed} idle terminals."),
+        };
+        self.show_message(message, false);
+    }
+
     /// Closes terminals whose shell exited and that no panel shows, in any
     /// tab.
     fn prune_terminals(&mut self) {
@@ -12392,6 +12416,30 @@ mod tests {
         key(&mut app, KeyCode::Char('c'));
         assert!(app.terminals.is_empty());
         assert!(app.active_terminal().is_none());
+    }
+
+    #[test]
+    fn cleaning_up_closes_hidden_terminals_running_nothing() {
+        let _serial = crate::test_serial();
+        let root = fixture("clean-up-terminals", &[]);
+        let mut app = app(&root, None);
+        app.run(Command::NewTerminal, false);
+        type_text(&mut app, "sleep 30");
+        key(&mut app, KeyCode::Enter);
+        wait_until(&mut app, "sleep to run", |app| {
+            app.terminals[0].borrow().program().as_deref() == Some("sleep")
+        });
+        app.run(Command::NewTerminal, false);
+        wait_until(&mut app, "the shell to start", |app| {
+            !app.terminals[1].borrow().is_busy()
+        });
+        app.run(Command::NewTerminal, false);
+        let ids: Vec<_> = app.terminals.iter().map(|t| t.borrow().id()).collect();
+        app.run(Command::CleanUpTerminals, false);
+        let left: Vec<_> = app.terminals.iter().map(|t| t.borrow().id()).collect();
+        // The busy one, and the one the panel shows.
+        assert_eq!(left, [ids[0], ids[2]]);
+        assert!(screen(&app).contains("Closed 1 idle terminal."));
     }
 
     #[test]
