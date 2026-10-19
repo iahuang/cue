@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Ctrl+Enter shows the context menu of what's selected in the sidebar; Open to the Side keeps Cmd+Enter
+- Left and Right in the file dialog go to the start and end of the name it suggests, as from any selection
+- Ctrl+Enter shows the context menu of what's selected in the sidebar; Open to the Side keeps Cmd+Enter (`3bd002f`)
 
 ## v0.4.7 — 2026-10-19
 

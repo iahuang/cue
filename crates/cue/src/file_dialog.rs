@@ -288,7 +288,11 @@ impl FileDialog {
                 self.text_changed();
                 return;
             }
-            // Moving the cursor leaves the name to edit, narrowing the list.
+            // Moving the cursor leaves the name to edit, narrowing the list,
+            // and from its selection: Left goes to its start.
+            let folder = self.folder_text().len();
+            self.caret.move_to(&self.text, folder, false);
+            self.caret.move_to(&self.text, self.text.len(), true);
             self.refilter();
         }
         let changed = match select {
@@ -1162,6 +1166,29 @@ mod tests {
             dialog.run(Command::PickerAccept),
             DialogAction::Accept(root.join("a.rs"))
         );
+    }
+
+    #[test]
+    fn the_suggested_name_is_left_as_a_selection() {
+        let root = fixture("suggested", &["mine.txt"]);
+        let at = |dialog: &FileDialog| dialog.caret.at(&dialog.text);
+        let start = dialog(Purpose::Move, &root, "mine.txt").folder_text().len();
+
+        // Left goes to the name's start, and Right to its end.
+        let mut left = dialog(Purpose::Move, &root, "mine.txt");
+        left.edit(Edit::Left);
+        assert_eq!(at(&left), start);
+        type_text(&mut left, "x");
+        assert_eq!(left.name(), "xmine.txt");
+        let mut right = dialog(Purpose::Move, &root, "mine.txt");
+        right.edit(Edit::Right);
+        type_text(&mut right, "x");
+        assert_eq!(right.name(), "mine.txtx");
+
+        // Shift+Left shrinks the selection from its end.
+        let mut shrunk = dialog(Purpose::Move, &root, "mine.txt");
+        shrunk.edit_selecting(Edit::Left);
+        assert_eq!(shrunk.selected_text(), Some("mine.tx"));
     }
 
     #[test]
