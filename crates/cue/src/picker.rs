@@ -32,6 +32,7 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use opentui::{Attributes, Buffer, Rgba};
 
+use crate::checkpoint::{self, Mark};
 use crate::file_index::FileIndex;
 use crate::git::{Branch, SwitchTo};
 use crate::icons;
@@ -70,15 +71,20 @@ pub enum Mode {
     Terminals,
     /// A repository's branches, to switch to, or a new one.
     Branches,
+    /// The workspace's checkpoints, and the last commit, to compare with.
+    Checkpoints,
 }
 
 impl Mode {
     /// The character that starts a query for this mode.
     fn prefix(self) -> Option<char> {
         match self {
-            Mode::Files | Mode::Languages | Mode::Themes | Mode::Branches | Mode::Definitions => {
-                None
-            }
+            Mode::Files
+            | Mode::Languages
+            | Mode::Themes
+            | Mode::Branches
+            | Mode::Checkpoints
+            | Mode::Definitions => None,
             Mode::Unsaved => Some('!'),
             Mode::Commands => Some('>'),
             Mode::Line => Some(':'),
@@ -110,6 +116,8 @@ pub enum Choice {
     Untitled(u32),
     /// A branch to switch to.
     Branch(SwitchTo),
+    /// A checkpoint to compare with, or with `None`, the last commit.
+    Checkpoint(Option<Mark>),
 }
 
 /// What the app should do after the picker handled input.
@@ -247,6 +255,35 @@ impl Item {
         }
     }
 
+    /// The checkpoint `mark`, to compare with, with how long ago it was
+    /// taken, as of `now`, in seconds since the Unix epoch, or if it's
+    /// `current`, that it's compared with now.
+    pub fn checkpoint(mark: &Mark, now: i64, current: bool) -> Item {
+        let detail = match current {
+            true => "current".to_string(),
+            false => format!("{} ago", crate::log::ago(now - mark.id / 1000)),
+        };
+        Item {
+            text: checkpoint::label(mark),
+            dim: 0..0,
+            detail,
+            choice: Choice::Checkpoint(Some(mark.clone())),
+            color: None,
+        }
+    }
+
+    /// The last commit, to compare with rather than a checkpoint, saying
+    /// so if it's `current`.
+    pub fn last_commit(current: bool) -> Item {
+        Item {
+            text: "The last commit".to_string(),
+            dim: 0..0,
+            detail: if current { "current" } else { "" }.to_string(),
+            choice: Choice::Checkpoint(None),
+            color: None,
+        }
+    }
+
     /// The same, with `detail` on the right instead.
     pub fn with_detail(self, detail: &str) -> Item {
         Item {
@@ -300,6 +337,8 @@ pub struct Picker {
     themes: Vec<Item>,
     /// A repository's branches, once given.
     branches: Vec<Item>,
+    /// The workspace's checkpoints, after the last commit.
+    checkpoints: Vec<Item>,
     /// In branch mode, the branch the query names, to make, if there's
     /// none by that name: listed after the branches that match.
     new_branch: Vec<Item>,
@@ -406,6 +445,7 @@ impl Picker {
                 })
                 .collect(),
             branches: Vec::new(),
+            checkpoints: Vec::new(),
             new_branch: Vec::new(),
             fixed_mode: None,
             outline: None,
@@ -459,7 +499,7 @@ impl Picker {
         let needle = self.needle().to_string();
         let fixed = matches!(
             mode,
-            Mode::Languages | Mode::Themes | Mode::Branches | Mode::Definitions
+            Mode::Languages | Mode::Themes | Mode::Branches | Mode::Checkpoints | Mode::Definitions
         );
         self.fixed_mode = fixed.then_some(mode);
         self.query = match mode.prefix() {
@@ -515,6 +555,12 @@ impl Picker {
     /// Lists `items` as the branches, in order, selecting the first.
     pub fn set_branches(&mut self, items: Vec<Item>) {
         self.branches = items;
+        self.query_changed();
+    }
+
+    /// Lists `items` as the checkpoints, in order, selecting the first.
+    pub fn set_checkpoints(&mut self, items: Vec<Item>) {
+        self.checkpoints = items;
         self.query_changed();
     }
 
@@ -797,6 +843,7 @@ impl Picker {
             Mode::Definitions => (&self.definitions, &[]),
             Mode::Terminals => (&self.terminals, &[]),
             Mode::Branches => (&self.branches, &self.new_branch),
+            Mode::Checkpoints => (&self.checkpoints, &[]),
         }
     }
 
@@ -984,6 +1031,7 @@ impl Picker {
             Mode::Definitions => ("Go to Definition", "definitions"),
             Mode::Terminals => ("Go to Terminal", "terminals"),
             Mode::Branches => ("Switch Branch", "branches"),
+            Mode::Checkpoints => ("Compare with Checkpoint", "checkpoints"),
         };
         draw_frame(frame, area, title);
         let status = self.status(noun);
@@ -1030,6 +1078,7 @@ impl Picker {
                 Mode::Definitions => "Search definitions",
                 Mode::Terminals => "Search terminals by name or running program.",
                 Mode::Branches => "Search branches, or name a new one.",
+                Mode::Checkpoints => "Search checkpoints",
             };
             let hint: String = hint
                 .chars()
@@ -1132,6 +1181,7 @@ pub fn draw_item(
         Choice::Untitled(_) => Some(icons::file("")),
         Choice::Terminal(_) => Some(icons::terminal()),
         Choice::Branch(_) => Some(icons::branch()),
+        Choice::Checkpoint(Some(_)) => Some(icons::checkpoint()),
         _ => None,
     };
     let (x, room) = match icon.filter(|_| icons::enabled() && room > 2 * icons::WIDTH as usize) {

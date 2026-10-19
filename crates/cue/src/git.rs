@@ -25,10 +25,11 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::checkpoint::{Mark, Since};
 use crate::theme::Hue;
 
 /// Changes past this many in a repository aren't listed.
-const MAX_CHANGES: usize = 10_000;
+pub(crate) const MAX_CHANGES: usize = 10_000;
 /// New files git doesn't know of yet are counted as lines added only up to
 /// this big; bigger ones count as none, as binary files do.
 const MAX_COUNTED_FILE: u64 = 1 << 20;
@@ -196,13 +197,18 @@ impl Repo {
 }
 
 /// What git says of a file: the repository it's in, how it changed since
-/// the last commit, if it did, and what it was in that commit, read the
-/// first time it's asked for.
+/// the last commit, or the checkpoint the workspace is compared with, if
+/// it did, and what it was then, read the first time it's asked for.
 #[derive(Debug)]
 pub struct Tracked {
+    /// The repository's top folder, or the one the checkpoint's paths are
+    /// from.
     pub root: PathBuf,
-    /// The commit checked out; `None` before the first.
+    /// The commit checked out, or the checkpoint's tree; `None` before the
+    /// first commit.
     commit: Option<String>,
+    /// The checkpoint store `commit` is in, if it's a checkpoint's.
+    store: Option<PathBuf>,
     /// Where it was in that commit, from the root: where it is now, or
     /// where it was renamed from.
     old_path: PathBuf,
@@ -228,13 +234,22 @@ impl Tracked {
         (&self.root, &self.commit, &self.old_path) == (&other.root, &other.commit, &other.old_path)
     }
 
-    /// What the file was in the last commit, asking git the first time.
+    /// Whether it's compared with a checkpoint rather than the last commit.
+    pub fn checkpoint(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// What the file was in the last commit, or at the checkpoint, asking
+    /// git the first time.
     pub fn base(&self) -> &Base {
         self.base.get_or_init(|| {
             let Some(commit) = &self.commit else {
                 return Base::Missing;
             };
-            file_at(&self.root, commit, &self.old_path)
+            match &self.store {
+                Some(store) => crate::checkpoint::file_at(store, commit, &self.old_path),
+                None => file_at(&self.root, commit, &self.old_path),
+            }
         })
     }
 
@@ -328,7 +343,7 @@ pub fn commit_changes(root: &Path, commit: &Commit) -> Vec<Change> {
 
 /// `git diff-tree --name-status -z`'s output: a status, then a path, or
 /// for a rename or copy, the old path and the new.
-fn parse_name_status(root: &Path, output: &[u8]) -> Vec<Change> {
+pub(crate) fn parse_name_status(root: &Path, output: &[u8]) -> Vec<Change> {
     let mut fields = output
         .split(|&byte| byte == 0)
         .map(|field| String::from_utf8_lossy(field).into_owned());
@@ -376,7 +391,7 @@ pub fn file_at(root: &Path, commit: &str, path: &Path) -> Base {
 /// A file's bytes as [`Base`] has them: binary if there's a NUL early on,
 /// as git tells, and otherwise its text, with `\r\n` as `\n`, as editors
 /// have it.
-fn base_text(bytes: Vec<u8>) -> Base {
+pub(crate) fn base_text(bytes: Vec<u8>) -> Base {
     if bytes[..bytes.len().min(8000)].contains(&0) {
         return Base::Binary;
     }
@@ -929,12 +944,39 @@ fn run_with_input(mut command: Command, input: &[u8]) -> Result<String, String> 
     })
 }
 
+/// Files changed, as the changes view lists them: in a repository, or a
+/// workspace folder in none, which only has changes since a checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    /// The repository's top folder, or the workspace folder.
+    pub root: PathBuf,
+    pub repo: Option<Repo>,
+    /// Sorted by path.
+    pub changes: Vec<Change>,
+}
+
+/// What a run found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Reading {
+    /// In the order of the roots they hold.
+    repos: Vec<Repo>,
+    /// The workspace's checkpoints, newest first.
+    marks: Vec<Mark>,
+    /// What changed since the checkpoint compared with, if any.
+    since: Option<Since>,
+}
+
 pub struct Git {
     roots: Vec<PathBuf>,
-    /// As of the last run, in the order of the roots they hold.
-    repos: Vec<Repo>,
+    /// The checkpoint the workspace is compared with, if any, rather than
+    /// the last commit.
+    mark: Option<Mark>,
+    /// As of the last run.
+    reading: Reading,
+    /// The changes listed, from `reading`.
+    groups: Vec<Group>,
     /// The run in progress, if any, and when it started.
-    running: Option<(Receiver<Vec<Repo>>, Instant)>,
+    running: Option<(Receiver<Reading>, Instant)>,
     /// Something asked for a run while one was in progress, or too soon
     /// after the last started.
     again: bool,
@@ -947,7 +989,9 @@ impl Git {
     pub fn new(roots: &[PathBuf]) -> Git {
         let mut git = Git {
             roots: roots.to_vec(),
-            repos: Vec::new(),
+            mark: None,
+            reading: Reading::default(),
+            groups: Vec::new(),
             running: None,
             again: false,
             last: None,
@@ -964,37 +1008,74 @@ impl Git {
         }
     }
 
+    /// The workspace's folders.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// Compares the workspace with the checkpoint `mark`, or with `None`,
+    /// with the last commit again, asking git again now.
+    pub fn compare_with(&mut self, mark: Option<Mark>) {
+        self.mark = mark;
+        self.restart();
+    }
+
+    /// The checkpoint the workspace is compared with, if any.
+    pub fn mark(&self) -> Option<&Mark> {
+        self.mark.as_ref()
+    }
+
+    /// The workspace's checkpoints, as last heard, newest first.
+    pub fn marks(&self) -> &[Mark] {
+        &self.reading.marks
+    }
+
+    /// What changed since the checkpoint compared with, as last heard.
+    pub fn since(&self) -> Option<&Since> {
+        self.reading.since.as_ref()
+    }
+
     /// The repositories as last heard, in the order of the roots they hold.
     pub fn repos(&self) -> &[Repo] {
-        &self.repos
+        &self.reading.repos
+    }
+
+    /// The changes, as the changes view lists them: since the checkpoint
+    /// compared with, or the last commit.
+    pub fn groups(&self) -> &[Group] {
+        &self.groups
     }
 
     /// The repository `path` is in, if any: the deepest, should they nest.
     pub fn repo_of(&self, path: &Path) -> Option<&Repo> {
-        self.repos
+        self.reading
+            .repos
             .iter()
             .filter(|repo| path.starts_with(&repo.root))
             .max_by_key(|repo| repo.root.components().count())
     }
 
-    /// What git says of the file at `path`, if it's in a repository.
+    /// What git says of the file at `path`: since the checkpoint compared
+    /// with, if its folder has one, or else since the last commit, if it's
+    /// in a repository.
     pub fn tracked(&self, path: &Path) -> Option<Tracked> {
+        if let Some(root) = self.since().and_then(|since| since.root_of(path)) {
+            return tracked(
+                path,
+                &root.changes,
+                &root.top,
+                Some(&root.tree),
+                Some(&root.store),
+            );
+        }
         let repo = self.repo_of(path)?;
-        let change = repo
-            .changes
-            .binary_search_by(|change| change.path.as_path().cmp(path))
-            .ok()
-            .map(|index| &repo.changes[index]);
-        let old = change
-            .and_then(|change| change.from.as_deref())
-            .unwrap_or(path);
-        Some(Tracked {
-            root: repo.root.clone(),
-            commit: repo.commit.clone(),
-            old_path: old.strip_prefix(&repo.root).ok()?.to_path_buf(),
-            kind: Cell::new(change.map(|change| change.kind)),
-            base: OnceCell::new(),
-        })
+        tracked(
+            path,
+            &repo.changes,
+            &repo.root,
+            repo.commit.as_deref(),
+            None,
+        )
     }
 
     /// Asks git again: now, unless a run is in progress or one started
@@ -1022,11 +1103,11 @@ impl Git {
         let mut changed = false;
         if let Some((receiver, started)) = &self.running {
             match receiver.try_recv() {
-                Ok(repos) => {
+                Ok(reading) => {
                     self.last = Some((*started, started.elapsed()));
                     self.running = None;
-                    changed = repos != self.repos;
-                    self.repos = repos;
+                    changed = reading != self.reading;
+                    self.take(reading);
                 }
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
@@ -1053,22 +1134,131 @@ impl Git {
     #[cfg(test)]
     pub fn wait(&mut self) {
         while let Some((receiver, started)) = self.running.take() {
-            if let Ok(repos) = receiver.recv() {
-                self.repos = repos;
+            if let Ok(reading) = receiver.recv() {
+                self.take(reading);
             }
             self.last = Some((started, started.elapsed()));
         }
     }
 
+    /// Takes what a run found, and lists the changes again.
+    fn take(&mut self, reading: Reading) {
+        self.reading = reading;
+        self.groups = group(&self.roots, &self.reading);
+    }
+
     fn start(&mut self) {
         let (sender, receiver) = mpsc::channel();
         let roots = self.roots.clone();
+        let mark = self.mark.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(read_repos(&roots));
+            let marks = crate::checkpoint::marks(&roots);
+            let since = mark
+                .filter(|mark| marks.contains(mark))
+                .map(|mark| crate::checkpoint::since(&roots, &mark));
+            let repos = read_repos(&roots);
+            let _ = sender.send(Reading {
+                repos,
+                marks,
+                since,
+            });
         });
         self.running = Some((receiver, Instant::now()));
         self.again = false;
     }
+}
+
+/// What git says of the file at `path`, changed as `changes` say, if at
+/// all, from what it was in `commit`, its paths from `root`, in the
+/// checkpoint `store`, if it's a checkpoint's.
+fn tracked(
+    path: &Path,
+    changes: &[Change],
+    root: &Path,
+    commit: Option<&str>,
+    store: Option<&Path>,
+) -> Option<Tracked> {
+    let change = changes
+        .binary_search_by(|change| change.path.as_path().cmp(path))
+        .ok()
+        .map(|index| &changes[index]);
+    let old = change
+        .and_then(|change| change.from.as_deref())
+        .unwrap_or(path);
+    Some(Tracked {
+        root: root.to_path_buf(),
+        commit: commit.map(str::to_string),
+        store: store.map(Path::to_path_buf),
+        old_path: old.strip_prefix(root).ok()?.to_path_buf(),
+        kind: Cell::new(change.map(|change| change.kind)),
+        base: OnceCell::new(),
+    })
+}
+
+/// The changes `reading` found, as the changes view lists them: each
+/// repository's, and with a checkpoint, each of `roots` in none that has
+/// one. With a checkpoint, a repository lists what changed since it in the
+/// folders that have one, and elsewhere, since the last commit.
+fn group(roots: &[PathBuf], reading: &Reading) -> Vec<Group> {
+    let Some(since) = &reading.since else {
+        return reading
+            .repos
+            .iter()
+            .map(|repo| Group {
+                root: repo.root.clone(),
+                repo: Some(repo.clone()),
+                changes: repo.changes.clone(),
+            })
+            .collect();
+    };
+    let repo_of = |path: &Path| {
+        reading
+            .repos
+            .iter()
+            .filter(|repo| path.starts_with(&repo.root))
+            .max_by_key(|repo| repo.root.components().count())
+            .map(|repo| repo.root.as_path())
+    };
+    let mut groups: Vec<Group> = reading
+        .repos
+        .iter()
+        .map(|repo| {
+            let mut changes: Vec<Change> = since
+                .roots
+                .iter()
+                .flat_map(|root| &root.changes)
+                .filter(|change| repo_of(&change.path) == Some(repo.root.as_path()))
+                .cloned()
+                .collect();
+            changes.extend(
+                repo.changes
+                    .iter()
+                    .filter(|change| since.root_of(&change.path).is_none())
+                    .cloned(),
+            );
+            changes.sort_by(|a, b| a.path.cmp(&b.path));
+            changes.dedup_by(|a, b| a.path == b.path);
+            Group {
+                root: repo.root.clone(),
+                repo: Some(repo.clone()),
+                changes,
+            }
+        })
+        .collect();
+    for root in roots.iter().filter(|root| repo_of(root).is_none()) {
+        let changes = since
+            .roots
+            .iter()
+            .filter(|since| &since.root == root)
+            .flat_map(|since| since.changes.iter().cloned())
+            .collect();
+        groups.push(Group {
+            root: root.clone(),
+            repo: None,
+            changes,
+        });
+    }
+    groups
 }
 
 /// The repositories `roots` are in, each once, in the order of the roots.
@@ -1104,7 +1294,7 @@ fn git(dir: &Path) -> Command {
 
 /// The top folder of the working tree `dir` is in, and its `.git` folder,
 /// if it's in one.
-fn locate(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn locate(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let output = git(dir)
         .args(["rev-parse", "--show-toplevel", "--absolute-git-dir"])
         .output()

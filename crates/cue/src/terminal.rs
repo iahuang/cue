@@ -1092,7 +1092,7 @@ pub fn describe_exit(status: ExitStatus) -> String {
 }
 
 /// `secs` since the epoch as the local time, as `Oct 2 14:03`.
-fn local_time(secs: u64) -> String {
+pub(crate) fn local_time(secs: u64) -> String {
     // Named, `time_t` is deprecated on musl, whose is changing size.
     let time = secs as _;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };

@@ -83,6 +83,7 @@ use opentui::{Attributes, Buffer, EditBuffer, Rgba};
 use crate::alert::{Alert, AlertAction, Button};
 use crate::arrange::{self, Arranging, Before, PanelClip};
 use crate::changes::ChangesView;
+use crate::checkpoint;
 use crate::commit_diff::{CommitDiff, Outcome};
 use crate::commit_view::{CantCommit, CommitAction, CommitView};
 use crate::complete::{self, Completer, Completion};
@@ -94,7 +95,7 @@ use crate::editor::{Action, Editor};
 use crate::file_dialog::{DialogAction, FileDialog, Purpose};
 use crate::file_index::FileIndex;
 use crate::find;
-use crate::git::{self, Carried, Change, Commit, Git, Repo, SwitchTo};
+use crate::git::{self, Carried, Change, Commit, Git, Repo, SwitchTo, Sync};
 use crate::image::{self, ImageView};
 use crate::indent::{self, Indent};
 use crate::input::{Key, KeyCode, Mods, Mouse, MouseButton, MouseKind, MULTI_CLICK};
@@ -300,6 +301,8 @@ enum Naming {
     Session,
     /// A new branch at a commit, by hash, in the repository at this root.
     Branch(PathBuf, String),
+    /// A checkpoint of the workspace, to take.
+    Checkpoint,
 }
 
 /// What a context menu's commands act on.
@@ -438,8 +441,11 @@ pub struct App {
     commit_views: Vec<CommitView>,
     /// The repositories syncing with their remotes, in the background.
     syncing: Vec<Syncing>,
-    /// The repository whose branches the picker lists, while it does.
-    branch_root: Option<PathBuf>,
+    /// The checkpoint being taken, in the background, if one is.
+    taking: Option<Receiver<Result<checkpoint::Mark, String>>>,
+    /// The repository whose branches or checkpoints the picker lists,
+    /// while it does.
+    picker_repo: Option<PathBuf>,
     /// What git says about the workspace's repositories.
     git: Git,
     width: u32,
@@ -736,7 +742,8 @@ impl App {
             log: None,
             commit_views: Vec::new(),
             syncing: Vec::new(),
-            branch_root: None,
+            taking: None,
+            picker_repo: None,
             sidebar: Sidebar::Files,
             index_symbols_after_listing: false,
             pending_definition: None,
@@ -1111,6 +1118,7 @@ impl App {
                     return self.switch_branch(root, SwitchTo::NewAt { name, commit });
                 }
             }
+            Naming::Checkpoint => self.take_checkpoint(name.as_deref()),
         }
         AppAction::Continue
     }
@@ -1562,6 +1570,17 @@ impl App {
             Command::GitFetch | Command::GitPull | Command::GitPush => {
                 self.sync_command(command, None)
             }
+            Command::GitCheckpoint => self.ask_checkpoint_name(),
+            Command::GitCompareWith => self.show_checkpoints(),
+            Command::GitSync => match self.command_repo() {
+                Some(root) => self.sync_repo(root),
+                None => self.show_message("Not in a git repository.", false),
+            },
+            Command::GitLog | Command::GitSwitchBranch => match self.command_repo() {
+                Some(root) if command == Command::GitLog => self.show_log(&root),
+                Some(root) => self.show_branches(root),
+                None => self.show_message("Not in a git repository.", false),
+            },
             command if command.context() == Context::Tree => match self.sidebar {
                 Sidebar::Files => {
                     let action = self.tree.run(command);
@@ -2708,6 +2727,22 @@ impl App {
             self.synced(&root, &sync, result);
             changed = true;
         }
+        let taken = self.taking.as_ref().map(|taking| taking.try_recv());
+        match taken {
+            None | Some(Err(TryRecvError::Empty)) => {}
+            Some(result) => {
+                self.taking = None;
+                match result {
+                    Ok(Ok(mark)) => self.compare_with(Some(mark)),
+                    Ok(Err(err)) => {
+                        self.show_git_error("Can't Take Checkpoint", &err);
+                        self.compare_with(self.git.mark().cloned());
+                    }
+                    Err(_) => self.compare_with(self.git.mark().cloned()),
+                }
+                changed = true;
+            }
+        }
         if self.git.poll() {
             self.git_changed();
             changed = true;
@@ -2719,7 +2754,9 @@ impl App {
     /// show it, and the watcher hears of the repositories' `.git` folders.
     fn git_changed(&mut self) {
         let repos = self.git.repos();
-        self.changes.set_repos(repos);
+        self.changes.set_groups(self.git.groups());
+        self.changes
+            .set_since(self.git.mark(), self.taking.is_some());
         if let Some(log) = &mut self.log {
             match repos.iter().find(|repo| repo.root == log.root()) {
                 Some(repo) => log.set_repo(repo),
@@ -2749,7 +2786,7 @@ impl App {
         {
             self.sidebar = Sidebar::Changes;
         }
-        self.tree.set_changes(repos);
+        self.tree.set_changes(self.git.groups());
         self.track_documents();
         self.watch_folders();
     }
@@ -4044,10 +4081,11 @@ impl App {
                         }
                     }
                     Choice::Branch(to) => {
-                        if let Some(root) = self.branch_root.take() {
+                        if let Some(root) = self.picker_repo.take() {
                             return self.switch_branch(root, to);
                         }
                     }
+                    Choice::Checkpoint(mark) => self.compare_with(mark),
                 }
             }
         }
@@ -5008,7 +5046,8 @@ impl App {
             | Choice::Command(_)
             | Choice::Language(_)
             | Choice::Theme(_)
-            | Choice::Branch(_) => {}
+            | Choice::Branch(_)
+            | Choice::Checkpoint(_) => {}
         }
     }
 
@@ -6550,11 +6589,11 @@ impl App {
                     self.focus = Focus::Editor;
                 }
             }
-            // The tree has no logs, commits, branches, or remotes.
-            TreeAction::Log(_)
-            | TreeAction::Commit(_)
-            | TreeAction::Branches(_)
-            | TreeAction::Sync(_) => {}
+            // The tree has no repositories' rows or checkpoints.
+            TreeAction::RepoMenu(_)
+            | TreeAction::Checkpoints
+            | TreeAction::CompareWithCommit
+            | TreeAction::TakeCheckpoint => {}
         }
     }
 
@@ -6564,16 +6603,10 @@ impl App {
     fn changes_action(&mut self, action: TreeAction) {
         let (path, focus, preview) = match action {
             TreeAction::None => return,
-            TreeAction::Log(root) => return self.show_log(&root),
-            TreeAction::Commit(root) => return self.show_commit_view(&root),
-            TreeAction::Branches(root) => return self.show_branches(root),
-            TreeAction::Sync(root) => {
-                let repo = self.git.repos().iter().find(|repo| repo.root == root);
-                if let Some(sync) = repo.and_then(Repo::sync) {
-                    self.sync(root, sync);
-                }
-                return;
-            }
+            TreeAction::RepoMenu(root) => return self.show_repo_menu(root),
+            TreeAction::Checkpoints => return self.show_checkpoints(),
+            TreeAction::CompareWithCommit => return self.compare_with(None),
+            TreeAction::TakeCheckpoint => return self.ask_checkpoint_name(),
             TreeAction::Open {
                 path,
                 focus,
@@ -7168,8 +7201,128 @@ impl App {
         self.show_picker(Mode::Branches);
         if let Some(picker) = &mut self.picker {
             picker.set_branches(items);
-            self.branch_root = Some(root);
+            self.picker_repo = Some(root);
         }
+    }
+
+    /// Asks what to call a checkpoint of the workspace, to take one.
+    fn ask_checkpoint_name(&mut self) {
+        if self.taking.is_some() {
+            return;
+        }
+        let placeholder = "Name it, or leave it unnamed";
+        self.ask_name("Take Checkpoint", placeholder, "", Naming::Checkpoint);
+    }
+
+    /// Takes a checkpoint, called `name`, if anything, of the workspace's
+    /// folders, in the background, then compares the workspace with it, so
+    /// what changes from now on is listed.
+    fn take_checkpoint(&mut self, name: Option<&str>) {
+        let mark = checkpoint::Mark {
+            id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as i64),
+            name: name.map(str::to_string),
+        };
+        let roots = self.git.roots().to_vec();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = checkpoint::take(&roots, &mark).map(|()| mark);
+            let _ = sender.send(result);
+        });
+        self.taking = Some(receiver);
+        self.changes.set_since(self.git.mark(), true);
+    }
+
+    /// Compares the workspace with the checkpoint `mark`, or with `None`,
+    /// the last commit.
+    fn compare_with(&mut self, mark: Option<checkpoint::Mark>) {
+        self.git.compare_with(mark);
+        self.changes
+            .set_since(self.git.mark(), self.taking.is_some());
+    }
+
+    /// Lists the workspace's checkpoints, after the last commit, to compare
+    /// with one.
+    fn show_checkpoints(&mut self) {
+        if self.git.marks().is_empty() {
+            self.show_message("No checkpoints yet: + takes one.", false);
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64);
+        let current = self.git.mark();
+        let mut items = vec![Item::last_commit(current.is_none())];
+        items.extend(
+            self.git
+                .marks()
+                .iter()
+                .map(|mark| Item::checkpoint(mark, now, current == Some(mark))),
+        );
+        self.show_picker(Mode::Checkpoints);
+        if let Some(picker) = &mut self.picker {
+            picker.set_checkpoints(items);
+        }
+    }
+
+    /// Catches the repository at `root` up with the branch it tracks, as
+    /// it takes: fetching, pulling, pushing, or pulling then pushing.
+    fn sync_repo(&mut self, root: PathBuf) {
+        let repo = self.git.repos().iter().find(|repo| repo.root == root);
+        match repo.and_then(Repo::sync) {
+            Some(sync) => self.sync(root, sync),
+            None => self.show_message("Not on a branch.", false),
+        }
+    }
+
+    /// Pops up, beside its row in the changes view, what can be done to the
+    /// repository at `root`: committing, its log, switching branches, and
+    /// catching up with the branch it tracks.
+    fn show_repo_menu(&mut self, root: PathBuf) {
+        use Command::*;
+        let Some(repo) = self.git.repos().iter().find(|repo| repo.root == root) else {
+            return;
+        };
+        let item = |command, label: &str| MenuItem::Command(command, label.to_string());
+        let (ahead, behind) = repo
+            .upstream
+            .as_ref()
+            .map_or((0, 0), |upstream| (upstream.ahead, upstream.behind));
+        // What catching up takes first, saying so, then the rest.
+        let sync = repo.sync();
+        let first = match &sync {
+            Some(Sync::Fetch) => Some((GitFetch, "Fetch".to_string())),
+            Some(Sync::Pull) => Some((GitPull, format!("Pull ↓{behind}"))),
+            Some(Sync::Push) => Some((GitPush, format!("Push ↑{ahead}"))),
+            Some(Sync::Both) => Some((GitSync, format!("Sync ↓{behind} ↑{ahead}"))),
+            Some(Sync::Publish(_)) => Some((GitPush, "Publish".to_string())),
+            None => None,
+        };
+        let mut items = vec![
+            item(TreeCommit, "Commit…"),
+            item(GitLog, "Log"),
+            item(GitSwitchBranch, "Switch Branch…"),
+            MenuItem::Separator,
+        ];
+        if let Some((command, label)) = &first {
+            items.push(item(*command, label));
+        }
+        for (command, label) in [(GitFetch, "Fetch"), (GitPull, "Pull"), (GitPush, "Push")] {
+            if first.as_ref().is_none_or(|(first, _)| *first != command) {
+                items.push(item(command, label));
+            }
+        }
+        let y = self.changes.selected_position().map_or(0, |(_, y)| y);
+        let x = self.visible_tree_width();
+        let menu = ContextMenu::new(items, &self.keymap, x, y, false, self.width, self.height);
+        self.close_popups();
+        let target = Entry {
+            path: root,
+            is_dir: true,
+            is_root: true,
+        };
+        self.menu = Some((menu.beside(), MenuFor::File(target)));
     }
 
     /// Switches the repository at `root` to `to`, saving the files in it
@@ -7472,15 +7625,11 @@ impl App {
     fn open_menu(&mut self, target: Entry, at: Option<(u32, u32)>) {
         use Command::*;
         let item = |command, label: &str| MenuItem::Command(command, label.to_string());
-        let mut items = Vec::new();
-        if self.sidebar == Sidebar::Changes && target.is_root {
-            items.extend([
-                item(GitFetch, "Fetch"),
-                item(GitPull, "Pull"),
-                item(GitPush, "Push"),
-                MenuItem::Separator,
-            ]);
+        let repo = self.git.repos().iter().any(|repo| repo.root == target.path);
+        if self.sidebar == Sidebar::Changes && target.is_root && repo {
+            return self.show_repo_menu(target.path);
         }
+        let mut items = Vec::new();
         if !target.is_dir {
             items.extend([
                 item(TreeOpen, "Open"),
@@ -7892,6 +8041,11 @@ impl App {
             Command::GitFetch | Command::GitPull | Command::GitPush => {
                 self.sync_command(command, Some(target.path))
             }
+            Command::GitCompareWith | Command::GitCheckpoint => return self.run(command, false),
+            Command::TreeCommit => self.show_commit_view(&target.path),
+            Command::GitLog => self.show_log(&target.path),
+            Command::GitSync => self.sync_repo(target.path),
+            Command::GitSwitchBranch => self.show_branches(target.path),
             Command::TreeNewFile => self.open_dialog(Purpose::Create, &folder, "", None),
             Command::TreeNewFolder => self.open_dialog(Purpose::CreateFolder, &folder, "", None),
             Command::TreeOpenInTerminal => self.new_terminal_in(&folder),
@@ -10862,8 +11016,11 @@ mod tests {
         assert_eq!(app.sidebar, Sidebar::Changes);
         assert_eq!(app.focus, Focus::Tree);
         let changes = lines(&app);
-        assert!(changes[0].starts_with(" main") && changes[0].ends_with("Log"));
-        assert_eq!(changes[1], " ▾ app-badge");
+        assert!(
+            changes[0].starts_with(" Since the last commit"),
+            "{changes:?}"
+        );
+        assert!(changes[1].starts_with(" ▾ app-badge") && changes[1].ends_with("main"));
         assert!(changes[2].starts_with("     a.txt") && changes[2].ends_with('M'));
         assert!(changes[3].starts_with("     b.txt") && changes[3].ends_with('D'));
         assert!(status(&app).starts_with(" ‹ Files  "), "{}", status(&app));
@@ -10991,8 +11148,7 @@ mod tests {
         let mut app = tall_app(&root, None);
         wait_for_git(&mut app);
         app.run(Command::ToggleChanges, false);
-        let width = app.visible_tree_width();
-        left_click(&mut app, width - 3, 0);
+        app.run(Command::GitLog, false);
         assert_eq!(app.sidebar, Sidebar::Log);
         let log = git::log(&root, 0, 2);
 
@@ -11059,8 +11215,7 @@ mod tests {
         wait_for_git(&mut app);
         let line = |app: &App, y: usize| screen(app).lines().nth(y).unwrap_or("").to_string();
         app.run(Command::ToggleChanges, false);
-        let width = app.visible_tree_width();
-        left_click(&mut app, width - 3, 0);
+        app.run(Command::GitLog, false);
         assert_eq!(app.sidebar, Sidebar::Log);
         assert!(line(&app, 0).starts_with(" ‹ app-log"), "{}", line(&app, 0));
         assert!(line(&app, 1).starts_with(" ▸ third"), "{}", line(&app, 1));
@@ -13097,15 +13252,14 @@ mod tests {
             mouse_at(app, MouseKind::Move, x, y);
             app.hover_area().map(|rect| rect.x..rect.x + rect.width)
         };
-        // A repository's first row: the branch and the buttons, not the
-        // space between.
-        assert_eq!(hover(&mut app, 2, 0), Some(0..6), "the branch");
-        assert_eq!(hover(&mut app, 8, 0), None);
-        assert_eq!(hover(&mut app, width - 2, 0), Some(width - 5..width));
-        assert_eq!(hover(&mut app, width - 8, 0), Some(width - 13..width - 5));
+        // The top row, apart from its button, and the button; a
+        // repository's row, and a file's.
+        assert_eq!(hover(&mut app, 2, 0), Some(0..width - 3));
+        assert_eq!(hover(&mut app, width - 2, 0), Some(width - 3..width), "+");
+        assert_eq!(hover(&mut app, 8, 1), Some(0..width), "a repository");
         assert_eq!(hover(&mut app, 2, 2), Some(0..width), "a file");
 
-        left_click(&mut app, width - 8, 0);
+        app.run(Command::TreeCommit, false);
         assert_eq!(app.sidebar, Sidebar::Commit);
         // The top row's buttons: back, by the name, the branch, and the log.
         assert_eq!(hover(&mut app, 2, 0), Some(0..13));
@@ -13237,6 +13391,82 @@ mod tests {
         }
     }
 
+    /// Waits for the checkpoint being taken, then for git.
+    fn wait_for_checkpoint(app: &mut App) {
+        while app.taking.is_some() {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        wait_for_git(app);
+    }
+
+    #[test]
+    fn checkpoints_list_what_changed_since_and_go_back_to_the_last_commit() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-checkpoints");
+        fs::write(root.join("a.txt"), "changed before\n").unwrap();
+        let mut app = tall_app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+        app.run(Command::ToggleChanges, false);
+        assert!(tall_screen(&app).contains("Since the last commit"));
+        app.run(Command::GitCompareWith, false);
+        assert!(tall_screen(&app).contains("No checkpoints yet"));
+
+        app.run(Command::GitCheckpoint, false);
+        type_text(&mut app, "agent");
+        key(&mut app, KeyCode::Enter);
+        assert!(tall_screen(&app).contains("Taking a checkpoint…"));
+        wait_for_checkpoint(&mut app);
+        let shown = tall_screen(&app);
+        assert!(shown.contains("Since “agent”"), "{shown}");
+        assert!(shown.contains("No changes."), "{shown}");
+        let doc = app.editor().unwrap().document().clone();
+        let tracked = doc.tracked().unwrap();
+        assert!(tracked.checkpoint() && tracked.kind.get().is_none());
+        assert!(git::stashes(&root).is_empty() && app.git.repos()[0].changes.len() == 1);
+
+        fs::write(root.join("b.txt"), "changed after\n").unwrap();
+        app.git.restart();
+        wait_for_git(&mut app);
+        let changes = &app.git.groups()[0].changes;
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, root.join("b.txt"));
+
+        app.run(Command::GitCompareWith, false);
+        assert_eq!(
+            app.picker.as_ref().map(Picker::mode),
+            Some(Mode::Checkpoints)
+        );
+        let shown = tall_screen(&app);
+        assert!(
+            shown.contains("The last commit") && shown.contains("“agent”"),
+            "{shown}"
+        );
+        key(&mut app, KeyCode::Enter);
+        wait_for_git(&mut app);
+        assert_eq!(app.git.since(), None);
+        assert!(tall_screen(&app).contains("Since the last commit"));
+        assert!(!doc.tracked().unwrap().checkpoint());
+    }
+
+    #[test]
+    fn a_repositorys_row_pops_up_what_can_be_done_to_it() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("app-repo-menu");
+        let mut app = tall_app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+        app.run(Command::ToggleChanges, false);
+        left_click(&mut app, 8, 1);
+        let shown = tall_screen(&app);
+        assert!(
+            shown.contains("Switch Branch…") && shown.contains("Log"),
+            "{shown}"
+        );
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.sidebar, Sidebar::Log, "the second item");
+    }
+
     #[test]
     fn the_branch_in_the_sidebar_switches_branches_bringing_changes() {
         let _serial = crate::test_serial();
@@ -13253,7 +13483,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         };
         app.run(Command::ToggleChanges, false);
-        left_click(&mut app, 2, 0);
+        app.run(Command::GitSwitchBranch, false);
         assert_eq!(app.picker.as_ref().map(Picker::mode), Some(Mode::Branches));
         let shown = tall_screen(&app);
         assert!(

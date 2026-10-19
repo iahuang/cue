@@ -267,8 +267,14 @@ impl DiffView {
         };
         let old = match tracked.base() {
             Base::Text(text) => text.as_str(),
+            Base::Binary if tracked.checkpoint() => {
+                return Layout::note("The file was binary at the checkpoint.")
+            }
             Base::Binary => return Layout::note("The file was binary in the last commit."),
             // Ignored, or so git says.
+            Base::Missing if tracked.kind.get().is_none() && tracked.checkpoint() => {
+                return Layout::note("File not found at the checkpoint.")
+            }
             Base::Missing if tracked.kind.get().is_none() => {
                 return Layout::note("File not found in the last commit.")
             }
@@ -343,6 +349,9 @@ impl DiffView {
         };
         let note = layout.note.or_else(|| {
             layout.rows.is_empty().then_some(match self.source {
+                Source::Live(_) if self.tracked().is_some_and(|tracked| tracked.checkpoint()) => {
+                    "No changes since the checkpoint."
+                }
                 Source::Live(_) => "No changes since the last commit.",
                 Source::Fixed { .. } => "No text changes.",
             })

@@ -22,7 +22,7 @@ use ignore::WalkBuilder;
 use opentui::{Attributes, Buffer, Rgba};
 
 use crate::file_index;
-use crate::git::{Kind, Repo};
+use crate::git::{Group, Kind};
 use crate::icons;
 use crate::keymap::Command;
 use crate::theme;
@@ -186,15 +186,15 @@ pub enum TreeAction {
         focus: bool,
         preview: bool,
     },
-    /// Show the log of the repository at this root, from the changes.
-    Log(PathBuf),
-    /// Show the commit view of the repository at this root, from the
+    /// Pop up what can be done to the repository at this root, from the
     /// changes.
-    Commit(PathBuf),
-    /// Show the branches of the repository at this root, to switch to one.
-    Branches(PathBuf),
-    /// Sync the repository at this root with the branch it tracks.
-    Sync(PathBuf),
+    RepoMenu(PathBuf),
+    /// Show the workspace's checkpoints, to compare with one.
+    Checkpoints,
+    /// Compare the workspace with the last commit again.
+    CompareWithCommit,
+    /// Take a checkpoint of the workspace.
+    TakeCheckpoint,
 }
 
 /// An entry in the tree, as the file commands see it.
@@ -355,15 +355,15 @@ impl FileTree {
         self.active_preview = preview;
     }
 
-    /// Marks the files changed in `repos`, and the folders they're in.
-    pub fn set_changes(&mut self, repos: &[Repo]) {
+    /// Marks the files changed in `groups`, and the folders they're in.
+    pub fn set_changes(&mut self, groups: &[Group]) {
         self.changes.clear();
         self.changed_folders.clear();
-        for repo in repos {
-            for change in &repo.changes {
+        for group in groups {
+            for change in &group.changes {
                 self.changes.insert(change.path.clone(), change.kind);
                 let folders = change.path.ancestors().skip(1);
-                for folder in folders.take_while(|folder| folder.starts_with(&repo.root)) {
+                for folder in folders.take_while(|folder| folder.starts_with(&group.root)) {
                     if !self.changed_folders.insert(folder.to_path_buf()) {
                         break;
                     }

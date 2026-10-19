@@ -6,6 +6,7 @@ mod arrange;
 mod attach;
 mod autoindent;
 mod changes;
+mod checkpoint;
 mod client;
 mod commit_diff;
 mod commit_view;

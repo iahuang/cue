@@ -40,6 +40,9 @@ pub struct ContextMenu {
     x: u32,
     y: u32,
     selected: Option<usize>,
+    /// It pops up beside the cell it was opened at, its top on that row,
+    /// rather than below it.
+    beside: bool,
     /// The right button went down to open it and hasn't come up yet, nor
     /// left the cell it went down on.
     right_held: bool,
@@ -75,6 +78,7 @@ impl ContextMenu {
             x,
             y,
             selected: None,
+            beside: false,
             right_held: from_mouse,
             screen_width: width,
             screen_height: height,
@@ -83,6 +87,15 @@ impl ContextMenu {
             menu.step(1);
         }
         menu
+    }
+
+    /// The same, popped up beside the cell it was opened at, as for what
+    /// a row's clicked for, rather than below it.
+    pub fn beside(self) -> ContextMenu {
+        ContextMenu {
+            beside: true,
+            ..self
+        }
     }
 
     pub fn set_size(&mut self, width: u32, height: u32) {
@@ -244,9 +257,12 @@ impl ContextMenu {
         let room = self.screen_height.saturating_sub(1);
         let height = (self.items.len() as u32 + 2).min(room);
         let x = self.x.min(self.screen_width - width);
-        // Below the cell clicked, so the row stays in sight; failing that,
-        // above it; failing that, as low as it fits.
-        let y = if self.y + 1 + height <= room {
+        // Beside, its first item on the row it's for. Otherwise below the
+        // cell clicked, so the row stays in sight; failing that, above it;
+        // failing that, as low as it fits.
+        let y = if self.beside {
+            self.y.saturating_sub(1).min(room - height)
+        } else if self.y + 1 + height <= room {
             self.y + 1
         } else if self.y >= height {
             self.y - height

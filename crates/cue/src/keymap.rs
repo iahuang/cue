@@ -205,6 +205,11 @@ commands! {
     GitFetch => "git:fetch", "Fetch from Remote";
     GitPull => "git:pull", "Pull from Remote";
     GitPush => "git:push", "Push to Remote";
+    GitSync => "git:sync", "Sync with Remote";
+    GitCheckpoint => "git:checkpoint", "Take Checkpoint…";
+    GitCompareWith => "git:compare-with", "Compare with Checkpoint…";
+    GitLog => "git:log", "Show Git Log";
+    GitSwitchBranch => "git:switch-branch", "Switch Branch…";
     PickerUp => "picker:up", "Picker: Select Previous";
     PickerDown => "picker:down", "Picker: Select Next";
     PickerPageUp => "picker:page-up", "Picker: Page Up";
@@ -289,10 +294,11 @@ impl Command {
             | SplitDown | ClosePanel | ToggleZoom | ArrangePanels | ToggleScratchpad
             | ToggleRain | Pop | GoBack | GoForward | RecentlyViewed | SetMark | JumpToMark
             | FocusPanelLeft | FocusPanelRight | FocusPanelUp | FocusPanelDown | NewTerminal
-            | GoToWaitingTerminal | CleanUpTerminals | NewTab | CloseTab | NextTab | PreviousTab | MoveTabLeft
-            | MoveTabRight | RenameTab | GoToTab1 | GoToTab2 | GoToTab3 | GoToTab4 | GoToTab5
-            | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9 | AddFolder | RenameSession | GitFetch
-            | GitPull | GitPush => Context::Global,
+            | GoToWaitingTerminal | CleanUpTerminals | NewTab | CloseTab | NextTab
+            | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2
+            | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9
+            | AddFolder | RenameSession | GitFetch | GitPull | GitPush | GitCheckpoint
+            | GitCompareWith | GitLog | GitSwitchBranch | GitSync => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeSwitchView | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder
