@@ -604,8 +604,8 @@ impl Default for Keymap {
             (key(Char('r'), SUPER), TreeRefresh),
             (key(Tab, Mods::NONE), TreeSwitchView),
             // As in VS Code.
-            (key(Enter, Mods::CTRL), TreeOpenToSide),
             (key(Enter, SUPER), TreeOpenToSide),
+            (key(Enter, Mods::CTRL), TreeContextMenu),
             // As in Windows and GTK; F2 renames there, and in VS Code.
             (key(F(10), SHIFT), TreeContextMenu),
             // In a panel showing no file, the panel's menu.

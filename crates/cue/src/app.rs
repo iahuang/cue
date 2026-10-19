@@ -13714,6 +13714,21 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_enter_shows_the_menu_of_the_selected_entry() {
+        let _serial = crate::test_serial();
+        let root = fixture("menu-key", &[("a.txt", "alpha"), ("b.txt", "beta")]);
+        let mut app = tall_app(&root, None);
+        key(&mut app, KeyCode::Down);
+        app.handle_key(Key::new(KeyCode::Enter, Mods::CTRL));
+        assert!(app.menu.is_some());
+        click_item(&mut app, "Rename…");
+        assert_eq!(
+            app.dialog.as_ref().map(|d| d.purpose()),
+            Some(Purpose::Move)
+        );
+    }
+
+    #[test]
     fn renaming_to_an_existing_name_is_refused() {
         let _serial = crate::test_serial();
         let root = fixture("menu-exists", &[("a.txt", "alpha"), ("b.txt", "beta")]);

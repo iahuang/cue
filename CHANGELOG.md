@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Ctrl+Enter shows the context menu of what's selected in the sidebar; Open to the Side keeps Cmd+Enter
+
 ## v0.4.7 — 2026-10-19
 
 - Make workspace search's matches easier to see in syntax-colored lines, in find's colors (`503e6d1`)
