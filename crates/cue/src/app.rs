@@ -3587,8 +3587,8 @@ impl App {
         })
     }
 
-    /// Goes back to where the recently viewed list picked, as it says to,
-    /// closing it.
+    /// Goes to where the recently viewed list picked, as it says to,
+    /// closing it, which then comes first in it.
     fn switcher_action(&mut self, action: SwitcherAction) {
         let back = match action {
             SwitcherAction::Continue => return,
@@ -3601,7 +3601,7 @@ impl App {
         let Some(index) = back.filter(|_| self.active_id() == switcher.panel) else {
             return;
         };
-        if let Some(visit) = self.active_panel_mut().step_history_to(true, index) {
+        if let Some(visit) = self.active_panel_mut().bring_back(index) {
             self.show_visit(visit);
         }
     }
@@ -10015,7 +10015,7 @@ mod tests {
     }
 
     #[test]
-    fn recently_viewed_goes_back_a_file_at_a_time_while_ctrl_is_held() {
+    fn recently_viewed_goes_a_file_at_a_time_while_ctrl_is_held() {
         let _serial = crate::test_serial();
         let text: String = (1..=200).map(|i| format!("line {i}\n")).collect();
         let files = [("a.txt", text.as_str()), ("b.txt", "b"), ("c.txt", "c")];
@@ -10030,8 +10030,13 @@ mod tests {
         let listed = |app: &App| app.switcher.as_ref().map(Switcher::listed);
         let list = |names: &[&str]| Some(names.iter().map(|name| name.to_string()).collect());
 
-        // Two places in a.txt, then b.txt and c.txt.
+        // Two places in a.txt: only other places in what's shown, nothing
+        // to go back to.
         app.handle_key(Key::new(KeyCode::End, Mods::CTRL));
+        chord(&mut app, '-', ctrl_shift);
+        assert_eq!(listed(&app), None);
+
+        // Then b.txt and c.txt.
         app.open(&root.join("b.txt"), false);
         app.open(&root.join("c.txt"), false);
         chord(&mut app, '-', ctrl_shift);
@@ -10052,38 +10057,40 @@ mod tests {
             (Some("a.txt"), 200)
         );
 
-        // Going back across panels comes back to where it was.
+        // Going back comes back to where it was, across panels or not.
         ctrl(&mut app, '-');
         assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
         ctrl(&mut app, '=');
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
-
-        // As the list went there, the panel's own forward comes back a
-        // place at a time.
+        app.go_history(true);
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
         app.go_history(false);
-        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
-        // A tap goes back one.
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+
+        // What it went to comes first, as with Cmd+Tab: taps go back and
+        // forth between two.
         chord(&mut app, '-', ctrl_shift);
+        assert_eq!(listed(&app), list(&["a.txt", ">c.txt", "b.txt"]));
+        app.handle_release(Mods::SHIFT);
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
+        chord(&mut app, '-', ctrl_shift);
+        assert_eq!(listed(&app), list(&["c.txt", ">a.txt", "b.txt"]));
         app.handle_release(Mods::SHIFT);
         assert_eq!(
             (shown_name(&app).as_deref(), row(&app)),
             (Some("a.txt"), 200)
         );
-        // Only other places in what's shown: nothing to go back to.
-        chord(&mut app, '-', ctrl_shift);
-        assert_eq!(listed(&app), None);
 
         // Esc stays; from the palette, it's open until Enter.
-        app.go_history(false);
         chord(&mut app, '-', ctrl_shift);
         key(&mut app, KeyCode::Esc);
-        assert_eq!(shown_name(&app).as_deref(), Some("b.txt"));
+        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         app.run(Command::RecentlyViewed, false);
         assert!(!app.wants_key_releases());
         app.handle_release(Mods::NONE);
-        assert_eq!(listed(&app), list(&["b.txt", ">a.txt"]));
+        assert_eq!(listed(&app), list(&["a.txt", ">c.txt", "b.txt"]));
         key(&mut app, KeyCode::Enter);
-        assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
+        assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
     }
 
     #[test]

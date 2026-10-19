@@ -694,6 +694,25 @@ impl Panel {
         visit
     }
 
+    /// Takes the place at `index` among those to go back to out of the
+    /// history, to go to as somewhere new: what's on screen becomes the
+    /// place to go back to, and there's no going forward. The caller shows
+    /// the place, as for [`Panel::step_history`].
+    pub fn bring_back(&mut self, index: usize) -> Option<Visit> {
+        if index >= self.history.back.len() {
+            return None;
+        }
+        let visit = self.history.back.remove(index);
+        let current = self.visit();
+        let History { back, forward } = &mut self.history;
+        forward.clear();
+        if let Some(current) = current {
+            back.retain(|old| !old.is(&current));
+            back.push(current);
+        }
+        Some(visit)
+    }
+
     /// The places it left since last asked, as its history noted them,
     /// oldest first, even while the history was taken out.
     pub fn take_left(&mut self) -> Vec<Visit> {

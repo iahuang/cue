@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Make workspace search's matches easier to see in syntax-colored lines, in find's colors (`HASH`)
+- Make workspace search's matches easier to see in syntax-colored lines, in find's colors (`503e6d1`)
+- Recently viewed (Ctrl+Shift+-) puts what it goes to first, as Cmd+Tab does, so taps go back and forth between two files (`HASH`)
 
 ## v0.4.6 — 2026-10-18
 
