@@ -950,10 +950,12 @@ impl Editor {
             return;
         }
         let wheel_lines = config::get().scroll_lines as i64;
-        // Clicks on the line numbers go to the start of the line.
+        // Clicks on the line numbers go to the start of the line, and
+        // those below the text to its last line.
+        let last_row = (self.view.visible_lines().len() as u32).saturating_sub(1);
         let at = (
             mouse.x.saturating_sub(text_x).min(text_w - 1),
-            mouse.y.min(text_h - 1),
+            mouse.y.min(text_h - 1).min(last_row),
         );
         match mouse.kind {
             MouseKind::Press(MouseButton::Left) if mouse.y < text_h => {
@@ -3913,6 +3915,22 @@ mod tests {
         assert_eq!((eb.cursor().row, eb.cursor().col), (2, 5));
         editor.handle_key(Key::new(KeyCode::Home, Mods::CTRL));
         assert_eq!((eb.cursor().row, eb.cursor().col), (0, 0));
+    }
+
+    #[test]
+    fn clicks_below_the_text_go_to_its_last_line() {
+        let _serial = serial();
+        let eb = Rc::new(EditBuffer::new(WidthMethod::Unicode).unwrap());
+        eb.set_text("hello world\nsecond line");
+        let mut editor = Editor::new(eb.clone(), unnamed(), theme(), 60, 6).unwrap();
+        let t0 = Instant::now();
+        let left = MouseButton::Left;
+        mouse(&mut editor, MouseKind::Press(left), 4, 4, t0);
+        mouse(&mut editor, MouseKind::Release(left), 4, 4, t0);
+        assert_eq!((eb.cursor().row, eb.cursor().col), (1, 4));
+        mouse(&mut editor, MouseKind::Press(left), 40, 5, t0 + Duration::from_secs(1));
+        mouse(&mut editor, MouseKind::Release(left), 40, 5, t0 + Duration::from_secs(1));
+        assert_eq!((eb.cursor().row, eb.cursor().col), (1, 11));
     }
 
     #[test]
