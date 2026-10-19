@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.7 — 2026-10-19
 
 - Make workspace search's matches easier to see in syntax-colored lines, in find's colors (`503e6d1`)
 - Recently viewed (Ctrl+Shift+-) puts what it goes to first, as Cmd+Tab does, so taps go back and forth between two files (`9d6ba9c`)
