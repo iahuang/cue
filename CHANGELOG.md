@@ -4,8 +4,8 @@
 
 - Make workspace search's matches easier to see in syntax-colored lines, in find's colors (`503e6d1`)
 - Recently viewed (Ctrl+Shift+-) puts what it goes to first, as Cmd+Tab does, so taps go back and forth between two files (`9d6ba9c`)
-- Checkpoints: `+` at the top of the changes view takes one of the workspace's folders, named if you like, and the changes, diffs, and gutter then show what changed since, until `✕`; clicking the row picks an older one. They're kept in cue's state folder, not the repository, the last 20 per folder, and work in folders that aren't repositories (`HASH`)
-- Each repository in the changes view is one row, with its branch and how far it is from the branch it tracks; clicking it pops up Commit, Log, Switch Branch, and syncing beside it, in place of the buttons over it. Show Git Log, Switch Branch…, and Sync with Remote are in the palette too (`HASH`)
+- Checkpoints: `+` at the top of the changes view takes one of the workspace's folders, named if you like, and the changes, diffs, and gutter then show what changed since, until `✕`; clicking the row picks an older one. They're kept in cue's state folder, not the repository, the last 20 per folder, and work in folders that aren't repositories (`4c815a9`)
+- Each repository in the changes view is one row, with its branch and how far it is from the branch it tracks; clicking it pops up Commit, Log, Switch Branch, and syncing beside it, in place of the buttons over it. Show Git Log, Switch Branch…, and Sync with Remote are in the palette too (`4c815a9`)
 
 ## v0.4.6 — 2026-10-18
 
