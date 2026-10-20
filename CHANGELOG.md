@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.8 — 2026-10-19
 
 - Unit 01 replaces Slate: white on black with Evangelion's pastel neons, lilac keywords, apricot functions, amber strings, and blue types (`4bf35d5`)
 - Plainer wording in messages and prompts; Rename Session's placeholder is the session's ID (`07da435`)
