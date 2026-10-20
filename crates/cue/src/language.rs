@@ -206,7 +206,10 @@ static LANGUAGES: &[Language] = &[
     language("Python", &["py", "pyi", "pyw"], &[], &["python"])
         .highlighted(
             || tree_sitter_python::LANGUAGE.into(),
-            &[tree_sitter_python::HIGHLIGHTS_QUERY],
+            &[
+                tree_sitter_python::HIGHLIGHTS_QUERY,
+                include_str!("../queries/python/highlights.scm"),
+            ],
         )
         .tagged(&[tree_sitter_python::TAGS_QUERY]),
     language("JavaScript", &["js", "mjs", "cjs", "jsx"], &[], &["node"])
