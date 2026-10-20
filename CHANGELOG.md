@@ -4,7 +4,8 @@
 
 - Ctrl+Enter shows the context menu of what's selected in the sidebar; Open to the Side keeps Cmd+Enter (`3bd002f`)
 - Left and Right in the file dialog go to the start and end of the name it suggests, as from any selection (`1359343`)
-- Clicking below a file's last line puts the cursor on it
+- Clicking below a file's last line puts the cursor on it (`d1c5d66`)
+- Math in the scratchpad no longer shows the PDF under the scratchpad through it
 
 ## v0.4.7 — 2026-10-19
 

@@ -1379,13 +1379,14 @@ pub const CliRenderer = struct {
     }
 
     // A cell stays reserved while it shows this placement or a higher Kitty
-    // placement, which the terminal composites by z. Text, fills, and images
-    // on another protocol paint the cell, so they exclude it.
+    // placement drawn over it, which the terminal composites by z. Text,
+    // fills, and images on another protocol paint the cell, so they exclude
+    // it, and keep excluding it under images drawn over them.
     fn imageCharReserved(self: *CliRenderer, buffer: *const OptimizedBuffer, placement: OptimizedBuffer.ImagePlacement, char: u32) bool {
         if (!gp.isImageChar(char)) return false;
         const id = gp.imageIdFromChar(char);
         if (id == placement.placement_id) return true;
-        if (id < placement.placement_id or id > buffer.image_placements.items.len) return false;
+        if (id > buffer.image_placements.items.len or !buffer.imageShowsUnder(placement.placement_id, id)) return false;
         return self.nextPlacementProtocol(buffer.image_placements.items[id - 1]) == .kitty;
     }
 

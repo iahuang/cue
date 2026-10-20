@@ -1009,6 +1009,38 @@ test "renderer keeps a Kitty image whole under an overlapping Kitty image" {
     try std.testing.expect(std.mem.find(u8, covered, ",p=2147483648,c=1,r=1,x=0,y=0,w=1,h=1,C=1,z=-1073741823") != null);
 }
 
+test "renderer keeps text over a Kitty image covering it under a Kitty image drawn on the text" {
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    defer link.deinitGlobalLinkPool();
+    var test_renderer = try TestRenderer.create(std.testing.allocator, 2, 1, pool);
+    defer test_renderer.deinit();
+    const red = try image.createFromRgba(std.testing.allocator, &[_]u8{
+        255, 0, 0, 255,
+        255, 0, 0, 255,
+    }, 2, 1, 8);
+    const transparent = try image.createFromRgba(std.testing.allocator, &[_]u8{ 0, 0, 0, 0 }, 1, 1, 4);
+    const red_handle = try handles.insert(.image, @ptrCast(red));
+    const transparent_handle = try handles.insert(.image, @ptrCast(transparent));
+    defer for ([_]u32{ transparent_handle, red_handle }) |handle| {
+        const token = handles.beginDestroy(handle, .image, image.Image).?;
+        token.ptr.deinit();
+        handles.finishDestroy(token.handle);
+    };
+
+    // As a panel floating over a PDF draws math over its own background:
+    // the PDF stays hidden under the math's transparent pixels.
+    var next = test_renderer.renderer.getNextBuffer();
+    try std.testing.expect(try next.drawImage(red, red_handle, 0, 0, 2, 1, 0, 0, 0, 0, 2, 1, .kitty));
+    next.fillRect(1, 0, 1, 1, ansi.rgbColor(0, 0, 255, 255));
+    try std.testing.expect(try next.drawImage(transparent, transparent_handle, 1, 0, 1, 1, 0, 0, 0, 0, 1, 1, .kitty));
+    try std.testing.expectEqual(renderer.RenderStatus.rendered, test_renderer.renderer.render(true));
+    const covered = test_renderer.memory.lastWrite();
+    try std.testing.expect(std.mem.find(u8, covered, ",c=2,r=1") == null);
+    try std.testing.expect(std.mem.find(u8, covered, ",c=1,r=1,x=0,y=0,w=1,h=1,C=1,z=-1073741823") != null);
+    try std.testing.expect(std.mem.find(u8, covered, ",p=2,c=1,r=1,x=0,y=0,w=1,h=1,C=1,z=-1073741822") != null);
+}
+
 test "renderer merges uncovered Kitty rows into one placement" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

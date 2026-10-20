@@ -174,6 +174,10 @@ pub const OptimizedBuffer = struct {
         source_height: u32,
         opacity: u8,
         protocol: native_image.RenderProtocol,
+        /// The lowest placement this one was drawn over without anything
+        /// painted between: lower placements don't show through it. Its own
+        /// id if it was drawn over no image, 0 if unknown (all show through).
+        floor: u32 = 0,
     };
 
     buffer: struct {
@@ -1531,6 +1535,12 @@ pub const OptimizedBuffer = struct {
                 .source_height = source_end_y - source_start_y,
                 .opacity = @intCast(mulDiv255(placement.opacity, opacityToU8(self.getCurrentOpacity()))),
                 .protocol = placement.protocol,
+                .floor = if (placement.floor == source_id)
+                    @intCast(self.image_placements.items.len + 1)
+                else if (placement.floor < image_id_map.len)
+                    image_id_map[placement.floor]
+                else
+                    0,
             });
             placement.image.retain();
             image_id_map[source_id] = @intCast(self.image_placements.items.len);
@@ -2608,6 +2618,7 @@ pub const OptimizedBuffer = struct {
         });
         @constCast(image).retain();
 
+        var floor = placement_id;
         var cell_y: u32 = 0;
         while (cell_y < clipped_height) : (cell_y += 1) {
             const dest_y: u32 = @intCast(clip_y0 + cell_y);
@@ -2615,10 +2626,25 @@ pub const OptimizedBuffer = struct {
             while (cell_x < clipped_width) : (cell_x += 1) {
                 const dest_x: u32 = @intCast(clip_x0 + cell_x);
                 const current = self.get(dest_x, dest_y) orelse continue;
+                if (gp.isImageChar(current.char)) floor = @min(floor, self.imageFloor(gp.imageIdFromChar(current.char)));
                 self.set(dest_x, dest_y, makeCell(gp.packImageCell(placement_id, 0), current.fg, current.bg, current.attributes));
             }
         }
+        self.image_placements.items[placement_id - 1].floor = floor;
         return true;
+    }
+
+    /// The lowest placement that shows through placement `id`.
+    fn imageFloor(self: *const OptimizedBuffer, id: u32) u32 {
+        if (id == 0 or id > self.image_placements.items.len) return id;
+        return self.image_placements.items[id - 1].floor;
+    }
+
+    /// Whether placement `lower` shows in a cell that shows placement
+    /// `upper`: the terminal composites them unless something was painted
+    /// between them.
+    pub fn imageShowsUnder(self: *const OptimizedBuffer, lower: u32, upper: u32) bool {
+        return upper == lower or (upper > lower and self.imageFloor(upper) <= lower);
     }
 
     pub fn materializeImageFallback(self: *OptimizedBuffer, placement_id: u32) !void {
@@ -2634,7 +2660,7 @@ pub const OptimizedBuffer = struct {
                 const current = self.get(dest_x, dest_y) orelse continue;
                 if (!gp.isImageChar(current.char)) continue;
                 const current_placement_id = gp.imageIdFromChar(current.char);
-                if (current_placement_id < placement_id) continue;
+                if (!self.imageShowsUnder(placement_id, current_placement_id)) continue;
 
                 var pixels: [4]RGBA = undefined;
                 inline for (0..4) |quadrant| {
