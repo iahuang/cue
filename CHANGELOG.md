@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Unit 01 replaces Slate: white on black with Evangelion's pastel neons, lilac keywords, apricot functions, amber strings, and blue types
+- Unit 01 replaces Slate: white on black with Evangelion's pastel neons, lilac keywords, apricot functions, amber strings, and blue types (`4bf35d5`)
 - Plainer wording in messages and prompts; Rename Session's placeholder is the session's ID (`07da435`)
 - Python's `and`, `in`, `is`, `not`, and `or` take the keyword color, not the operators' (`aef12fa`)
 - Cue Light, a light theme to go with Cue Dark: Cue Dark's syntax colors, deepened to read on a warm off-white (`c6e8d7d`)
