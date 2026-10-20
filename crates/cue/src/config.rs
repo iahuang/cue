@@ -42,6 +42,9 @@ pub struct Config {
     /// `editor.autocomplete`: whether completions pop up as a word is
     /// typed, rather than only with Show Completions.
     pub autocomplete: bool,
+    /// `editor.auto_close`: whether typing a bracket or quote types its
+    /// closer too, as the language pairs them.
+    pub auto_close: bool,
     /// `editor.scroll_margin`: the part of the view, up to half, kept
     /// between the cursor and the view's edges.
     pub scroll_margin: f32,
@@ -92,6 +95,7 @@ impl Default for Config {
             line_highlight: true,
             wrap: true,
             autocomplete: true,
+            auto_close: true,
             scroll_margin: 0.15,
             scroll_lines: 2,
             theme: ThemeSetting::default(),
@@ -124,6 +128,7 @@ pub const TEMPLATE: &str = r#"# Uncomment settings to customize. Save in cue or 
 # line_highlight = true       # Highlight the cursor's line.
 # wrap = true
 # autocomplete = true         # Suggest words while typing; Ctrl+Space always does.
+# auto_close = true           # Close brackets and quotes as they're typed.
 # scroll_margin = 0.15        # Cursor margin as a fraction of the view (0–0.5).
 
 [ui]
@@ -274,6 +279,7 @@ impl Config {
             }
             "editor.wrap" => self.wrap = value.as_bool().ok_or("true or false")?,
             "editor.autocomplete" => self.autocomplete = value.as_bool().ok_or("true or false")?,
+            "editor.auto_close" => self.auto_close = value.as_bool().ok_or("true or false")?,
             "editor.indent_guides" => {
                 self.indent_guides = value.as_bool().ok_or("true or false")?
             }
@@ -639,6 +645,7 @@ mod tests {
             line_highlight = false
             wrap = false
             autocomplete = false
+            auto_close = false
             scroll_margin = 0
             [ui]
             scroll_lines = 5
@@ -667,6 +674,7 @@ mod tests {
                 line_highlight: false,
                 wrap: false,
                 autocomplete: false,
+                auto_close: false,
                 scroll_margin: 0.0,
                 scroll_lines: 5,
                 theme: ThemeSetting::one(ThemeId::named("Catppuccin Mocha").unwrap()),

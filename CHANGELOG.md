@@ -6,7 +6,8 @@
 - Left and Right in the file dialog go to the start and end of the name it suggests, as from any selection (`1359343`)
 - Clicking below a file's last line puts the cursor on it (`d1c5d66`)
 - Math in the scratchpad no longer shows the PDF under the scratchpad through it (`8b7b98f`)
-- Left and Right no longer collapse and expand folders in the sidebar; Enter does
+- Left and Right no longer collapse and expand folders in the sidebar; Enter does (`5be05c5`)
+- Brackets and quotes close as they're typed, by the language: `<>` in HTML, backticks in JavaScript, no `'` in Rust or Markdown; quotes only in code and not after a word. Typing the closer steps over it, Backspace deletes both, and with text selected they go around it; `editor.auto_close = false` turns it off
 
 ## v0.4.7 — 2026-10-19
 

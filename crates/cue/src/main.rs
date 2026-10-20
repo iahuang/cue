@@ -36,6 +36,7 @@ mod line_edit;
 mod location;
 mod log;
 mod math;
+mod pairs;
 mod panel;
 mod pdf;
 mod picker;

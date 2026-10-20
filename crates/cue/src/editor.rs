@@ -40,6 +40,7 @@ use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind, DRAG_SCROLL_EVER
 use crate::keymap::{Command, Keymap};
 use crate::line_edit::Edit;
 use crate::location::Position;
+use crate::pairs::{self, Typed};
 use crate::reader::{Reader, ReaderEvent};
 use crate::scroller::{Ran, Scrolled};
 use crate::search::Toggle;
@@ -125,6 +126,15 @@ struct Drag {
     scrolled: Option<Instant>,
 }
 
+/// Closers typed for the openers before them, on one line of the text as
+/// it was once: each as bytes from it to the line's end, which typing
+/// before it doesn't change.
+struct Closed {
+    epoch: u64,
+    row: u32,
+    from_end: Vec<usize>,
+}
+
 struct Click {
     at: (u32, u32),
     time: Instant,
@@ -174,6 +184,9 @@ pub struct Editor {
     find_text: Option<(u64, String)>,
     /// The bytes of the name underlined to go to the definition of, if any.
     underlined: Option<Range<usize>>,
+    /// Closers typed for brackets and quotes, while typing goes on before
+    /// them (see [`pairs`]).
+    closed: Option<Closed>,
 }
 
 impl Editor {
@@ -224,6 +237,7 @@ impl Editor {
             find_painted: Cell::new(None),
             find_text: None,
             underlined: None,
+            closed: None,
         };
         editor.attach();
         Ok(editor)
@@ -706,6 +720,7 @@ impl Editor {
     /// typed, with `word`, as one undo step.
     pub fn complete(&mut self, typed: usize, word: &str) {
         self.attach();
+        let current = self.closed_current();
         self.history().break_group();
         let eb = &*self.buffer;
         let mut steps = 0;
@@ -714,6 +729,7 @@ impl Editor {
         }
         steps += eb.insert_text(word);
         self.history().record(EditKind::Other, steps);
+        self.keep_closed(current);
         self.sync_find();
     }
 
@@ -759,16 +775,20 @@ impl Editor {
             };
         }
         if let KeyCode::Char(c) = key.code {
-            if key.mods.is_plain() {
+            if key.mods.is_plain() && !self.type_pair(c) {
                 let mut utf8 = [0u8; 4];
                 let text: &str = c.encode_utf8(&mut utf8);
                 let indent = self.closer_indent(c);
+                let current = self.closed_current();
                 self.edit(EditKind::Type(c), |eb| {
                     let outdented = indent.map_or(0, |(row, from, indent)| {
                         eb.delete_range((row, 0), (row, from)) + eb.insert_text(&indent)
                     });
                     outdented + eb.insert_text(text)
                 });
+                self.keep_closed(current);
+                self.sync_find();
+            } else if key.mods.is_plain() {
                 self.sync_find();
             }
         }
@@ -827,6 +847,10 @@ impl Editor {
         clipboard: &mut Option<String>,
     ) -> Action {
         use Direction::{Backward, Forward};
+        // Closers typed are stepped over only as typing goes on.
+        if !matches!(command, Command::DeleteBackward | Command::InsertTab) {
+            self.closed = None;
+        }
         match command {
             Command::Save => return self.save(),
             Command::Undo => self.undo(),
@@ -858,12 +882,22 @@ impl Editor {
             Command::NewLine => self.new_line(),
             // With lines selected, Tab indents them, as in most editors.
             Command::InsertTab if self.selection_spans_lines() => self.indent_lines(Forward),
-            Command::InsertTab => self.insert_indent(),
+            Command::InsertTab => {
+                let current = self.closed_current();
+                self.insert_indent();
+                self.keep_closed(current);
+            }
             Command::ToggleComment => self.change_lines(None),
             Command::Indent => self.indent_lines(Forward),
             Command::Outdent => self.indent_lines(Backward),
-            Command::DeleteBackward if self.delete_indent() => {}
-            Command::DeleteBackward => self.delete(EditBuffer::delete_char_backward),
+            Command::DeleteBackward if self.delete_pair() => {}
+            Command::DeleteBackward => {
+                let current = self.closed_current();
+                if !self.delete_indent() {
+                    self.delete(EditBuffer::delete_char_backward);
+                }
+                self.keep_closed(current);
+            }
             Command::DeleteForward => self.delete(EditBuffer::delete_char),
             Command::DeleteWordBackward => self.delete_word(Backward),
             Command::DeleteWordForward => self.delete_word(Forward),
@@ -960,6 +994,7 @@ impl Editor {
         match mouse.kind {
             MouseKind::Press(MouseButton::Left) if mouse.y < text_h => {
                 self.history().break_group();
+                self.closed = None;
                 let count = self.click_count(at, now);
                 if mouse.mods.shift && count == 1 {
                     self.extend_selection_to(at);
@@ -1417,6 +1452,169 @@ impl Editor {
             eb.set_cursor(at.row, at.col);
         }
         self.history().record(EditKind::Other, replaced + steps);
+    }
+
+    /// Types `c` as [`pairs`] does, if it pairs or closes one: around the
+    /// selection, with its closer, or over the closer typed for it. Returns
+    /// false, typing nothing, if it doesn't.
+    fn type_pair(&mut self, c: char) -> bool {
+        if !config::get().auto_close {
+            return false;
+        }
+        let pairs = pairs::of(self.doc.language.get());
+        if self.has_selection() {
+            let Some(close) = pairs::closer(pairs, c) else {
+                return false;
+            };
+            self.surround(c, close);
+            return true;
+        }
+        let (before, after) = self.around_cursor();
+        let closed = self.closed_after(&after);
+        // Only quotes go by what's around them.
+        let region = match pairs::closer(pairs, c) == Some(c) {
+            true => self.region_before(before.len()),
+            false => Region::Code,
+        };
+        match pairs::typed(pairs, c, &before, &after, region, closed) {
+            Typed::Plain => return false,
+            Typed::Over => {
+                self.buffer.move_cursor_right();
+                self.forget_closer(after.len());
+            }
+            Typed::Pair(close) => {
+                let text = String::from_iter([c, close]);
+                self.edit(EditKind::Type(c), |eb| {
+                    let steps = eb.insert_text(&text);
+                    eb.move_cursor_left();
+                    steps
+                });
+                let closed = self.closed.get_or_insert(Closed {
+                    epoch: 0,
+                    row: self.buffer.cursor().row,
+                    from_end: Vec::new(),
+                });
+                closed.from_end.push(after.len() + close.len_utf8());
+                closed.epoch = self.buffer.content_epoch();
+            }
+        }
+        true
+    }
+
+    /// Puts `open` and `close` around the selection, which stays on the
+    /// text inside, as one undo step.
+    fn surround(&mut self, open: char, close: char) {
+        let Some((start, end)) = self.view.selection() else {
+            return;
+        };
+        self.closed = None;
+        self.history().break_group();
+        let eb = &*self.buffer;
+        let mut utf8 = [0u8; 4];
+        eb.set_cursor_by_offset(end);
+        let mut steps = eb.insert_text(close.encode_utf8(&mut utf8));
+        eb.set_cursor_by_offset(start);
+        steps += eb.insert_text(open.encode_utf8(&mut utf8));
+        let width = eb.cursor().offset - start;
+        self.history().record(EditKind::Other, steps);
+        self.history().break_group();
+        self.buffer.set_cursor_by_offset(end + width);
+        self.anchor = Some(start + width);
+        self.select_to_cursor(start + width);
+    }
+
+    /// Backspace between a pair typed together deletes both. Returns false,
+    /// deleting nothing, anywhere else.
+    fn delete_pair(&mut self) -> bool {
+        if self.has_selection() || !config::get().auto_close {
+            return false;
+        }
+        let (before, after) = self.around_cursor();
+        let closed = self.closed_after(&after);
+        let pairs = pairs::of(self.doc.language.get());
+        if !pairs::deletes_pair(pairs, &before, &after, closed) {
+            return false;
+        }
+        let eb = &*self.buffer;
+        let steps = eb.delete_char() + eb.delete_char_backward();
+        self.history().record(EditKind::Delete, steps);
+        self.forget_closer(after.len());
+        if let Some(closed) = &mut self.closed {
+            closed.epoch = self.buffer.content_epoch();
+        }
+        true
+    }
+
+    /// The cursor's line, before and after it.
+    fn around_cursor(&self) -> (String, String) {
+        let eb = &*self.buffer;
+        let cursor = eb.cursor();
+        let line_start = eb.position_to_offset(cursor.row, 0);
+        let line_end = eb.line_end_offset(cursor.row);
+        (
+            eb.text_range(line_start, cursor.offset),
+            eb.text_range(cursor.offset, line_end),
+        )
+    }
+
+    /// What the character before the cursor is in, `column` bytes into its
+    /// line: code, at the text's start.
+    fn region_before(&self, column: usize) -> Region {
+        let row = self.buffer.cursor().row;
+        let (region, _) = self.with_regions(row, 1, |text, line_start, region| {
+            let at = line_start + column;
+            text[..at]
+                .chars()
+                .next_back()
+                .map_or(Region::Code, |c| region(at - c.len_utf8()))
+        });
+        region
+    }
+
+    /// Whether the closers typed are of the text as it is, on the cursor's
+    /// line, with nothing selected to type over them.
+    fn closed_current(&self) -> bool {
+        let row = self.buffer.cursor().row;
+        let epoch = self.buffer.content_epoch();
+        !self.has_selection()
+            && self
+                .closed
+                .as_ref()
+                .is_some_and(|closed| closed.row == row && closed.epoch == epoch)
+    }
+
+    /// After an edit before the cursor on its line, keeps the closers typed
+    /// after it if they were `current` before, and forgets them otherwise.
+    fn keep_closed(&mut self, current: bool) {
+        match &mut self.closed {
+            Some(closed) if current => {
+                closed.epoch = self.buffer.content_epoch();
+                closed.row = self.buffer.cursor().row;
+            }
+            _ => self.closed = None,
+        }
+    }
+
+    /// Whether the character starting `after`, the line after the cursor,
+    /// was typed for an opener. Forgets the closers the cursor has left
+    /// behind, or all of them if the text has changed since.
+    fn closed_after(&mut self, after: &str) -> bool {
+        if !self.closed_current() {
+            self.closed = None;
+            return false;
+        }
+        let Some(closed) = &mut self.closed else {
+            return false;
+        };
+        closed.from_end.retain(|&n| n <= after.len());
+        closed.from_end.contains(&after.len())
+    }
+
+    /// Forgets the closer `from_end` bytes from the end of the cursor's line.
+    fn forget_closer(&mut self, from_end: usize) {
+        if let Some(closed) = &mut self.closed {
+            closed.from_end.retain(|&n| n != from_end);
+        }
     }
 
     /// Where typing `c` at the cursor moves its line to, as [`autoindent`]
@@ -3366,8 +3564,8 @@ mod tests {
     #[test]
     fn enter_and_closing_brackets_indent_as_one_edit_each() {
         let _serial = serial();
-        let (eb, mut editor) = editor_of("");
-        press(&mut editor, "fn f() {");
+        let (eb, mut editor) = editor_of("fn f() {");
+        eb.set_cursor(0, u32::MAX);
         key(&mut editor, KeyCode::Enter);
         press(&mut editor, "x");
         key(&mut editor, KeyCode::Enter);
@@ -3395,6 +3593,110 @@ mod tests {
         shift(&mut editor, KeyCode::Right);
         key(&mut editor, KeyCode::Enter);
         assert_eq!(eb.text(), "  a(\n      c)");
+    }
+
+    #[test]
+    fn brackets_and_quotes_close_as_typed() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of("");
+        let rust = crate::language::detect(Some(std::path::Path::new("a.rs")), String::new);
+        editor.doc.set_language(rust);
+        press(&mut editor, "f(");
+        assert_eq!(eb.text(), "f()");
+        assert_eq!(pos(&eb), (0, 2));
+        // Typing goes on inside, and the closers are stepped over.
+        press(&mut editor, "a, [\"x");
+        assert_eq!(eb.text(), "f(a, [\"x\"])");
+        press(&mut editor, "\"]);");
+        assert_eq!(eb.text(), "f(a, [\"x\"]);");
+        assert_eq!(pos(&eb), (0, 12));
+        // Closers undo with what was typed, a word at a time.
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "f(a, )");
+
+        // Closers already there are typed again.
+        eb.set_text("g()");
+        eb.set_cursor(0, 2);
+        press(&mut editor, ")");
+        assert_eq!(eb.text(), "g())");
+        // Before a word, nothing closes; nor a quote after one.
+        eb.set_text("x");
+        eb.set_cursor(0, 0);
+        press(&mut editor, "(");
+        assert_eq!(eb.text(), "(x");
+        eb.set_text("");
+        press(&mut editor, "don't '");
+        assert_eq!(eb.text(), "don't '");
+        // Rust's `'` is a lifetime.
+        eb.set_text("");
+        press(&mut editor, "&'a ");
+        assert_eq!(eb.text(), "&'a ");
+        // In a string, quotes don't close; in code, a string prefix may
+        // come before.
+        let python = crate::language::detect(Some(std::path::Path::new("a.py")), String::new);
+        editor.doc.set_language(python);
+        eb.set_text("x = \"a b\"");
+        eb.set_cursor(0, 6);
+        press(&mut editor, "'");
+        assert_eq!(eb.text(), "x = \"a' b\"");
+        eb.set_text("print()");
+        eb.set_cursor(0, 6);
+        press(&mut editor, "f'");
+        assert_eq!(eb.text(), "print(f'')");
+    }
+
+    #[test]
+    fn backspace_deletes_a_pair_typed_together() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of("");
+        press(&mut editor, "f({");
+        assert_eq!(eb.text(), "f({})");
+        key(&mut editor, KeyCode::Backspace);
+        assert_eq!(eb.text(), "f()");
+        key(&mut editor, KeyCode::Backspace);
+        assert_eq!(eb.text(), "f");
+        // Not one that was there already.
+        eb.set_text("()");
+        eb.set_cursor(0, 1);
+        key(&mut editor, KeyCode::Backspace);
+        assert_eq!(eb.text(), ")");
+        // Nor once the cursor has left it.
+        eb.set_text("");
+        press(&mut editor, "[");
+        key(&mut editor, KeyCode::Right);
+        key(&mut editor, KeyCode::Left);
+        key(&mut editor, KeyCode::Backspace);
+        assert_eq!(eb.text(), "]");
+    }
+
+    #[test]
+    fn brackets_and_quotes_go_around_the_selection() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of("a bc d");
+        eb.set_cursor(0, 2);
+        shift(&mut editor, KeyCode::Right);
+        shift(&mut editor, KeyCode::Right);
+        press(&mut editor, "(");
+        assert_eq!(eb.text(), "a (bc) d");
+        press(&mut editor, "\"");
+        assert_eq!(eb.text(), "a (\"bc\") d");
+        // The text inside stays selected, to type over.
+        press(&mut editor, "x");
+        assert_eq!(eb.text(), "a (\"x\") d");
+        ctrl(&mut editor, 'z');
+        ctrl(&mut editor, 'z');
+        assert_eq!(eb.text(), "a (bc) d");
+    }
+
+    #[test]
+    fn html_closes_angle_brackets() {
+        let _serial = serial();
+        let (eb, mut editor) = editor_of("");
+        let html = crate::language::detect(Some(std::path::Path::new("a.html")), String::new);
+        editor.doc.set_language(html);
+        press(&mut editor, "<a href=\"x\">");
+        assert_eq!(eb.text(), "<a href=\"x\">");
+        assert_eq!(pos(&eb), (0, 12));
     }
 
     #[test]
