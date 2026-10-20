@@ -9915,7 +9915,7 @@ mod tests {
         // A folder expanded is watched from then on.
         ctrl(&mut app, 'e');
         key(&mut app, KeyCode::Up);
-        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Enter);
         assert!(screen(&app).contains("b.txt"), "{}", screen(&app));
         fs::write(root.join("sub/c.txt"), "").unwrap();
         wait_until(&mut app, "the file in the folder", |app| {

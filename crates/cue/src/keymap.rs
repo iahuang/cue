@@ -591,8 +591,6 @@ impl Default for Keymap {
             (key(Esc, Mods::NONE), FocusEditor),
             (key(Up, Mods::NONE), TreeUp),
             (key(Down, Mods::NONE), TreeDown),
-            (key(Right, Mods::NONE), TreeExpand),
-            (key(Left, Mods::NONE), TreeCollapse),
             (key(Enter, Mods::NONE), TreeOpen),
             (key(Char(' '), Mods::NONE), TreeQuickLook),
             (key(Char(' '), SHIFT), TreePreview),
