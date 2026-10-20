@@ -135,7 +135,7 @@ pub const TEMPLATE: &str = r#"# Uncomment settings to customize. Save in cue or 
 # scroll_lines = 2           # Lines per scroll (1–100); applies across views.
 # Browse themes with Select Theme in the command palette.
 # theme = "Terminal"
-# theme = { dark = "Cue Dark", light = "GitHub Light" }
+# theme = { dark = "Cue Dark", light = "Cue Light" }
 # terminal_background = true # Match terminal padding to the theme.
 # cursor_color = true        # Use the theme's cursor color.
 # nerd_font = false          # File icons; requires a Nerd Font.
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(config.shell, Some(PathBuf::from("/bin/zsh")));
         assert_eq!(config.exclude, ["node_modules", "*.pyc"]);
         assert_eq!(config.theme.dark.name(), "Cue Dark");
-        assert_eq!(config.theme.light.name(), "GitHub Light");
+        assert_eq!(config.theme.light.name(), "Cue Light");
         assert_eq!(config.keys.len(), 4);
     }
 
