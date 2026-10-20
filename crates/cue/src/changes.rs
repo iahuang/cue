@@ -448,7 +448,7 @@ impl ChangesView {
                 self.draw_row(frame, index, (x, y, width), focused);
             }
             let note = match self.groups.is_empty() {
-                true => Some("Not in a git repository. Take a checkpoint (+) to see what changes."),
+                true => Some("Not in a git repository. Take a checkpoint (+) to track changes."),
                 false => self
                     .groups
                     .iter()

@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Python's `and`, `in`, `is`, `not`, and `or` take the keyword color, not the operators'
+- Plainer wording in messages and prompts; Rename Session's placeholder is the session's ID
+- Python's `and`, `in`, `is`, `not`, and `or` take the keyword color, not the operators' (`aef12fa`)
 - Cue Light, a light theme to go with Cue Dark: Cue Dark's syntax colors, deepened to read on a warm off-white (`c6e8d7d`)
 - Ctrl+Enter shows the context menu of what's selected in the sidebar; Open to the Side keeps Cmd+Enter (`3bd002f`)
 - Left and Right in the file dialog go to the start and end of the name it suggests, as from any selection (`1359343`)

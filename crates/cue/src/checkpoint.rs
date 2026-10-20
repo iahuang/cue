@@ -106,14 +106,14 @@ impl Store {
             store.copy_excludes();
             return Ok(store);
         }
-        let dir = store_dir(root).ok_or("There's no folder to keep checkpoints in.")?;
+        let dir = store_dir(root).ok_or("Failed to locate checkpoints folder.")?;
         std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
         let mut init = Command::new("git");
         init.args(["init", "--bare", "-q"]).arg(&dir);
         run(init)?;
         // For whoever wonders what it's of.
         let _ = std::fs::write(dir.join("cue-root"), root.as_os_str().as_encoded_bytes());
-        let store = Store::find(root).ok_or("Can't make a checkpoint store.")?;
+        let store = Store::find(root).ok_or("Failed to create checkpoints store.")?;
         store.copy_excludes();
         Ok(store)
     }

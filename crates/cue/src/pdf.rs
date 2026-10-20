@@ -385,7 +385,7 @@ fn reason(err: LoadPdfError) -> &'static str {
             "This PDF's encryption isn't supported"
         }
         LoadPdfError::Decryption(_) => "This PDF's encryption is malformed",
-        LoadPdfError::Invalid => "Not a PDF, or a malformed one",
+        LoadPdfError::Invalid => "Invalid or malformed PDF",
     }
 }
 
@@ -612,7 +612,7 @@ mod tests {
     fn what_isnt_a_pdf_says_so() {
         assert_eq!(
             Pdf::open(b"hello".to_vec()).err().as_deref(),
-            Some("Not a PDF, or a malformed one")
+            Some("Invalid or malformed PDF")
         );
         assert!(Pdf::open(test_pdf(&[])).is_err());
     }

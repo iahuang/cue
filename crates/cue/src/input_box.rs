@@ -28,7 +28,7 @@ pub enum InputAction {
 pub struct InputBox {
     title: &'static str,
     /// Shown, dimmed, while the field is empty: what an empty one means.
-    placeholder: &'static str,
+    placeholder: String,
     text: String,
     caret: Caret,
     screen_width: u32,
@@ -40,7 +40,7 @@ impl InputBox {
     /// on a screen `width` x `height`.
     pub fn new(
         title: &'static str,
-        placeholder: &'static str,
+        placeholder: &str,
         text: &str,
         width: u32,
         height: u32,
@@ -49,7 +49,7 @@ impl InputBox {
         caret.select_all(text);
         InputBox {
             title,
-            placeholder,
+            placeholder: placeholder.to_string(),
             text: text.to_string(),
             caret,
             screen_width: width,

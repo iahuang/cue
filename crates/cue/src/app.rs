@@ -1093,7 +1093,7 @@ impl App {
     fn ask_name(
         &mut self,
         title: &'static str,
-        placeholder: &'static str,
+        placeholder: &str,
         name: &str,
         naming: Naming,
     ) {
@@ -1256,8 +1256,8 @@ impl App {
             Command::RenameSession => match &self.session {
                 Some(session) => {
                     let name = session.name().unwrap_or_default().to_string();
-                    let placeholder = "Leave empty to go by its ID";
-                    self.ask_name("Rename Session", placeholder, &name, Naming::Session);
+                    let id = session.id().to_string();
+                    self.ask_name("Rename Session", &id, &name, Naming::Session);
                 }
                 None => {
                     self.show_message("No active session. Use Keep Session to create one.", false)
@@ -1388,7 +1388,7 @@ impl App {
             }
             Command::RenameTab => {
                 let name = self.tab().name.clone().unwrap_or_default();
-                let placeholder = "Leave empty to name it for what it shows";
+                let placeholder = "Enter name…";
                 self.ask_name("Rename Tab", placeholder, &name, Naming::Tab);
             }
             Command::NewTerminal => self.new_terminal(),
@@ -1417,7 +1417,7 @@ impl App {
                 if let Some(terminal) = self.active_terminal() {
                     let terminal = terminal.borrow();
                     let name = terminal.given_name().unwrap_or_default().to_string();
-                    let placeholder = "Leave empty to name it for what's running";
+                    let placeholder = "Enter name…";
                     let naming = Naming::Terminal(terminal.id());
                     drop(terminal);
                     self.ask_name("Rename Terminal", placeholder, &name, naming);
@@ -4169,9 +4169,9 @@ impl App {
         let cursor = editor.place();
         let Some(reference) = reference_in(&doc, |text| editor.cursor_byte(text), true) else {
             let message = match doc.language.get() {
-                Some(language) if tagged(language) => "No name at the cursor.".to_string(),
-                Some(language) => format!("Go to Definition doesn't know {}.", language.name),
-                None => "Go to Definition doesn't know plain text.".to_string(),
+                Some(language) if tagged(language) => "No symbol at the cursor.".to_string(),
+                Some(language) => format!("Go to Definition doesn't support {}.", language.name),
+                None => "Go to Definition doesn't support plain text.".to_string(),
             };
             self.show_message(message, false);
             return;
@@ -4223,7 +4223,7 @@ impl App {
         let name = &reference.name;
         if found.candidates.is_empty() {
             let message = match found.at_definition {
-                true => format!("This is where “{name}” is defined."),
+                true => format!("Already at the definition for “{name}”."),
                 false => format!("No definition of “{name}” found."),
             };
             self.show_message(message, false);
@@ -6685,7 +6685,7 @@ impl App {
             LogAction::NewBranch(commit) => {
                 if let Some(root) = self.log.as_ref().map(|log| log.root().to_path_buf()) {
                     let naming = Naming::Branch(root, commit.hash);
-                    self.ask_name("New Branch", "Name the branch", "", naming);
+                    self.ask_name("New Branch", "Branch name", "", naming);
                 }
             }
             LogAction::Revert(commit) => {
@@ -6805,7 +6805,7 @@ impl App {
     /// background, unless it's busy.
     fn sync(&mut self, root: PathBuf, sync: git::Sync) {
         if self.syncing.iter().any(|syncing| syncing.root == root) {
-            self.show_message("Wait for the last one to finish.", false);
+            self.show_message("Wait for the git sync to finish.", false);
             return;
         }
         if self
@@ -7073,7 +7073,7 @@ impl App {
             Err(CantCommit::NoMessage) => {
                 view.set_editing(true);
                 self.focus = Focus::Tree;
-                self.show_message("Write a message for the commit.", false);
+                self.show_message("Enter a commit message.", false);
             }
             Err(CantCommit::NothingStaged) => {
                 let key = self.shortcut(Command::TreeToggleStaged);
@@ -7104,7 +7104,7 @@ impl App {
             message.push("…");
         }
         let message = match message.is_empty() {
-            true => "git didn't say why.".to_string(),
+            true => "No error message provided.".to_string(),
             false => message.join("\n"),
         };
         let mut alert = Alert::new(title, message, Vec::new(), self.width, self.height);
@@ -7210,7 +7210,7 @@ impl App {
         if self.taking.is_some() {
             return;
         }
-        let placeholder = "Name it, or leave it unnamed";
+        let placeholder = "Name (optional)";
         self.ask_name("Take Checkpoint", placeholder, "", Naming::Checkpoint);
     }
 
@@ -7246,7 +7246,7 @@ impl App {
     /// with one.
     fn show_checkpoints(&mut self) {
         if self.git.marks().is_empty() {
-            self.show_message("No checkpoints yet: + takes one.", false);
+            self.show_message("No checkpoints yet.", false);
             return;
         }
         let now = std::time::SystemTime::now()
@@ -7373,12 +7373,12 @@ impl App {
         match result {
             Ok(Carried::Along) => self.show_message(format!("Switched to {name}."), false),
             Ok(Carried::Stashed) => {
-                let message = format!("Switched to {name}, bringing your changes.");
+                let message = format!("Switched to {name} with your changes (now unstaged).");
                 self.show_message(message, false);
             }
             Ok(Carried::Unstaged) => {
                 let message = format!(
-                    "Switched to {name}, bringing your changes, but they had to be unstaged."
+                    "Switched to {name}, bringing your changes (now unstaged)."
                 );
                 self.show_message(message, false);
             }
@@ -7387,7 +7387,7 @@ impl App {
                     "Switched to {name}, but your changes didn't all go back cleanly. \
                      They're kept in a stash too.\n\n{err}"
                 );
-                self.show_git_error("Changes Conflicted", &message);
+                self.show_git_error("Switched with Conflicts", &message);
             }
             Err(err) => self.show_git_error("Can't Switch Branch", &err),
         }
@@ -8099,7 +8099,7 @@ impl App {
             return AppAction::Continue;
         };
         let Some(path) = editor.path() else {
-            self.show_message("The file has no path yet.".to_string(), false);
+            self.show_message("File isn't saved yet.".to_string(), false);
             return AppAction::Continue;
         };
         let lines = match editor.selected_lines() {
@@ -13563,7 +13563,7 @@ mod tests {
         app.run(Command::GitFetch, false);
         assert_eq!(
             status_message(&app).as_deref(),
-            Some("Wait for the last one to finish.")
+            Some("Wait for the git sync to finish.")
         );
         while !app.syncing.is_empty() {
             app.poll();
@@ -16141,7 +16141,7 @@ fn helper() {}
         f12(&mut app);
         assert_eq!(
             status_message(&app).as_deref(),
-            Some("This is where “helper” is defined.")
+            Some("Already at the definition for “helper”.")
         );
 
         // Defined as well in two files: pick one.
