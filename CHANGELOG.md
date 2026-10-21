@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Builds share one Zig cache in `target/zig-cache` instead of copying ~800 MB into each opentui-sys build directory
+
 ## v0.4.8 — 2026-10-19
 
 - Unit 01 replaces Slate: white on black with Evangelion's pastel neons, lilac keywords, apricot functions, amber strings, and blue types (`4bf35d5`)

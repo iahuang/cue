@@ -272,7 +272,7 @@ fn build_native(zig: &str, native_dir: &Path, out_dir: &Path) -> PathBuf {
         .arg("--prefix")
         .arg(&prefix)
         .arg("--cache-dir")
-        .arg(out_dir.join("zig-cache"))
+        .arg(zig_cache_dir(out_dir))
         .current_dir(native_dir));
 
     // build.zig installs to `<prefix>/../lib/<output_name>/`.
@@ -283,6 +283,18 @@ fn build_native(zig: &str, native_dir: &Path, out_dir: &Path) -> PathBuf {
         lib_dir.display()
     );
     lib_dir
+}
+
+/// One Zig cache for the whole Cargo target directory, which Cargo marks with
+/// `CACHEDIR.TAG`. Each build script hash gets its own `OUT_DIR`, so a cache
+/// there was copied in full (~800 MB) every time the script reran; Zig's cache
+/// is content-addressed and locked, so profiles and targets can share it.
+fn zig_cache_dir(out_dir: &Path) -> PathBuf {
+    out_dir
+        .ancestors()
+        .find(|dir| dir.join("CACHEDIR.TAG").is_file())
+        .map(|target_dir| target_dir.join("zig-cache"))
+        .unwrap_or_else(|| out_dir.join("zig-cache"))
 }
 
 /// The Zig target and `build.zig` output name for the Cargo target.
