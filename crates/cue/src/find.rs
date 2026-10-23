@@ -492,6 +492,27 @@ impl FindBar {
     }
 }
 
+/// A read-only view of a file, the reader or the diff, that the editor's
+/// find bar finds in the text as shown, and that highlights the matches.
+pub trait Findable {
+    /// Counts layouts: matches found in a layout of another count need
+    /// finding again.
+    fn generation(&self) -> u64;
+    /// Finds `query` in the text as shown, and highlights the matches. The
+    /// current match stays current if it's still there. Fails with a
+    /// message if the query isn't a valid regex.
+    fn find(&mut self, query: &Query) -> Result<(Vec<Match>, bool), String>;
+    /// Where the top of the view is in the text found in, to find from.
+    fn find_origin(&self) -> u32;
+    /// The current match, if any.
+    fn current_match(&self) -> Option<usize>;
+    /// Makes match `index` the current one, scrolling to it if it's out of
+    /// view or under the top `covered` rows, which the find bar covers.
+    fn select_match(&mut self, index: usize, covered: u32);
+    /// Stops highlighting matches, leaving the current one selected.
+    fn clear_find(&mut self);
+}
+
 /// The matches of `query` in `text`, as byte ranges, and whether there
 /// were more than [`MAX_MATCHES`]. Empty matches (of `^`, say) don't count.
 /// Fails with a message if the query isn't a valid regex.

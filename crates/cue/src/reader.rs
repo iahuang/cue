@@ -31,7 +31,7 @@ use pulldown_cmark::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::find::{self, Match};
+use crate::find::{self, Findable, Match};
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::language;
 use crate::math::{self, Formula, Typesetter};
@@ -1873,12 +1873,10 @@ impl Reader {
         }
         row.is_some()
     }
+}
 
-    // --- finding -----------------------------------------------------------
-
-    /// Counts layouts: the text, the width, or the theme changed since
-    /// matches found in a layout of another count.
-    pub fn generation(&self) -> u64 {
+impl Findable for Reader {
+    fn generation(&self) -> u64 {
         self.sync();
         self.laid
             .borrow()
@@ -1886,10 +1884,7 @@ impl Reader {
             .map_or(0, |laid| laid.generation)
     }
 
-    /// Finds `query` in the text as shown, and highlights the matches. The
-    /// current match stays current if it's still there. Fails with a
-    /// message if the query isn't a valid regex.
-    pub fn find(&mut self, query: &Query) -> Result<(Vec<Match>, bool), String> {
+    fn find(&mut self, query: &Query) -> Result<(Vec<Match>, bool), String> {
         self.sync();
         let searchable = self.with_layout(Searchable::new);
         let current = self.found.current.map(|i| self.found.matches[i].0);
@@ -1917,21 +1912,17 @@ impl Reader {
         Ok((matches, truncated))
     }
 
-    /// Where the top of the view is in the text found in, to find from.
-    pub fn find_origin(&self) -> u32 {
+    fn find_origin(&self) -> u32 {
         self.sync();
         let top = self.scroller.top.get();
         self.with_layout(|layout| Searchable::new(layout).offset_of(top)) as u32
     }
 
-    /// The current match, if any.
-    pub fn current_match(&self) -> Option<usize> {
+    fn current_match(&self) -> Option<usize> {
         self.found.current
     }
 
-    /// Makes match `index` the current one, scrolling to it if it's out of
-    /// view or under the top `covered` rows, which the find bar covers.
-    pub fn select_match(&mut self, index: usize, covered: u32) {
+    fn select_match(&mut self, index: usize, covered: u32) {
         self.sync();
         let Some(&(_, start, end)) = self.found.matches.get(index) else {
             return;
@@ -1950,14 +1941,15 @@ impl Reader {
         }
     }
 
-    /// Stops highlighting matches, leaving the current one selected.
-    pub fn clear_find(&mut self) {
+    fn clear_find(&mut self) {
         let found = std::mem::take(&mut self.found);
         if let Some(&(_, start, end)) = found.current.and_then(|i| found.matches.get(i)) {
             self.scroller.selection.set(Some((start, end)));
         }
     }
+}
 
+impl Reader {
     /// A mouse event at cell (`mouse.x`, `mouse.y`) of the view, or the
     /// nearest one to it, `above` it when dragged there.
     pub fn handle_mouse(&mut self, mouse: Mouse, above: bool, now: Instant) -> Option<ReaderEvent> {

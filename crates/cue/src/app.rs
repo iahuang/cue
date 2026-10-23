@@ -16040,6 +16040,59 @@ mod tests {
     }
 
     #[test]
+    fn diff_mode_finds_in_the_lines_shown() {
+        let _serial = crate::test_serial();
+        let root = crate::git::tests::repo("diff-find");
+        fs::write(root.join("a.txt"), "a\nfig and fig\n").unwrap();
+        let mut app = app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+        app.focus = Focus::Editor;
+        app.run(Command::ToggleDiff, false);
+        assert!(app.ed().diffing());
+        ctrl(&mut app, 'f');
+        assert!(app.ed().diffing(), "finding stays in diff mode");
+        type_text(&mut app, "fig");
+        let shown = screen(&app);
+        assert!(shown.contains("1 of 2"), "{shown}");
+        assert!(!shown.contains(" ▸ "), "no replacing: {shown}");
+
+        // The current match is shaded as such.
+        let frame = OwnedBuffer::new(80, 10, false, WidthMethod::Unicode, "test").unwrap();
+        app.draw(&frame);
+        let rows = frame.to_text(true);
+        let (y, row) = rows
+            .lines()
+            .enumerate()
+            .find(|(_, row)| row.contains("+ fig and fig"))
+            .unwrap();
+        let x = row[..row.find("fig").unwrap()].chars().count() as u32;
+        let colors = theme::colors();
+        assert_eq!(frame.bg_at(x, y as u32), Some(colors.current_match_bg));
+        let other = row[..row.rfind("fig").unwrap()].chars().count() as u32;
+        assert_eq!(frame.bg_at(other, y as u32), Some(colors.match_bg));
+
+        // Esc leaves the current match selected; Find Next goes on.
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.ed().find_open());
+        assert_eq!(app.ed().selected_text().as_deref(), Some("fig"));
+        ctrl(&mut app, 'g');
+        ctrl(&mut app, 'g');
+        assert!(app.ed().diffing());
+        assert!(screen(&app).contains("2 of 2"), "{}", screen(&app));
+
+        // Back to editing, the bar finds in the text as written.
+        app.run(Command::ToggleDiff, false);
+        assert!(!app.ed().diffing());
+        assert!(screen(&app).contains("2 matches"), "{}", screen(&app));
+
+        // Replacing is in the text as written.
+        app.run(Command::ToggleDiff, false);
+        ctrl(&mut app, 'h');
+        assert!(!app.ed().diffing());
+        assert!(screen(&app).contains(" ▾ "), "{}", screen(&app));
+    }
+
+    #[test]
     fn reader_mode_keeps_the_line_at_the_top_both_ways() {
         let _serial = crate::test_serial();
         let text: String = (0..60).map(|i| format!("para {i}\n\n")).collect();

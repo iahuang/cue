@@ -11,6 +11,8 @@
 //! It can't be typed in. The wheel and the arrow and page keys scroll,
 //! dragging selects text to copy, as written, without the line numbers,
 //! and a double click goes to editing with the cursor on the line clicked.
+//! The editor's find bar finds in the lines shown, old and new, where a
+//! line that wrapped is still one; folded lines aren't found.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -26,11 +28,13 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::config;
 use crate::document::Document;
+use crate::find::{self, Findable, Match};
 use crate::git::{Base, Kind, Tracked};
 use crate::input::{Mouse, MouseButton, MouseKind};
 use crate::language::Language;
 use crate::reader::columns;
 use crate::scroller::{Scrolled, Scroller, Spot};
+use crate::search::Query;
 use crate::status::Status;
 use crate::syntax::{ExcerptHighlighter, LineColors};
 use crate::theme::{self, Colors, Hue, SyntaxColor};
@@ -140,6 +144,76 @@ struct Key {
     unfolded: usize,
 }
 
+/// The text as shown, for finding in: a line for each line of the diff,
+/// its rows that wrapping broke apart as one, and folds left out.
+struct Searchable {
+    text: String,
+    /// Each character's byte in the text, row, and columns, in order.
+    chars: Vec<(usize, usize, Range<usize>)>,
+}
+
+impl Searchable {
+    fn new(layout: &Layout) -> Searchable {
+        let mut text = String::new();
+        let mut chars = Vec::new();
+        for (row, at) in layout.rows.iter().enumerate() {
+            let What::Line {
+                first,
+                spans,
+                text: shown,
+                ..
+            } = &at.what
+            else {
+                continue;
+            };
+            if *first && row > 0 {
+                text.push('\n');
+            }
+            let width: usize = spans.iter().map(|span| text_width(&span.text)).sum();
+            for (i, &(col, c)) in shown.iter().enumerate() {
+                let end = shown.get(i + 1).map_or(width, |&(next, _)| next);
+                chars.push((text.len(), row, col..end));
+                text.push(c);
+            }
+        }
+        Searchable { text, chars }
+    }
+
+    /// The spot of `byte` of the text: where its character starts, or with
+    /// `end`, where the one before it ends.
+    fn spot(&self, byte: usize, end: bool) -> Spot {
+        let i = self.chars.partition_point(|&(at, ..)| at < byte);
+        let char = match end {
+            true => i.checked_sub(1).and_then(|i| self.chars.get(i)),
+            false => self.chars.get(i).or(self.chars.last()),
+        };
+        match char {
+            Some((_, row, cols)) if end => (*row, cols.end),
+            Some((_, row, cols)) => (*row, cols.start),
+            None => (0, 0),
+        }
+    }
+
+    /// Where row `row`, or the first after it with text, starts in the
+    /// text.
+    fn offset_of(&self, row: usize) -> usize {
+        let i = self.chars.partition_point(|&(_, at, _)| at < row);
+        self.chars
+            .get(i)
+            .map_or(self.text.len(), |&(byte, ..)| byte)
+    }
+}
+
+/// The find bar's matches, in the layout they were found in.
+#[derive(Default)]
+struct Found {
+    generation: u64,
+    /// Where each starts in the text found in, and where it starts and
+    /// ends on screen. In order.
+    matches: Vec<(usize, Spot, Spot)>,
+    current: Option<usize>,
+}
+
 pub enum DiffEvent {
     /// Go to editing, with the cursor on file line `line`, which was at
     /// `row` of the view.
@@ -163,6 +237,9 @@ pub struct DiffView {
     source: Source,
     highlighter: RefCell<ExcerptHighlighter>,
     laid: RefCell<Option<(Key, Layout)>>,
+    /// Counts layouts (see [`Findable::generation`]).
+    generation: Cell<u64>,
+    found: Found,
     /// Laid out again, the rows are others, and the selection is gone.
     scroller: Scroller,
     /// A file line to scroll to once the text is laid out, and how many
@@ -203,6 +280,8 @@ impl DiffView {
             source,
             highlighter: RefCell::new(ExcerptHighlighter::new()),
             laid: RefCell::new(None),
+            generation: Cell::new(0),
+            found: Found::default(),
             scroller: Scroller::default(),
             pending: Cell::new(Some((top, 0))),
             unfolded: HashSet::new(),
@@ -361,17 +440,41 @@ impl DiffView {
             return;
         }
         let selection = self.scroller.ordered_selection();
-        let rows = layout.rows.iter().enumerate().skip(self.scroller.top.get());
+        let top = self.scroller.top.get();
+        let bottom = top + self.height as usize;
+        // The matches in view, if they're in this layout.
+        let found = &self.found;
+        let matches = match found.generation == self.generation.get() {
+            true => {
+                let first = found.matches.partition_point(|m| m.2 .0 < top);
+                let last = found.matches.partition_point(|m| m.1 .0 < bottom);
+                first..last.max(first)
+            }
+            false => 0..0,
+        };
+        let rows = layout.rows.iter().enumerate().skip(top);
         for ((index, row), screen_y) in rows.zip(y..y + self.height) {
-            let selected = selection
-                .map(|selection| selected_columns(index, selection))
-                .filter(|range| !range.is_empty());
+            // What's shaded, as (columns, background, foreground), the last
+            // over the others.
+            let mut shades = Vec::new();
+            for n in matches.clone() {
+                let (_, start, end) = found.matches[n];
+                let shade = match found.current == Some(n) {
+                    true => (colors.current_match_bg, Some(colors.current_match_fg)),
+                    false => (colors.match_bg, None),
+                };
+                shades.push((selected_columns(index, (start, end)), shade.0, shade.1));
+            }
+            if let Some(selection) = selection {
+                shades.push((selected_columns(index, selection), colors.selection, None));
+            }
+            shades.retain(|(columns, ..)| !columns.is_empty());
             draw_row(
                 frame,
                 &colors,
                 layout,
                 row,
-                selected,
+                &shades,
                 (x, screen_y, self.width),
             );
         }
@@ -408,6 +511,7 @@ impl Scrolled for DiffView {
                 Some((row.line, self.scroller.top.get() - layout.row_of(row.line)))
             });
             let layout = self.lay_out(tracked.as_deref());
+            self.generation.set(self.generation.get() + 1);
             self.scroller.selection.set(None);
             if let Some((line, within)) = keep {
                 self.scroller.top.set(layout.row_of(line) + within);
@@ -459,6 +563,77 @@ impl Scrolled for DiffView {
             out
         });
         Some(text)
+    }
+}
+
+impl Findable for DiffView {
+    fn generation(&self) -> u64 {
+        self.sync();
+        self.generation.get()
+    }
+
+    fn find(&mut self, query: &Query) -> Result<(Vec<Match>, bool), String> {
+        self.sync();
+        let searchable = self.with_layout(Searchable::new);
+        let current = self.found.current.map(|i| self.found.matches[i].0);
+        self.found = Found {
+            generation: self.generation.get(),
+            ..Found::default()
+        };
+        let (ranges, truncated) = find::find(&searchable.text, query)?;
+        let matches: Vec<Match> = ranges
+            .into_iter()
+            .map(|bytes| {
+                let start = searchable.spot(bytes.start, false);
+                let end = searchable.spot(bytes.end, true);
+                self.found.matches.push((bytes.start, start, end));
+                Match {
+                    row: start.0 as u32,
+                    cols: start.1 as u32..end.1 as u32,
+                    offsets: bytes.start as u32..bytes.end as u32,
+                    bytes,
+                }
+            })
+            .collect();
+        self.found.current =
+            current.and_then(|byte| self.found.matches.iter().position(|m| m.0 == byte));
+        Ok((matches, truncated))
+    }
+
+    fn find_origin(&self) -> u32 {
+        self.sync();
+        let top = self.scroller.top.get();
+        self.with_layout(|layout| Searchable::new(layout).offset_of(top)) as u32
+    }
+
+    fn current_match(&self) -> Option<usize> {
+        self.found.current
+    }
+
+    fn select_match(&mut self, index: usize, covered: u32) {
+        self.sync();
+        let Some(&(_, start, end)) = self.found.matches.get(index) else {
+            return;
+        };
+        self.found.current = Some(index);
+        self.scroller.selection.set(None);
+        let height = self.height as usize;
+        let top = self.scroller.top.get();
+        let first = match height > covered as usize + 1 {
+            true => top + covered as usize,
+            false => top,
+        };
+        if start.0 < first || end.0 >= top + height {
+            let top = start.0.saturating_sub(height / 2);
+            self.scroller.top.set(top.min(self.max_top()));
+        }
+    }
+
+    fn clear_find(&mut self) {
+        let found = std::mem::take(&mut self.found);
+        if let Some(&(_, start, end)) = found.current.and_then(|i| found.matches.get(i)) {
+            self.scroller.selection.set(Some((start, end)));
+        }
     }
 }
 
@@ -676,14 +851,15 @@ fn selected_columns(index: usize, (start, end): (Spot, Spot)) -> Range<usize> {
     from..to.max(from)
 }
 
-/// Draws `row` at (`x`, `y`), `width` wide, with the text columns
-/// `selected` selected.
+/// Draws `row` at (`x`, `y`), `width` wide, with text columns shaded
+/// by `shades`, as (columns, background, foreground), the last over the
+/// others.
 fn draw_row(
     frame: &Buffer,
     colors: &Colors,
     layout: &Layout,
     row: &Row,
-    selected: Option<Range<usize>>,
+    shades: &[(Range<usize>, Rgba, Option<Rgba>)],
     (x, y, width): (u32, u32, u32),
 ) {
     let gutter = layout.gutter() as u32;
@@ -733,15 +909,21 @@ fn draw_row(
                 let bg = if span.changed { strong } else { band };
                 let span_width = text_width(&span.text);
                 let end = col + span_width;
-                // Split where the selection starts and ends.
-                let (from, to) = selected.as_ref().map_or((col, col), |s| {
-                    (s.start.clamp(col, end), s.end.clamp(col, end))
-                });
-                for (n, (a, b)) in [(col, from), (from, to), (to, end)].into_iter().enumerate() {
-                    if a >= b {
-                        continue;
-                    }
-                    let bg = if n == 1 { colors.selection } else { bg };
+                // Split where shading starts and ends.
+                let mut bounds = vec![col, end];
+                for (columns, ..) in shades {
+                    bounds.push(columns.start.clamp(col, end));
+                    bounds.push(columns.end.clamp(col, end));
+                }
+                bounds.sort_unstable();
+                bounds.dedup();
+                for part in bounds.windows(2) {
+                    let (a, b) = (part[0], part[1]);
+                    let shade = shades.iter().rev().find(|(c, ..)| c.contains(&a));
+                    let (fg, bg) = match shade {
+                        Some(&(_, bg, shade_fg)) => (shade_fg.unwrap_or(fg), bg),
+                        None => (fg, bg),
+                    };
                     let text = columns(&span.text, a - col..b - col);
                     let screen_x = x + gutter + a as u32;
                     frame.draw_text(text, screen_x, y, fg, Some(bg), attributes);
@@ -1217,6 +1399,20 @@ mod tests {
             listing(&layout),
             ["+ _ 1     abcdefghijklmnopqrs", ". _ _ tuvwxyz"]
         );
+    }
+
+    #[test]
+    fn finding_sees_lines_shown_and_wrapped_rows_as_one() {
+        let new = "\tabcdefghijklmnopqrstuvwxyz\n";
+        let layout = layout("gone\n", new, 30, &HashSet::new());
+        let searchable = Searchable::new(&layout);
+        // Lines taken out are found too, tabs as tabs.
+        assert_eq!(searchable.text, "gone\n\tabcdefghijklmnopqrstuvwxyz");
+        // "rstu" starts on the line's first row and ends on the next.
+        let start = searchable.text.find("rstu").unwrap();
+        assert_eq!(searchable.spot(start, false), (1, 21));
+        assert_eq!(searchable.spot(start + 4, true), (2, 2));
+        assert_eq!(searchable.offset_of(1), 5);
     }
 
     #[test]
