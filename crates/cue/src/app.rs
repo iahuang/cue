@@ -84,8 +84,8 @@ use crate::alert::{Alert, AlertAction, Button};
 use crate::arrange::{self, Arranging, Before, PanelClip};
 use crate::changes::ChangesView;
 use crate::checkpoint;
+use crate::commit_dialog::{CantCommit, CommitAction, CommitDialog, Plan};
 use crate::commit_diff::{CommitDiff, Outcome};
-use crate::commit_view::{CantCommit, CommitAction, CommitView};
 use crate::complete::{self, Completer, Completion};
 use crate::config::{self, Config, MIN_TREE_WIDTH};
 use crate::context_menu::{ContextMenu, MenuAction, MenuItem};
@@ -116,6 +116,7 @@ use crate::scratch::{self, Scratch};
 use crate::search::Toggle;
 use crate::search_modal::{Memory, SearchAction, SearchModal};
 use crate::session::{self, Session, Shown};
+use crate::stash_view::{StashAction, StashView};
 use crate::status::{self, GitBadge, NoticeBadge, StatusButton};
 use crate::switcher::{Switcher, SwitcherAction};
 use crate::symbols::{self, Symbol, SymbolIndex};
@@ -185,6 +186,9 @@ enum Redo {
     Trash(PathBuf),
     /// Staging these files, in the repository at this root.
     Stage(PathBuf, Vec<PathBuf>),
+    /// Staging these files, in the repository at this root, then
+    /// committing them.
+    CommitAll(PathBuf, Vec<PathBuf>),
     /// Stashing the changes in the repository at this root, as this
     /// message: all of them.
     Stash(PathBuf, String),
@@ -287,9 +291,8 @@ enum Sidebar {
     Changes,
     /// A repository's commits (see [`App::log`]).
     Log,
-    /// Where a repository's changes are staged and committed (see
-    /// [`App::commit_views`]).
-    Commit,
+    /// A repository's stashes (see [`App::stashes`]).
+    Stashes,
 }
 
 /// What the input box names.
@@ -303,6 +306,9 @@ enum Naming {
     Branch(PathBuf, String),
     /// A checkpoint of the workspace, to take.
     Checkpoint,
+    /// A stash of the changes in the repository at this root: only those
+    /// staged, if `true`.
+    Stash(PathBuf, bool),
 }
 
 /// What a context menu's commands act on.
@@ -436,9 +442,13 @@ pub struct App {
     changes: ChangesView,
     /// The log the sidebar shows, or showed last.
     log: Option<LogView>,
-    /// The commit views shown, each with the message written in it: the
-    /// one the sidebar shows, or showed last, first.
-    commit_views: Vec<CommitView>,
+    /// The stashes the sidebar shows, or showed last.
+    stashes: Option<StashView>,
+    /// The commit dialogs opened, each with the message written in it: the
+    /// one open, or open last, first.
+    commit_dialogs: Vec<CommitDialog>,
+    /// The first of them is open.
+    commit_open: bool,
     /// The repositories syncing with their remotes, in the background.
     syncing: Vec<Syncing>,
     /// The checkpoint being taken, in the background, if one is.
@@ -740,7 +750,9 @@ impl App {
             git: Git::new(workspace.roots()),
             changes: ChangesView::new(),
             log: None,
-            commit_views: Vec::new(),
+            stashes: None,
+            commit_dialogs: Vec::new(),
+            commit_open: false,
             syncing: Vec::new(),
             taking: None,
             picker_repo: None,
@@ -959,6 +971,9 @@ impl App {
         if self.input.is_some() {
             return self.input_key(key);
         }
+        if self.commit_open {
+            return self.commit_key(key);
+        }
         if let Some(switcher) = &mut self.switcher {
             let action = switcher.handle_key(key);
             if !matches!(action, SwitcherAction::AcceptAndPass(_)) {
@@ -1007,9 +1022,6 @@ impl App {
             && self.keymap.lookup_terminal(key, true) == Some(Command::Find)
         {
             return self.run(Command::Find, false);
-        }
-        if self.writing_message() {
-            return self.message_key(key);
         }
         if self.completion_key(key) {
             return AppAction::Continue;
@@ -1090,13 +1102,7 @@ impl App {
 
     /// Asks for a new name for what `naming` names, starting from `name`,
     /// in the input box.
-    fn ask_name(
-        &mut self,
-        title: &'static str,
-        placeholder: &str,
-        name: &str,
-        naming: Naming,
-    ) {
+    fn ask_name(&mut self, title: &'static str, placeholder: &str, name: &str, naming: Naming) {
         let input = InputBox::new(title, placeholder, name, self.width, self.height);
         self.input = Some((input, naming));
     }
@@ -1119,6 +1125,9 @@ impl App {
                 }
             }
             Naming::Checkpoint => self.take_checkpoint(name.as_deref()),
+            Naming::Stash(root, staged) => {
+                return self.stash(root, name.unwrap_or_default(), staged)
+            }
         }
         AppAction::Continue
     }
@@ -1561,12 +1570,12 @@ impl App {
             Command::TreeRefresh if self.sidebar != Sidebar::Files => self.git.refresh(),
             Command::TreeQuickLook => self.toggle_quick_look(),
             Command::TreeSwitchView => self.toggle_changes(),
-            Command::GitCommit
-                if self.sidebar == Sidebar::Commit && self.visible_tree_width() > 0 =>
-            {
-                self.commit()
-            }
+            Command::GitCommit if self.commit_open => return self.commit(),
             Command::TreeCommit | Command::GitCommit => self.write_commit_message(),
+            Command::TreeStash | Command::TreeStashStaged => match self.command_repo() {
+                Some(root) => self.ask_stash_message(root, command == Command::TreeStashStaged),
+                None => self.show_message("Not in a git repository.", false),
+            },
             Command::GitFetch | Command::GitPull | Command::GitPush => {
                 self.sync_command(command, None)
             }
@@ -1576,11 +1585,14 @@ impl App {
                 Some(root) => self.sync_repo(root),
                 None => self.show_message("Not in a git repository.", false),
             },
-            Command::GitLog | Command::GitSwitchBranch => match self.command_repo() {
-                Some(root) if command == Command::GitLog => self.show_log(&root),
-                Some(root) => self.show_branches(root),
-                None => self.show_message("Not in a git repository.", false),
-            },
+            Command::GitLog | Command::GitSwitchBranch | Command::GitShowStashes => {
+                match self.command_repo() {
+                    Some(root) if command == Command::GitLog => self.show_log(&root),
+                    Some(root) if command == Command::GitShowStashes => self.show_stashes(&root),
+                    Some(root) => self.show_branches(root),
+                    None => self.show_message("Not in a git repository.", false),
+                }
+            }
             command if command.context() == Context::Tree => match self.sidebar {
                 Sidebar::Files => {
                     let action = self.tree.run(command);
@@ -1588,7 +1600,7 @@ impl App {
                 }
                 Sidebar::Changes => {
                     let action = self.changes.run(command);
-                    self.changes_action(action);
+                    return self.changes_action(action);
                 }
                 Sidebar::Log => {
                     if let Some(log) = &mut self.log {
@@ -1596,10 +1608,10 @@ impl App {
                         return self.log_action(action);
                     }
                 }
-                Sidebar::Commit => {
-                    if let Some(view) = self.commit_views.first_mut() {
+                Sidebar::Stashes => {
+                    if let Some(view) = &mut self.stashes {
                         let action = view.run(command);
-                        return self.commit_action(action);
+                        return self.stash_action(action);
                     }
                 }
             },
@@ -1672,6 +1684,11 @@ impl App {
                 self.input = None;
             }
             return AppAction::Continue;
+        }
+        if let Some(dialog) = self.commit_dialogs.first_mut().filter(|_| self.commit_open) {
+            self.mouse_target = None;
+            let action = dialog.handle_mouse(mouse);
+            return self.commit_dialog_action(action);
         }
         if let Some(switcher) = &mut self.switcher {
             // Nor does the rest of a click on it go anywhere else.
@@ -1780,18 +1797,15 @@ impl App {
                             true => self.changes.selected(),
                             false => None,
                         },
-                        Sidebar::Commit => {
+                        Sidebar::Stashes => {
                             let hit = self
-                                .commit_views
-                                .first_mut()
+                                .stashes
+                                .as_mut()
                                 .is_some_and(|view| view.select_at(mouse.y));
-                            let view = self.commit_views.first().filter(|_| hit);
-                            if view.is_some_and(CommitView::stash_selected) {
+                            if hit {
                                 self.open_stash_menu(Some((mouse.x, mouse.y)));
-                                None
-                            } else {
-                                view.and_then(CommitView::selected)
                             }
+                            None
                         }
                         Sidebar::Log => {
                             let hit = self.log.as_mut().is_some_and(|log| log.select_at(mouse.y));
@@ -1855,7 +1869,7 @@ impl App {
                             let width = self.visible_tree_width();
                             let action = self.changes.click(mouse.x, mouse.y, width, double);
                             if keep(&action) {
-                                self.changes_action(action);
+                                return self.changes_action(action);
                             }
                         }
                         Sidebar::Log => {
@@ -1865,12 +1879,11 @@ impl App {
                                 return self.log_action(action);
                             }
                         }
-                        Sidebar::Commit => {
-                            if let Some(view) = self.commit_views.first_mut() {
-                                let action = view.click(mouse.x, mouse.y, double);
-                                if !(looking && matches!(action, CommitAction::Open { .. })) {
-                                    return self.commit_action(action);
-                                }
+                        Sidebar::Stashes => {
+                            let width = self.visible_tree_width();
+                            if let Some(view) = &mut self.stashes {
+                                let action = view.click(mouse.x, mouse.y, width, double);
+                                return self.stash_action(action);
                             }
                         }
                     }
@@ -1882,14 +1895,14 @@ impl App {
                     };
                     match self.sidebar {
                         Sidebar::Files => self.tree.scroll(rows),
-                        Sidebar::Changes => self.changes.scroll(rows),
+                        Sidebar::Changes => self.changes.scroll(mouse.y, rows),
                         Sidebar::Log => {
                             if let Some(log) = &mut self.log {
                                 log.scroll(rows);
                             }
                         }
-                        Sidebar::Commit => {
-                            if let Some(view) = self.commit_views.first_mut() {
+                        Sidebar::Stashes => {
+                            if let Some(view) = &mut self.stashes {
                                 view.scroll(rows);
                             }
                         }
@@ -1966,6 +1979,7 @@ impl App {
             return;
         };
         let popup = self.alert.is_some()
+            || self.commit_open
             || self.menu.is_some()
             || self.switcher.is_some()
             || self.search.is_some()
@@ -2239,6 +2253,12 @@ impl App {
             input.paste(text);
             return;
         }
+        if self.commit_open {
+            if let Some(dialog) = self.commit_dialogs.first_mut() {
+                dialog.edit(Edit::Insert(text), false);
+            }
+            return;
+        }
         let terminal = self
             .keyboard_terminal()
             .filter(|terminal| terminal.borrow().exit().is_none());
@@ -2248,10 +2268,6 @@ impl App {
             self.note_find_memory();
         } else if let Some(terminal) = terminal {
             terminal.borrow_mut().paste(text);
-        } else if self.writing_message() {
-            if let Some(view) = self.commit_views.first_mut() {
-                view.edit(Edit::Insert(text), false);
-            }
         } else if let Some(input) = self.query_input() {
             // Terminals send newlines in pastes as CR.
             let line = text.split(['\r', '\n']).next().unwrap_or("");
@@ -2308,7 +2324,6 @@ impl App {
         frame.clear(colors.bg);
         let tree_width = self.visible_tree_width();
         let main = self.main_area();
-        let mut message_cursor = None;
         if tree_width > 0 {
             let focused = self.focus == Focus::Tree;
             match self.sidebar {
@@ -2319,9 +2334,9 @@ impl App {
                         log.draw(frame, 0, tree_width, focused);
                     }
                 }
-                Sidebar::Commit => {
-                    if let Some(view) = self.commit_views.first() {
-                        message_cursor = view.draw(frame, 0, focused);
+                Sidebar::Stashes => {
+                    if let Some(view) = &self.stashes {
+                        view.draw(frame, 0, tree_width, focused);
                     }
                 }
             }
@@ -2346,9 +2361,6 @@ impl App {
             if active {
                 cursor = at;
             }
-        }
-        if message_cursor.is_some() {
-            cursor = message_cursor;
         }
         if self.arranging.is_some() && self.height > 1 {
             let clip = self.panel_clip.as_ref().map(PanelClip::label);
@@ -2396,9 +2408,6 @@ impl App {
             let preview = panel.document().is_some_and(|doc| self.is_preview(doc));
             let (keymap, workspace) = (&self.keymap, &self.workspace);
             cursor = self.scratch.draw(frame, main, keymap, workspace, preview);
-            if message_cursor.is_some() {
-                cursor = message_cursor;
-            }
         }
         // Over everything but what pops up.
         if let Some(rain) = &self.rain {
@@ -2461,6 +2470,9 @@ impl App {
         if self.input.is_some() {
             return None;
         }
+        if let Some(dialog) = self.commit_dialogs.first().filter(|_| self.commit_open) {
+            return dialog.hover_area(x, y).map(rect);
+        }
         if let Some((menu, _)) = &self.menu {
             return menu.hover_area(x, y).map(rect);
         }
@@ -2493,7 +2505,10 @@ impl App {
                     Sidebar::Files => self.tree.hover_row(y).then_some(0..width),
                     Sidebar::Changes => self.changes.hover(x, y, width),
                     Sidebar::Log => self.log.as_ref().and_then(|log| log.hover(x, y, width)),
-                    Sidebar::Commit => self.commit_views.first().and_then(|view| view.hover(x, y)),
+                    Sidebar::Stashes => self
+                        .stashes
+                        .as_ref()
+                        .and_then(|view| view.hover(x, y, width)),
                 };
                 columns.map(|columns| span(columns.start..columns.end.min(width)))
             }
@@ -2594,6 +2609,9 @@ impl App {
         if let Some((input, _)) = &self.input {
             return input.draw(frame);
         }
+        if let Some(dialog) = self.commit_dialogs.first().filter(|_| self.commit_open) {
+            return dialog.draw(frame);
+        }
         if let Some((menu, _)) = &self.menu {
             menu.draw(frame);
             return None;
@@ -2618,7 +2636,7 @@ impl App {
         if let Some(dialog) = &self.dialog {
             return dialog.draw(frame);
         }
-        cursor.filter(|_| self.focus == Focus::Editor || self.writing_message())
+        cursor.filter(|_| self.focus == Focus::Editor)
     }
 
     /// Catches up on work in the background: output from terminals,
@@ -2705,12 +2723,12 @@ impl App {
             changed |= self.follow_settings();
         }
         let committed: Vec<_> = self
-            .commit_views
+            .commit_dialogs
             .iter_mut()
-            .filter_map(CommitView::poll)
+            .filter_map(|dialog| Some((dialog.root().to_path_buf(), dialog.poll()?)))
             .collect();
-        for result in committed {
-            self.committed(result);
+        for (root, result) in committed {
+            self.committed(&root, result);
             changed = true;
         }
         let mut index = 0;
@@ -2768,23 +2786,36 @@ impl App {
                 }
             }
         }
-        let shown = self
-            .commit_views
-            .first()
-            .map(|view| view.root().to_path_buf());
-        self.commit_views.retain_mut(|view| {
+        if let Some(view) = &mut self.stashes {
             match repos.iter().find(|repo| repo.root == view.root()) {
+                Some(repo) => view.set_repo(repo),
+                None => {
+                    self.stashes = None;
+                    if self.sidebar == Sidebar::Stashes {
+                        self.sidebar = Sidebar::Changes;
+                    }
+                }
+            }
+        }
+        let open = self
+            .commit_dialogs
+            .first()
+            .filter(|_| self.commit_open)
+            .map(|dialog| dialog.root().to_path_buf());
+        self.commit_dialogs.retain_mut(|dialog| {
+            match repos.iter().find(|repo| repo.root == dialog.root()) {
                 Some(repo) => {
-                    view.set_repo(repo);
+                    dialog.set_repo(repo);
                     true
                 }
                 None => false,
             }
         });
-        if self.sidebar == Sidebar::Commit
-            && self.commit_views.first().map(CommitView::root) != shown.as_deref()
-        {
-            self.sidebar = Sidebar::Changes;
+        if let Some(root) = open {
+            match self.commit_dialogs.first_mut() {
+                Some(dialog) if dialog.root() == root => dialog.read_lines(),
+                _ => self.commit_open = false,
+            }
         }
         self.tree.set_changes(self.git.groups());
         self.track_documents();
@@ -3985,6 +4016,7 @@ impl App {
     /// Opens the picker listing `mode`, or switches it to `mode`. Pressed
     /// again, the same shortcut closes it.
     fn show_picker(&mut self, mode: Mode) {
+        self.commit_open = false;
         self.menu = None;
         self.close_search();
         self.dialog = None;
@@ -4552,6 +4584,7 @@ impl App {
     fn popup_open(&self) -> bool {
         self.alert.is_some()
             || self.input.is_some()
+            || self.commit_open
             || self.menu.is_some()
             || self.switcher.is_some()
             || self.search.is_some()
@@ -4610,6 +4643,7 @@ impl App {
     }
 
     fn close_popups(&mut self) {
+        self.commit_open = false;
         self.menu = None;
         self.switcher = None;
         self.picker = None;
@@ -4846,15 +4880,14 @@ impl App {
         self.tree.set_active(path.as_deref(), preview);
         self.changes.set_active(path.as_deref(), preview);
         let commit = active_of(&self.tabs, self.tab, &self.scratch).commit();
-        for view in &mut self.commit_views {
-            view.set_active(path.as_deref(), preview);
+        if let Some(view) = &mut self.stashes {
             let stashed = commit
                 .filter(|commit| commit.root() == view.root())
                 .map(|commit| {
                     let path = commit.change().path.as_path();
                     (commit.commit().hash.as_str(), path)
                 });
-            view.set_active_stashed(stashed);
+            view.set_active(stashed);
         }
         if let Some(log) = &mut self.log {
             let active = commit
@@ -5236,6 +5269,10 @@ impl App {
             }
             Redo::Stage(root, paths) => {
                 self.stage_now(&root, &paths, true);
+                AppAction::Continue
+            }
+            Redo::CommitAll(root, paths) => {
+                self.commit_all_now(&root, &paths);
                 AppAction::Continue
             }
             Redo::Stash(root, message) => {
@@ -6590,7 +6627,12 @@ impl App {
                 }
             }
             // The tree has no repositories' rows or checkpoints.
-            TreeAction::RepoMenu(_)
+            TreeAction::RepoMenu { .. }
+            | TreeAction::Branches(_)
+            | TreeAction::Commit(_)
+            | TreeAction::Sync(_)
+            | TreeAction::Log(_)
+            | TreeAction::Stage { .. }
             | TreeAction::Checkpoints
             | TreeAction::CompareWithCommit
             | TreeAction::TakeCheckpoint => {}
@@ -6600,26 +6642,32 @@ impl App {
     /// What the changes view asked for: as the tree's, but a file opens
     /// to how it changed, and a file that's gone isn't opened, as a new
     /// one.
-    fn changes_action(&mut self, action: TreeAction) {
-        let (path, focus, preview) = match action {
-            TreeAction::None => return,
-            TreeAction::RepoMenu(root) => return self.show_repo_menu(root),
-            TreeAction::Checkpoints => return self.show_checkpoints(),
-            TreeAction::CompareWithCommit => return self.compare_with(None),
-            TreeAction::TakeCheckpoint => return self.ask_checkpoint_name(),
+    fn changes_action(&mut self, action: TreeAction) -> AppAction {
+        match action {
+            TreeAction::None => {}
+            TreeAction::Open { path, .. } if !path.exists() => {
+                self.show_message(format!("{} was deleted.", file_name(&path)), false);
+            }
             TreeAction::Open {
                 path,
                 focus,
                 preview,
-            } => (path, focus, preview),
-        };
-        if !path.exists() {
-            self.show_message(format!("{} was deleted.", file_name(&path)), false);
-            return;
+            } => {
+                if self.open_as(&path, preview, true) && focus {
+                    self.focus = Focus::Editor;
+                }
+            }
+            TreeAction::Stage { root, paths, stage } => return self.stage(root, paths, stage),
+            TreeAction::RepoMenu { root, at } => self.show_repo_menu(root, at),
+            TreeAction::Branches(root) => self.show_branches(root),
+            TreeAction::Commit(root) => self.show_commit_dialog(&root),
+            TreeAction::Sync(root) => self.sync_repo(root),
+            TreeAction::Log(root) => self.show_log(&root),
+            TreeAction::Checkpoints => self.show_checkpoints(),
+            TreeAction::CompareWithCommit => self.compare_with(None),
+            TreeAction::TakeCheckpoint => self.ask_checkpoint_name(),
         }
-        if self.open_as(&path, preview, true) && focus {
-            self.focus = Focus::Editor;
-        }
+        AppAction::Continue
     }
 
     /// Shows the log of the repository at `root` in the sidebar, as it
@@ -6703,10 +6751,7 @@ impl App {
 
     /// Makes a commit that undoes `commit`, in the repository at `root`.
     fn revert(&mut self, root: &Path, commit: &Commit) {
-        if self
-            .commit_view_of(root)
-            .is_some_and(|view| view.committing())
-        {
+        if self.committing_in(root) {
             self.show_message("Wait for the commit to finish.", false);
             return;
         }
@@ -6720,43 +6765,17 @@ impl App {
         self.git.restart();
     }
 
-    /// Shows the commit view of the repository at `root` in the sidebar,
-    /// as it was left if it was shown before.
-    fn show_commit_view(&mut self, root: &Path) {
-        match self
-            .commit_views
-            .iter()
-            .position(|view| view.root() == root)
-        {
-            Some(index) => {
-                let view = self.commit_views.remove(index);
-                self.commit_views.insert(0, view);
-            }
-            None => {
-                let Some(repo) = self.git.repos().iter().find(|repo| repo.root == root) else {
-                    return;
-                };
-                let name = self.changes.name_of(root).unwrap_or_default();
-                self.commit_views.insert(0, CommitView::open(repo, name));
-            }
-        }
-        self.sidebar = Sidebar::Commit;
-        self.tree_visible = true;
-        self.layout();
-        self.show_active_in_tree();
-    }
-
     /// The repository a git command is for: the one the changes view has
-    /// selected, if it has the keyboard, or the one the commit view or log
-    /// shown is of, or else the one the file on screen is in, or the first.
+    /// selected, if it has the keyboard, or the one the log or stashes
+    /// shown are of, or else the one the file on screen is in, or the
+    /// first.
     fn command_repo(&self) -> Option<PathBuf> {
         let shown = self.visible_tree_width() > 0;
         let root = match self.sidebar {
             Sidebar::Changes if shown && self.focus == Focus::Tree => self.changes.selected_repo(),
-            Sidebar::Commit if shown => self
-                .commit_views
-                .first()
-                .map(|view| view.root().to_path_buf()),
+            Sidebar::Stashes if shown => {
+                self.stashes.as_ref().map(|view| view.root().to_path_buf())
+            }
             Sidebar::Log if shown => self.log.as_ref().map(|log| log.root().to_path_buf()),
             _ => None,
         };
@@ -6808,10 +6827,7 @@ impl App {
             self.show_message("Wait for the git sync to finish.", false);
             return;
         }
-        if self
-            .commit_view_of(&root)
-            .is_some_and(|view| view.committing())
-        {
+        if self.committing_in(&root) {
             self.show_message("Wait for the commit to finish.", false);
             return;
         }
@@ -6856,57 +6872,76 @@ impl App {
         self.show_git_error(title, &err);
     }
 
-    /// Shows a commit view with the keyboard in its message box: of the
-    /// repository [`App::command_repo`] finds.
+    /// Opens the commit dialog of the repository [`App::command_repo`]
+    /// finds.
     fn write_commit_message(&mut self) {
-        let Some(root) = self.command_repo() else {
-            self.show_message("Not in a git repository.", false);
+        match self.command_repo() {
+            Some(root) => self.show_commit_dialog(&root),
+            None => self.show_message("Not in a git repository.", false),
+        }
+    }
+
+    /// Opens the commit dialog of the repository at `root`, with what was
+    /// written in it before.
+    fn show_commit_dialog(&mut self, root: &Path) {
+        let Some(repo) = self
+            .git
+            .repos()
+            .iter()
+            .find(|repo| repo.root == root)
+            .cloned()
+        else {
             return;
         };
-        self.show_commit_view(&root);
-        if let Some(view) = self.commit_views.first_mut() {
-            view.set_editing(true);
-            if self.visible_tree_width() > 0 {
-                self.focus = Focus::Tree;
+        match self
+            .commit_dialogs
+            .iter()
+            .position(|dialog| dialog.root() == root)
+        {
+            Some(index) => {
+                let dialog = self.commit_dialogs.remove(index);
+                self.commit_dialogs.insert(0, dialog);
+            }
+            None => {
+                let name = self
+                    .changes
+                    .name_of(root)
+                    .unwrap_or_else(|| file_name(root));
+                let dialog = CommitDialog::new(&repo, name, self.width, self.height);
+                self.commit_dialogs.insert(0, dialog);
             }
         }
+        self.close_popups();
+        if let Some(dialog) = self.commit_dialogs.first_mut() {
+            dialog.set_repo(&repo);
+            dialog.read();
+            dialog.reset_focus();
+            dialog.set_size(self.width, self.height);
+        }
+        self.commit_open = true;
     }
 
-    /// Whether the keyboard is in the message box of the commit view.
-    fn writing_message(&self) -> bool {
-        self.focus == Focus::Tree
-            && self.sidebar == Sidebar::Commit
-            && self.menu.is_none()
-            && self.switcher.is_none()
-            && self.search.is_none()
-            && self.dialog.is_none()
-            && self.picker.is_none()
-            && self.commit_views.first().is_some_and(CommitView::editing)
-    }
-
-    /// A key for the commit view's message box: the editor's keys for
-    /// moving, selecting, deleting, and the clipboard, Esc to go back to
-    /// the list, and the shortcut that commits.
-    fn message_key(&mut self, key: Key) -> AppAction {
+    /// A key for the commit dialog: Tab between its parts, and in the
+    /// message box, the editor's keys for moving, selecting, deleting, and
+    /// the clipboard, Esc to close it, and the shortcut that commits.
+    fn commit_key(&mut self, key: Key) -> AppAction {
         if let Some((Command::GitCommit, _)) = self.keymap.lookup(key, Context::Message) {
-            self.commit();
-            return AppAction::Continue;
+            return self.commit();
         }
         let binding = self.keymap.lookup(key, Context::Editor);
-        if let Some((command, select)) = binding {
-            if command.context() == Context::Global {
-                return self.run(command, select);
-            }
-        }
         let clipboard = self.clipboard.clone();
-        let Some(view) = self.commit_views.first_mut() else {
+        let Some(dialog) = self.commit_dialogs.first_mut() else {
+            self.commit_open = false;
             return AppAction::Continue;
         };
+        if let Some(action) = dialog.handle_key(key) {
+            return self.commit_dialog_action(action);
+        }
         let mut buf = [0; 4];
         let Some((command, select)) = binding else {
             if let KeyCode::Char(c) = key.code {
                 if key.mods.is_plain() {
-                    view.edit(Edit::Insert(c.encode_utf8(&mut buf)), false);
+                    dialog.edit(Edit::Insert(c.encode_utf8(&mut buf)), false);
                 }
             }
             return AppAction::Continue;
@@ -6929,78 +6964,71 @@ impl App {
             },
             Command::CursorUp | Command::CursorDown => {
                 let by = if command == Command::CursorUp { -1 } else { 1 };
-                view.move_rows(by, select);
+                dialog.move_rows(by, select);
                 return AppAction::Continue;
             }
             Command::LineStart | Command::LineEnd => {
-                view.move_to_row_edge(command == Command::LineEnd, select);
+                dialog.move_to_row_edge(command == Command::LineEnd, select);
                 return AppAction::Continue;
             }
             Command::SelectAll => {
-                view.select_all();
+                dialog.select_all();
                 return AppAction::Continue;
             }
-            // Esc: the selection goes, and then the keyboard, to the list.
+            // Esc: the selection goes, and then the dialog.
             Command::ClearSelection => {
-                if !view.clear_selection() {
-                    view.set_editing(false);
+                if !dialog.clear_selection() {
+                    self.commit_open = false;
                 }
                 return AppAction::Continue;
             }
             Command::Copy | Command::Cut => {
-                let Some(text) = view.selected_text().map(str::to_string) else {
+                let Some(text) = dialog.selected_text().map(str::to_string) else {
                     return AppAction::Continue;
                 };
                 if command == Command::Cut {
-                    view.edit(Edit::DeleteBackward, false);
+                    dialog.edit(Edit::DeleteBackward, false);
                 }
                 self.clipboard = Some(text.clone());
                 return AppAction::Copy(text);
             }
             _ => return AppAction::Continue,
         };
-        view.edit(edit, select);
+        dialog.edit(edit, select);
         AppAction::Continue
     }
 
-    /// What the commit view asked for.
-    fn commit_action(&mut self, action: CommitAction) -> AppAction {
-        let Some(root) = self
-            .commit_views
-            .first()
-            .map(|view| view.root().to_path_buf())
-        else {
+    /// What the commit dialog asked for.
+    fn commit_dialog_action(&mut self, action: CommitAction) -> AppAction {
+        match action {
+            CommitAction::Continue => {}
+            CommitAction::Close => self.commit_open = false,
+            CommitAction::Commit => return self.commit(),
+        }
+        AppAction::Continue
+    }
+
+    /// What the stashes asked for.
+    fn stash_action(&mut self, action: StashAction) -> AppAction {
+        let Some(root) = self.stashes.as_ref().map(|view| view.root().to_path_buf()) else {
             return AppAction::Continue;
         };
         match action {
-            CommitAction::None => {}
-            CommitAction::Back => {
+            StashAction::None => {}
+            StashAction::Back => {
                 self.sidebar = Sidebar::Changes;
                 self.git.refresh();
             }
-            CommitAction::Log => self.show_log(&root),
-            CommitAction::Branches => self.show_branches(root),
-            CommitAction::Open {
-                path,
-                focus,
-                preview,
-            } => self.changes_action(TreeAction::Open {
-                path,
-                focus,
-                preview,
-            }),
-            CommitAction::Stage { paths, stage } => return self.stage(root, paths, stage),
-            CommitAction::Commit => self.commit(),
-            CommitAction::Stash { message, staged } => return self.stash(root, message, staged),
-            CommitAction::ApplyStash { hash, pop } => self.apply_stash(&root, &hash, pop),
-            CommitAction::DropStash { hash, subject } => {
+            StashAction::Branches => self.show_branches(root),
+            StashAction::Apply { hash, pop } => self.apply_stash(&root, &hash, pop),
+            StashAction::Drop { hash, subject } => {
                 let message = "Its changes will be lost.";
                 let redo = Redo::DropStash(root, hash);
                 let buttons = vec![Button::new("&Drop", Answer::Go(redo)).danger()];
                 let title = format!("Drop “{subject}”?");
                 self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
             }
-            CommitAction::OpenStashed {
+            StashAction::Open {
                 commit,
                 change,
                 focus,
@@ -7009,22 +7037,49 @@ impl App {
         AppAction::Continue
     }
 
+    /// Shows the stashes of the repository at `root` in the sidebar, as
+    /// they were left if they were the last shown.
+    fn show_stashes(&mut self, root: &Path) {
+        if self.stashes.as_ref().is_none_or(|view| view.root() != root) {
+            let Some(repo) = self.git.repos().iter().find(|repo| repo.root == root) else {
+                return;
+            };
+            let name = self
+                .changes
+                .name_of(root)
+                .unwrap_or_else(|| file_name(root));
+            self.stashes = Some(StashView::open(repo, name));
+        }
+        self.sidebar = Sidebar::Stashes;
+        self.tree_visible = true;
+        self.layout();
+        self.show_active_in_tree();
+    }
+
+    /// The files with unsaved changes at `paths`, which git has as they
+    /// really are.
+    fn unsaved_at(&self, paths: &[PathBuf]) -> Vec<Rc<Document>> {
+        let wanted = |path: &Path| {
+            paths.iter().any(|wanted| wanted == path)
+                || path.canonicalize().is_ok_and(|path| paths.contains(&path))
+        };
+        self.documents
+            .iter()
+            .filter(|doc| doc.is_modified() && doc.path().is_some_and(|path| wanted(&path)))
+            .cloned()
+            .collect()
+    }
+
     /// Stages the files at `paths`, in the repository at `root`, saving
     /// those with unsaved changes first, so what's staged is what's shown;
     /// or unless `stage`, unstages them.
     fn stage(&mut self, root: PathBuf, paths: Vec<PathBuf>, stage: bool) -> AppAction {
+        if self.committing_in(&root) {
+            self.show_message("Wait for the commit to finish.", false);
+            return AppAction::Continue;
+        }
         if stage {
-            // git has the paths as they really are.
-            let wanted = |path: &Path| {
-                paths.iter().any(|wanted| wanted == path)
-                    || path.canonicalize().is_ok_and(|path| paths.contains(&path))
-            };
-            let docs: Vec<Rc<Document>> = self
-                .documents
-                .iter()
-                .filter(|doc| doc.is_modified() && doc.path().is_some_and(|path| wanted(&path)))
-                .cloned()
-                .collect();
+            let docs = self.unsaved_at(&paths);
             if !docs.is_empty() {
                 let redo = Redo::Stage(root, paths);
                 return self.save_then_go(Saving { docs, redo });
@@ -7035,7 +7090,8 @@ impl App {
     }
 
     /// Stages or unstages the files at `paths` as they are on disk.
-    fn stage_now(&mut self, root: &Path, paths: &[PathBuf], stage: bool) {
+    /// Returns whether git did.
+    fn stage_now(&mut self, root: &Path, paths: &[PathBuf], stage: bool) -> bool {
         let initial = self
             .git
             .repos()
@@ -7045,51 +7101,100 @@ impl App {
             true => git::stage(root, paths),
             false => git::unstage(root, paths, initial),
         };
+        self.git.restart();
         match result {
             Ok(()) => {
-                for view in &mut self.commit_views {
-                    if view.root() == root {
-                        view.set_staged(paths, stage);
-                    }
-                }
+                self.changes.set_staged(root, paths, stage);
+                true
             }
             Err(err) => {
                 let what = if stage { "stage" } else { "unstage" };
                 let reason = err.lines().next().unwrap_or("");
                 self.show_message(format!("Can't {what}: {reason}"), true);
+                false
             }
         }
-        self.git.restart();
     }
 
-    /// Commits what's staged with the message written, in the commit view
-    /// shown.
-    fn commit(&mut self) {
-        let Some(view) = self.commit_views.first_mut() else {
-            return;
+    /// Whether a commit's being made in the repository at `root`.
+    fn committing_in(&self, root: &Path) -> bool {
+        self.commit_dialogs
+            .iter()
+            .any(|dialog| dialog.root() == root && dialog.committing())
+    }
+
+    /// The commit dialog of the repository at `root`, if it was opened.
+    fn commit_dialog_of(&mut self, root: &Path) -> Option<&mut CommitDialog> {
+        self.commit_dialogs
+            .iter_mut()
+            .find(|dialog| dialog.root() == root)
+    }
+
+    /// Commits with the message written in the commit dialog that's open:
+    /// what's staged, or with nothing staged, all the changes, staging
+    /// them first.
+    fn commit(&mut self) -> AppAction {
+        let Some(dialog) = self.commit_dialogs.first_mut().filter(|_| self.commit_open) else {
+            return AppAction::Continue;
         };
-        match view.commit() {
-            Ok(()) => {}
+        match dialog.plan() {
+            Ok(Plan::Staged) => dialog.start(),
+            Ok(Plan::All) => {
+                let root = dialog.root().to_path_buf();
+                let repo = self.git.repos().iter().find(|repo| repo.root == root);
+                let paths = repo.map_or(Vec::new(), |repo| {
+                    repo.changes
+                        .iter()
+                        .map(|change| change.path.clone())
+                        .collect()
+                });
+                return self.commit_all(root, paths);
+            }
             Err(CantCommit::NoMessage) => {
-                view.set_editing(true);
-                self.focus = Focus::Tree;
+                dialog.reset_focus();
                 self.show_message("Enter a commit message.", false);
             }
-            Err(CantCommit::NothingStaged) => {
-                let key = self.shortcut(Command::TreeToggleStaged);
-                let message = format!("Nothing is staged. Press {key} on a file to stage it.");
-                self.show_message(message, false);
+            Err(CantCommit::NothingToCommit) => self.show_message("Nothing to commit.", false),
+            Err(CantCommit::Committing) => {}
+        }
+        AppAction::Continue
+    }
+
+    /// Stages the files at `paths`, in the repository at `root`, saving
+    /// those with unsaved changes first, then commits them.
+    fn commit_all(&mut self, root: PathBuf, paths: Vec<PathBuf>) -> AppAction {
+        let docs = self.unsaved_at(&paths);
+        if !docs.is_empty() {
+            let redo = Redo::CommitAll(root, paths);
+            return self.save_then_go(Saving { docs, redo });
+        }
+        self.commit_all_now(&root, &paths);
+        AppAction::Continue
+    }
+
+    fn commit_all_now(&mut self, root: &Path, paths: &[PathBuf]) {
+        if self.stage_now(root, paths, true) {
+            if let Some(dialog) = self.commit_dialog_of(root) {
+                dialog.start();
             }
         }
     }
 
-    /// Says how a commit went: its hash, or in an alert, what git or a
-    /// hook said went wrong.
-    fn committed(&mut self, result: Result<String, String>) {
+    /// Says how a commit in the repository at `root` went: its hash, once
+    /// the dialog's closed, or in an alert, what git or a hook said went
+    /// wrong.
+    fn committed(&mut self, root: &Path, result: Result<String, String>) {
+        self.git.restart();
         match result {
             Ok(hash) => {
+                if self
+                    .commit_dialogs
+                    .first()
+                    .is_some_and(|dialog| dialog.root() == root)
+                {
+                    self.commit_open = false;
+                }
                 self.show_message(format!("Committed {hash}."), false);
-                self.git.restart();
             }
             Err(err) => self.show_git_error("Can't Commit", &err),
         }
@@ -7112,11 +7217,32 @@ impl App {
         self.alert = Some(alert);
     }
 
-    /// The commit view of the repository at `root`, if it was shown.
-    fn commit_view_of(&mut self, root: &Path) -> Option<&mut CommitView> {
-        self.commit_views
-            .iter_mut()
-            .find(|view| view.root() == root)
+    /// Asks what to call a stash of the changes in the repository at
+    /// `root`: those staged, if `staged`, or else all of them.
+    fn ask_stash_message(&mut self, root: PathBuf, staged: bool) {
+        let Some(repo) = self.git.repos().iter().find(|repo| repo.root == root) else {
+            return self.show_message("Not in a git repository.", false);
+        };
+        let unsaved = self.documents.iter().any(|doc| {
+            let path = doc.path().and_then(|path| path.canonicalize().ok());
+            doc.is_modified() && path.is_some_and(|path| path.starts_with(&root))
+        });
+        if staged
+            && repo
+                .changes
+                .iter()
+                .all(|change| change.staged == git::Staged::No)
+        {
+            return self.show_message("Nothing is staged.", false);
+        }
+        if !staged && repo.changes.is_empty() && !unsaved {
+            return self.show_message("No changes to stash.", false);
+        }
+        let title = match staged {
+            true => "Stash Staged Changes",
+            false => "Stash Changes",
+        };
+        self.ask_name(title, "Message (optional)", "", Naming::Stash(root, staged));
     }
 
     /// Stashes the changes in the repository at `root`, as `message`: what's
@@ -7155,9 +7281,7 @@ impl App {
     fn stash_now(&mut self, root: &Path, message: &str, staged: bool) {
         match git::stash(root, message, staged) {
             Ok(()) => {
-                if let Some(view) = self.commit_view_of(root) {
-                    view.stashed();
-                }
+                self.read_stashes(root);
                 let what = if staged {
                     "the staged changes"
                 } else {
@@ -7170,13 +7294,23 @@ impl App {
         self.git.restart();
     }
 
+    /// Reads the stashes of the repository at `root` again, if the sidebar
+    /// shows them, or showed them last.
+    fn read_stashes(&mut self, root: &Path) {
+        if let Some(view) = self.stashes.as_mut().filter(|view| view.root() == root) {
+            view.read_stashes();
+        }
+    }
+
     /// Puts the changes stashed as `hash`, in the repository at `root`,
     /// back, and if `pop`, drops the stash.
     fn apply_stash(&mut self, root: &Path, hash: &str, pop: bool) {
-        let result = git::apply_stash(root, hash, pop);
-        if let Some(view) = self.commit_view_of(root) {
-            view.read_stashes();
+        if self.committing_in(root) {
+            self.show_message("Wait for the commit to finish.", false);
+            return;
         }
+        let result = git::apply_stash(root, hash, pop);
+        self.read_stashes(root);
         self.git.restart();
         match result {
             Ok(()) if pop => self.show_message("Popped the stash.", false),
@@ -7276,10 +7410,11 @@ impl App {
         }
     }
 
-    /// Pops up, beside its row in the changes view, what can be done to the
-    /// repository at `root`: committing, its log, switching branches, and
-    /// catching up with the branch it tracks.
-    fn show_repo_menu(&mut self, root: PathBuf) {
+    /// Pops up what can be done to the repository at `root`: committing,
+    /// its log and stashes, switching branches, catching up with the branch
+    /// it tracks, stashing, and staging. It's below the cell `at`, its `…`
+    /// in the changes view, or else beside its row there.
+    fn show_repo_menu(&mut self, root: PathBuf, at: Option<(u32, u32)>) {
         use Command::*;
         let Some(repo) = self.git.repos().iter().find(|repo| repo.root == root) else {
             return;
@@ -7295,13 +7430,18 @@ impl App {
             Some(Sync::Fetch) => Some((GitFetch, "Fetch".to_string())),
             Some(Sync::Pull) => Some((GitPull, format!("Pull ↓{behind}"))),
             Some(Sync::Push) => Some((GitPush, format!("Push ↑{ahead}"))),
-            Some(Sync::Both) => Some((GitSync, format!("Sync ↓{behind} ↑{ahead}"))),
+            Some(Sync::Both) => Some((GitSync, format!("Pull/Push ↓{behind} ↑{ahead}"))),
             Some(Sync::Publish(_)) => Some((GitPush, "Publish".to_string())),
             None => None,
         };
+        let stashes = match repo.stashes.len() {
+            0 => "Stashes".to_string(),
+            count => format!("Stashes ({count})"),
+        };
         let mut items = vec![
             item(TreeCommit, "Commit…"),
-            item(GitLog, "Log"),
+            item(GitLog, "View Log"),
+            item(GitShowStashes, &stashes),
             item(GitSwitchBranch, "Switch Branch…"),
             MenuItem::Separator,
         ];
@@ -7313,16 +7453,44 @@ impl App {
                 items.push(item(command, label));
             }
         }
-        let y = self.changes.selected_position().map_or(0, |(_, y)| y);
-        let x = self.visible_tree_width();
-        let menu = ContextMenu::new(items, &self.keymap, x, y, false, self.width, self.height);
+        let staged = |staged| {
+            repo.changes
+                .iter()
+                .filter(move |change| change.staged == staged)
+        };
+        items.extend([MenuItem::Separator, item(TreeStash, "Stash Changes…")]);
+        if staged(git::Staged::No).count() < repo.changes.len() {
+            items.push(item(TreeStashStaged, "Stash Staged Changes…"));
+        }
+        if !repo.changes.is_empty() {
+            let label = match staged(git::Staged::Yes).count() == repo.changes.len() {
+                true => "Unstage All Changes",
+                false => "Stage All Changes",
+            };
+            items.extend([MenuItem::Separator, item(TreeToggleStaged, label)]);
+        }
+        let row = self.changes.selected_position().map_or(0, |(_, y)| y);
+        let (x, y) = at.unwrap_or((self.visible_tree_width(), row));
+        let menu = ContextMenu::new(
+            items,
+            &self.keymap,
+            x,
+            y,
+            at.is_some(),
+            self.width,
+            self.height,
+        );
+        let menu = match at {
+            Some(_) => menu,
+            None => menu.beside(),
+        };
         self.close_popups();
         let target = Entry {
             path: root,
             is_dir: true,
             is_root: true,
         };
-        self.menu = Some((menu.beside(), MenuFor::File(target)));
+        self.menu = Some((menu, MenuFor::File(target)));
     }
 
     /// Switches the repository at `root` to `to`, saving the files in it
@@ -7353,10 +7521,7 @@ impl App {
     }
 
     fn switch_now(&mut self, root: &Path, to: &SwitchTo) {
-        if self
-            .commit_view_of(root)
-            .is_some_and(|view| view.committing())
-        {
+        if self.committing_in(root) {
             self.show_message(
                 "Wait for the commit to finish before switching branches.",
                 true,
@@ -7366,8 +7531,8 @@ impl App {
         let name = to.name().to_string();
         let result = git::switch(root, to);
         if result.is_ok() {
-            if let Some(view) = self.commit_view_of(root) {
-                view.clear_amend();
+            if let Some(dialog) = self.commit_dialog_of(root) {
+                dialog.clear_amend();
             }
         }
         match result {
@@ -7377,9 +7542,7 @@ impl App {
                 self.show_message(message, false);
             }
             Ok(Carried::Unstaged) => {
-                let message = format!(
-                    "Switched to {name}, bringing your changes (now unstaged)."
-                );
+                let message = format!("Switched to {name}, bringing your changes (now unstaged).");
                 self.show_message(message, false);
             }
             Ok(Carried::Conflicts(err)) => {
@@ -7391,18 +7554,14 @@ impl App {
             }
             Err(err) => self.show_git_error("Can't Switch Branch", &err),
         }
-        if let Some(view) = self.commit_view_of(root) {
-            view.read_stashes();
-        }
+        self.read_stashes(root);
         self.git.restart();
     }
 
     /// Drops the stash `hash`, in the repository at `root`.
     fn drop_stash(&mut self, root: &Path, hash: &str) {
         let result = git::drop_stash(root, hash);
-        if let Some(view) = self.commit_view_of(root) {
-            view.read_stashes();
-        }
+        self.read_stashes(root);
         self.git.restart();
         match result {
             Ok(()) => self.show_message("Dropped the stash.", false),
@@ -7525,11 +7684,7 @@ impl App {
         if self.focus != Focus::Tree {
             return;
         }
-        let stash = self
-            .commit_views
-            .first()
-            .is_some_and(CommitView::stash_selected);
-        if self.sidebar == Sidebar::Commit && stash {
+        if self.sidebar == Sidebar::Stashes {
             self.open_stash_menu(None);
         } else if self.sidebar == Sidebar::Log {
             self.open_log_menu(None);
@@ -7538,8 +7693,8 @@ impl App {
         }
     }
 
-    /// Opens the context menu of the stash selected in the commit view, at
-    /// the cell right-clicked, or from the keyboard, next to it.
+    /// Opens the context menu of the stash selected in the sidebar, at the
+    /// cell right-clicked, or from the keyboard, next to it.
     fn open_stash_menu(&mut self, at: Option<(u32, u32)>) {
         use Command::*;
         let item = |command, label: &str| MenuItem::Command(command, label.to_string());
@@ -7549,10 +7704,7 @@ impl App {
             MenuItem::Separator,
             item(TreeDropStash, "Drop…"),
         ];
-        let position = self
-            .commit_views
-            .first()
-            .and_then(CommitView::selected_position);
+        let position = self.stashes.as_ref().and_then(StashView::selected_position);
         let (x, y) = at.or(position).unwrap_or((0, 0));
         let menu = ContextMenu::new(
             items,
@@ -7627,7 +7779,7 @@ impl App {
         let item = |command, label: &str| MenuItem::Command(command, label.to_string());
         let repo = self.git.repos().iter().any(|repo| repo.root == target.path);
         if self.sidebar == Sidebar::Changes && target.is_root && repo {
-            return self.show_repo_menu(target.path);
+            return self.show_repo_menu(target.path, None);
         }
         let mut items = Vec::new();
         if !target.is_dir {
@@ -7674,10 +7826,7 @@ impl App {
             .or_else(|| match self.sidebar {
                 Sidebar::Files => self.tree.selected_position(),
                 Sidebar::Changes => self.changes.selected_position(),
-                Sidebar::Commit => self
-                    .commit_views
-                    .first()
-                    .and_then(CommitView::selected_position),
+                Sidebar::Stashes => self.stashes.as_ref().and_then(StashView::selected_position),
                 Sidebar::Log => self.log.as_ref().and_then(LogView::selected_position),
             })
             .unwrap_or((0, 0));
@@ -8042,7 +8191,19 @@ impl App {
                 self.sync_command(command, Some(target.path))
             }
             Command::GitCompareWith | Command::GitCheckpoint => return self.run(command, false),
-            Command::TreeCommit => self.show_commit_view(&target.path),
+            Command::TreeCommit => {
+                if let Some(root) = self.git.repo_of(&target.path).map(|repo| repo.root.clone()) {
+                    self.show_commit_dialog(&root);
+                }
+            }
+            Command::TreeStash | Command::TreeStashStaged => {
+                self.ask_stash_message(target.path, command == Command::TreeStashStaged)
+            }
+            Command::TreeToggleStaged => {
+                let action = self.changes.stage_all(&target.path);
+                return self.changes_action(action);
+            }
+            Command::GitShowStashes => self.show_stashes(&target.path),
             Command::GitLog => self.show_log(&target.path),
             Command::GitSync => self.sync_repo(target.path),
             Command::GitSwitchBranch => self.show_branches(target.path),
@@ -8729,7 +8890,7 @@ impl App {
             Sidebar::Files => self.tree.selected(),
             Sidebar::Changes => self.changes.selected(),
             Sidebar::Log => self.log.as_ref().and_then(LogView::selected),
-            Sidebar::Commit => self.commit_views.first().and_then(CommitView::selected),
+            Sidebar::Stashes => self.stashes.as_ref().and_then(StashView::selected),
         }
     }
 
@@ -8823,9 +8984,11 @@ impl App {
         if let Some(log) = &mut self.log {
             log.set_height(self.height.saturating_sub(1));
         }
-        let width = self.visible_tree_width();
-        for view in &mut self.commit_views {
-            view.set_size(width, self.height.saturating_sub(1));
+        if let Some(view) = &mut self.stashes {
+            view.set_height(self.height.saturating_sub(1));
+        }
+        for dialog in &mut self.commit_dialogs {
+            dialog.set_size(self.width, self.height);
         }
         if let Some(picker) = &mut self.picker {
             picker.set_size(self.width, self.height);
@@ -8875,7 +9038,8 @@ impl App {
     }
 
     /// Space in the sidebar: puts Quick Look away, or shows it, of the
-    /// selection. The log has no files; there, it shows the commit.
+    /// selection. The log and stashes have no files; there, it shows how
+    /// the commit or stash changed one.
     fn toggle_quick_look(&mut self) {
         if self.quick_look.take().is_some() {
             return;
@@ -8884,6 +9048,13 @@ impl App {
             if let Some(log) = &mut self.log {
                 let action = log.run(Command::TreePreview);
                 self.log_action(action);
+            }
+            return;
+        }
+        if self.sidebar == Sidebar::Stashes {
+            if let Some(view) = &mut self.stashes {
+                let action = view.run(Command::TreePreview);
+                self.stash_action(action);
             }
             return;
         }
@@ -10918,26 +11089,22 @@ mod tests {
     }
 
     #[test]
-    fn stages_and_commits_from_the_commit_view() {
+    fn stages_and_commits_from_the_changes() {
         let _serial = crate::test_serial();
         let root = crate::git::tests::repo("app-commit");
         crate::git::tests::commit_as_cue(&root);
         fs::write(root.join("a.txt"), "a changed\n").unwrap();
         fs::write(root.join("b.txt"), "b changed\n").unwrap();
-        let mut app = app(&root, Some("a.txt"));
+        let mut app = tall_app(&root, Some("a.txt"));
         wait_for_git(&mut app);
         // Unsaved, until staging saves it.
         app.focus = Focus::Editor;
         type_text(&mut app, "x");
 
+        // On the repository's header, s stages all of it.
         app.run(Command::ToggleChanges, false);
-        key(&mut app, KeyCode::Char('c'));
-        assert_eq!(app.sidebar, Sidebar::Commit);
-        assert!(app.writing_message(), "c goes to the message box");
-        key(&mut app, KeyCode::Esc);
-        assert!(!app.writing_message(), "Esc goes back to the list");
-        assert_eq!(app.focus, Focus::Tree);
-
+        key(&mut app, KeyCode::Home);
+        key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Char('s'));
         assert!(!app.documents[0].is_modified(), "saved to stage it");
         wait_for_git(&mut app);
@@ -10947,39 +11114,80 @@ mod tests {
             .map(|c| c.staged)
             .collect();
         assert_eq!(staged, [git::Staged::Yes, git::Staged::Yes]);
-        assert!(screen(&app).contains("Commit 2"), "{}", screen(&app));
+        assert!(tall_screen(&app).contains("M ●"), "{}", tall_screen(&app));
 
         key(&mut app, KeyCode::Char('c'));
+        assert!(app.commit_open, "c opens the commit dialog");
+        let shown = tall_screen(&app);
+        assert!(shown.contains("2 files, +2 −2, to "), "{shown}");
+        assert!(shown.contains(" on main"), "{shown}");
+        type_text(&mut app, "Draft");
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.commit_open, "Esc closes it");
+        key(&mut app, KeyCode::Char('c'));
+        assert_eq!(
+            app.commit_dialogs[0].message(),
+            "Draft",
+            "and keeps the draft"
+        );
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Backspace);
+        }
         type_text(&mut app, "Change a and b");
-        let frame = OwnedBuffer::new(80, 10, false, WidthMethod::Unicode, "test").unwrap();
-        assert_eq!(app.draw(&frame), Some((17, 2)), "the cursor's in the box");
+        let frame = OwnedBuffer::new(80, 24, false, WidthMethod::Unicode, "test").unwrap();
+        let area = app.commit_dialogs[0].area();
+        assert_eq!(
+            app.draw(&frame),
+            Some((area.x + 4 + 14, area.y + 2)),
+            "the cursor's in the box"
+        );
         app.handle_key(Key::new(KeyCode::Enter, Mods::CTRL));
-        assert!(screen(&app).contains("Committing…"));
-        let result = app.commit_views[0].wait().unwrap();
-        app.committed(result);
+        assert!(tall_screen(&app).contains("Committing…"));
+        let result = app.commit_dialogs[0].wait().unwrap();
+        app.committed(&root, result);
         let last = git::log(&root, 0, 1).remove(0);
         assert_eq!(last.subject, "Change a and b");
-        assert!(screen(&app).contains(&format!("Committed {}.", last.short)));
-        assert_eq!(app.commit_views[0].message(), "", "the box is emptied");
+        assert!(!app.commit_open, "it closes once it's made");
+        assert!(tall_screen(&app).contains(&format!("Committed {}.", last.short)));
+        assert_eq!(app.commit_dialogs[0].message(), "", "the box is emptied");
         assert_eq!(
             fs::read_to_string(root.join("a.txt")).unwrap(),
             "xa changed\n"
         );
         wait_for_git(&mut app);
-        assert!(screen(&app).contains("No changes."));
+        assert!(tall_screen(&app).contains("No changes."));
 
-        // Nothing staged: it says so, and how to stage.
-        type_text(&mut app, "More");
+        // With nothing staged, it stages and commits everything.
+        fs::write(root.join("c.txt"), "new\n").unwrap();
+        app.git.restart();
+        wait_for_git(&mut app);
+        key(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "Add c");
+        let shown = tall_screen(&app);
+        assert!(shown.contains("Nothing's staged, so all 1 file"), "{shown}");
+        assert!(shown.contains("Commit All"), "{shown}");
         app.handle_key(Key::new(KeyCode::Enter, Mods::CTRL));
-        assert!(
-            screen(&app).contains("Nothing is staged."),
-            "{}",
-            screen(&app)
-        );
+        let result = app.commit_dialogs[0].wait().unwrap();
+        app.committed(&root, result);
+        assert_eq!(git::log(&root, 0, 1)[0].subject, "Add c");
+        wait_for_git(&mut app);
+        assert!(app.git.repos()[0].changes.is_empty());
+
         // And the log is a click away.
-        let width = app.visible_tree_width();
-        left_click(&mut app, width - 3, 0);
+        let (x, y) = cell_of(&app, "View log");
+        left_click(&mut app, x, y);
         assert_eq!(app.sidebar, Sidebar::Log);
+    }
+
+    /// Where `text` is on the 80 x 24 screen: its first cell's column and
+    /// row.
+    fn cell_of(app: &App, text: &str) -> (u32, u32) {
+        let screen = tall_screen(app);
+        let found = screen.lines().enumerate().find_map(|(y, line)| {
+            let at = line.find(text)?;
+            Some((line[..at].chars().count() as u32, y as u32))
+        });
+        found.unwrap_or_else(|| panic!("no {text:?} in\n{screen}"))
     }
 
     #[test]
@@ -11024,8 +11232,8 @@ mod tests {
             "{changes:?}"
         );
         assert!(changes[1].starts_with(" ▾ app-badge") && changes[1].ends_with("main"));
-        assert!(changes[2].starts_with("     a.txt") && changes[2].ends_with('M'));
-        assert!(changes[3].starts_with("     b.txt") && changes[3].ends_with('D'));
+        assert!(changes[2].starts_with("     a.txt") && changes[2].ends_with("M ○"));
+        assert!(changes[3].starts_with("     b.txt") && changes[3].ends_with("D ○"));
         assert!(status(&app).starts_with(" ‹ Files  "), "{}", status(&app));
 
         // A file that's gone isn't opened as a new one.
@@ -13247,6 +13455,7 @@ mod tests {
         let _serial = crate::test_serial();
         let root = crate::git::tests::repo("app-hover");
         fs::write(root.join("a.txt"), "changed\n").unwrap();
+        fs::remove_file(root.join("b.txt")).unwrap();
         let mut app = tall_app(&root, None);
         wait_for_git(&mut app);
         app.run(Command::ToggleChanges, false);
@@ -13256,43 +13465,52 @@ mod tests {
             app.hover_area().map(|rect| rect.x..rect.x + rect.width)
         };
         // The top row, apart from its button, and the button; a
-        // repository's row, and a file's.
+        // repository's row, and its branch; a file, and its mark; and the
+        // buttons under them.
         assert_eq!(hover(&mut app, 2, 0), Some(0..width - 3));
         assert_eq!(hover(&mut app, width - 2, 0), Some(width - 3..width), "+");
-        assert_eq!(hover(&mut app, 8, 1), Some(0..width), "a repository");
-        assert_eq!(hover(&mut app, 2, 2), Some(0..width), "a file");
-
-        app.run(Command::TreeCommit, false);
-        assert_eq!(app.sidebar, Sidebar::Commit);
-        // The top row's buttons: back, by the name, the branch, and the log.
-        assert_eq!(hover(&mut app, 2, 0), Some(0..13));
-        assert_eq!(hover(&mut app, 16, 0), Some(13..19), "the branch");
-        assert_eq!(hover(&mut app, 20, 0), None);
-        assert_eq!(hover(&mut app, width - 2, 0), Some(width - 5..width));
-        assert_eq!(hover(&mut app, 5, 2), None, "the message box");
-        assert_eq!(hover(&mut app, 2, 4), Some(0..9), "Amend");
-        assert_eq!(hover(&mut app, 10, 4), None);
+        assert_eq!(hover(&mut app, 8, 1), Some(0..width - 6), "a repository");
         assert_eq!(
-            hover(&mut app, 15, 4),
-            Some(width - 19..width - 8),
-            "Stash all"
+            hover(&mut app, width - 3, 1),
+            Some(width - 6..width),
+            "main"
         );
+        assert_eq!(hover(&mut app, 2, 2), Some(0..width - 3), "a file");
         assert_eq!(
-            hover(&mut app, width - 2, 4),
-            Some(width - 8..width),
-            "Commit"
-        );
-        assert_eq!(hover(&mut app, 2, 6), Some(0..width - 3), "a file");
-        assert_eq!(
-            hover(&mut app, width - 2, 6),
+            hover(&mut app, width - 2, 2),
             Some(width - 3..width),
             "its mark"
         );
-        assert_eq!(hover(&mut app, 2, 8), None, "below the files");
+        // They're at the bottom, the one repository's section filling
+        // the sidebar but for its last row.
+        let bottom = app.height - 3;
+        assert_eq!(hover(&mut app, 2, 4), None, "past the files");
+        assert_eq!(hover(&mut app, 2, bottom), Some(0..8), "Commit");
+        assert_eq!(
+            hover(&mut app, width - 2, bottom),
+            Some(width - 3..width),
+            "…"
+        );
+
+        // The commit dialog's switch and buttons; nothing under it.
+        app.run(Command::TreeCommit, false);
+        assert!(app.commit_open);
+        let area = app.commit_dialogs[0].area();
+        let (x, y) = (area.x, area.y);
+        assert_eq!(hover(&mut app, x + 5, y + 2), None, "the message box");
+        assert_eq!(hover(&mut app, x + 5, y + 4), Some(x + 2..x + 21), "Amend");
+        let buttons = y + area.height - 2;
+        let right = x + area.width - 2;
+        assert_eq!(
+            hover(&mut app, right - 3, buttons),
+            Some(right - 12..right),
+            "Commit All"
+        );
+        assert_eq!(hover(&mut app, 2, 2), None, "the changes under it");
     }
 
     #[test]
-    fn stashes_from_the_commit_view_and_puts_them_back() {
+    fn stashes_from_the_repository_menu_and_puts_them_back() {
         let _serial = crate::test_serial();
         let root = crate::git::tests::repo("app-stash");
         crate::git::tests::commit_as_cue(&root);
@@ -13301,30 +13519,28 @@ mod tests {
         let mut app = tall_app(&root, None);
         wait_for_git(&mut app);
         app.run(Command::ToggleChanges, false);
-        key(&mut app, KeyCode::Char('c'));
-        type_text(&mut app, "wip");
-        key(&mut app, KeyCode::Esc);
-        assert!(tall_screen(&app).contains("Stash all"));
-        let row_with = |app: &App, text: &str| -> u32 {
-            let screen = tall_screen(app);
-            let row = screen.lines().position(|line| line.contains(text));
-            row.unwrap_or_else(|| panic!("no {text:?} in\n{screen}")) as u32
-        };
 
-        let width = app.visible_tree_width();
-        let y = row_with(&app, "Stash all");
-        left_click(&mut app, width - 15, y);
+        // … pops up what can be done to the repository.
+        let (x, y) = cell_of(&app, "…");
+        left_click(&mut app, x, y);
+        let (x, y) = cell_of(&app, "Stash Changes…");
+        left_click(&mut app, x, y);
+        assert!(tall_screen(&app).contains("Message (optional)"));
+        type_text(&mut app, "wip");
+        key(&mut app, KeyCode::Enter);
         assert!(tall_screen(&app).contains("Stashed the changes."));
         assert!(!root.join("c.txt").exists(), "new files go too");
-        assert_eq!(app.commit_views[0].message(), "", "the box is emptied");
         wait_for_git(&mut app);
         assert!(tall_screen(&app).contains("No changes."));
 
-        // It opens to its buttons and files; a file opens to its diff.
-        let y = row_with(&app, "wip");
+        // The stashes replace the changes, and open to their buttons and
+        // files; a file opens to its diff.
+        app.run(Command::GitShowStashes, false);
+        assert_eq!(app.sidebar, Sidebar::Stashes);
+        let (_, y) = cell_of(&app, "wip");
         left_click(&mut app, 4, y);
-        let actions = row_with(&app, "Apply  Pop  Drop");
-        let y = row_with(&app, "c.txt");
+        let (_, actions) = cell_of(&app, "Apply  Pop  Drop");
+        let (_, y) = cell_of(&app, "c.txt");
         left_click(&mut app, 8, y);
         let shown = tall_screen(&app);
         assert!(
@@ -13332,66 +13548,60 @@ mod tests {
             "{shown}"
         );
 
-        left_click(&mut app, 12, actions);
+        left_click(&mut app, 10, actions);
         assert!(tall_screen(&app).contains("Popped the stash."));
         assert_eq!(fs::read_to_string(root.join("c.txt")).unwrap(), "new\n");
         wait_for_git(&mut app);
-        assert!(!tall_screen(&app).contains("Stashes"), "none left");
+        assert!(tall_screen(&app).contains("No stashes."));
 
-        // Dropping asks first.
+        // Dropping asks first; the top row goes back.
         app.run(Command::TreeStash, false);
+        key(&mut app, KeyCode::Enter);
         wait_for_git(&mut app);
-        let y = row_with(&app, "WIP on main");
+        let (_, y) = cell_of(&app, "WIP on main");
         left_click(&mut app, 4, y);
         app.run(Command::TreeDropStash, false);
         assert!(tall_screen(&app).contains("Its changes will be lost."));
         key(&mut app, KeyCode::Enter);
         assert!(tall_screen(&app).contains("Dropped the stash."));
         assert!(git::stashes(&root).is_empty());
+        left_click(&mut app, 3, 0);
+        assert_eq!(app.sidebar, Sidebar::Changes);
     }
 
     #[test]
     fn stashing_saves_edits_when_the_working_tree_is_clean() {
         let _serial = crate::test_serial();
-        for click in [false, true] {
-            let root = crate::git::tests::repo(&format!("app-unsaved-stash-{click}"));
-            crate::git::tests::commit_as_cue(&root);
-            let mut app = tall_app(&root, Some("a.txt"));
-            wait_for_git(&mut app);
-            app.focus = Focus::Editor;
-            type_text(&mut app, "unsaved ");
-            assert!(app.documents[0].is_modified());
-            assert!(app.git.repos()[0].changes.is_empty());
-            app.run(Command::TreeCommit, false);
-            type_text(&mut app, "My stash");
-            key(&mut app, KeyCode::Esc);
-            if click {
-                let width = app.visible_tree_width();
-                left_click(&mut app, width - 15, 4);
-            } else {
-                app.run(Command::TreeStash, false);
-            }
+        let root = crate::git::tests::repo("app-unsaved-stash");
+        crate::git::tests::commit_as_cue(&root);
+        let mut app = tall_app(&root, Some("a.txt"));
+        wait_for_git(&mut app);
+        app.focus = Focus::Editor;
+        type_text(&mut app, "unsaved ");
+        assert!(app.documents[0].is_modified());
+        assert!(app.git.repos()[0].changes.is_empty());
+        app.run(Command::TreeStash, false);
+        type_text(&mut app, "My stash");
+        key(&mut app, KeyCode::Enter);
 
-            let stashes = git::stashes(&root);
-            assert_eq!(stashes.len(), 1);
-            assert_eq!(stashes[0].commit.subject, "My stash");
-            assert_eq!(
-                git::file_at(&root, &stashes[0].commit.hash, Path::new("a.txt")),
-                git::Base::Text("unsaved a\n".into())
-            );
-            assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
-            assert!(!app.documents[0].is_modified());
-            assert_eq!(app.commit_views[0].message(), "");
+        let stashes = git::stashes(&root);
+        assert_eq!(stashes.len(), 1);
+        assert_eq!(stashes[0].commit.subject, "My stash");
+        assert_eq!(
+            git::file_at(&root, &stashes[0].commit.hash, Path::new("a.txt")),
+            git::Base::Text("unsaved a\n".into())
+        );
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+        assert!(!app.documents[0].is_modified());
 
-            // On a clean repository, the enabled button leaves the draft
-            // and existing stashes alone and explains there's nothing to do.
-            wait_for_git(&mut app);
-            app.commit_views[0].edit(Edit::Insert("Keep this draft"), false);
-            app.run(Command::TreeStash, false);
-            assert_eq!(git::stashes(&root), stashes);
-            assert_eq!(app.commit_views[0].message(), "Keep this draft");
-            assert!(tall_screen(&app).contains("No changes to stash."));
-        }
+        // On a clean repository, there's nothing to ask about.
+        wait_for_git(&mut app);
+        app.run(Command::TreeStash, false);
+        assert!(app.input.is_none());
+        assert_eq!(git::stashes(&root), stashes);
+        assert!(tall_screen(&app).contains("No changes to stash."));
+        app.run(Command::TreeStashStaged, false);
+        assert!(tall_screen(&app).contains("Nothing is staged."));
     }
 
     /// Waits for the checkpoint being taken, then for git.
@@ -13453,18 +13663,35 @@ mod tests {
     }
 
     #[test]
-    fn a_repositorys_row_pops_up_what_can_be_done_to_it() {
+    fn a_repositorys_buttons_pop_up_what_else_can_be_done_to_it() {
         let _serial = crate::test_serial();
         let root = crate::git::tests::repo("app-repo-menu");
+        fs::write(root.join("a.txt"), "changed\n").unwrap();
         let mut app = tall_app(&root, Some("a.txt"));
         wait_for_git(&mut app);
         app.run(Command::ToggleChanges, false);
-        left_click(&mut app, 8, 1);
+        let (x, y) = cell_of(&app, "…");
+        left_click(&mut app, x, y);
         let shown = tall_screen(&app);
         assert!(
-            shown.contains("Switch Branch…") && shown.contains("Log"),
+            shown.contains("Switch Branch…")
+                && shown.contains("Stash Changes…")
+                && shown.contains("Stage All Changes"),
             "{shown}"
         );
+        assert!(!shown.contains("Stash Staged"), "nothing is: {shown}");
+        let (x, y) = cell_of(&app, "Stage All Changes");
+        left_click(&mut app, x, y);
+        wait_for_git(&mut app);
+        assert_eq!(app.git.repos()[0].changes[0].staged, git::Staged::Yes);
+
+        // So does a right click on its row, and Ctrl+Enter.
+        mouse_at(&mut app, MouseKind::Press(MouseButton::Right), 5, 1);
+        mouse_at(&mut app, MouseKind::Release(MouseButton::Right), 5, 1);
+        assert!(tall_screen(&app).contains("Unstage All Changes"));
+        key(&mut app, KeyCode::Esc);
+        app.handle_key(Key::new(KeyCode::Enter, Mods::CTRL));
+        assert!(tall_screen(&app).contains("Stash Staged Changes…"));
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.sidebar, Sidebar::Log, "the second item");
@@ -13501,14 +13728,14 @@ mod tests {
         assert!(tall_screen(&app).contains("Switched to topic."));
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "changed\n");
 
-        // From the commit view, with an unsaved edit, which is saved and
-        // comes along.
+        // From the repository's branch in the changes, with an unsaved
+        // edit, which is saved and comes along.
         wait_for_git(&mut app);
         app.focus = Focus::Editor;
         key(&mut app, KeyCode::Char('x'));
-        app.run(Command::TreeCommit, false);
-        key(&mut app, KeyCode::Esc);
-        left_click(&mut app, 17, 0);
+        let (x, y) = cell_of(&app, "topic");
+        assert_eq!(y, 1, "{}", tall_screen(&app));
+        left_click(&mut app, x, y);
         assert_eq!(app.picker.as_ref().map(Picker::mode), Some(Mode::Branches));
         type_text(&mut app, "main");
         key(&mut app, KeyCode::Enter);
@@ -13523,14 +13750,15 @@ mod tests {
         git::stage(&root, &[root.join("a.txt")]).unwrap();
         app.git.restart();
         wait_for_git(&mut app);
-        app.commit_views[0].edit(Edit::Insert("Stay on main"), false);
+        app.run(Command::TreeCommit, false);
+        type_text(&mut app, "Stay on main");
         app.commit();
-        assert!(app.commit_views[0].committing());
+        assert!(app.commit_dialogs[0].committing());
         let to = SwitchTo::Branch("topic".to_string());
         app.switch_branch(root.clone(), to.clone());
         assert_eq!(branch(), "main");
-        assert!(tall_screen(&app).contains("Wait for the commit"));
-        app.commit_views[0].wait().unwrap().unwrap();
+        assert!(status_message(&app).is_some_and(|said| said.starts_with("Wait for the commit")));
+        app.commit_dialogs[0].wait().unwrap().unwrap();
         assert_eq!(git::log(&root, 0, 1)[0].subject, "Stay on main");
         app.switch_branch(root.clone(), to);
         assert_eq!(branch(), "topic");
@@ -13596,22 +13824,24 @@ mod tests {
             let mut app = tall_app(&root, Some("a.txt"));
             wait_for_git(&mut app);
             app.run(Command::TreeCommit, false);
-            app.commit_views[0].toggle_amend();
+            app.commit_dialogs[0].toggle_amend();
             if edited {
-                app.commit_views[0].edit(Edit::Insert("My draft: "), false);
+                app.commit_dialogs[0].edit(Edit::Insert("My draft: "), false);
             }
-            let message = app.commit_views[0].message().to_string();
+            let message = app.commit_dialogs[0].message().to_string();
 
             app.show_branches(root.clone());
+            assert!(!app.commit_open, "the picker takes its place");
             type_text(&mut app, "other");
             key(&mut app, KeyCode::Enter);
             // Input can arrive before the background status refresh, or
             // in the same batch as the key that accepted the branch.
+            app.run(Command::TreeCommit, false);
             app.handle_key(Key::new(KeyCode::Enter, Mods::CTRL));
-            assert!(!app.commit_views[0].committing());
+            assert!(!app.commit_dialogs[0].committing());
             assert_eq!(git::log(&root, 0, 1)[0].hash, before);
             assert_eq!(
-                app.commit_views[0].message(),
+                app.commit_dialogs[0].message(),
                 if edited { message.as_str() } else { "" }
             );
         }

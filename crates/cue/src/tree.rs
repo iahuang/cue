@@ -59,7 +59,7 @@ struct Row {
 }
 
 /// Rows, some of which open to show the rows under them, gone through the
-/// same way: the tree, the changes, the log, and the commit view.
+/// same way: the tree, the changes, the log, and the stashes.
 pub trait Outline {
     fn row_count(&self) -> usize;
     fn row_depth(&self, row: usize) -> usize;
@@ -94,17 +94,16 @@ pub trait Outline {
         }
     }
 
-    /// Selects row `index` (clamped), or the one next to it if it's
-    /// skipped, and scrolls it into view.
+    /// Selects row `index` (clamped), or if it's skipped, the next one
+    /// that isn't, or failing that, the one before, and scrolls it into
+    /// view.
     fn select(&mut self, index: usize) {
         let count = self.row_count();
-        let mut index = index.min(count.saturating_sub(1));
-        if self.row_skipped(index) {
-            index = match index + 1 < count {
-                true => index + 1,
-                false => index.saturating_sub(1),
-            };
-        }
+        let index = index.min(count.saturating_sub(1));
+        let index = (index..count)
+            .find(|&row| !self.row_skipped(row))
+            .or_else(|| (0..index).rev().find(|&row| !self.row_skipped(row)))
+            .unwrap_or(index);
         *self.place().0 = index;
         self.scroll_into_view();
     }
@@ -112,8 +111,11 @@ pub trait Outline {
     /// Moves the selection `by` rows, over those skipped.
     fn step(&mut self, by: isize) {
         let mut index = self.place().0.saturating_add_signed(by);
-        if self.row_skipped(index) {
-            index = index.saturating_add_signed(by.signum());
+        while index < self.row_count() && self.row_skipped(index) {
+            match index.checked_add_signed(by.signum()) {
+                Some(next) => index = next,
+                None => return,
+            }
         }
         if index < self.row_count() {
             self.select(index);
@@ -164,7 +166,7 @@ pub trait Outline {
 
 /// The row at the top of the screen, from `scroll`, to show row
 /// `selected` of `count`, with `shown` rows on screen.
-fn scroll_to_show(selected: usize, scroll: usize, shown: usize, count: usize) -> usize {
+pub(crate) fn scroll_to_show(selected: usize, scroll: usize, shown: usize, count: usize) -> usize {
     let scroll = if selected < scroll {
         selected
     } else if selected >= scroll + shown {
@@ -186,9 +188,28 @@ pub enum TreeAction {
         focus: bool,
         preview: bool,
     },
-    /// Pop up what can be done to the repository at this root, from the
-    /// changes.
-    RepoMenu(PathBuf),
+    /// Pop up what can be done to the repository at `root`, from the
+    /// changes: below the cell `at`, its `…` button, or else beside its
+    /// row.
+    RepoMenu {
+        root: PathBuf,
+        at: Option<(u32, u32)>,
+    },
+    /// Show the branches of the repository at this root, to switch to one.
+    Branches(PathBuf),
+    /// Open the commit dialog of the repository at this root.
+    Commit(PathBuf),
+    /// Catch the repository at this root up with the branch it tracks.
+    Sync(PathBuf),
+    /// Show the log of the repository at this root.
+    Log(PathBuf),
+    /// Stage the files at `paths`, in the repository at `root`, or with
+    /// `stage` false, unstage them.
+    Stage {
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        stage: bool,
+    },
     /// Show the workspace's checkpoints, to compare with one.
     Checkpoints,
     /// Compare the workspace with the last commit again.

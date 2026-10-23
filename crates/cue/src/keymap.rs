@@ -191,7 +191,8 @@ commands! {
     TreeRemoveFolder => "tree:remove-folder", "File Tree: Remove Folder from Workspace";
     TreeToggleStaged => "tree:toggle-staged", "Changes: Stage or Unstage";
     TreeCommit => "tree:commit", "Changes: Commit…";
-    TreeStash => "tree:stash", "Changes: Stash";
+    TreeStash => "tree:stash", "Changes: Stash…";
+    TreeStashStaged => "tree:stash-staged", "Changes: Stash Staged…";
     TreeApplyStash => "tree:apply-stash", "Changes: Apply Stash";
     TreePopStash => "tree:pop-stash", "Changes: Pop Stash";
     TreeDropStash => "tree:drop-stash", "Changes: Drop Stash…";
@@ -210,6 +211,7 @@ commands! {
     GitCompareWith => "git:compare-with", "Compare with Checkpoint…";
     GitLog => "git:log", "Show Git Log";
     GitSwitchBranch => "git:switch-branch", "Switch Branch…";
+    GitShowStashes => "git:show-stashes", "Show Stashes";
     PickerUp => "picker:up", "Picker: Select Previous";
     PickerDown => "picker:down", "Picker: Select Next";
     PickerPageUp => "picker:page-up", "Picker: Page Up";
@@ -250,7 +252,7 @@ pub enum Context {
     /// A terminal, which gets every key but a few (see
     /// [`Keymap::lookup_terminal`]).
     Terminal,
-    /// The commit view's message box, while it has focus. The editor's
+    /// The commit dialog's message box, while it has focus. The editor's
     /// keys for moving and deleting work there too.
     Message,
 }
@@ -298,15 +300,17 @@ impl Command {
             | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2
             | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9
             | AddFolder | RenameSession | GitFetch | GitPull | GitPush | GitCheckpoint
-            | GitCompareWith | GitLog | GitSwitchBranch | GitSync => Context::Global,
+            | GitCompareWith | GitLog | GitSwitchBranch | GitSync | GitShowStashes => {
+                Context::Global
+            }
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeSwitchView | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder
             | TreeRename | TreeDuplicate | TreeTrash | TreeCopyPath | TreeCopyRelativePath
             | TreeReveal | TreeOpenInTerminal | TreeRemoveFolder | TreeToggleStaged
-            | TreeCommit | TreeStash | TreeApplyStash | TreePopStash | TreeDropStash
-            | TreeOpenFile | TreeCopyHash | TreeCopyMessage | TreeCheckOut | TreeNewBranch
-            | TreeRevert => Context::Tree,
+            | TreeCommit | TreeStash | TreeStashStaged | TreeApplyStash | TreePopStash
+            | TreeDropStash | TreeOpenFile | TreeCopyHash | TreeCopyMessage | TreeCheckOut
+            | TreeNewBranch | TreeRevert => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,

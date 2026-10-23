@@ -298,7 +298,7 @@ impl LogView {
     /// Draws the log in the columns from `x` to `x + width`.
     pub fn draw(&self, frame: &Buffer, x: u32, width: u32, focused: bool) {
         frame.with_clip(x, 0, width, self.height as u32 + 1, || {
-            self.draw_top(frame, x, width);
+            draw_top(frame, (x, width), &self.name, &self.branch);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs() as i64);
@@ -314,39 +314,9 @@ impl LogView {
         });
     }
 
-    /// The top row: back to the changes, the repository, and its branch.
-    fn draw_top(&self, frame: &Buffer, x: u32, width: u32) {
-        let colors = theme::colors();
-        frame.draw_text("‹", x + 1, 0, colors.muted, None, Attributes::NONE);
-        let (branch, branch_x) = self.top_branch(width);
-        let branch_x = x + branch_x;
-        let name_x = x + 3;
-        let room = branch_x.saturating_sub(name_x + 1) as usize;
-        let name = truncate(&self.name, room);
-        frame.draw_text(&name, name_x, 0, colors.text, None, Attributes::BOLD);
-        if branch_x > name_x + name.chars().count() as u32 {
-            let mut at = branch_x;
-            if icons::enabled() {
-                at = icons::branch().draw(frame, at, 0, None);
-            }
-            frame.draw_text(&branch, at, 0, colors.muted, None, Attributes::NONE);
-        }
-    }
-
-    /// The branch as the top row shows it, at its right end, in a list
-    /// `width` wide, and the column it starts at, its icon's if it has one.
-    fn top_branch(&self, width: u32) -> (String, u32) {
-        let branch_room = (width / 2).saturating_sub(2) as usize;
-        let branch = truncate(&self.branch, branch_room);
-        let branch_width = branch.chars().count() as u32 + icons::width();
-        let branch_x = width.saturating_sub(branch_width + 1);
-        (branch, branch_x)
-    }
-
     /// The top row's button that shows the branches: the branch.
     fn branch_area(&self, width: u32) -> Range<u32> {
-        let (branch, start) = self.top_branch(width);
-        button_area(start..start + icons::width() + branch.chars().count() as u32)
+        top_branch_area(&self.branch, width)
     }
 
     fn draw_row(
@@ -375,6 +345,7 @@ impl LogView {
                     attributes: Attributes::NONE,
                     right: Some((&right, colors.muted)),
                     mark: None,
+                    right_icon: None,
                 }
             }
             What::Info(_) => Look {
@@ -387,6 +358,7 @@ impl LogView {
                 attributes: Attributes::NONE,
                 right: None,
                 mark: None,
+                right_icon: None,
             },
             What::Folder(i) => {
                 let key = (self.commits[*i].hash.clone(), row.path.clone());
@@ -401,6 +373,7 @@ impl LogView {
                     attributes: Attributes::NONE,
                     right: None,
                     mark: None,
+                    right_icon: None,
                 }
             }
             What::File(i, change) => {
@@ -427,6 +400,7 @@ impl LogView {
                     attributes,
                     right: Some((&right, colors.hue(change.kind.hue()))),
                     mark: None,
+                    right_icon: None,
                 }
             }
         };
@@ -625,6 +599,43 @@ pub(crate) fn ago(seconds: i64) -> String {
         s if s < 365 * DAY => format!("{}mo", s / (30 * DAY)),
         s => format!("{}y", s / (365 * DAY)),
     }
+}
+
+/// Draws the top row of a view of a repository that's shown in place of
+/// the changes, in the columns from `x` to `x + width`: back to them, the
+/// repository, called `name`, and its `branch`.
+pub(crate) fn draw_top(frame: &Buffer, (x, width): (u32, u32), name: &str, branch: &str) {
+    let colors = theme::colors();
+    frame.draw_text("‹", x + 1, 0, colors.muted, None, Attributes::NONE);
+    let (branch, branch_x) = top_branch(branch, width);
+    let branch_x = x + branch_x;
+    let name_x = x + 3;
+    let room = branch_x.saturating_sub(name_x + 1) as usize;
+    let name = truncate(name, room);
+    frame.draw_text(&name, name_x, 0, colors.text, None, Attributes::BOLD);
+    if branch_x > name_x + name.chars().count() as u32 {
+        let mut at = branch_x;
+        if icons::enabled() {
+            at = icons::branch().draw(frame, at, 0, None);
+        }
+        frame.draw_text(&branch, at, 0, colors.muted, None, Attributes::NONE);
+    }
+}
+
+/// `branch` as the top row shows it, at its right end, in a view `width`
+/// wide, and the column it starts at, its icon's if it has one.
+fn top_branch(branch: &str, width: u32) -> (String, u32) {
+    let branch_room = (width / 2).saturating_sub(2) as usize;
+    let branch = truncate(branch, branch_room);
+    let branch_width = branch.chars().count() as u32 + icons::width();
+    let branch_x = width.saturating_sub(branch_width + 1);
+    (branch, branch_x)
+}
+
+/// The top row's button that shows the branches: `branch`.
+pub(crate) fn top_branch_area(branch: &str, width: u32) -> Range<u32> {
+    let (branch, start) = top_branch(branch, width);
+    button_area(start..start + icons::width() + branch.chars().count() as u32)
 }
 
 #[cfg(test)]

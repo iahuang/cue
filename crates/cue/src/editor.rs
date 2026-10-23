@@ -4230,8 +4230,20 @@ mod tests {
         mouse(&mut editor, MouseKind::Press(left), 4, 4, t0);
         mouse(&mut editor, MouseKind::Release(left), 4, 4, t0);
         assert_eq!((eb.cursor().row, eb.cursor().col), (1, 4));
-        mouse(&mut editor, MouseKind::Press(left), 40, 5, t0 + Duration::from_secs(1));
-        mouse(&mut editor, MouseKind::Release(left), 40, 5, t0 + Duration::from_secs(1));
+        mouse(
+            &mut editor,
+            MouseKind::Press(left),
+            40,
+            5,
+            t0 + Duration::from_secs(1),
+        );
+        mouse(
+            &mut editor,
+            MouseKind::Release(left),
+            40,
+            5,
+            t0 + Duration::from_secs(1),
+        );
         assert_eq!((eb.cursor().row, eb.cursor().col), (1, 11));
     }
 

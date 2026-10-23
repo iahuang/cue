@@ -1404,6 +1404,45 @@ fn diff_lines(top: &Path, initial: bool) -> (usize, usize) {
     }
 }
 
+/// The lines the changes staged in the repository at `root` add and
+/// remove, since the last commit, or if there's none yet (`initial`), since
+/// the start.
+pub fn staged_lines(root: &Path, initial: bool) -> (usize, usize) {
+    let base = if initial { EMPTY_TREE } else { "HEAD" };
+    let output = git(root)
+        .args([
+            "diff",
+            "--cached",
+            "--numstat",
+            "--no-ext-diff",
+            "--no-color",
+            base,
+            "--",
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => parse_numstat(&output.stdout),
+        _ => (0, 0),
+    }
+}
+
+/// Who a commit in the repository at `root` would be by, `Name <email>`,
+/// or what git said if it doesn't know.
+pub fn author(root: &Path) -> Result<String, String> {
+    let output = git(root)
+        .args(["var", "GIT_AUTHOR_IDENT"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    // It ends with the time, in seconds, and the time zone.
+    let ident = String::from_utf8_lossy(&output.stdout);
+    let ident = ident.trim();
+    let end = ident.rfind('>').map_or(ident.len(), |end| end + 1);
+    Ok(ident[..end].to_string())
+}
+
 /// The lines added and removed in all, from `git diff --numstat`: a line
 /// per file, starting with the counts, which are `-` for a binary file.
 fn parse_numstat(output: &[u8]) -> (usize, usize) {
