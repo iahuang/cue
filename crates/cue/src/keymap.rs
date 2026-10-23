@@ -506,10 +506,9 @@ impl Default for Keymap {
         bindings.push((key(Char('-'), Mods::CTRL), GoBack));
         bindings.push((key(Char('_'), Mods::CTRL), GoBack));
         bindings.push((key(Char('='), Mods::CTRL), GoForward));
-        // Held, as macOS's Cmd+Tab, to go back further. Some terminals
-        // report the shifted key, `_`; legacy terminals send it as Ctrl+-.
-        bindings.push((key(Char('-'), CTRL_SHIFT), RecentlyViewed));
-        bindings.push((key(Char('_'), CTRL_SHIFT), RecentlyViewed));
+        // Held, as macOS's Cmd+Tab, to go back further. Alt rather than
+        // Ctrl, which terminals keep for their own tabs.
+        bindings.push((key(Tab, ALT), RecentlyViewed));
         // Ctrl+' sets the mark and Ctrl+Shift+' jumps to it. Some terminals
         // report the shifted key, `"`. Legacy terminals can't send these;
         // the kitty protocol can.
@@ -665,14 +664,16 @@ impl Default for Keymap {
         // cue's shortcuts or the shell gets Ctrl keys (VS Code's terminal
         // toggle; shells don't use it). Ctrl+1 to 9 go to tabs, and
         // Ctrl+Shift+W pops, from terminals too: shells don't use them
-        // either. Ctrl+Shift+K
-        // clears, as Cmd+K does in macOS terminals; legacy terminals send it
-        // as Ctrl+K, the command palette.
+        // either. Alt+Tab shows what the panel showed, over bash's history
+        // completion. Ctrl+Shift+K clears, as Cmd+K does in macOS
+        // terminals; legacy terminals send it as Ctrl+K, the command
+        // palette.
         let go_to_tab = ('1'..='9')
             .zip(Command::GO_TO_TAB)
             .map(|(n, command)| (key(Char(n), Mods::CTRL), command));
         for (key, command) in go_to_tab.chain([
             (key(Char('w'), CTRL_SHIFT), Pop),
+            (key(Tab, ALT), RecentlyViewed),
             (key(Char('`'), Mods::CTRL), ToggleTerminalKeys),
             (key(Char('k'), CTRL_SHIFT), ClearTerminal),
             (key(Char('c'), CTRL_SHIFT), Copy),
@@ -1154,6 +1155,10 @@ mod tests {
                 Command::FocusPanelLeft,
             ),
             (key('t', false, false, false, true), Command::NewTab),
+            (
+                Key::new(KeyCode::Tab, mods(false, true, false, false)),
+                Command::RecentlyViewed,
+            ),
             (key('1', false, false, true, false), Command::GoToTab1),
             (key('9', false, false, false, true), Command::GoToTab9),
             (key('w', false, true, true, false), Command::CloseTab),

@@ -10169,40 +10169,43 @@ mod tests {
     }
 
     #[test]
-    fn recently_viewed_goes_a_file_at_a_time_while_ctrl_is_held() {
+    fn recently_viewed_goes_a_file_at_a_time_while_alt_is_held() {
         let _serial = crate::test_serial();
         let text: String = (1..=200).map(|i| format!("line {i}\n")).collect();
         let files = [("a.txt", text.as_str()), ("b.txt", "b"), ("c.txt", "c")];
         let root = fixture("recently-viewed", &files);
         let mut app = app(&root, Some("a.txt"));
-        let ctrl_shift = Mods {
-            shift: true,
-            ..Mods::CTRL
+        let alt = Mods {
+            alt: true,
+            ..Mods::NONE
         };
+        let alt_shift = Mods { shift: true, ..alt };
         let row = |app: &App| app.ed().place().0;
         let chord = |app: &mut App, c, mods| app.handle_key(Key::new(KeyCode::Char(c), mods));
+        let tab = |app: &mut App, mods| app.handle_key(Key::new(KeyCode::Tab, mods));
         let listed = |app: &App| app.switcher.as_ref().map(Switcher::listed);
         let list = |names: &[&str]| Some(names.iter().map(|name| name.to_string()).collect());
 
         // Two places in a.txt: only other places in what's shown, nothing
         // to go back to.
         app.handle_key(Key::new(KeyCode::End, Mods::CTRL));
-        chord(&mut app, '-', ctrl_shift);
+        tab(&mut app, alt);
         assert_eq!(listed(&app), None);
 
         // Then b.txt and c.txt.
         app.open(&root.join("b.txt"), false);
         app.open(&root.join("c.txt"), false);
-        chord(&mut app, '-', ctrl_shift);
+        tab(&mut app, alt);
         assert_eq!(listed(&app), list(&["c.txt", ">b.txt", "a.txt"]));
         assert!(app.wants_key_releases());
-        // Shift goes up first; - and = with Ctrl alone move too.
-        app.handle_release(Mods::CTRL);
-        chord(&mut app, '-', Mods::CTRL);
-        chord(&mut app, '-', Mods::CTRL);
+        // Tab and - move back with Alt held, Shift+Tab and = forward.
+        tab(&mut app, alt);
         assert_eq!(listed(&app), list(&["c.txt", "b.txt", ">a.txt"]));
-        chord(&mut app, '=', Mods::CTRL);
-        chord(&mut app, '-', ctrl_shift);
+        tab(&mut app, alt_shift);
+        assert_eq!(listed(&app), list(&["c.txt", ">b.txt", "a.txt"]));
+        chord(&mut app, '-', alt);
+        chord(&mut app, '=', alt);
+        tab(&mut app, alt);
         assert_eq!(shown_name(&app).as_deref(), Some("c.txt"), "still open");
         app.handle_release(Mods::NONE);
         assert!(app.switcher.is_none() && !app.wants_key_releases());
@@ -10222,12 +10225,12 @@ mod tests {
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
 
         // What it went to comes first, as with Cmd+Tab: taps go back and
-        // forth between two.
-        chord(&mut app, '-', ctrl_shift);
+        // forth between two. Shift doesn't hold it open.
+        tab(&mut app, alt);
         assert_eq!(listed(&app), list(&["a.txt", ">c.txt", "b.txt"]));
-        app.handle_release(Mods::SHIFT);
+        app.handle_release(Mods::NONE);
         assert_eq!(shown_name(&app).as_deref(), Some("c.txt"));
-        chord(&mut app, '-', ctrl_shift);
+        tab(&mut app, alt_shift);
         assert_eq!(listed(&app), list(&["c.txt", ">a.txt", "b.txt"]));
         app.handle_release(Mods::SHIFT);
         assert_eq!(
@@ -10236,7 +10239,7 @@ mod tests {
         );
 
         // Esc stays; from the palette, it's open until Enter.
-        chord(&mut app, '-', ctrl_shift);
+        tab(&mut app, alt);
         key(&mut app, KeyCode::Esc);
         assert_eq!(shown_name(&app).as_deref(), Some("a.txt"));
         app.run(Command::RecentlyViewed, false);

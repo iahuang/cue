@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Builds share one Zig cache in `target/zig-cache` instead of copying ~800 MB into each opentui-sys build directory
+- Recently viewed is Alt+Tab instead of Ctrl+Shift+-, which terminals keep for their own tabs, and works from cue's terminals too; with Alt held, Tab goes back and Shift+Tab forward
+- Builds share one Zig cache in `target/zig-cache` instead of copying ~800 MB into each opentui-sys build directory (`73dd959`)
 
 ## v0.4.8 — 2026-10-19
 

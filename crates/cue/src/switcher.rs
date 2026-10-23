@@ -1,15 +1,15 @@
-//! A panel's recently viewed list (Ctrl+Shift+-): what the panel showed,
-//! most recent first, each file or terminal once however many places in it
-//! the history keeps, dropped down from the panel's header.
+//! A panel's recently viewed list (Alt+Tab): what the panel showed, most
+//! recent first, each file or terminal once however many places in it the
+//! history keeps, dropped down from the panel's header.
 //!
 //! It works as macOS's Cmd+Tab does. It opens on what was shown before
-//! what's on screen, and stays open while Ctrl is held; letting go goes
-//! there, so a tap goes back one. With Ctrl still held, `-` selects the one
-//! before, and `+` (`=`) the one after. Up and Down, Enter, Esc, and clicks
-//! work too, and any other key goes to the selection and then does what it
-//! does. Opened without a modifier held (from the command palette), or in a
-//! terminal that can't say when keys go up, it stays open until one of
-//! those.
+//! what's on screen, and stays open while Alt is held; letting go goes
+//! there, so a tap goes back one. With Alt still held, Tab (or `-`) selects
+//! the one before, and Shift+Tab (or `+`, `=`) the one after. Up and Down,
+//! Enter, Esc, and clicks work too, and any other key goes to the selection
+//! and then does what it does. Opened without a modifier held (from the
+//! command palette), or in a terminal that can't say when keys go up, it
+//! stays open until one of those.
 //!
 //! Held open, it shows only after a moment, as Cmd+Tab does, so a tap
 //! doesn't flash it on screen; going to another row shows it at once.
