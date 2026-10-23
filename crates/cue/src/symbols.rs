@@ -603,6 +603,29 @@ static COUNT: u32 = 0;
     fn outlines_other_languages() {
         assert_eq!(
             outline_of(
+                "a.lua",
+                "local function f() end\nfunction M.g() end\nfunction M:h() end\nlocal k = function() end\n"
+            ),
+            [
+                symbol("f", "function", 0, ""),
+                symbol("g", "function", 1, ""),
+                symbol("h", "method", 2, ""),
+                symbol("k", "function", 3, ""),
+            ]
+        );
+        assert_eq!(
+            outline_of(
+                "a.luau",
+                "export type Point = { x: number }\ntype Box<T> = { v: T }\nlocal function f(p: Point) end\n"
+            ),
+            [
+                symbol("Point", "type", 0, ""),
+                symbol("Box", "type", 1, ""),
+                symbol("f", "function", 2, ""),
+            ]
+        );
+        assert_eq!(
+            outline_of(
                 "a.py",
                 "class A:\n    def f(self):\n        pass\n\ndef g():\n    pass\n"
             ),

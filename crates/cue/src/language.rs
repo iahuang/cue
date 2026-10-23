@@ -48,7 +48,7 @@ impl Language {
             "Python" | "TOML" | "YAML" | "Shell" | "Ruby" | "Perl" | "Elixir" | "R" | "GraphQL"
             | "PowerShell" | "GDScript" | "Dockerfile" | "Makefile" | "CMake" | "Nginx"
             | "Requirements" => Some("#"),
-            "Haskell" | "SQL" => Some("--"),
+            "Haskell" | "SQL" | "Lua" | "Luau" => Some("--"),
             "Clojure" | "Scheme" | "Common Lisp" | "Assembly" => Some(";"),
             "Vim script" => Some("\""),
             "LaTeX" | "BibTeX" => Some("%"),
@@ -374,6 +374,25 @@ static LANGUAGES: &[Language] = &[
             &[include_str!("../queries/perl/highlights.scm")],
         )
         .injecting(&[arborium_perl::INJECTIONS_QUERY]),
+    // Strings passed to LuaJIT's `ffi.cdef` are C.
+    language("Lua", &["lua"], &[], &["lua", "luajit"])
+        .highlighted(
+            || tree_sitter_lua::LANGUAGE.into(),
+            &[tree_sitter_lua::HIGHLIGHTS_QUERY],
+        )
+        .injecting(&[tree_sitter_lua::INJECTIONS_QUERY])
+        .tagged(&[tree_sitter_lua::TAGS_QUERY]),
+    // Indented as StyLua and Roblox Studio write it.
+    language("Luau", &["luau"], &[], &["luau"])
+        .indented(Indent::Tabs)
+        .highlighted(
+            || tree_sitter_luau::LANGUAGE.into(),
+            &[include_str!("../queries/luau/highlights.scm")],
+        )
+        .tagged(&[
+            tree_sitter_lua::TAGS_QUERY,
+            include_str!("../queries/luau/tags.scm"),
+        ]),
     language("Elixir", &["ex", "exs"], &[], &["elixir"])
         .indented(Indent::Spaces(2))
         .highlighted(
@@ -639,6 +658,8 @@ mod tests {
         assert_eq!(name("kernel.cu", ""), Some("C++"), "CUDA");
         assert_eq!(name("shader.frag", ""), Some("GLSL"));
         assert_eq!(name("events.jsonl", ""), Some("JSON Lines"));
+        assert_eq!(name("init.lua", ""), Some("Lua"));
+        assert_eq!(name("Player.luau", ""), Some("Luau"));
     }
 
     #[test]
@@ -648,6 +669,7 @@ mod tests {
         assert_eq!(name("run", "#!/usr/bin/env ruby"), Some("Ruby"));
         assert_eq!(name("run", "#!/usr/bin/env Rscript"), Some("R"));
         assert_eq!(name("run", "#!/usr/bin/perl -w"), Some("Perl"));
+        assert_eq!(name("run", "#!/usr/bin/env lua5.4"), Some("Lua"));
         assert_eq!(name("run", "#!/usr/bin/python3.12 -u"), Some("Python"));
         assert_eq!(
             name("run", "#!/usr/bin/env -S deno run"),
