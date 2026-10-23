@@ -7377,12 +7377,8 @@ impl App {
     }
 
     /// Lists the workspace's checkpoints, after the last commit, to compare
-    /// with one.
+    /// with one, and last, taking one.
     fn show_checkpoints(&mut self) {
-        if self.git.marks().is_empty() {
-            self.show_message("No checkpoints yet.", false);
-            return;
-        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs() as i64);
@@ -7394,6 +7390,7 @@ impl App {
                 .iter()
                 .map(|mark| Item::checkpoint(mark, now, current == Some(mark))),
         );
+        items.push(Item::take_checkpoint());
         self.show_picker(Mode::Checkpoints);
         if let Some(picker) = &mut self.picker {
             picker.set_checkpoints(items);
@@ -13622,10 +13619,15 @@ mod tests {
         wait_for_git(&mut app);
         app.run(Command::ToggleChanges, false);
         assert!(tall_screen(&app).contains("Since the last commit"));
+        // With none yet, the list offers to take one.
         app.run(Command::GitCompareWith, false);
-        assert!(tall_screen(&app).contains("No checkpoints yet"));
-
-        app.run(Command::GitCheckpoint, false);
+        let shown = tall_screen(&app);
+        assert!(
+            shown.contains("The last commit") && shown.contains("Take a checkpoint…"),
+            "{shown}"
+        );
+        type_text(&mut app, "take");
+        key(&mut app, KeyCode::Enter);
         type_text(&mut app, "agent");
         key(&mut app, KeyCode::Enter);
         assert!(tall_screen(&app).contains("Taking a checkpoint…"));

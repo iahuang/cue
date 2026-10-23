@@ -284,6 +284,18 @@ impl Item {
         }
     }
 
+    /// Takes a checkpoint, listed after them, so there's always something
+    /// to do from the list, even with none taken yet.
+    pub fn take_checkpoint() -> Item {
+        Item {
+            text: "Take a checkpoint…".to_string(),
+            dim: 0..0,
+            detail: String::new(),
+            choice: Choice::Command(Command::GitCheckpoint),
+            color: None,
+        }
+    }
+
     /// The same, with `detail` on the right instead.
     pub fn with_detail(self, detail: &str) -> Item {
         Item {
