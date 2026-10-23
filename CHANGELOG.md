@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Clicking the changes view's top row with no checkpoints yet lists the last commit and Take a checkpoint…, instead of only saying there are none
-- The changes view stages and commits in place of the commit view: each repository's files are marked with how much of them is staged (●, ◐, ○), which a click or `s` toggles, and its section ends with Commit, a sync button saying how far it's behind and ahead, View log, and `…`. The sections share the sidebar's height, each scrolling on its own. Commit opens a dialog over the middle of the screen, with a draft kept per repository; stashes have a view of their own (Show Stashes), and Stash Staged… puts away only what's staged (`b994d88`)
+- Clicking the changes view's top row with no checkpoints yet lists the last commit and Take a checkpoint…, instead of only saying there are none (`27c5a7c`)
+- Git view UI rework (`b994d88`)
 - Highlight Lua and Luau, with outlines, Go to Definition, and `--` comments; C in LuaJIT's `ffi.cdef` strings is highlighted as C, and Luau indents with tabs, as StyLua and Roblox Studio do (`208352e`)
 - Recently viewed is Alt+Tab instead of Ctrl+Shift+-, which terminals keep for their own tabs, and works from cue's terminals too; with Alt held, Tab goes back and Shift+Tab forward (`3811d65`)
 - Builds share one Zig cache in `target/zig-cache` instead of copying ~800 MB into each opentui-sys build directory (`73dd959`)

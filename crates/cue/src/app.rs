@@ -11116,8 +11116,7 @@ mod tests {
         key(&mut app, KeyCode::Char('c'));
         assert!(app.commit_open, "c opens the commit dialog");
         let shown = tall_screen(&app);
-        assert!(shown.contains("2 files, +2 −2, to "), "{shown}");
-        assert!(shown.contains(" on main"), "{shown}");
+        assert!(shown.contains("main  +2 -2"), "{shown}");
         type_text(&mut app, "Draft");
         key(&mut app, KeyCode::Esc);
         assert!(!app.commit_open, "Esc closes it");
@@ -11161,7 +11160,7 @@ mod tests {
         key(&mut app, KeyCode::Char('c'));
         type_text(&mut app, "Add c");
         let shown = tall_screen(&app);
-        assert!(shown.contains("Nothing's staged, so all 1 file"), "{shown}");
+        assert!(shown.contains("main  +1 -0"), "{shown}");
         assert!(shown.contains("Commit All"), "{shown}");
         app.handle_key(Key::new(KeyCode::Enter, Mods::CTRL));
         let result = app.commit_dialogs[0].wait().unwrap();

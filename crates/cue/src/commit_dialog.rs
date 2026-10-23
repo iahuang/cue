@@ -3,8 +3,9 @@
 //! button, or `c`.
 //!
 //! At the top is the box the message is written in, which grows with it,
-//! then a switch to amend the last commit instead. Under them, it says
-//! what's committed, to which repository and branch, and as whom, above
+//! then a switch to amend the last commit instead. Under them are the
+//! repository and branch committed to, with the lines what's committed
+//! adds and removes, or that it changes none, and as whom, above
 //! the buttons that cancel and commit. With nothing staged, it commits all
 //! the changes, staging them first, as VS Code's smart commit does.
 //!
@@ -22,12 +23,12 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use opentui::{Attributes, Buffer, Rgba};
 
-use crate::alert::wrap as wrap_words;
 use crate::git::{self, Repo, Staged};
+use crate::icons;
 use crate::input::{Key, KeyCode, Mouse, MouseButton, MouseKind};
 use crate::line_edit::{Caret, Edit};
 use crate::picker::Area;
-use crate::theme;
+use crate::theme::{self, Hue};
 use crate::tree::truncate;
 
 /// The widest the dialog gets.
@@ -513,9 +514,8 @@ impl CommitDialog {
     /// buttons, which it says too.
     fn other_rows(&self) -> (u32, bool) {
         let room = self.screen_height.saturating_sub(1);
-        let summary = self.summary_lines(self.area_width()).len() as u32;
-        let spacious = 1 + summary + 9 <= room;
-        (summary + if spacious { 9 } else { 7 }, spacious)
+        let spacious = 11 <= room;
+        (if spacious { 10 } else { 8 }, spacious)
     }
 
     /// Where its parts are, in `area`.
@@ -524,13 +524,12 @@ impl CommitDialog {
         let message = area.y + 2..area.y + 2 + rows;
         let amend = message.end + 1;
         let summary = amend + 1 + self.other_rows().1 as u32;
-        let lines = self.summary_lines(area.width).len() as u32;
         Layout {
             text_x: area.x + 4,
             message,
             amend,
             summary,
-            author: summary + lines,
+            author: summary + 1,
             buttons: area.y + area.height.saturating_sub(2),
         }
     }
@@ -606,36 +605,14 @@ impl CommitDialog {
 
     // --- what it says ---------------------------------------------------------
 
-    /// What's committed, to which repository and branch, as it fits a
-    /// dialog `width` wide.
-    fn summary_lines(&self, width: u32) -> Vec<String> {
-        wrap_words(&self.summary(), width.saturating_sub(4).max(1) as usize)
-    }
-
-    fn summary(&self) -> String {
-        let count = |files: usize, (added, removed): (usize, usize)| {
-            let files = match files {
-                1 => "1 file".to_string(),
-                files => format!("{files} files"),
-            };
-            format!("{files}, +{added} −{removed}")
-        };
-        let to = format!("to {} on {}", self.name, self.branch);
-        let amending = self
-            .head
-            .as_ref()
-            .filter(|_| self.amend)
-            .map(|head| format!(", amending {head}"))
-            .unwrap_or_default();
+    /// The lines what's committed adds and removes: what's staged, or with
+    /// nothing staged, all the changes. `None` if it changes no files, as
+    /// for only a new message, or a merge.
+    fn committed_lines(&self) -> Option<(usize, usize)> {
         match self.staged {
-            0 if self.amend => format!("Only a new message, {to}{amending}"),
-            0 if self.merging => format!("The merge, {to}"),
-            0 if self.changed > 0 => {
-                let all = count(self.changed, self.lines);
-                format!("Nothing's staged, so all {all}, {to}")
-            }
-            0 => format!("Nothing to commit {to}."),
-            staged => format!("{}, {to}{amending}", count(staged, self.staged_lines)),
+            0 if self.amend || self.merging || self.changed == 0 => None,
+            0 => Some(self.lines),
+            _ => Some(self.staged_lines),
         }
     }
 
@@ -715,10 +692,7 @@ impl CommitDialog {
         );
 
         let room = width.saturating_sub(4) as usize;
-        let summary = self.summary_lines(width);
-        for (line, row) in summary.iter().zip(layout.summary..) {
-            frame.draw_text(line, x + 2, row, colors.text, None, Attributes::NONE);
-        }
+        self.draw_summary(frame, x + 2, layout.summary, room);
         let (author, author_fg) = match &self.author {
             Ok(author) => (format!("as {author}"), colors.muted),
             Err(_) => (
@@ -753,6 +727,35 @@ impl CommitDialog {
             frame.draw_text(label, bx + 1, layout.buttons, fg, Some(bg), attributes);
         }
         cursor
+    }
+
+    /// Draws, at (`x`, `y`), in `room` columns, the repository and branch
+    /// committed to, and the lines added, in green, and removed, in red,
+    /// or that none are.
+    fn draw_summary(&self, frame: &Buffer, x: u32, y: u32, room: usize) {
+        let colors = theme::colors();
+        let end = x + room as u32;
+        let mut at = x;
+        let put = |at: &mut u32, text: &str, fg: Rgba, attributes: Attributes| {
+            let text = truncate(text, end.saturating_sub(*at) as usize);
+            frame.draw_text(&text, *at, y, fg, None, attributes);
+            *at += text.chars().count() as u32;
+        };
+        put(&mut at, &self.name, colors.text, Attributes::BOLD);
+        put(&mut at, "  ", colors.text, Attributes::NONE);
+        if icons::enabled() && at + icons::WIDTH < end {
+            at = icons::branch().draw(frame, at, y, None);
+        }
+        put(&mut at, &self.branch, colors.muted, Attributes::NONE);
+        match self.committed_lines() {
+            Some((added, removed)) => {
+                let green = colors.hue(Hue::Green);
+                put(&mut at, &format!("  +{added}"), green, Attributes::NONE);
+                let red = colors.hue(Hue::Red);
+                put(&mut at, &format!(" -{removed}"), red, Attributes::NONE);
+            }
+            None => put(&mut at, "  (No changes)", colors.faint, Attributes::NONE),
+        }
     }
 
     /// The message box, bordered, with the cursor in it if the keyboard
@@ -995,7 +998,7 @@ mod tests {
                 "│ ╰──────────────────────────────────────────────────╯ │",
                 "│ ○ Amend last commit                                  │",
                 "│                                                      │",
-                "│ 1 file, +12 −3, to cue on main                       │",
+                "│ cue  main  +12 -3                                    │",
                 "│ as Ada <ada@example.com>                             │",
                 "│                                                      │",
                 "│                                    Cancel    Commit  │",
@@ -1029,19 +1032,18 @@ mod tests {
         assert_eq!(all.plan(), Ok(Plan::All));
         let shown = drawn(&all);
         assert_eq!(
-            shown[6],
-            "│ Nothing's staged, so all 2 files, +42 −7, to cue on  │"
+            shown[6], "│ cue  main  +42 -7                                    │",
+            "all the changes'"
         );
-        assert_eq!(
-            shown[7],
-            "│ main                                                 │"
-        );
-        assert!(shown[10].contains("Cancel    Commit All"), "{shown:?}");
+        assert!(shown[9].contains("Cancel    Commit All"), "{shown:?}");
 
         let mut clean = dialog(&[]);
         clean.edit(Edit::Insert("Nothing"), false);
         assert_eq!(clean.plan(), Err(CantCommit::NothingToCommit));
-        assert!(drawn(&clean)[6].contains("Nothing to commit to cue on main."));
+        assert_eq!(
+            drawn(&clean)[6],
+            "│ cue  main  (No changes)                              │"
+        );
         let mut repo = repo(&[]);
         repo.merging = true;
         clean.set_repo(&repo);
