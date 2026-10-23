@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.9 — 2026-10-23
 
 - Clicking the changes view's top row with no checkpoints yet lists the last commit and Take a checkpoint…, instead of only saying there are none (`27c5a7c`)
 - Git view UI rework (`b994d88`)
