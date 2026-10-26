@@ -24,9 +24,10 @@
 //! At the bottom of a repository's section is a row of buttons: Commit,
 //! which opens the commit dialog; one that catches up with the branch it
 //! tracks, as that takes (fetching, pulling, pushing, or both, as GitHub
-//! Desktop's does), with how many commits it's behind and ahead; View log;
-//! and `⋯`, which pops up the rest of what can be done to it. A rule is
-//! between sections.
+//! Desktop's does), with how many commits it's behind and ahead; Log;
+//! Stash, if there's room, which pops up what can be stashed; and `⋯`,
+//! which pops up the rest of what can be done to it. A rule is between
+//! sections.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -49,9 +50,10 @@ const TAKE_BUTTON: &str = "+";
 const CLEAR_BUTTON: &str = "✕";
 /// The button that pops up everything that can be done to a repository.
 const MORE_BUTTON: &str = "⋯";
-/// The log's button, and what it says when there's no room for that.
-const LOG_BUTTON: &str = "View log";
-const SHORT_LOG_BUTTON: &str = "Log";
+/// The log's button.
+const LOG_BUTTON: &str = "Log";
+/// The button that pops up what can be stashed.
+const STASH_BUTTON: &str = "Stash";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
@@ -132,6 +134,7 @@ enum Button {
     Commit,
     Sync,
     Log,
+    Stash,
     More,
 }
 
@@ -550,6 +553,10 @@ impl ChangesView {
             Button::Sync if self.syncing.contains_key(&root) => TreeAction::None,
             Button::Sync => TreeAction::Sync(root),
             Button::Log => TreeAction::Log(root),
+            Button::Stash => TreeAction::StashMenu {
+                root,
+                at: (columns.start, y),
+            },
             Button::More => TreeAction::RepoMenu {
                 root,
                 at: Some((columns.start, y)),
@@ -805,6 +812,7 @@ impl ChangesView {
             .filter_map(|(button, _, _)| match button {
                 Button::Commit => Some(Command::TreeCommit),
                 Button::Log => Some(Command::GitLog),
+                Button::Stash => Some(Command::TreeStash),
                 Button::Sync => sync.as_ref().map(sync_command),
                 Button::More => None,
             })
@@ -822,13 +830,8 @@ impl ChangesView {
             labels.extend(sync.map(|label| (Button::Sync, label)));
         }
         labels.push((Button::Log, LOG_BUTTON.to_string()));
+        labels.push((Button::Stash, STASH_BUTTON.to_string()));
         let mut buttons = place(&labels, more);
-        if buttons.len() < labels.len() {
-            if let Some(log) = labels.last_mut() {
-                log.1 = SHORT_LOG_BUTTON.to_string();
-            }
-            buttons = place(&labels, more);
-        }
         buttons.push((Button::More, MORE_BUTTON.to_string(), more..more + 1));
         buttons
     }
@@ -1489,29 +1492,36 @@ mod tests {
         let root = PathBuf::from("/w/cue");
         let selected = view.selected;
         assert_eq!(
-            drawn(&view, 30, 4)[3],
-            row(&["Commit", "Fetch", "View log"], 30)
+            drawn(&view, 34, 4)[3],
+            row(&["Commit", "Fetch", "Log", "Stash"], 34)
         );
         assert_eq!(
-            view.click(3, 3, 30, false),
+            view.click(3, 3, 34, false),
             TreeAction::Commit(root.clone())
         );
-        assert_eq!(view.click(10, 3, 30, false), TreeAction::Sync(root.clone()));
-        assert_eq!(view.click(18, 3, 30, false), TreeAction::Log(root.clone()));
-        assert_eq!(view.click(25, 3, 30, false), TreeAction::None, "between");
+        assert_eq!(view.click(10, 3, 34, false), TreeAction::Sync(root.clone()));
+        assert_eq!(view.click(17, 3, 34, false), TreeAction::Log(root.clone()));
         assert_eq!(
-            view.click(28, 3, 30, false),
+            view.click(23, 3, 34, false),
+            TreeAction::StashMenu {
+                root: root.clone(),
+                at: (21, 3),
+            }
+        );
+        assert_eq!(view.click(29, 3, 34, false), TreeAction::None, "between");
+        assert_eq!(
+            view.click(32, 3, 34, false),
             TreeAction::RepoMenu {
                 root: root.clone(),
-                at: Some((28, 3)),
+                at: Some((32, 3)),
             }
         );
         assert_eq!(
             view.selected, selected,
             "the buttons don't take the selection"
         );
-        assert_eq!(view.hover(10, 3, 30), Some(8..15));
-        assert_eq!(view.hover(25, 3, 30), None);
+        assert_eq!(view.hover(10, 3, 34), Some(8..15));
+        assert_eq!(view.hover(29, 3, 34), None);
     }
 
     #[test]
@@ -1534,23 +1544,23 @@ mod tests {
         cue.upstream = upstream(0, 2);
         assert_eq!(
             buttons(&cue, &mut view, 30),
-            row(&["Commit", "Pull ↓2", "View log"], 30)
+            row(&["Commit", "Pull ↓2", "Log"], 30)
         );
         cue.upstream = upstream(3, 0);
         assert_eq!(
             buttons(&cue, &mut view, 30),
-            row(&["Commit", "Push ↑3", "View log"], 30)
+            row(&["Commit", "Push ↑3", "Log"], 30)
         );
         cue.upstream = upstream(3, 2);
         assert_eq!(
             buttons(&cue, &mut view, 33),
             row(&["Commit", "Pull/Push ↓2 ↑3", "Log"], 33),
-            "the log's button gets shorter to fit"
+            "Stash is the first to go"
         );
         assert_eq!(drawn(&view, 30, 2)[1], " ▾ cue                   main");
         assert_eq!(
             buttons(&cue, &mut view, 40),
-            row(&["Commit", "Pull/Push ↓2 ↑3", "View log"], 40)
+            row(&["Commit", "Pull/Push ↓2 ↑3", "Log", "Stash"], 40)
         );
         assert_eq!(
             buttons(&cue, &mut view, 30),
@@ -1572,12 +1582,12 @@ mod tests {
         cue.publish_to = Some("origin".into());
         assert_eq!(
             buttons(&cue, &mut view, 30),
-            row(&["Commit", "Publish", "View log"], 30)
+            row(&["Commit", "Publish", "Log"], 30)
         );
         cue.publish_to = None;
         assert_eq!(
             buttons(&cue, &mut view, 30),
-            row(&["Commit", "View log"], 30),
+            row(&["Commit", "Log", "Stash"], 30),
             "nowhere to push to"
         );
     }

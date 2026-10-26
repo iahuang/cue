@@ -195,6 +195,12 @@ pub enum TreeAction {
         root: PathBuf,
         at: Option<(u32, u32)>,
     },
+    /// Pop up what can be stashed in the repository at `root`, below the
+    /// cell `at`, its Stash button in the changes.
+    StashMenu {
+        root: PathBuf,
+        at: (u32, u32),
+    },
     /// Show the branches of the repository at this root, to switch to one.
     Branches(PathBuf),
     /// Open the commit dialog of the repository at this root.
