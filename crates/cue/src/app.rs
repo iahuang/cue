@@ -330,6 +330,17 @@ enum MenuFor {
     Sidebar,
 }
 
+/// Which of what's drawn a hover is drawn with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoverLayer {
+    /// The panels, sidebar, and status bar, under the scratchpad.
+    Under,
+    /// The scratchpad.
+    Scratch,
+    /// What pops up, over quick look and everything else.
+    Over,
+}
+
 /// Where a mouse press landed; drags and the release go there too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MouseTarget {
@@ -2524,11 +2535,15 @@ impl App {
                 frame.fill_rect(rect.x, rect.y, rect.width, rect.height, colors.drop_tint);
             }
         }
+        // A hover's tint goes on with what it's over, so what's drawn over
+        // that, like a row of a panel under the scratchpad, isn't tinted too.
+        self.draw_hover(frame, HoverLayer::Under);
         if self.scratch.open {
             let panel = &self.scratch.panel;
             let preview = panel.document().is_some_and(|doc| self.is_preview(doc));
             let (keymap, workspace) = (&self.keymap, &self.workspace);
             cursor = self.scratch.draw(frame, main, keymap, workspace, preview);
+            self.draw_hover(frame, HoverLayer::Scratch);
         }
         // Over everything but what pops up.
         if let Some(rain) = &self.rain {
@@ -2546,11 +2561,11 @@ impl App {
             // Over any popup it asks for.
             Some(alert) => {
                 alert.draw(frame);
-                self.draw_hover(frame);
+                self.draw_hover(frame, HoverLayer::Over);
                 None
             }
             None => {
-                self.draw_hover(frame);
+                self.draw_hover(frame, HoverLayer::Over);
                 cursor
             }
         }
@@ -2703,23 +2718,41 @@ impl App {
         }
     }
 
-    fn draw_hover(&self, frame: &Buffer) {
+    /// What the hover is drawn with: under the scratchpad, in it, or over
+    /// both, as what pops up and quick look are.
+    fn hover_layer(&self, x: u32, y: u32) -> HoverLayer {
+        let popup = self.alert.is_some()
+            || self.input.is_some()
+            || (self.commit_open && !self.commit_dialogs.is_empty())
+            || self.menu.is_some()
+            || self.switcher.is_some()
+            || self.search.is_some()
+            || self.picker.is_some()
+            || self.dialog.is_some()
+            || self.toasts.at(x, y, self.toast_area()).is_some();
+        if popup {
+            HoverLayer::Over
+        } else if self.scratch.open && self.scratch.outer(self.main_area()).contains(x, y) {
+            HoverLayer::Scratch
+        } else {
+            HoverLayer::Under
+        }
+    }
+
+    fn draw_hover(&self, frame: &Buffer, layer: HoverLayer) {
+        let Some((x, y)) = self.hover else {
+            return;
+        };
+        if self.hover_layer(x, y) != layer {
+            return;
+        }
         if let Some(area) = self.hover_area() {
             let colors = theme::colors();
-            let divider = self.alert.is_none()
-                && self.input.is_none()
-                && self.toasts.at(area.x, area.y, self.toast_area()).is_none()
-                && self.menu.is_none()
-                && self.switcher.is_none()
-                && self.search.is_none()
-                && self.picker.is_none()
-                && self.dialog.is_none()
-                && self.hover.is_some_and(|(x, y)| {
-                    matches!(
-                        self.target_at(x, y),
-                        Some(MouseTarget::Divider | MouseTarget::Handle(_))
-                    )
-                });
+            let divider = layer == HoverLayer::Under
+                && matches!(
+                    self.target_at(x, y),
+                    Some(MouseTarget::Divider | MouseTarget::Handle(_))
+                );
             if divider {
                 let fg = theme::mix(colors.divider, colors.text, 0.25);
                 for y in area.y..area.y + area.height {
@@ -17680,6 +17713,55 @@ fn helper() {}
         left_click(&mut app, x, y);
         left_click(&mut app, x, y);
         assert_eq!(app.ed().path(), Some(root.join("b.txt")));
+    }
+
+    #[test]
+    fn a_browser_rows_hover_stays_under_quick_look_and_the_scratchpad() {
+        let _serial = crate::test_serial();
+        let files: Vec<(String, &str)> = (0..30).map(|i| (format!("f{i:02}.txt"), "")).collect();
+        let files: Vec<(&str, &str)> = files.iter().map(|(name, s)| (name.as_str(), *s)).collect();
+        let root = fixture("browser-hover-layers", &files);
+        let mut app = app(&root, None);
+        app.run(Command::NewFileBrowser, false);
+        wait_for_browsers(&mut app);
+        let id = app.tab().active;
+        // Hovers a row beside `over`, and checks the row's tint reaches
+        // neither into it nor stops short of the row.
+        let check = |app: &mut App, over: Rect| {
+            let panel = app.panel(id).unwrap();
+            let body = panel.body();
+            let y = (over.y + 1..over.bottom())
+                .find(|&y| panel.browser().unwrap().hover_row(y))
+                .expect("a row beside it");
+            let x = (body.x..body.x + body.width)
+                .find(|&x| !over.contains(x, y))
+                .expect("a column beside it");
+            let inside = over.x + over.width / 2;
+            let frame =
+                OwnedBuffer::new(app.width, app.height, false, WidthMethod::Unicode, "t").unwrap();
+            mouse_at(app, MouseKind::Move, x, y);
+            app.hover = None;
+            app.draw(&frame);
+            let (beside, under) = (frame.bg_at(x, y), frame.bg_at(inside, y));
+            mouse_at(app, MouseKind::Move, x, y);
+            assert!(app.hover_area().is_some());
+            app.draw(&frame);
+            assert_ne!(frame.bg_at(x, y), beside, "the row is tinted");
+            assert_eq!(frame.bg_at(inside, y), under, "what's over it isn't");
+        };
+        key(&mut app, KeyCode::Char(' '));
+        let area = app.quick_look.as_ref().unwrap().area();
+        let look = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: area.height,
+        };
+        check(&mut app, look);
+        key(&mut app, KeyCode::Esc);
+        app.toggle_scratch();
+        let scratch = app.scratch.outer(app.main_area());
+        check(&mut app, scratch);
     }
 
     #[test]
