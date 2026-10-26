@@ -84,7 +84,7 @@ use opentui::{Attributes, Buffer, EditBuffer, Rgba};
 use crate::alert::{Alert, AlertAction, Button};
 use crate::arrange::{self, Arranging, Before, PanelClip};
 use crate::browser::{self, BrowserAction, Sort};
-use crate::changes::ChangesView;
+use crate::changes::{self, ChangesView};
 use crate::checkpoint;
 use crate::commit_dialog::{CantCommit, CommitAction, CommitDialog, Plan};
 use crate::commit_diff::{CommitDiff, Outcome};
@@ -7614,64 +7614,88 @@ impl App {
         }
     }
 
-    /// Pops up what can be done to the repository at `root`: committing,
-    /// its log and stashes, switching branches, catching up with the branch
-    /// it tracks, stashing, and staging. It's below the cell `at`, its `…`
-    /// in the changes view, or else beside its row there.
+    /// Pops up what can be done to the repository at `root`: committing and
+    /// staging, its log, branches, and remote, and stashing. It's below
+    /// the cell `at`, its `⋯` in the changes view, leaving out what the
+    /// buttons beside that do, or else beside its row there, with it all.
     fn show_repo_menu(&mut self, root: PathBuf, at: Option<(u32, u32)>) {
         use Command::*;
         let Some(repo) = self.git.repos().iter().find(|repo| repo.root == root) else {
             return;
         };
         let item = |command, label: &str| MenuItem::Command(command, label.to_string());
+        let shown = match at {
+            Some(_) => (self.changes).button_commands(&root, self.visible_tree_width()),
+            None => Vec::new(),
+        };
         let (ahead, behind) = repo
             .upstream
             .as_ref()
             .map_or((0, 0), |upstream| (upstream.ahead, upstream.behind));
         // What catching up takes first, saying so, then the rest.
         let sync = repo.sync();
-        let first = match &sync {
-            Some(Sync::Fetch) => Some((GitFetch, "Fetch".to_string())),
-            Some(Sync::Pull) => Some((GitPull, format!("Pull ↓{behind}"))),
-            Some(Sync::Push) => Some((GitPush, format!("Push ↑{ahead}"))),
-            Some(Sync::Both) => Some((GitSync, format!("Pull/Push ↓{behind} ↑{ahead}"))),
-            Some(Sync::Publish(_)) => Some((GitPush, "Publish".to_string())),
-            None => None,
+        let first = sync.as_ref().map(|sync| {
+            let label = match sync {
+                Sync::Fetch => "Fetch".to_string(),
+                Sync::Pull => format!("Pull ↓{behind}"),
+                Sync::Push => format!("Push ↑{ahead}"),
+                Sync::Both => format!("Pull/Push ↓{behind} ↑{ahead}"),
+                Sync::Publish(_) => "Publish".to_string(),
+            };
+            (changes::sync_command(sync), label)
+        });
+        let count = |staged| {
+            (repo.changes.iter())
+                .filter(|change| change.staged == staged)
+                .count()
         };
-        let stashes = match repo.stashes.len() {
-            0 => "Stashes".to_string(),
-            count => format!("Stashes ({count})"),
-        };
-        let mut items = vec![
-            item(TreeCommit, "Commit…"),
-            item(GitLog, "View Log"),
-            item(GitShowStashes, &stashes),
-            item(GitSwitchBranch, "Switch Branch…"),
-            MenuItem::Separator,
-        ];
+        let (staged, unstaged) = (count(git::Staged::Yes), count(git::Staged::No));
+        let changed = repo.changes.len();
+
+        let mut files = Vec::new();
+        if !shown.contains(&TreeCommit) {
+            files.push(item(TreeCommit, "Commit…"));
+        }
+        if changed > 0 {
+            let label = match staged == changed {
+                true => "Unstage All",
+                false => "Stage All",
+            };
+            files.push(item(TreeToggleStaged, label));
+        }
+        let mut branch = Vec::new();
+        if !shown.contains(&GitLog) {
+            branch.push(item(GitLog, "View Log"));
+        }
+        branch.push(item(GitSwitchBranch, "Switch Branch…"));
         if let Some((command, label)) = &first {
-            items.push(item(*command, label));
+            if !shown.contains(command) {
+                branch.push(item(*command, label));
+            }
         }
         for (command, label) in [(GitFetch, "Fetch"), (GitPull, "Pull"), (GitPush, "Push")] {
             if first.as_ref().is_none_or(|(first, _)| *first != command) {
-                items.push(item(command, label));
+                branch.push(item(command, label));
             }
         }
-        let staged = |staged| {
-            repo.changes
-                .iter()
-                .filter(move |change| change.staged == staged)
-        };
-        items.extend([MenuItem::Separator, item(TreeStash, "Stash Changes…")]);
-        if staged(git::Staged::No).count() < repo.changes.len() {
-            items.push(item(TreeStashStaged, "Stash Staged Changes…"));
+        let mut stash = vec![item(TreeStash, "Stash All Changes…")];
+        // Only when it's not the same as stashing them all.
+        if unstaged < changed && staged < changed {
+            stash.push(item(TreeStashStaged, "Stash Only Staged…"));
         }
-        if !repo.changes.is_empty() {
-            let label = match staged(git::Staged::Yes).count() == repo.changes.len() {
-                true => "Unstage All Changes",
-                false => "Stage All Changes",
-            };
-            items.extend([MenuItem::Separator, item(TreeToggleStaged, label)]);
+        stash.push(match repo.stashes.len() {
+            0 => item(GitShowStashes, "View Stashes"),
+            count => item(GitShowStashes, &format!("View Stashes ({count})")),
+        });
+        let mut items = Vec::new();
+        for section in [files, branch, stash] {
+            if section.is_empty() {
+                continue;
+            }
+            if !items.is_empty() {
+                items.push(MenuItem::Separator);
+            }
+            items.extend(section);
         }
         let row = self.changes.selected_position().map_or(0, |(_, y)| y);
         let (x, y) = at.unwrap_or((self.visible_tree_width(), row));
@@ -14438,7 +14462,7 @@ mod tests {
         assert_eq!(
             hover(&mut app, width - 2, bottom),
             Some(width - 3..width),
-            "…"
+            "⋯"
         );
 
         // The commit dialog's switch and buttons; nothing under it.
@@ -14469,10 +14493,10 @@ mod tests {
         wait_for_git(&mut app);
         app.run(Command::ToggleChanges, false);
 
-        // … pops up what can be done to the repository.
-        let (x, y) = cell_of(&app, "…");
+        // ⋯ pops up what can be done to the repository.
+        let (x, y) = cell_of(&app, "⋯");
         left_click(&mut app, x, y);
-        let (x, y) = cell_of(&app, "Stash Changes…");
+        let (x, y) = cell_of(&app, "Stash All Changes…");
         left_click(&mut app, x, y);
         assert!(tall_screen(&app).contains("Message (optional)"));
         type_text(&mut app, "wip");
@@ -14624,31 +14648,41 @@ mod tests {
         let mut app = tall_app(&root, Some("a.txt"));
         wait_for_git(&mut app);
         app.run(Command::ToggleChanges, false);
-        let (x, y) = cell_of(&app, "…");
+        let (x, y) = cell_of(&app, "⋯");
         left_click(&mut app, x, y);
         let shown = tall_screen(&app);
         assert!(
             shown.contains("Switch Branch…")
-                && shown.contains("Stash Changes…")
-                && shown.contains("Stage All Changes"),
+                && shown.contains("Stash All Changes…")
+                && shown.contains("View Stashes")
+                && shown.contains("Stage All"),
             "{shown}"
         );
-        assert!(!shown.contains("Stash Staged"), "nothing is: {shown}");
-        let (x, y) = cell_of(&app, "Stage All Changes");
+        assert!(!shown.contains("Stash Only Staged"), "nothing is: {shown}");
+        assert!(
+            !shown.contains("Commit…") && !shown.contains("View Log"),
+            "the buttons beside it do those: {shown}"
+        );
+        let (x, y) = cell_of(&app, "Stage All");
         left_click(&mut app, x, y);
         wait_for_git(&mut app);
         assert_eq!(app.git.repos()[0].changes[0].staged, git::Staged::Yes);
 
-        // So does a right click on its row, and Ctrl+Enter.
+        // So does a right click on its row, and Ctrl+Enter, with all of it.
         mouse_at(&mut app, MouseKind::Press(MouseButton::Right), 5, 1);
         mouse_at(&mut app, MouseKind::Release(MouseButton::Right), 5, 1);
-        assert!(tall_screen(&app).contains("Unstage All Changes"));
+        let shown = tall_screen(&app);
+        assert!(
+            shown.contains("Commit…") && shown.contains("Unstage All"),
+            "{shown}"
+        );
         key(&mut app, KeyCode::Esc);
         app.handle_key(Key::new(KeyCode::Enter, Mods::CTRL));
-        assert!(tall_screen(&app).contains("Stash Staged Changes…"));
+        assert!(tall_screen(&app).contains("View Log"));
+        key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.sidebar, Sidebar::Log, "the second item");
+        assert_eq!(app.sidebar, Sidebar::Log, "the third item");
     }
 
     #[test]

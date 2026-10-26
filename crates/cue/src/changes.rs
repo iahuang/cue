@@ -25,7 +25,7 @@
 //! which opens the commit dialog; one that catches up with the branch it
 //! tracks, as that takes (fetching, pulling, pushing, or both, as GitHub
 //! Desktop's does), with how many commits it's behind and ahead; View log;
-//! and `…`, which pops up everything that can be done to it. A rule is
+//! and `⋯`, which pops up the rest of what can be done to it. A rule is
 //! between sections.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -48,7 +48,7 @@ const TAKE_BUTTON: &str = "+";
 /// the files are compared with a checkpoint.
 const CLEAR_BUTTON: &str = "✕";
 /// The button that pops up everything that can be done to a repository.
-const MORE_BUTTON: &str = "…";
+const MORE_BUTTON: &str = "⋯";
 /// The log's button, and what it says when there's no room for that.
 const LOG_BUTTON: &str = "View log";
 const SHORT_LOG_BUTTON: &str = "Log";
@@ -791,9 +791,29 @@ impl ChangesView {
         }
     }
 
+    /// What the buttons shown under the files of the repository at `root`
+    /// do, in a list `width` wide, but for `⋯`: none while it's collapsed.
+    pub fn button_commands(&self, root: &Path, width: u32) -> Vec<Command> {
+        let Some(group) = self.groups.iter().find(|group| group.root == root) else {
+            return Vec::new();
+        };
+        if self.collapsed.contains(root) {
+            return Vec::new();
+        }
+        let sync = group.repo.as_ref().and_then(Repo::sync);
+        (self.buttons(group, width).into_iter())
+            .filter_map(|(button, _, _)| match button {
+                Button::Commit => Some(Command::TreeCommit),
+                Button::Log => Some(Command::GitLog),
+                Button::Sync => sync.as_ref().map(sync_command),
+                Button::More => None,
+            })
+            .collect()
+    }
+
     /// The buttons under the files of the repository `group`, with their
     /// labels and columns, in a list `width` wide: as many as fit from the
-    /// left, and `…` at the right end, which has them all.
+    /// left, and `⋯` at the right end, which has the rest.
     fn buttons(&self, group: &Group, width: u32) -> Vec<(Button, String, Range<u32>)> {
         let more = width.saturating_sub(2);
         let mut labels = vec![(Button::Commit, "Commit".to_string())];
@@ -1124,6 +1144,16 @@ fn mark_area(width: u32) -> Range<u32> {
     width.saturating_sub(3)..width
 }
 
+/// What `sync` does, as a command.
+pub fn sync_command(sync: &Sync) -> Command {
+    match sync {
+        Sync::Fetch => Command::GitFetch,
+        Sync::Pull => Command::GitPull,
+        Sync::Push | Sync::Publish(_) => Command::GitPush,
+        Sync::Both => Command::GitSync,
+    }
+}
+
 /// What the sync button of `repo` says: what it does, and how many
 /// commits it's behind and ahead of the branch it tracks, or what it's
 /// doing, if it's `syncing`. `None` if it has nothing to sync with.
@@ -1331,10 +1361,10 @@ mod tests {
     }
 
     /// A repository's buttons, `labels`, as a row `width` wide shows them:
-    /// from the left, two columns apart, and `…` past them, at the end.
+    /// from the left, two columns apart, and `⋯` past them, at the end.
     fn row(labels: &[&str], width: usize) -> String {
         let left = format!(" {}", labels.join("  "));
-        format!("{left:<0$}…", width - 2)
+        format!("{left:<0$}⋯", width - 2)
     }
 
     const SINCE: &str = "◆ Since the last commit";
@@ -1680,7 +1710,7 @@ mod tests {
                 " ▾ cue                   main",
                 "     a-long-name.rs       A ○",
                 "     a.rs                 M ○",
-                " Commit  Pull/Push ↓12 ↑3   …",
+                " Commit  Pull/Push ↓12 ↑3   ⋯",
             ]
         );
         // A folder in no repository says nothing more.

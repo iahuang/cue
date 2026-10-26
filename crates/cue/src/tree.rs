@@ -189,7 +189,7 @@ pub enum TreeAction {
         preview: bool,
     },
     /// Pop up what can be done to the repository at `root`, from the
-    /// changes: below the cell `at`, its `…` button, or else beside its
+    /// changes: below the cell `at`, its `⋯` button, or else beside its
     /// row.
     RepoMenu {
         root: PathBuf,
