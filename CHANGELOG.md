@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.10 — 2026-10-26
 
 - A repository's `⋯` menu (was `…`) leaves out what the buttons beside it do, and groups the rest: Stage All, then branch and remote, then Stash All Changes…, Stash Only Staged…, and View Stashes; right-click or Ctrl+Enter on the row still lists it all (`63706f0`)
 - Unit 01's strings and find matches are a muted lime instead of amber, which sat too close to the apricot functions (`9bbb6ae`)
