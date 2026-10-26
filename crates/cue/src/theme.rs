@@ -1749,9 +1749,9 @@ static BUILTIN: &[Def] = &[
     },
     // cue's own: a NERV console at night. Black glass, white text, and
     // the pastel neons of Unit-01: lilac for keywords, LCL apricot for
-    // functions and what you're on, MAGI amber for strings and find, Rei's
-    // blue for types, a deeper warning orange kept for the few things that
-    // should catch the eye.
+    // functions and what you're on, Unit-01's lime for strings and find,
+    // Rei's blue for types, a deeper warning orange kept for the few things
+    // that should catch the eye.
     Def {
         name: "Unit 01",
         light: false,
@@ -1772,8 +1772,8 @@ static BUILTIN: &[Def] = &[
             (SelectedUnfocused, 0x1a1822),
             (Selection, 0x342a5c),
             (Accent, 0xffb37a),
-            (MatchBg, 0x45331a),
-            (CurrentMatchBg, 0xffd27a),
+            (MatchBg, 0x31391e),
+            (CurrentMatchBg, 0xbcd288),
             (CurrentMatchFg, 0x000000),
             (Error, 0xff6b81),
             (ErrorBg, 0x561c2a),
@@ -1783,7 +1783,7 @@ static BUILTIN: &[Def] = &[
         syntax: &[
             ("attribute", 0xb69cff),
             ("boolean", 0xff9bd2),
-            ("character", 0xffd27a),
+            ("character", 0xbcd288),
             ("comment", 0x6b6775),
             ("constant", 0xff9bd2),
             ("constructor", 0x8ccfff),
@@ -1797,11 +1797,11 @@ static BUILTIN: &[Def] = &[
             ("number", 0xff9bd2),
             ("operator", 0x9e98ab),
             ("property", 0xc9c4e0),
-            ("string", 0xffd27a),
+            ("string", 0xbcd288),
             ("string.escape", 0x7ff0e6),
             ("tag", 0xb69cff),
             ("text.list", 0xff8552),
-            ("text.literal", 0xffd27a),
+            ("text.literal", 0xbcd288),
             ("text.reference", 0x8ccfff),
             ("text.title", 0xffb37a),
             ("text.uri", 0x7ff0e6),

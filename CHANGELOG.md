@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- A file browser row's hover highlight no longer shows through Quick Look or the scratchpad over it
+- Unit 01's strings and find matches are a muted lime instead of amber, which sat too close to the apricot functions
+- A file browser row's hover highlight no longer shows through Quick Look or the scratchpad over it (`fefc402`)
 - File browser panels (Ctrl+Shift+E, or Open in File Browser from the sidebar): list any folder with sizes, dates, modes, and owners, sort by column, select several, and drag them onto a folder to move them or onto another panel to open them there; folders on another filesystem get copies (`d210865`)
 - Allow Ctrl+F find in diff view (`17d5488`)
 
