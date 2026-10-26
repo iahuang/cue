@@ -445,9 +445,10 @@ fn binding(key: &str, value: &Value) -> Result<(Key, Option<Command>), String> {
     // Only the tree has no text to type into.
     let types =
         matches!(key.code, KeyCode::Char(_)) && !(key.mods.ctrl || key.mods.alt || key.mods.sup);
-    if types && command.context() != Context::Tree {
+    if types && !matches!(command.context(), Context::Tree | Context::Browser) {
         return Err(
-            "Keys without Ctrl, Alt, or Cmd can only be bound to tree: commands.".to_string(),
+            "Keys without Ctrl, Alt, or Cmd can only be bound to tree: and browser: commands."
+                .to_string(),
         );
     }
     Ok((key, Some(command)))
@@ -628,7 +629,7 @@ mod tests {
                 r#"keys."ctrl+kk": unknown key "kk""#,
                 r#"keys."ctrl+j": unknown command "app:leave""#,
                 r#"keys."ctrl+l": expected a command ID, such as "app:quit", or "none""#,
-                r#"keys."shift+x": Keys without Ctrl, Alt, or Cmd can only be bound to tree: commands."#,
+                r#"keys."shift+x": Keys without Ctrl, Alt, or Cmd can only be bound to tree: and browser: commands."#,
             ]
         );
         assert_eq!(config.keys.len(), 1);

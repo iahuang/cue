@@ -1,5 +1,5 @@
 //! A panel: one area of the layout, showing an open file, an image, a
-//! terminal, how a commit changed a file, or nothing yet.
+//! terminal, how a commit changed a file, a file browser, or nothing yet.
 //!
 //! Panels have no tabs. Opening a file in a panel replaces what it shows,
 //! but the panel keeps an editor for each file it has shown, so going back
@@ -21,12 +21,14 @@
 //! to the start or end, a click, or the find bar, when they go far.
 
 use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use opentui::{Attributes, Buffer};
 
+use crate::browser::{self, Browser, Sort};
 use crate::commit_diff::CommitDiff;
 use crate::document::{Disk, Document, Spot};
 use crate::editor::Editor;
@@ -43,7 +45,12 @@ use crate::tree::truncate;
 use crate::workspace::Workspace;
 
 /// What an empty panel suggests.
-const SUGGESTIONS: &[Command] = &[Command::GoToFile, Command::NewFile, Command::NewTerminal];
+const SUGGESTIONS: &[Command] = &[
+    Command::GoToFile,
+    Command::NewFile,
+    Command::NewTerminal,
+    Command::NewFileBrowser,
+];
 /// How far back a panel's history goes.
 const HISTORY: usize = 50;
 /// Places in a file at most this many lines apart are one place to the
@@ -92,6 +99,9 @@ pub enum Visit {
         commit: Commit,
         change: Change,
     },
+    /// A folder in a file browser, as gone through, and the entry selected
+    /// in it, if any.
+    Browser(PathBuf, Option<OsString>),
 }
 
 /// A visit to `doc` at `row` and `col`, unless it's an unnamed document
@@ -131,6 +141,7 @@ impl Visit {
             }
             (Visit::Terminal(a), Visit::Terminal(b)) => a == b,
             (Visit::Image(a), Visit::Image(b)) => a == b,
+            (Visit::Browser(a, _), Visit::Browser(b, _)) => a == b,
             (
                 Visit::Commit {
                     root,
@@ -171,6 +182,14 @@ pub struct Panel {
     /// How a commit changed a file, if that's on screen. The panel owns
     /// it, as it does an image.
     commit: Option<CommitDiff>,
+    /// The file browser it showed last, if any, which it keeps when it
+    /// shows something else, to come back to as it was.
+    browser: Option<Box<Browser>>,
+    /// The browser is on screen.
+    browsing: bool,
+    /// Where each folder in a browser's header was when last drawn: its
+    /// columns, from the first to past the last, and its path.
+    crumbs: RefCell<Vec<(u32, u32, PathBuf)>>,
     area: Rect,
     history: History,
     /// The places it left, as its history noted them, since last taken
@@ -197,6 +216,9 @@ impl Panel {
             terminal: None,
             image: None,
             commit: None,
+            browser: None,
+            browsing: false,
+            crumbs: RefCell::new(Vec::new()),
             area: Rect::default(),
             history: History::default(),
             left: Vec::new(),
@@ -251,6 +273,9 @@ impl Panel {
         }
         if let Some(commit) = &mut self.commit {
             commit.set_size(body.width, body.height);
+        }
+        if let Some(browser) = &mut self.browser {
+            browser.set_area(body);
         }
     }
 
@@ -321,6 +346,7 @@ impl Panel {
         self.terminal = Some(terminal);
         self.image = None;
         self.commit = None;
+        self.browsing = false;
         self.leave_editor();
     }
 
@@ -342,6 +368,7 @@ impl Panel {
         self.image = Some(image);
         self.terminal = None;
         self.commit = None;
+        self.browsing = false;
         self.leave_editor();
     }
 
@@ -373,6 +400,7 @@ impl Panel {
         self.commit = Some(commit);
         self.image = None;
         self.terminal = None;
+        self.browsing = false;
         self.leave_editor();
     }
 
@@ -380,6 +408,71 @@ impl Panel {
     pub fn hide_commit(&mut self) {
         self.leave();
         self.commit = None;
+    }
+
+    /// The file browser on screen, if any.
+    pub fn browser(&self) -> Option<&Browser> {
+        self.browser.as_deref().filter(|_| self.browsing)
+    }
+
+    pub fn browser_mut(&mut self) -> Option<&mut Browser> {
+        self.browser.as_deref_mut().filter(|_| self.browsing)
+    }
+
+    /// The file browser it has, on screen or not, to keep up to date.
+    pub fn any_browser_mut(&mut self) -> Option<&mut Browser> {
+        self.browser.as_deref_mut()
+    }
+
+    /// Shows a file browser of `dir`, with `select` selected: the one it
+    /// had, as it was, if it had one, or else a new one sorted by `sort`,
+    /// and showing hidden files if `hidden`. An unnamed document left
+    /// behind that was never typed in is dropped.
+    pub fn show_browser(
+        &mut self,
+        dir: &Path,
+        select: Option<OsString>,
+        (sort, hidden): (Sort, bool),
+    ) {
+        let same = self.browser().is_some_and(|browser| browser.dir() == dir);
+        if !same {
+            self.leave();
+        }
+        let body = self.body();
+        match &mut self.browser {
+            Some(browser) if browser.dir() == dir => {
+                // Coming back to it, things may have changed.
+                if !self.browsing {
+                    browser.refresh();
+                }
+                if let Some(name) = select {
+                    browser.select_name(&name);
+                }
+            }
+            Some(browser) => browser.go(dir.to_path_buf(), select),
+            None => {
+                self.browser = Some(Box::new(Browser::new(
+                    dir.to_path_buf(),
+                    select,
+                    sort,
+                    hidden,
+                )))
+            }
+        }
+        if let Some(browser) = &mut self.browser {
+            browser.set_area(body);
+        }
+        self.browsing = true;
+        self.terminal = None;
+        self.image = None;
+        self.commit = None;
+        self.leave_editor();
+    }
+
+    /// Stops showing the file browser, leaving the panel empty.
+    pub fn hide_browser(&mut self) {
+        self.leave();
+        self.browsing = false;
     }
 
     /// Takes the editor off screen, for a terminal or an image, dropping it
@@ -418,6 +511,9 @@ impl Panel {
         if let Some(commit) = &self.commit {
             return commit.has_selection();
         }
+        if let Some(browser) = self.browser() {
+            return browser.takes_escape();
+        }
         self.editor()
             .is_some_and(|editor| editor.selected_text().is_some() || editor.find_open())
     }
@@ -427,6 +523,7 @@ impl Panel {
             && self.terminal.is_none()
             && self.image.is_none()
             && self.commit.is_none()
+            && !self.browsing
     }
 
     /// What's on screen, briefly, as the tab bar names it: the file's name,
@@ -448,6 +545,13 @@ impl Panel {
                 "{} @ {}",
                 name.to_string_lossy(),
                 commit.commit().short
+            ));
+        }
+        if let Some(browser) = self.browser() {
+            let dir = browser.dir();
+            return Some(dir.file_name().map_or_else(
+                || dir.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
             ));
         }
         let path = match (&self.image, self.document()) {
@@ -524,6 +628,7 @@ impl Panel {
         self.terminal = None;
         self.image = None;
         self.commit = None;
+        self.browsing = false;
         if let Some(left) = left.filter(|&left| left != index && self.editors[left].is_blank()) {
             self.editors.remove(left);
             if index > left {
@@ -562,6 +667,8 @@ impl Panel {
         self.terminal = None;
         self.image = None;
         self.commit = None;
+        self.browser = None;
+        self.browsing = false;
     }
 
     // --- history ------------------------------------------------------------------
@@ -581,6 +688,12 @@ impl Panel {
                 commit: commit.commit().clone(),
                 change: commit.change().clone(),
             });
+        }
+        if let Some(browser) = self.browser() {
+            return Some(Visit::Browser(
+                browser.dir().to_path_buf(),
+                browser.cursor_name(),
+            ));
         }
         let editor = self.editor()?;
         let (row, col, _) = editor.place();
@@ -760,6 +873,7 @@ impl Panel {
         self.terminal = None;
         self.image = None;
         self.commit = None;
+        self.browsing = false;
     }
 
     /// Takes the history out, so that showing a place from it doesn't
@@ -789,6 +903,9 @@ impl Panel {
         if let Some(commit) = &self.commit {
             return commit.status();
         }
+        if let Some(browser) = self.browser() {
+            return browser.status();
+        }
         match self.editor() {
             Some(editor) => editor.status(),
             None => Status::Info(String::new()),
@@ -808,6 +925,14 @@ impl Panel {
         }
         if let Some(image) = &mut self.image {
             image.handle_mouse(mouse, body);
+            return;
+        }
+        if let Some(browser) = self.browser_mut() {
+            // Only the wheel, here: the app has the rest (see
+            // [`crate::app`]), which it may drag to other panels.
+            if matches!(mouse.kind, MouseKind::ScrollUp | MouseKind::ScrollDown) {
+                browser.handle_mouse(mouse, now);
+            }
             return;
         }
         let local = Mouse {
@@ -864,6 +989,15 @@ impl Panel {
                 return frame.with_clip(body.x, body.y, body.width, body.height, || {
                     terminal.borrow().draw(frame, active, keymap)
                 });
+            }
+            if let Some(browser) = self.browser() {
+                self.draw_browser_header(frame, browser, active);
+                self.draw_buttons(frame, active);
+                let body = self.body();
+                frame.with_clip(body.x, body.y, body.width, body.height, || {
+                    browser.draw(frame, active)
+                });
+                return None;
             }
             self.draw_header(frame, workspace, active, preview);
             self.draw_buttons(frame, active);
@@ -954,6 +1088,19 @@ impl Panel {
 
     /// The interactive area under the pointer, without changing selection.
     pub fn hover_header(&self, x: u32) -> Option<Rect> {
+        // Each of a browser's folders, which a click goes to.
+        if self.browser().is_some() && self.on_name(x) {
+            let crumbs = self.crumbs.borrow();
+            let (start, end, _) = crumbs
+                .iter()
+                .find(|(start, end, _)| (*start..*end).contains(&x))?;
+            return Some(Rect {
+                x: *start,
+                y: self.area.y,
+                width: end - start,
+                height: 1,
+            });
+        }
         if self.on_name(x) {
             let (start, end) = self.name_columns.get();
             return Some(Rect {
@@ -1114,7 +1261,12 @@ impl Panel {
         };
         let (name, folder) = match path {
             Some(path) => {
-                let shown = workspace.display_path(&path);
+                let shown = match workspace.root_of(&path) {
+                    Some(_) => workspace.display_path(&path),
+                    // As it was gone through, from `~`: not the network
+                    // mount a symlink there leads to.
+                    None => browser::display(&browser::logical(&path)),
+                };
                 let shown = Path::new(&shown);
                 let name = shown.file_name().map_or_else(
                     || shown.display().to_string(),
@@ -1146,6 +1298,84 @@ impl Panel {
             frame.draw_text(&folder, x, area.y, colors.muted, None, Attributes::NONE);
             self.title_end.set(x + label_width(&folder));
         }
+    }
+
+    /// The folders of the browser's path, from `~` or `/`, with the
+    /// folder listed last, in bold, and those it's in dimmed, a click on
+    /// each going there. What doesn't fit goes from the left.
+    fn draw_browser_header(&self, frame: &Buffer, browser: &Browser, active: bool) {
+        let colors = theme::colors();
+        let area = self.header();
+        frame.fill_rect(area.x, area.y, area.width, 1, self.header_bg(active));
+        let icon = header_icon(frame, icons::folder(true), area, active);
+        let crumbs = browser::crumbs(browser.dir());
+        // Each folder with the `/` before it, but after the root.
+        let pieces: Vec<(&str, &str, &PathBuf)> = crumbs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, path))| {
+                let slash = i > 0 && crumbs[i - 1].0 != "/";
+                (if slash { "/" } else { "" }, name.as_str(), path)
+            })
+            .collect();
+        let room = self.title_width().saturating_sub(2 + icon);
+        let width =
+            |(slash, name, _): &(&str, &str, &PathBuf)| label_width(slash) + label_width(name);
+        let mut first = 0;
+        let ellipsis = "…";
+        while first + 1 < pieces.len() {
+            let total: u32 = pieces[first..].iter().map(width).sum();
+            let more = if first > 0 { label_width(ellipsis) } else { 0 };
+            if total + more <= room {
+                break;
+            }
+            first += 1;
+        }
+        let start = area.x + 1 + icon;
+        let mut x = start;
+        let mut columns = Vec::new();
+        let last = pieces.len().saturating_sub(1);
+        // The folder listed, alone, is cut from the left on its own.
+        let alone = first == last && first > 0 && width(&pieces[last]) + 1 > room;
+        if first > 0 && !alone {
+            frame.draw_text(ellipsis, x, area.y, colors.muted, None, Attributes::NONE);
+            x += label_width(ellipsis);
+        }
+        let end = area.x + 1 + icon + room;
+        for (i, (slash, name, path)) in pieces.iter().enumerate().skip(first) {
+            let slash = if alone { "" } else { *slash };
+            let fg = match (i == last, active) {
+                (true, true) => colors.text,
+                _ => colors.muted,
+            };
+            let attributes = if i == last {
+                Attributes::BOLD
+            } else {
+                Attributes::NONE
+            };
+            frame.draw_text(slash, x, area.y, colors.faint, None, Attributes::NONE);
+            x += label_width(slash);
+            let name = truncate_left(name, end.saturating_sub(x) as usize);
+            let name_start = x;
+            let drop = browser.drop() == Some(path.as_path()) && i != last;
+            let bg = drop.then_some(colors.drop_tint);
+            frame.draw_text(&name, x, area.y, fg, bg, attributes);
+            x += label_width(&name);
+            columns.push((name_start, x, (*path).clone()));
+        }
+        self.name_columns.set((start, x));
+        self.title_end.set(x);
+        *self.crumbs.borrow_mut() = columns;
+    }
+
+    /// The folder in a browser's header at screen column `x`, if any.
+    pub fn crumb_at(&self, x: u32) -> Option<PathBuf> {
+        self.browser()?;
+        self.crumbs
+            .borrow()
+            .iter()
+            .find(|(start, end, _)| (*start..*end).contains(&x))
+            .map(|(.., path)| path.clone())
     }
 
     /// Notes that the header's name, icon included, is `width` columns.

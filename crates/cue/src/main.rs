@@ -5,6 +5,7 @@ mod app;
 mod arrange;
 mod attach;
 mod autoindent;
+mod browser;
 mod changes;
 mod checkpoint;
 mod client;

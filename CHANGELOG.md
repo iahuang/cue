@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- File browser panels (Ctrl+Shift+E, or Open in File Browser from the sidebar): list any folder with sizes, dates, modes, and owners, sort by column, select several, and drag them onto a folder to move them or onto another panel to open them there; folders on another filesystem get copies
+- Allow Ctrl+F find in diff view (`17d5488`)
+
 ## v0.4.9 — 2026-10-23
 
 - Clicking the changes view's top row with no checkpoints yet lists the last commit and Take a checkpoint…, instead of only saying there are none (`27c5a7c`)

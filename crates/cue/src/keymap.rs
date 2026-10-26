@@ -187,6 +187,7 @@ commands! {
     TreeCopyRelativePath => "tree:copy-relative-path", "File Tree: Copy Relative Path";
     TreeReveal => "tree:reveal", "File Tree: Reveal in File Manager";
     TreeOpenInTerminal => "tree:open-in-terminal", "File Tree: Open in Terminal";
+    TreeOpenInBrowser => "tree:open-in-browser", "File Tree: Open in File Browser";
     AddFolder => "workspace:add-folder", "Add Folder to Workspace…";
     TreeRemoveFolder => "tree:remove-folder", "File Tree: Remove Folder from Workspace";
     TreeToggleStaged => "tree:toggle-staged", "Changes: Stage or Unstage";
@@ -223,6 +224,15 @@ commands! {
     SearchToggleWord => "search:toggle-word", "Search: Match Whole Word";
     SearchToggleRegex => "search:toggle-regex", "Search: Use Regular Expression";
     SearchSwitchField => "search:switch-field", "Search: Switch Between Query and Files";
+    NewFileBrowser => "browser:new", "New File Browser";
+    BrowserParent => "browser:parent", "File Browser: Parent Folder";
+    BrowserGoTo => "browser:go-to", "File Browser: Go to Folder…";
+    BrowserToggleSelected => "browser:toggle-selected", "File Browser: Add to or Remove from Selection";
+    BrowserToggleHidden => "browser:toggle-hidden", "File Browser: Show or Hide Hidden Files";
+    BrowserSortByName => "browser:sort-by-name", "File Browser: Sort by Name";
+    BrowserSortBySize => "browser:sort-by-size", "File Browser: Sort by Size";
+    BrowserSortByModified => "browser:sort-by-modified", "File Browser: Sort by Date Modified";
+    BrowserSortByKind => "browser:sort-by-kind", "File Browser: Sort by Kind";
     DialogParent => "dialog:parent", "File Dialog: Parent Folder";
     DialogComplete => "dialog:complete", "File Dialog: Complete Name";
 }
@@ -249,6 +259,9 @@ pub enum Context {
     /// The find bar's replacement, while it has focus. The find bar's keys
     /// work there too.
     Replace,
+    /// A file browser panel, while it has the keyboard. The tree's keys
+    /// work there too.
+    Browser,
     /// A terminal, which gets every key but a few (see
     /// [`Keymap::lookup_terminal`]).
     Terminal,
@@ -266,6 +279,7 @@ impl Context {
             Context::Dialog => &[Context::Picker],
             Context::Find => &[Context::SearchOptions],
             Context::Replace => &[Context::Find, Context::SearchOptions],
+            Context::Browser => &[Context::Tree],
             _ => &[],
         }
     }
@@ -300,22 +314,29 @@ impl Command {
             | PreviousTab | MoveTabLeft | MoveTabRight | RenameTab | GoToTab1 | GoToTab2
             | GoToTab3 | GoToTab4 | GoToTab5 | GoToTab6 | GoToTab7 | GoToTab8 | GoToTab9
             | AddFolder | RenameSession | GitFetch | GitPull | GitPush | GitCheckpoint
-            | GitCompareWith | GitLog | GitSwitchBranch | GitSync | GitShowStashes => {
-                Context::Global
-            }
+            | GitCompareWith | GitLog | GitSwitchBranch | GitSync | GitShowStashes
+            | NewFileBrowser => Context::Global,
             TreeUp | TreeDown | TreeExpand | TreeCollapse | TreeOpen | TreePreview
             | TreeQuickLook | TreeFirst | TreeLast | TreePageUp | TreePageDown | TreeRefresh
             | TreeSwitchView | TreeContextMenu | TreeOpenToSide | TreeNewFile | TreeNewFolder
             | TreeRename | TreeDuplicate | TreeTrash | TreeCopyPath | TreeCopyRelativePath
-            | TreeReveal | TreeOpenInTerminal | TreeRemoveFolder | TreeToggleStaged
-            | TreeCommit | TreeStash | TreeStashStaged | TreeApplyStash | TreePopStash
-            | TreeDropStash | TreeOpenFile | TreeCopyHash | TreeCopyMessage | TreeCheckOut
-            | TreeNewBranch | TreeRevert => Context::Tree,
+            | TreeReveal | TreeOpenInTerminal | TreeOpenInBrowser | TreeRemoveFolder
+            | TreeToggleStaged | TreeCommit | TreeStash | TreeStashStaged | TreeApplyStash
+            | TreePopStash | TreeDropStash | TreeOpenFile | TreeCopyHash | TreeCopyMessage
+            | TreeCheckOut | TreeNewBranch | TreeRevert => Context::Tree,
             PickerUp | PickerDown | PickerPageUp | PickerPageDown | PickerAccept | PickerClose
             | PickerCloseItem => Context::Picker,
             SearchToggleCase | SearchToggleWord | SearchToggleRegex => Context::SearchOptions,
             SearchSwitchField => Context::Search,
             DialogParent | DialogComplete => Context::Dialog,
+            BrowserParent
+            | BrowserGoTo
+            | BrowserToggleSelected
+            | BrowserToggleHidden
+            | BrowserSortByName
+            | BrowserSortBySize
+            | BrowserSortByModified
+            | BrowserSortByKind => Context::Browser,
             FindSwitchField | FindClose => Context::Find,
             ClearTerminal | RenameTerminal | ToggleTerminalKeys => Context::Terminal,
             Replace | ReplaceAll => Context::Replace,
@@ -464,6 +485,10 @@ impl Default for Keymap {
         // palette has it.
         bindings.push((key(Char('h'), Mods::CTRL), FindReplace));
         bindings.push((key(Char('f'), SUPER_ALT), FindReplace));
+        // As VS Code's Explorer. Legacy terminals send it as Ctrl+E, which
+        // focuses the tree; there, the command palette has it.
+        bindings.push((key(Char('e'), CTRL_SHIFT), NewFileBrowser));
+        bindings.push((key(Char('e'), SUPER_SHIFT), NewFileBrowser));
         // Legacy terminals send it as Ctrl+\, which splits right; there,
         // the command palette has it. Some report the shifted key, `|`.
         bindings.push((key(Char('\\'), CTRL_SHIFT), SplitDown));
@@ -643,6 +668,21 @@ impl Default for Keymap {
             (key(Up, ALT), DialogParent),
             (key(Up, SUPER), DialogParent),
             (key(Tab, Mods::NONE), DialogComplete),
+            // As in the Finder: Cmd+Up and Backspace go up (Alt+Up for
+            // terminals that keep Cmd), and Cmd+Shift+. shows hidden files.
+            (key(Backspace, Mods::NONE), BrowserParent),
+            (key(Up, ALT), BrowserParent),
+            (key(Up, SUPER), BrowserParent),
+            (key(Left, Mods::NONE), BrowserParent),
+            // As in browsers' and the Finder's location bars.
+            (key(Char('l'), Mods::CTRL), BrowserGoTo),
+            (key(Char('l'), SUPER), BrowserGoTo),
+            // Ctrl+click adds to the selection too.
+            (key(Char(' '), Mods::CTRL), BrowserToggleSelected),
+            (key(Char('.'), CTRL_SHIFT), BrowserToggleHidden),
+            (key(Char('>'), CTRL_SHIFT), BrowserToggleHidden),
+            (key(Char('.'), SUPER_SHIFT), BrowserToggleHidden),
+            (key(Char('>'), SUPER_SHIFT), BrowserToggleHidden),
         ]);
         let mut bindings: Vec<Binding> = bindings
             .into_iter()
@@ -652,6 +692,22 @@ impl Default for Keymap {
                 context: command.context(),
             })
             .collect();
+        // In a file browser, the editor's keys for selecting, and going into
+        // a folder, as in the Finder.
+        for (key, command) in [
+            (key(Char('a'), Mods::CTRL), SelectAll),
+            (key(Char('a'), SUPER), SelectAll),
+            (key(Esc, Mods::NONE), ClearSelection),
+            (key(Right, Mods::NONE), TreeExpand),
+            (key(Down, ALT), TreeOpen),
+            (key(Down, SUPER), TreeOpen),
+        ] {
+            bindings.push(Binding {
+                key,
+                command,
+                context: Context::Browser,
+            });
+        }
         // In the find bar, Enter steps through the matches.
         for (key, command) in [
             (key(Enter, Mods::NONE), FindNext),

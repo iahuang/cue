@@ -70,6 +70,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::fd::RawFd;
@@ -82,6 +83,7 @@ use opentui::{Attributes, Buffer, EditBuffer, Rgba};
 
 use crate::alert::{Alert, AlertAction, Button};
 use crate::arrange::{self, Arranging, Before, PanelClip};
+use crate::browser::{self, BrowserAction, Sort};
 use crate::changes::ChangesView;
 use crate::checkpoint;
 use crate::commit_dialog::{CantCommit, CommitAction, CommitDialog, Plan};
@@ -182,8 +184,8 @@ enum Redo {
     CloseTab(TabId),
     /// Closing a file or terminal the picker lists.
     CloseItem(Choice),
-    /// Moving this to the Trash.
-    Trash(PathBuf),
+    /// Moving these to the Trash.
+    Trash(Vec<PathBuf>),
     /// Staging these files, in the repository at this root.
     Stage(PathBuf, Vec<PathBuf>),
     /// Staging these files, in the repository at this root, then
@@ -321,6 +323,9 @@ enum MenuFor {
     Status,
     /// A panel, from its header.
     Panel(PanelId),
+    /// What's selected in the file browser in a panel, or the folder it
+    /// lists.
+    Browser(PanelId),
     /// What's selected in the sidebar, which its commands act on.
     Sidebar,
 }
@@ -353,6 +358,39 @@ enum MouseTarget {
     QuickLook,
     /// The scratchpad's frame, which drags these edges of it.
     ScratchFrame(scratch::Edges),
+}
+
+/// Files or folders dragged from a file browser: onto a folder, in a
+/// browser, its header, or the tree, to move there, or onto another panel,
+/// to open there.
+struct FileDrag {
+    /// What's dragged, in the order shown.
+    targets: Vec<browser::Target>,
+    /// The folder they're in.
+    dir: PathBuf,
+    /// Where the pointer is.
+    at: (u32, u32),
+    /// Where they'd go if let go now.
+    drop: Option<FileDrop>,
+}
+
+/// Where files dragged from a browser would go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileDrop {
+    /// Into this folder, tinting `rect` if the browser it's in doesn't mark
+    /// it itself.
+    Move { folder: PathBuf, rect: Option<Rect> },
+    /// Opened in this panel, over its area.
+    Open { panel: PanelId, rect: Rect },
+}
+
+/// Files moved to another filesystem, copied in the background.
+struct Copying {
+    /// What it's copying, and where to.
+    names: Vec<String>,
+    folder: PathBuf,
+    /// Why some couldn't be copied, once done.
+    done: Receiver<Vec<String>>,
 }
 
 /// A panel's header being dragged. A header with a panel above it is also
@@ -464,6 +502,13 @@ pub struct App {
     /// Last pointer position, independent of the pressed or dragged target.
     hover: Option<(u32, u32)>,
     header_drag: Option<HeaderDrag>,
+    /// Files being dragged from a file browser.
+    file_drag: Option<FileDrag>,
+    /// Files being copied to another filesystem.
+    copying: Vec<Copying>,
+    /// How the last file browser changed was sorted, and whether it showed
+    /// hidden files, which new ones start with.
+    browser_prefs: (Sort, bool),
     /// A question to answer before going on, above everything else.
     alert: Option<Alert<Answer>>,
     /// The alert was answered: what it asked about goes ahead without
@@ -793,6 +838,9 @@ impl App {
             mouse_target: None,
             hover: None,
             header_drag: None,
+            file_drag: None,
+            copying: Vec::new(),
+            browser_prefs: (Sort::default(), false),
             alert: None,
             confirmed: false,
             preview: None,
@@ -1033,6 +1081,7 @@ impl App {
             _ if self.dialog.is_some() => Context::Dialog,
             _ if self.picker.is_some() => Context::Picker,
             Focus::Tree => Context::Tree,
+            Focus::Editor if self.active_panel().browser().is_some() => Context::Browser,
             Focus::Editor if self.finding_terminal().is_some() => Context::Find,
             Focus::Editor if self.finding_image() => Context::Find,
             Focus::Editor => self
@@ -1040,7 +1089,12 @@ impl App {
                 .and_then(Editor::find_field)
                 .map_or(Context::Editor, find::Field::context),
         };
-        match self.keymap.lookup(key, context) {
+        // The tree's keys that do nothing in a browser, such as `s` to
+        // stage, type there instead, to find a name.
+        let found = self.keymap.lookup(key, context).filter(|&(command, _)| {
+            context != Context::Browser || command.context() != Context::Tree || browses(command)
+        });
+        match found {
             Some((command, select)) => {
                 // Other global commands (save, quit, ...) close the picker,
                 // search, or file dialog and run as usual.
@@ -1070,6 +1124,14 @@ impl App {
             }
             None => {
                 if self.focus == Focus::Editor {
+                    if let Some(browser) = self.active_panel_mut().browser_mut() {
+                        if let KeyCode::Char(c) = key.code {
+                            if key.mods.is_plain() {
+                                browser.type_char(c, Instant::now());
+                            }
+                        }
+                        return AppAction::Continue;
+                    }
                     if let Some(commit) = self.active_panel_mut().commit_mut() {
                         let outcome = commit.type_key(key);
                         return self.commit_outcome(outcome);
@@ -1243,6 +1305,10 @@ impl App {
             return AppAction::Continue;
         }
         match command {
+            command if browses(command) && self.browser_has_keyboard() => {
+                return self.run_browser(command, false)
+            }
+            Command::NewFileBrowser => self.new_browser(),
             Command::Quit => return self.quit(),
             Command::Restart => return AppAction::Restart,
             Command::KeepSession if self.session.is_some() => {
@@ -1563,6 +1629,7 @@ impl App {
             | Command::TreeCopyRelativePath
             | Command::TreeReveal
             | Command::TreeOpenInTerminal
+            | Command::TreeOpenInBrowser
             | Command::TreeRemoveFolder => {
                 let target = self.file_target();
                 return self.file_command(command, target, false);
@@ -1721,6 +1788,22 @@ impl App {
         if let Some(dialog) = &mut self.dialog {
             let action = dialog.handle_mouse(mouse, now);
             return self.dialog_action(action);
+        }
+        if self.file_drag.is_some() {
+            match mouse.kind {
+                MouseKind::Drag(MouseButton::Left) => {
+                    self.drag_files_to(mouse.x, mouse.y);
+                    return AppAction::Continue;
+                }
+                MouseKind::Release(_) => {
+                    self.mouse_target = None;
+                    self.drop_files();
+                    return AppAction::Continue;
+                }
+                // The last drag's release never came.
+                MouseKind::Press(_) => drop(self.end_file_drag()),
+                _ => {}
+            }
         }
         if let MouseKind::Press(_) = mouse.kind {
             if let Some(index) = self.toasts.at(mouse.x, mouse.y, self.toast_area()) {
@@ -1931,6 +2014,10 @@ impl App {
                 }
             }
             MouseTarget::Header(id) => self.drag_header(id, mouse, now),
+            MouseTarget::Panel(id) if self.panel(id).is_some_and(|p| p.browser().is_some()) => {
+                self.input_panel = Some(id);
+                self.browser_mouse(id, mouse, now);
+            }
             MouseTarget::Panel(id) => {
                 self.input_panel = Some(id);
                 if let MouseKind::Press(MouseButton::Left) = mouse.kind {
@@ -2182,7 +2269,30 @@ impl App {
                 let clicked = drag.on_name && !drag.moving && !drag.resizing && mouse.y == drag.y;
                 let panels = &self.tab().panels;
                 if clicked && panels.iter().any(|p| p.id == id && p.on_name(mouse.x)) {
-                    self.run(self.name_command(), false);
+                    // A browser's folders go there, and the one it lists
+                    // asks where to go.
+                    let dir = self
+                        .panel(id)
+                        .and_then(Panel::browser)
+                        .map(|browser| browser.dir().to_path_buf());
+                    let crumb = self.panel(id).and_then(|panel| panel.crumb_at(mouse.x));
+                    match (dir, crumb) {
+                        (Some(dir), Some(crumb)) if dir == crumb => {
+                            self.run_browser(Command::BrowserGoTo, false);
+                        }
+                        (Some(dir), Some(crumb)) => {
+                            let select = dir
+                                .strip_prefix(&crumb)
+                                .ok()
+                                .and_then(|rest| rest.iter().next())
+                                .map(OsStr::to_os_string);
+                            self.browse(&crumb, select);
+                        }
+                        (Some(_), None) => {}
+                        (None, _) => {
+                            self.run(self.name_command(), false);
+                        }
+                    }
                 }
             }
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
@@ -2403,6 +2513,17 @@ impl App {
             let rect = drop.rect;
             frame.fill_rect(rect.x, rect.y, rect.width, rect.height, colors.drop_tint);
         }
+        if let Some(drag) = &self.file_drag {
+            if let Some(
+                FileDrop::Move {
+                    rect: Some(rect), ..
+                }
+                | FileDrop::Open { rect, .. },
+            ) = &drag.drop
+            {
+                frame.fill_rect(rect.x, rect.y, rect.width, rect.height, colors.drop_tint);
+            }
+        }
         if self.scratch.open {
             let panel = &self.scratch.panel;
             let preview = panel.document().is_some_and(|doc| self.is_preview(doc));
@@ -2416,6 +2537,7 @@ impl App {
         if let Some(look) = &self.quick_look {
             look.draw(frame, &self.keymap);
         }
+        self.draw_file_drag(frame);
         self.draw_completion(frame);
         // Under the popups, which they don't take clicks from.
         self.toasts.draw(frame, self.toast_area());
@@ -2562,6 +2684,14 @@ impl App {
             }
             MouseTarget::Panel(id) => {
                 let panel = self.panel(id)?;
+                if let Some(browser) = panel.browser() {
+                    let body = panel.body();
+                    return browser.hover_row(y).then_some(Rect {
+                        y,
+                        height: 1,
+                        ..body
+                    });
+                }
                 if let Some(terminal) = panel.terminal() {
                     terminal.borrow().hover_find(x, y)
                 } else if let Some(image) = panel.image() {
@@ -2655,7 +2785,11 @@ impl App {
             if let Some(image) = panel.image_mut() {
                 changed |= image.poll();
             }
+            if let Some(browser) = panel.any_browser_mut() {
+                changed |= browser.poll();
+            }
         }
+        changed |= self.poll_copying();
         changed |= self
             .switcher
             .as_mut()
@@ -2848,6 +2982,10 @@ impl App {
                 .filter_map(|panel| panel.image()?.path().parent().map(Path::to_path_buf)),
         );
         files.extend(self.git.repos().iter().map(|repo| repo.git_dir.clone()));
+        files.extend(
+            tab::all_panels(&self.tabs, &self.scratch.panel)
+                .filter_map(|panel| Some(panel.browser()?.dir().to_path_buf())),
+        );
         let watching = (self.tree.listing(), files);
         if self.watching.as_ref() == Some(&watching) {
             return;
@@ -2885,6 +3023,16 @@ impl App {
             if let Some(image) = panel.image_mut() {
                 if touched(image.path()) {
                     changed |= image.reload();
+                }
+            }
+            if let Some(browser) = panel.browser_mut() {
+                let lists = |path: &PathBuf| {
+                    let folder = path.parent();
+                    folder == Some(browser.dir())
+                        || folder.is_some() && folder == browser.real_dir()
+                };
+                if changes.rescan || changes.paths.iter().any(lists) {
+                    browser.refresh();
                 }
             }
         }
@@ -3652,6 +3800,7 @@ impl App {
                 change,
             } => Item::file(root.join(&change.path), &self.workspace, "")
                 .with_detail(&format!("@ {}", commit.short)),
+            Visit::Browser(dir, _) => Item::folder(dir.clone()),
         })
     }
 
@@ -3834,6 +3983,11 @@ impl App {
                 change,
             } => {
                 self.open_commit(root, commit.clone(), change.clone(), true);
+                true
+            }
+            Visit::Browser(dir, select) => {
+                self.browse(dir, select.clone());
+                self.focus = Focus::Editor;
                 true
             }
         }
@@ -5022,6 +5176,10 @@ impl App {
             self.active_panel_mut().hide_commit();
             return true;
         }
+        if self.active_panel().browser().is_some() {
+            self.active_panel_mut().hide_browser();
+            return true;
+        }
         let Some(doc) = self.active_panel().document().cloned() else {
             return true;
         };
@@ -5263,8 +5421,8 @@ impl App {
                 AppAction::Continue
             }
             Redo::CloseItem(choice) => self.picker_action(PickerAction::CloseItem(choice)),
-            Redo::Trash(path) => {
-                self.trash(&path, true);
+            Redo::Trash(paths) => {
+                self.trash(&paths, true);
                 AppAction::Continue
             }
             Redo::Stage(root, paths) => {
@@ -6262,9 +6420,11 @@ impl App {
                 Shown::Untitled(_) => Some(Visit::File(Rc::downgrade(&doc?), None, spot)),
                 Shown::Terminal(id) => Some(Visit::Terminal(*id)),
                 Shown::Image(path) => Some(Visit::Image(path.clone())),
+                Shown::Browser(dir) => Some(Visit::Browser(dir.clone(), None)),
             }
         };
         let terminals = &self.terminals;
+        let prefs = self.browser_prefs;
         let restore = |panel: &mut Panel, saved: &session::PanelState| {
             for place in &saved.places {
                 let Some(doc) = find_doc(&place.doc) else {
@@ -6288,6 +6448,10 @@ impl App {
                 Some(Shown::Image(path)) => ImageView::open(path)
                     .map(|image| panel.show_image(image))
                     .is_ok(),
+                Some(Shown::Browser(dir)) => {
+                    panel.show_browser(dir, None, prefs);
+                    true
+                }
                 Some(doc) => find_doc(doc).is_some_and(|doc| panel.show(&doc).is_ok()),
                 None => false,
             };
@@ -6338,10 +6502,11 @@ impl App {
         self.recent = state
             .recent
             .iter()
-            .map(|shown| match shown {
-                Shown::File(path) | Shown::Image(path) => Recent::File(path.clone()),
-                Shown::Terminal(id) => Recent::Terminal(*id),
-                Shown::Untitled(number) => Recent::Untitled(*number),
+            .filter_map(|shown| match shown {
+                Shown::File(path) | Shown::Image(path) => Some(Recent::File(path.clone())),
+                Shown::Terminal(id) => Some(Recent::Terminal(*id)),
+                Shown::Untitled(number) => Some(Recent::Untitled(*number)),
+                Shown::Browser(_) => None,
             })
             .collect();
         self.prune_terminals();
@@ -6473,6 +6638,9 @@ impl App {
                 return folder;
             }
         }
+        if let Some(browser) = self.active_panel().browser() {
+            return browser.dir().to_path_buf();
+        }
         let file = self.active_panel().path();
         match file.as_deref().and_then(Path::parent) {
             Some(folder) if folder.is_dir() => folder.to_path_buf(),
@@ -6502,6 +6670,11 @@ impl App {
                     Purpose::Create => self.create_file(&path),
                     Purpose::CreateFolder => self.create_folder(&path),
                     Purpose::AddFolder => self.add_folder(&path),
+                    Purpose::GoToFolder => {
+                        self.browse(&path, None);
+                        self.focus = Focus::Editor;
+                        Ok(AppAction::Continue)
+                    }
                     Purpose::Move | Purpose::Duplicate => match dialog.current() {
                         Some(from) => {
                             let from = from.to_path_buf();
@@ -6578,6 +6751,7 @@ impl App {
         created.map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
         self.tree.refresh();
         self.files.refresh();
+        self.refresh_browsers();
         let path = document::resolve(path);
         if self.open(&path, false) {
             self.tree.reveal(&path);
@@ -7793,6 +7967,7 @@ impl App {
         if target.is_dir {
             items.push(item(TreeOpenInTerminal, "Open in Terminal"));
         }
+        items.push(item(TreeOpenInBrowser, "Open in File Browser"));
         if target.is_root {
             items.extend([
                 MenuItem::Separator,
@@ -8142,6 +8317,13 @@ impl App {
                     self.activate(id);
                     self.run(command, false)
                 }
+                Some((_, MenuFor::Browser(id))) => {
+                    self.activate(id);
+                    match self.active_panel().browser() {
+                        Some(_) => self.run_browser(command, true),
+                        None => AppAction::Continue,
+                    }
+                }
                 None => AppAction::Continue,
             },
         }
@@ -8207,6 +8389,11 @@ impl App {
             Command::TreeNewFile => self.open_dialog(Purpose::Create, &folder, "", None),
             Command::TreeNewFolder => self.open_dialog(Purpose::CreateFolder, &folder, "", None),
             Command::TreeOpenInTerminal => self.new_terminal_in(&folder),
+            Command::TreeOpenInBrowser => {
+                let (dir, select) = browser_place(&target.path, target.is_dir);
+                self.browse(&dir, select);
+                self.focus = Focus::Editor;
+            }
             Command::TreeRename | Command::TreeDuplicate | Command::TreeTrash if target.is_root => {
                 self.show_message(format!("{name} is a workspace folder."), false);
             }
@@ -8221,7 +8408,7 @@ impl App {
                     Command::TreeRename => {
                         self.open_dialog(Purpose::Move, &parent, &name, Some(target.path));
                     }
-                    _ => self.trash(&target.path, from_menu),
+                    _ => self.trash(&[target.path], from_menu),
                 }
             }
             Command::TreeDuplicate => {
@@ -8234,15 +8421,7 @@ impl App {
                 return self.copy_path(target.path.display().to_string());
             }
             Command::TreeCopyRelativePath => {
-                let relative = match self.workspace.root_of(&target.path) {
-                    Some(root) => target.path.strip_prefix(root).unwrap_or(&target.path),
-                    None => &target.path,
-                };
-                let relative = match relative.as_os_str().is_empty() {
-                    true => ".".to_string(),
-                    false => relative.display().to_string(),
-                };
-                return self.copy_path(relative);
+                return self.copy_path(self.relative_path(&target.path));
             }
             Command::TreeReveal => self.reveal(&target.path),
             _ => {}
@@ -8269,6 +8448,18 @@ impl App {
             None => &path,
         };
         self.copy_path(format!("{}:{lines}", relative.display()))
+    }
+
+    /// `path` relative to the workspace folder it's in, or in full.
+    fn relative_path(&self, path: &Path) -> String {
+        let relative = match self.workspace.root_of(path) {
+            Some(root) => path.strip_prefix(root).unwrap_or(path),
+            None => path,
+        };
+        match relative.as_os_str().is_empty() {
+            true => ".".to_string(),
+            false => relative.display().to_string(),
+        }
     }
 
     /// Puts the path `text` on the clipboard.
@@ -8335,6 +8526,7 @@ impl App {
             .map_err(|err| format!("Can't create {}: {err}", file_name(path)))?;
         self.tree.refresh();
         self.tree.reveal(path);
+        self.refresh_browsers();
         Ok(AppAction::Continue)
     }
 
@@ -8349,6 +8541,17 @@ impl App {
                 .map_err(|err| format!("Can't create the destination folder: {err}"))?;
         }
         fs::rename(from, to).map_err(|err| format!("Can't move {}: {err}", file_name(from)))?;
+        self.follow_move(from, to);
+        self.tree.moved(from, to);
+        self.files.refresh();
+        self.show_active_in_tree();
+        self.refresh_browsers();
+        Ok(AppAction::Continue)
+    }
+
+    /// Follows the file or folder that moved from `from` to `to`: open
+    /// files, images, and the recent files go with it.
+    fn follow_move(&mut self, from: &Path, to: &Path) {
         // Open files have their paths resolved.
         let (resolved_from, resolved_to) = (document::resolve(from), document::resolve(to));
         let moved = |path: &Path| {
@@ -8380,10 +8583,6 @@ impl App {
                 }
             }
         }
-        self.tree.moved(from, to);
-        self.files.refresh();
-        self.show_active_in_tree();
-        Ok(AppAction::Continue)
     }
 
     /// Copies the file or folder `from` to `to`, creating the folder it goes
@@ -8400,45 +8599,67 @@ impl App {
         self.tree.refresh();
         self.tree.reveal(to);
         self.files.refresh();
+        self.refresh_browsers();
         Ok(AppAction::Continue)
     }
 
-    /// Moves the file or folder at `path` to the Trash, after asking, unless
-    /// `confirmed`. Open files that were in it close, unless they have
-    /// unsaved changes, which saving puts back.
-    fn trash(&mut self, path: &Path, confirmed: bool) {
-        let name = file_name(path);
+    /// Moves the files and folders at `paths` to the Trash, after asking,
+    /// unless `confirmed`. Open files that were in them close, unless they
+    /// have unsaved changes, which saving puts back.
+    fn trash(&mut self, paths: &[PathBuf], confirmed: bool) {
         if !confirmed {
-            let message = match path.is_dir() {
-                true => "You can restore this folder and its contents from the Trash.",
-                false => "You can restore this file from the Trash.",
+            let (title, message) = match paths {
+                [] => return,
+                [path] => (
+                    format!("Move {} to the Trash?", file_name(path)),
+                    match path.is_dir() {
+                        true => "You can restore this folder and its contents from the Trash.",
+                        false => "You can restore this file from the Trash.",
+                    },
+                ),
+                _ => (
+                    format!("Move {} items to the Trash?", paths.len()),
+                    "You can restore them from the Trash.",
+                ),
             };
-            let redo = Redo::Trash(path.to_path_buf());
+            let redo = Redo::Trash(paths.to_vec());
             let buttons = vec![Button::new("Move to &Trash", Answer::Go(redo)).danger()];
-            let title = format!("Move {name} to the Trash?");
             self.alert = Some(Alert::new(title, message, buttons, self.width, self.height));
             return;
         }
-        let resolved = document::resolve(path);
-        if let Err(err) = move_to_trash(path) {
-            self.show_message(format!("Can't move {name} to the Trash: {err}"), true);
-            return;
+        let mut failed = Vec::new();
+        for path in paths {
+            let name = file_name(path);
+            let resolved = document::resolve(path);
+            if let Err(err) = move_to_trash(path) {
+                failed.push(format!("Can't move {name} to the Trash: {err}"));
+                continue;
+            }
+            let closing: Vec<Rc<Document>> = self
+                .documents
+                .iter()
+                .filter(|doc| !doc.is_modified())
+                .filter(|doc| doc.path().is_some_and(|open| open.starts_with(&resolved)))
+                .cloned()
+                .collect();
+            for doc in closing {
+                self.destroy_document(&doc);
+            }
+            self.close_images(&resolved);
+            self.recent.retain(
+                |recent| !matches!(recent, Recent::File(open) if open.starts_with(&resolved)),
+            );
         }
-        let closing: Vec<Rc<Document>> = self
-            .documents
-            .iter()
-            .filter(|doc| !doc.is_modified())
-            .filter(|doc| doc.path().is_some_and(|open| open.starts_with(&resolved)))
-            .cloned()
-            .collect();
-        for doc in closing {
-            self.destroy_document(&doc);
+        if let Some(first) = failed.first() {
+            let message = match failed.len() {
+                1 => first.clone(),
+                n => format!("{first} (and {} more)", n - 1),
+            };
+            self.show_message(message, true);
         }
-        self.close_images(&resolved);
-        self.recent
-            .retain(|recent| !matches!(recent, Recent::File(open) if open.starts_with(&resolved)));
         self.tree.refresh();
         self.files.refresh();
+        self.refresh_browsers();
     }
 
     /// Shows `path` in the Finder, or elsewhere, opens its folder.
@@ -8535,6 +8756,631 @@ impl App {
             Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
             Err(err) => self.show_message(format!("Can't open {url}: {err}"), true),
         }
+    }
+
+    // --- file browsers ---------------------------------------------------------
+
+    /// Whether the active panel's file browser has the keyboard.
+    fn browser_has_keyboard(&self) -> bool {
+        self.focus == Focus::Editor && self.active_panel().browser().is_some()
+    }
+
+    /// Shows a file browser of `dir` in the active panel, with `select`
+    /// selected once it's listed.
+    fn browse(&mut self, dir: &Path, select: Option<OsString>) {
+        let prefs = self.browser_prefs;
+        self.active_panel_mut().show_browser(dir, select, prefs);
+        self.prune_documents();
+        self.watch_folders();
+    }
+
+    /// New File Browser, in the active panel: of the folder selected in the
+    /// sidebar while it has the keyboard, or the one a file selected there
+    /// is in, or else of the folder a browser shown lists, or the file on
+    /// screen's, a terminal's, or the workspace's.
+    fn new_browser(&mut self) {
+        let (dir, select) = self.browser_start();
+        self.browse(&dir, select);
+        self.focus = Focus::Editor;
+    }
+
+    fn browser_start(&self) -> (PathBuf, Option<OsString>) {
+        if self.focus == Focus::Tree {
+            if let Some(entry) = self.sidebar_selected() {
+                return browser_place(&entry.path, entry.is_dir);
+            }
+        }
+        let panel = self.active_panel();
+        if let Some(browser) = panel.browser() {
+            return (browser.dir().to_path_buf(), browser.cursor_name());
+        }
+        if let Some(path) = panel.path() {
+            return browser_place(&path, false);
+        }
+        if let Some(terminal) = self.active_terminal() {
+            return (browser::logical(terminal.borrow().cwd()), None);
+        }
+        (browser::logical(&self.current_root()), None)
+    }
+
+    /// Lists again the folders file browsers show, after cue changed files.
+    fn refresh_browsers(&mut self) {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
+            if let Some(browser) = panel.browser_mut() {
+                browser.refresh();
+            }
+        }
+    }
+
+    /// A mouse event in the file browser in panel `id`. A press gives the
+    /// panel the keyboard; the wheel scrolls it either way.
+    fn browser_mouse(&mut self, id: PanelId, mouse: Mouse, now: Instant) {
+        if let MouseKind::Press(_) = mouse.kind {
+            self.activate(id);
+        }
+        let Some(browser) = self.panel_mut(id).and_then(Panel::browser_mut) else {
+            return;
+        };
+        let action = browser.handle_mouse(mouse, now);
+        if action == BrowserAction::Drag {
+            return self.start_file_drag(id, (mouse.x, mouse.y));
+        }
+        self.browser_action(id, action);
+    }
+
+    /// Does what the file browser in panel `id` asked for.
+    fn browser_action(&mut self, id: PanelId, action: BrowserAction) -> AppAction {
+        match action {
+            BrowserAction::None | BrowserAction::Drag => {}
+            BrowserAction::Open(paths) => {
+                self.activate(id);
+                let mut opened = false;
+                for path in &paths {
+                    opened |= self.open(path, false);
+                }
+                if opened {
+                    self.focus = Focus::Editor;
+                }
+            }
+            BrowserAction::Go(dir, select) => {
+                self.activate(id);
+                self.browse(&dir, select);
+            }
+            BrowserAction::Look(path) => {
+                match self
+                    .quick_look
+                    .as_ref()
+                    .is_some_and(|look| look.path() == path)
+                {
+                    true => self.quick_look = None,
+                    false => self.look_at(&path),
+                }
+            }
+            BrowserAction::Menu(at) => self.open_browser_menu(id, at),
+        }
+        AppAction::Continue
+    }
+
+    /// Runs `command` in the active panel's file browser, from its keys, or
+    /// if `from_menu`, its menu, where trashing doesn't ask first.
+    fn run_browser(&mut self, command: Command, from_menu: bool) -> AppAction {
+        let id = self.active_id();
+        match command {
+            Command::TreeQuickLook | Command::TreePreview => self.toggle_quick_look(),
+            // Esc puts Quick Look away first, and with nothing else for it
+            // to do, the scratchpad.
+            Command::ClearSelection if self.quick_look.is_some() => self.quick_look = None,
+            Command::ClearSelection if self.scratch.open && !self.active_panel().takes_escape() => {
+                self.hide_scratch()
+            }
+            Command::TreeContextMenu => self.open_browser_menu(id, None),
+            Command::BrowserGoTo => {
+                if let Some(browser) = self.active_panel().browser() {
+                    let dir = browser.dir().to_path_buf();
+                    self.open_dialog(Purpose::GoToFolder, &dir, "", None);
+                }
+            }
+            Command::TreeOpenToSide
+            | Command::TreeNewFile
+            | Command::TreeNewFolder
+            | Command::TreeRename
+            | Command::TreeDuplicate
+            | Command::TreeTrash
+            | Command::TreeCopyPath
+            | Command::TreeCopyRelativePath
+            | Command::TreeReveal
+            | Command::TreeOpenInTerminal
+            | Command::TreeOpenInBrowser => return self.browser_file_command(command, from_menu),
+            command => {
+                // Shift with the keys that move selects as it goes.
+                let extend = self.pressed.shift && !from_menu;
+                let Some(browser) = self.active_panel_mut().browser_mut() else {
+                    return AppAction::Continue;
+                };
+                let action = browser.run(command, extend);
+                self.browser_prefs = (browser.sort(), browser.shows_hidden());
+                return self.browser_action(id, action);
+            }
+        }
+        AppAction::Continue
+    }
+
+    /// Runs the file command `command` on what the active panel's browser
+    /// has selected: on all of it, trashing and copying paths, and on one
+    /// entry otherwise. New files and folders go in the folder listed.
+    fn browser_file_command(&mut self, command: Command, from_menu: bool) -> AppAction {
+        let Some(browser) = self.active_panel().browser() else {
+            return AppAction::Continue;
+        };
+        let selection = browser.selection();
+        let folder = browser.folder();
+        let entry = |target: &browser::Target| Entry {
+            path: target.path.clone(),
+            is_dir: target.is_dir,
+            is_root: false,
+        };
+        let paths: Vec<PathBuf> = selection.iter().map(|t| t.path.clone()).collect();
+        match command {
+            Command::TreeTrash if paths.is_empty() => {
+                self.show_message("Nothing is selected.", false)
+            }
+            Command::TreeTrash => match self.workspace_folder_in(&paths) {
+                Some(message) => self.show_message(message, false),
+                None => self.trash(&paths, from_menu),
+            },
+            Command::TreeCopyPath | Command::TreeCopyRelativePath => {
+                let paths = match paths.is_empty() {
+                    true => vec![folder.path],
+                    false => paths,
+                };
+                let text: Vec<String> = paths
+                    .iter()
+                    .map(|path| match command {
+                        Command::TreeCopyPath => path.display().to_string(),
+                        _ => self.relative_path(path),
+                    })
+                    .collect();
+                return self.copy_path(text.join("\n"));
+            }
+            Command::TreeNewFile | Command::TreeNewFolder => {
+                return self.file_command(command, entry(&folder), from_menu);
+            }
+            // Of the one folder selected, or the one listed.
+            Command::TreeOpenInTerminal | Command::TreeReveal | Command::TreeOpenInBrowser => {
+                let target = match selection.as_slice() {
+                    [one] if one.is_dir || command == Command::TreeReveal => one.clone(),
+                    _ => folder,
+                };
+                return self.file_command(command, entry(&target), from_menu);
+            }
+            _ if selection.len() > 1 => self.show_message("Select only one item for this.", false),
+            _ if selection.is_empty() => self.show_message("Nothing is selected.", false),
+            Command::TreeOpenToSide if selection[0].is_dir => {
+                let dir = selection[0].path.clone();
+                if self.scratch.open {
+                    self.hide_scratch();
+                } else {
+                    self.split(Axis::Horizontal);
+                }
+                self.browse(&dir, None);
+            }
+            _ => return self.file_command(command, entry(&selection[0]), from_menu),
+        }
+        AppAction::Continue
+    }
+
+    /// Why `paths` can't be moved or trashed, if one is a workspace folder
+    /// or has one in it.
+    fn workspace_folder_in(&self, paths: &[PathBuf]) -> Option<String> {
+        paths.iter().find_map(|path| {
+            let root = self.roots_in(path).into_iter().next()?;
+            let name = file_name(path);
+            let root = self.workspace.name(&root).unwrap_or_default();
+            Some(match name == root {
+                true => format!("{name} is a workspace folder."),
+                false => format!("{name} contains workspace folder {root}."),
+            })
+        })
+    }
+
+    /// Opens the context menu of what the browser in panel `id` has
+    /// selected, or with nothing, of the folder it lists: at the cell
+    /// right-clicked, or from the keyboard, beside the cursor's row.
+    fn open_browser_menu(&mut self, id: PanelId, at: Option<(u32, u32)>) {
+        use Command::*;
+        self.activate(id);
+        let Some(browser) = self.active_panel().browser() else {
+            return;
+        };
+        let item = |command, label: &str| MenuItem::Command(command, label.to_string());
+        let selection = browser.selection();
+        let mut items = Vec::new();
+        match selection.as_slice() {
+            [] => {}
+            [one] => {
+                items.extend([
+                    item(TreeOpen, "Open"),
+                    item(TreeOpenToSide, "Open to the Side"),
+                ]);
+                if one.is_dir {
+                    items.push(item(TreeOpenInTerminal, "Open in Terminal"));
+                }
+                items.push(MenuItem::Separator);
+            }
+            many if many.iter().any(|target| !target.is_dir) => {
+                items.extend([item(TreeOpen, "Open"), MenuItem::Separator]);
+            }
+            _ => {}
+        }
+        items.extend([
+            item(TreeNewFile, "New File…"),
+            item(TreeNewFolder, "New Folder…"),
+        ]);
+        if selection.is_empty() {
+            items.push(item(TreeOpenInTerminal, "Open in Terminal"));
+        } else {
+            items.push(MenuItem::Separator);
+            if selection.len() == 1 {
+                items.extend([
+                    item(TreeRename, "Rename…"),
+                    item(TreeDuplicate, "Duplicate…"),
+                ]);
+            }
+            items.push(item(TreeTrash, "Move to Trash"));
+        }
+        let reveal = match cfg!(target_os = "macos") {
+            true => "Reveal in Finder",
+            false => "Open Containing Folder",
+        };
+        let copy = match selection.len() {
+            0 | 1 => "Copy Path",
+            _ => "Copy Paths",
+        };
+        items.extend([MenuItem::Separator, item(TreeCopyPath, copy)]);
+        if selection.len() <= 1 {
+            items.push(item(TreeCopyRelativePath, "Copy Relative Path"));
+        }
+        items.push(item(TreeReveal, reveal));
+        let hidden = match browser.shows_hidden() {
+            true => "Hide Hidden Files",
+            false => "Show Hidden Files",
+        };
+        items.extend([
+            MenuItem::Separator,
+            item(BrowserToggleHidden, hidden),
+            item(BrowserGoTo, "Go to Folder…"),
+            item(TreeRefresh, "Refresh"),
+        ]);
+        let body = self.active_panel().body();
+        let (x, y) = at
+            .or_else(|| browser.cursor_position())
+            .unwrap_or((body.x + 2, body.y));
+        let menu = ContextMenu::new(
+            items,
+            &self.keymap,
+            x,
+            y,
+            at.is_some(),
+            self.width,
+            self.height,
+        );
+        self.close_popups();
+        self.menu = Some((menu, MenuFor::Browser(id)));
+    }
+
+    /// Starts dragging what the browser in panel `id` has selected, from
+    /// the cell `at`.
+    fn start_file_drag(&mut self, id: PanelId, at: (u32, u32)) {
+        let Some(browser) = self.panel(id).and_then(Panel::browser) else {
+            return;
+        };
+        let targets = browser.selection();
+        if targets.is_empty() {
+            return;
+        }
+        let dir = browser.dir().to_path_buf();
+        self.quick_look = None;
+        self.file_drag = Some(FileDrag {
+            targets,
+            dir,
+            at,
+            drop: None,
+        });
+        self.drag_files_to(at.0, at.1);
+    }
+
+    /// Follows the pointer with the files dragged, to (`x`, `y`), marking
+    /// where they'd go.
+    fn drag_files_to(&mut self, x: u32, y: u32) {
+        let drop = self.file_drop_at(x, y);
+        // A folder in a browser, or its header, the browser marks.
+        let marked = match &drop {
+            Some(FileDrop::Move { folder, rect: None }) => Some(folder.clone()),
+            _ => None,
+        };
+        let over = match self.target_at(x, y) {
+            Some(MouseTarget::Panel(id) | MouseTarget::Header(id)) => Some(id),
+            _ => None,
+        };
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
+            let id = panel.id;
+            if let Some(browser) = panel.browser_mut() {
+                browser.set_drop(marked.clone().filter(|_| over == Some(id)));
+            }
+        }
+        if let Some(drag) = &mut self.file_drag {
+            drag.at = (x, y);
+            drag.drop = drop;
+        }
+    }
+
+    /// Where the files dragged would go if let go at (`x`, `y`): into a
+    /// folder in a browser, its header, or the tree, or into the folder a
+    /// browser lists; opened in a panel showing something else; or
+    /// nowhere, as into the folder they're in, or into one of themselves.
+    fn file_drop_at(&self, x: u32, y: u32) -> Option<FileDrop> {
+        let drag = self.file_drag.as_ref()?;
+        let into = |folder: &Path| {
+            folder != drag.dir
+                && !drag
+                    .targets
+                    .iter()
+                    .any(|target| folder.starts_with(&target.path))
+        };
+        let open = |id: PanelId| {
+            let panel = self.panel(id)?;
+            Some(FileDrop::Open {
+                panel: id,
+                rect: panel.area(),
+            })
+        };
+        let listed = |id: PanelId| {
+            let panel = self.panel(id)?;
+            let dir = panel.browser()?.dir();
+            into(dir).then(|| FileDrop::Move {
+                folder: dir.to_path_buf(),
+                rect: Some(panel.area()),
+            })
+        };
+        match self.target_at(x, y)? {
+            MouseTarget::Tree if self.sidebar == Sidebar::Files => {
+                let entry = self.tree.entry_at(y).filter(|entry| entry.is_dir)?;
+                let rect = Rect {
+                    x: 0,
+                    y,
+                    width: self.visible_tree_width(),
+                    height: 1,
+                };
+                into(&entry.path).then_some(FileDrop::Move {
+                    folder: entry.path,
+                    rect: Some(rect),
+                })
+            }
+            MouseTarget::Header(id) => {
+                let panel = self.panel(id)?;
+                if let Some(crumb) = panel.crumb_at(x) {
+                    return into(&crumb).then_some(FileDrop::Move {
+                        folder: crumb,
+                        rect: None,
+                    });
+                }
+                match panel.browser() {
+                    Some(_) => listed(id),
+                    None => open(id),
+                }
+            }
+            MouseTarget::Panel(id) => {
+                let browser = match self.panel(id)?.browser() {
+                    Some(browser) => browser,
+                    None => return open(id),
+                };
+                if let Some((folder, _)) = browser.folder_at(x, y) {
+                    return into(&folder).then_some(FileDrop::Move { folder, rect: None });
+                }
+                if browser.is_dragged_at(y) {
+                    return None;
+                }
+                listed(id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Stops dragging files, unmarking where they'd have gone.
+    fn end_file_drag(&mut self) -> Option<FileDrag> {
+        for panel in tab::all_panels_mut(&mut self.tabs, &mut self.scratch.panel) {
+            if let Some(browser) = panel.any_browser_mut() {
+                browser.set_drop(None);
+            }
+        }
+        self.file_drag.take()
+    }
+
+    /// Lets the files dragged go: they move, or open, where they're over.
+    fn drop_files(&mut self) {
+        let Some(drag) = self.end_file_drag() else {
+            return;
+        };
+        match drag.drop {
+            None => {}
+            Some(FileDrop::Move { folder, .. }) => {
+                let paths: Vec<PathBuf> = drag.targets.into_iter().map(|t| t.path).collect();
+                self.move_into(&paths, &folder);
+            }
+            Some(FileDrop::Open { panel, .. }) => {
+                let (folders, files): (Vec<_>, Vec<_>) =
+                    drag.targets.into_iter().partition(|target| target.is_dir);
+                match (files.is_empty(), folders.first()) {
+                    // A folder, without files, opens in a browser there.
+                    (true, Some(folder)) => {
+                        self.activate(panel);
+                        self.browse(&folder.path, None);
+                    }
+                    _ => {
+                        let paths = files.into_iter().map(|target| target.path).collect();
+                        self.browser_action(panel, BrowserAction::Open(paths));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draws what's dragged by the pointer, and where it would go.
+    fn draw_file_drag(&self, frame: &Buffer) {
+        let Some(drag) = &self.file_drag else {
+            return;
+        };
+        let colors = theme::colors();
+        let what = match drag.targets.as_slice() {
+            [one] => file_name(&one.path),
+            many => format!("{} items", many.len()),
+        };
+        let label = match &drag.drop {
+            Some(FileDrop::Move { folder, .. }) => {
+                format!(" Move {what} to {} ", file_name(folder))
+            }
+            Some(FileDrop::Open { .. }) => format!(" Open {what} "),
+            None => format!(" {what} "),
+        };
+        let label = crate::tree::truncate(&label, self.width.saturating_sub(2) as usize);
+        let width = label.chars().count() as u32;
+        let (x, y) = drag.at;
+        let x = (x + 2).min(self.width.saturating_sub(width));
+        let y = match y + 1 < self.height.saturating_sub(1) {
+            true => y + 1,
+            false => y.saturating_sub(1),
+        };
+        frame.draw_text(
+            &label,
+            x,
+            y,
+            colors.on_accent,
+            Some(colors.accent),
+            Attributes::NONE,
+        );
+    }
+
+    /// Moves the files and folders at `paths` into `folder`, unless one's
+    /// there already, or is a workspace folder. Open files go with them.
+    /// Those on another filesystem than `folder` can't be moved there, so
+    /// they're copied there instead, in the background, and stay put.
+    fn move_into(&mut self, paths: &[PathBuf], folder: &Path) {
+        if let Some(path) = paths.iter().find(|path| folder.starts_with(path)) {
+            let message = format!("Can't move {} into itself.", file_name(path));
+            return self.show_message(message, false);
+        }
+        if let Some(message) = self.workspace_folder_in(paths) {
+            return self.show_message(message, false);
+        }
+        let mut moves = Vec::new();
+        for path in paths {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let to = folder.join(name);
+            // In it already, by another path.
+            if document::same_file(path, &to) {
+                continue;
+            }
+            if fs::symlink_metadata(&to).is_ok() {
+                let message = format!("{} already has {}.", file_name(folder), file_name(path));
+                return self.show_message(message, false);
+            }
+            moves.push((path.clone(), to));
+        }
+        let mut copies = Vec::new();
+        let mut failed = Vec::new();
+        for (from, to) in moves {
+            match fs::rename(&from, &to) {
+                Ok(()) => {
+                    self.follow_move(&from, &to);
+                    if fs::symlink_metadata(&to).is_ok_and(|meta| meta.is_dir()) {
+                        // Its folders expanded in the tree stay so.
+                        self.tree.moved(&from, &to);
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::CrossesDevices => copies.push((from, to)),
+                Err(err) => failed.push(format!("Can't move {}: {err}", file_name(&from))),
+            }
+        }
+        if let Some(first) = failed.first() {
+            let message = match failed.len() {
+                1 => first.clone(),
+                n => format!("{first} (and {} more)", n - 1),
+            };
+            self.show_message(message, true);
+        }
+        if !copies.is_empty() {
+            self.copy_in_background(copies, folder);
+        }
+        self.tree.refresh();
+        self.files.refresh();
+        self.show_active_in_tree();
+        self.refresh_browsers();
+    }
+
+    /// Copies each file or folder to where it goes, on another thread,
+    /// saying so once it's done (see [`App::poll_copying`]).
+    fn copy_in_background(&mut self, copies: Vec<(PathBuf, PathBuf)>, folder: &Path) {
+        let names: Vec<String> = copies.iter().map(|(from, _)| file_name(from)).collect();
+        let message = format!(
+            "{} is on another filesystem: copying {} there instead of moving.",
+            file_name(folder),
+            items_named(&names)
+        );
+        self.show_message(message, false);
+        let (sender, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            let failed: Vec<String> = copies
+                .iter()
+                .filter_map(|(from, to)| {
+                    let err = copy_all(from, to).err()?;
+                    Some(format!("Can't copy {}: {err}", file_name(from)))
+                })
+                .collect();
+            let _ = sender.send(failed);
+            wake::wake();
+        });
+        self.copying.push(Copying {
+            names,
+            folder: folder.to_path_buf(),
+            done,
+        });
+    }
+
+    /// Says how the copies finished since the last call went. Returns
+    /// whether any did.
+    fn poll_copying(&mut self) -> bool {
+        let mut finished = Vec::new();
+        self.copying.retain(|copying| {
+            let failed = match copying.done.try_recv() {
+                Ok(failed) => failed,
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => vec!["Copying stopped unexpectedly.".into()],
+            };
+            finished.push((
+                items_named(&copying.names),
+                file_name(&copying.folder),
+                failed,
+            ));
+            false
+        });
+        let any = !finished.is_empty();
+        for (what, folder, failed) in finished {
+            match failed.first() {
+                Some(first) => self.show_message(first.clone(), true),
+                None => {
+                    let message = format!("Copied {what} to {folder}. The originals stay.");
+                    self.show_message(message, false);
+                }
+            }
+        }
+        if any {
+            self.tree.refresh();
+            self.files.refresh();
+            self.refresh_browsers();
+        }
+        any
     }
 
     // --- terminals --------------------------------------------------------------
@@ -9041,6 +9887,12 @@ impl App {
         if self.quick_look.take().is_some() {
             return;
         }
+        if self.browser_has_keyboard() {
+            if let Some(target) = self.active_panel().browser().and_then(|b| b.cursor()) {
+                self.look_at(&target.path);
+            }
+            return;
+        }
         if self.sidebar == Sidebar::Log {
             if let Some(log) = &mut self.log {
                 let action = log.run(Command::TreePreview);
@@ -9062,10 +9914,10 @@ impl App {
 
     fn look_at(&mut self, path: &Path) {
         let shown = match path.parent() {
-            Some(folder) if self.workspace.root_of(path) != Some(path) => {
-                self.workspace.display_path(folder)
-            }
-            _ => String::new(),
+            _ if self.workspace.root_of(path) == Some(path) => String::new(),
+            Some(folder) if self.workspace.root_of(folder).is_none() => browser::display(folder),
+            Some(folder) => self.workspace.display_path(folder),
+            None => String::new(),
         };
         let bounds = self.quick_look_bounds();
         self.quick_look = Some(QuickLook::new(path, shown, &self.theme, bounds));
@@ -9085,12 +9937,19 @@ impl App {
             || self.dialog.is_some()
             || self.input.is_some();
         let selected = match self.focus {
-            Focus::Tree if !popup && self.visible_tree_width() > 0 => self.sidebar_selected(),
+            Focus::Tree if !popup && self.visible_tree_width() > 0 => {
+                self.sidebar_selected().map(|entry| entry.path)
+            }
+            Focus::Editor if !popup => self
+                .active_panel()
+                .browser()
+                .and_then(|browser| browser.cursor())
+                .map(|target| target.path),
             _ => None,
         };
         match selected {
             None => self.quick_look = None,
-            Some(entry) if entry.path != look.path() => self.look_at(&entry.path),
+            Some(path) if path != look.path() => self.look_at(&path),
             Some(_) => {}
         }
     }
@@ -9224,6 +10083,66 @@ fn visit_usable(
         }
         Visit::Image(path) => path.is_file(),
         Visit::Commit { root, .. } => root.is_dir(),
+        Visit::Browser(dir, _) => dir.is_dir(),
+    }
+}
+
+/// Whether a file browser with the keyboard takes `command` itself,
+/// rather than the tree or the editor: those that move through its
+/// entries, open them, or act on them as the tree's file commands do.
+fn browses(command: Command) -> bool {
+    use Command::*;
+    command.context() == Context::Browser
+        || matches!(
+            command,
+            TreeUp
+                | TreeDown
+                | TreePageUp
+                | TreePageDown
+                | TreeFirst
+                | TreeLast
+                | TreeOpen
+                | TreeExpand
+                | TreeCollapse
+                | TreeRefresh
+                | TreeQuickLook
+                | TreePreview
+                | TreeContextMenu
+                | TreeOpenToSide
+                | TreeNewFile
+                | TreeNewFolder
+                | TreeRename
+                | TreeDuplicate
+                | TreeTrash
+                | TreeCopyPath
+                | TreeCopyRelativePath
+                | TreeReveal
+                | TreeOpenInTerminal
+                | TreeOpenInBrowser
+                | SelectAll
+                | ClearSelection
+        )
+}
+
+/// Where a browser opened on `path` goes: into it, if it's a folder, or
+/// else to the folder it's in, with it selected. A resolved path is shown
+/// as it was gone through (see [`browser::logical`]).
+fn browser_place(path: &Path, is_dir: bool) -> (PathBuf, Option<OsString>) {
+    let path = browser::logical(path);
+    match (is_dir, path.parent()) {
+        (false, Some(folder)) => (
+            folder.to_path_buf(),
+            path.file_name().map(OsStr::to_os_string),
+        ),
+        _ => (path, None),
+    }
+}
+
+/// `names`, or how many there are, to say what's being done to them.
+fn items_named(names: &[String]) -> String {
+    match names {
+        [one] => one.clone(),
+        many => format!("{} items", many.len()),
     }
 }
 
@@ -9239,6 +10158,7 @@ fn visit_shown(visit: &Visit) -> Option<Shown> {
         Visit::File(doc, None, _) => Shown::Untitled(doc.upgrade()?.untitled.get()),
         Visit::Terminal(id) => Shown::Terminal(*id),
         Visit::Image(path) => Shown::Image(path.clone()),
+        Visit::Browser(dir, _) => Shown::Browser(dir.clone()),
         // Read from git again easily enough, but not worth keeping.
         Visit::Commit { .. } => return None,
     })
@@ -16634,5 +17554,266 @@ fn helper() {}
         ctrl_mouse(&mut app, MouseKind::Press(MouseButton::Left), keyword);
         ctrl_mouse(&mut app, MouseKind::Release(MouseButton::Left), keyword);
         assert_eq!(cursor(&app), (2, 0));
+    }
+
+    /// Waits for every file browser shown to list its folder.
+    fn wait_for_browsers(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.poll();
+            let loading = tab::all_panels(&app.tabs, &app.scratch.panel)
+                .filter_map(Panel::browser)
+                .any(browser::Browser::is_loading);
+            if !loading {
+                return;
+            }
+            assert!(Instant::now() < deadline, "listing took too long");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn browser_of(app: &App) -> &browser::Browser {
+        app.active_panel()
+            .browser()
+            .expect("a file browser is shown")
+    }
+
+    fn browsed(app: &App) -> (PathBuf, Vec<String>) {
+        let browser = browser_of(app);
+        let names = browser
+            .selection()
+            .iter()
+            .map(|target| file_name(&target.path))
+            .collect();
+        (browser.dir().to_path_buf(), names)
+    }
+
+    /// The screen row of the entry named `name` in the active browser.
+    fn row_of(app: &App, name: &str) -> u32 {
+        let frame =
+            OwnedBuffer::new(app.width, app.height, false, WidthMethod::Unicode, "t").unwrap();
+        app.draw(&frame);
+        let body = app.active_panel().body();
+        let text = frame.to_text(true);
+        let lines: Vec<&str> = text.lines().collect();
+        (body.y + 1..body.bottom())
+            .find(|&y| {
+                let line: String = lines[y as usize].chars().skip(body.x as usize).collect();
+                let first = line.trim_start().split_whitespace().next();
+                // Without icons, folders end in `/`.
+                first.map(|first| first.trim_end_matches('/')) == Some(name)
+            })
+            .unwrap_or_else(|| panic!("{name} isn't on screen:\n{text}"))
+    }
+
+    #[test]
+    fn a_file_browser_opens_at_the_file_and_goes_through_folders() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "browser-open",
+            &[
+                ("src/main.rs", "fn main() {}"),
+                ("src/lib/mod.rs", ""),
+                ("README", ""),
+            ],
+        );
+        let mut app = app(&root, Some("src/main.rs"));
+        app.run(Command::NewFileBrowser, false);
+        wait_for_browsers(&mut app);
+        assert_eq!(
+            browsed(&app),
+            (root.join("src"), vec!["main.rs".to_string()])
+        );
+        assert!(screen(&app).contains("src"), "the header names the folder");
+        // Folders first.
+        key(&mut app, KeyCode::Up);
+        assert_eq!(browsed(&app).1, ["lib"]);
+        key(&mut app, KeyCode::Enter);
+        wait_for_browsers(&mut app);
+        assert_eq!(browsed(&app).0, root.join("src/lib"));
+        // Backspace goes up, back to the folder come from.
+        key(&mut app, KeyCode::Backspace);
+        wait_for_browsers(&mut app);
+        assert_eq!(browsed(&app), (root.join("src"), vec!["lib".to_string()]));
+        // The header's back button goes back through the folders.
+        app.go_history(true);
+        wait_for_browsers(&mut app);
+        assert_eq!(browsed(&app).0, root.join("src/lib"));
+        // Enter on a file opens it in the panel; going back returns.
+        app.go_history(true);
+        wait_for_browsers(&mut app);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.ed().path(), Some(root.join("src/main.rs")));
+        app.go_history(true);
+        wait_for_browsers(&mut app);
+        assert_eq!(
+            browsed(&app),
+            (root.join("src"), vec!["main.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn clicks_in_a_browser_select_and_double_clicks_open() {
+        let _serial = crate::test_serial();
+        let root = fixture("browser-click", &[("a.txt", "a"), ("b.txt", "b")]);
+        let mut app = app(&root, None);
+        app.run(Command::NewFileBrowser, false);
+        wait_for_browsers(&mut app);
+        let x = app.active_panel().body().x + 4;
+        let y = row_of(&app, "b.txt");
+        left_click(&mut app, x, y);
+        assert_eq!(browsed(&app).1, ["b.txt"]);
+        assert!(
+            app.active_panel().browser().is_some(),
+            "a click only selects"
+        );
+        // Space looks, and follows the selection.
+        key(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.quick_look.as_ref().unwrap().path(), root.join("b.txt"));
+        key(&mut app, KeyCode::Up);
+        app.after_input();
+        assert_eq!(app.quick_look.as_ref().unwrap().path(), root.join("a.txt"));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.quick_look.is_none());
+        let y = row_of(&app, "b.txt");
+        left_click(&mut app, x, y);
+        left_click(&mut app, x, y);
+        assert_eq!(app.ed().path(), Some(root.join("b.txt")));
+    }
+
+    #[test]
+    fn letters_in_a_browser_find_names_rather_than_run_the_trees_keys() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "browser-type",
+            &[("apple", ""), ("cherry", ""), ("sun", "")],
+        );
+        let mut app = app(&root, None);
+        app.run(Command::NewFileBrowser, false);
+        wait_for_browsers(&mut app);
+        // `s` stages and `c` commits in the sidebar.
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(browsed(&app).1, ["sun"]);
+        assert!(!app.commit_open);
+    }
+
+    #[test]
+    fn dragging_from_a_browser_moves_into_folders_and_opens_in_panels() {
+        let _serial = crate::test_serial();
+        let root = fixture(
+            "browser-drag",
+            &[("a.txt", "a"), ("b.txt", "b"), ("dest/keep", "")],
+        );
+        let mut app = app(&root, None);
+        app.split(Axis::Horizontal);
+        let other = app.active_id();
+        app.focus_panel(Direction::Left);
+        app.run(Command::NewFileBrowser, false);
+        wait_for_browsers(&mut app);
+        let x = app.active_panel().body().x + 4;
+        // Drag a.txt onto dest.
+        let (a, dest) = (row_of(&app, "a.txt"), row_of(&app, "dest"));
+        mouse_at(&mut app, MouseKind::Press(MouseButton::Left), x, a);
+        mouse_at(&mut app, MouseKind::Drag(MouseButton::Left), x, dest);
+        assert!(screen(&app).contains("Move a.txt to dest"));
+        mouse_at(&mut app, MouseKind::Release(MouseButton::Left), x, dest);
+        assert!(root.join("dest/a.txt").is_file());
+        assert!(!root.join("a.txt").exists());
+        wait_for_browsers(&mut app);
+        // Drag b.txt onto the other panel, which opens it.
+        let b = row_of(&app, "b.txt");
+        let area = app.panel(other).unwrap().body();
+        mouse_at(&mut app, MouseKind::Press(MouseButton::Left), x, b);
+        mouse_at(
+            &mut app,
+            MouseKind::Drag(MouseButton::Left),
+            area.x + 5,
+            area.y + 2,
+        );
+        mouse_at(
+            &mut app,
+            MouseKind::Release(MouseButton::Left),
+            area.x + 5,
+            area.y + 2,
+        );
+        assert_eq!(app.active_id(), other);
+        assert_eq!(app.ed().path(), Some(root.join("b.txt")));
+        assert!(root.join("b.txt").is_file(), "opening doesn't move it");
+        // Dropping on the folder it's in goes nowhere.
+        app.focus_panel(Direction::Left);
+        let b = row_of(&app, "b.txt");
+        mouse_at(&mut app, MouseKind::Press(MouseButton::Left), x, b);
+        mouse_at(&mut app, MouseKind::Drag(MouseButton::Left), x + 1, b + 1);
+        assert!(app.file_drag.as_ref().unwrap().drop.is_none());
+        mouse_at(
+            &mut app,
+            MouseKind::Release(MouseButton::Left),
+            x + 1,
+            b + 1,
+        );
+        assert!(root.join("b.txt").is_file());
+    }
+
+    #[test]
+    fn dropping_on_another_browser_moves_into_its_folder() {
+        let _serial = crate::test_serial();
+        let root = fixture("browser-drop", &[("a.txt", "a"), ("there/x", "")]);
+        let mut app = app(&root, None);
+        app.split(Axis::Horizontal);
+        app.browse(&root.join("there"), None);
+        app.focus_panel(Direction::Left);
+        app.run(Command::NewFileBrowser, false);
+        wait_for_browsers(&mut app);
+        let x = app.active_panel().body().x + 4;
+        let a = row_of(&app, "a.txt");
+        let right = app.tab().panels[1].body();
+        mouse_at(&mut app, MouseKind::Press(MouseButton::Left), x, a);
+        mouse_at(
+            &mut app,
+            MouseKind::Drag(MouseButton::Left),
+            right.x + 3,
+            right.bottom() - 1,
+        );
+        mouse_at(
+            &mut app,
+            MouseKind::Release(MouseButton::Left),
+            right.x + 3,
+            right.bottom() - 1,
+        );
+        assert!(root.join("there/a.txt").is_file());
+    }
+
+    #[test]
+    fn several_entries_selected_go_to_the_trash_together() {
+        let _serial = crate::test_serial();
+        let root = fixture("browser-trash", &[("a", ""), ("b", ""), ("c", "")]);
+        let mut app = app(&root, None);
+        app.run(Command::NewFileBrowser, false);
+        wait_for_browsers(&mut app);
+        let shift_down = Key::new(KeyCode::Down, Mods::SHIFT);
+        app.handle_key(shift_down);
+        assert_eq!(browsed(&app).1, ["a", "b"]);
+        app.run(Command::TreeTrash, false);
+        assert!(app.alert.is_some(), "asks first");
+        assert!(root.join("a").exists());
+        key(&mut app, KeyCode::Char('t'));
+        assert!(!root.join("a").exists() && !root.join("b").exists());
+        assert!(root.join("c").exists());
+        wait_for_browsers(&mut app);
+        assert_eq!(browsed(&app).1, ["c"], "what took their place");
+    }
+
+    #[test]
+    fn a_browser_comes_back_with_its_session() {
+        let _serial = crate::test_serial();
+        let root = fixture("browser-session", &[("dir/f", "")]);
+        let mut app = app(&root, None);
+        app.browse(&root.join("dir"), None);
+        let state = panel_state(app.active_panel());
+        assert_eq!(state.shows, Some(Shown::Browser(root.join("dir"))));
+        let mut panel = Panel::new(9);
+        panel.show_browser(&root.join("dir"), None, app.browser_prefs);
+        assert_eq!(panel.visit().as_ref().and_then(visit_shown), state.shows);
     }
 }

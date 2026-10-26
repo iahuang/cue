@@ -436,6 +436,16 @@ impl FileTree {
         true
     }
 
+    /// The entry on screen row `y`, if any.
+    pub fn entry_at(&self, y: u32) -> Option<Entry> {
+        let row = &self.rows[self.row_at(y)?];
+        Some(Entry {
+            path: row.path.clone(),
+            is_dir: row.is_dir,
+            is_root: row.depth == 0 || self.roots.contains(&row.path),
+        })
+    }
+
     /// The index of the row on screen row `y`, if any: a folder stuck to
     /// the top, or the row scrolled there.
     fn row_at(&self, y: u32) -> Option<usize> {

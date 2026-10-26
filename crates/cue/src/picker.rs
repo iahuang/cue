@@ -178,6 +178,21 @@ impl Item {
         }
     }
 
+    /// The folder at `path`, which a file browser shows.
+    pub fn folder(path: PathBuf) -> Item {
+        let text = format!("{}/", crate::browser::display(&path));
+        let parent = text[..text.len() - 1]
+            .rsplit_once('/')
+            .map_or(0, |(dir, _)| dir.chars().count() + 1);
+        Item {
+            text,
+            dim: 0..parent,
+            detail: "browser".to_string(),
+            choice: Choice::File(path),
+            color: None,
+        }
+    }
+
     /// Untitled file `number`, not yet saved.
     pub fn untitled(number: u32) -> Item {
         Item {

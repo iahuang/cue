@@ -65,6 +65,8 @@ pub enum Purpose {
     Duplicate,
     /// A folder that exists, to add to the workspace.
     AddFolder,
+    /// A folder that exists, for a file browser to go to.
+    GoToFolder,
 }
 
 impl Purpose {
@@ -77,12 +79,21 @@ impl Purpose {
             Purpose::Move => "Rename or Move",
             Purpose::Duplicate => "Duplicate",
             Purpose::AddFolder => "Add Folder to Workspace",
+            Purpose::GoToFolder => "Go to Folder",
         }
+    }
+
+    /// Whether it chooses a folder that exists, listing only folders.
+    fn picks_folder(self) -> bool {
+        matches!(self, Purpose::AddFolder | Purpose::GoToFolder)
     }
 
     /// Whether the path chosen may not exist yet.
     fn names_a_new_file(self) -> bool {
-        !matches!(self, Purpose::Open | Purpose::AddFolder)
+        !matches!(
+            self,
+            Purpose::Open | Purpose::AddFolder | Purpose::GoToFolder
+        )
     }
 }
 
@@ -167,7 +178,11 @@ impl FileDialog {
         width: u32,
         height: u32,
     ) -> FileDialog {
-        let add = (purpose == Purpose::AddFolder).then_some((Command::PickerAccept, "add"));
+        let add = match purpose {
+            Purpose::AddFolder => Some((Command::PickerAccept, "add")),
+            Purpose::GoToFolder => Some((Command::PickerAccept, "go")),
+            _ => None,
+        };
         let hints = add
             .iter()
             .chain(&[
@@ -555,7 +570,7 @@ impl FileDialog {
             None => {}
         }
         let path = self.resolve(&self.text);
-        if self.purpose == Purpose::AddFolder {
+        if self.purpose.picks_folder() {
             return match path.is_dir() {
                 // The folder listed.
                 true if self.name().is_empty() => DialogAction::Accept(path),
@@ -593,7 +608,7 @@ impl FileDialog {
         let exists = fs::symlink_metadata(&path).is_ok();
         let name = file_name(&path);
         match self.purpose {
-            Purpose::Open | Purpose::AddFolder => DialogAction::Accept(path),
+            Purpose::Open | Purpose::AddFolder | Purpose::GoToFolder => DialogAction::Accept(path),
             Purpose::Create if exists => {
                 self.show_error(format!("{name} already exists."));
                 DialogAction::Continue
@@ -677,7 +692,7 @@ impl FileDialog {
         self.selected = match self.purpose {
             Purpose::Open => self.rows.iter().position(|&row| row != Row::Parent),
             // Enter takes the folder listed, until a name is typed.
-            Purpose::AddFolder if !filter.is_empty() => {
+            Purpose::AddFolder | Purpose::GoToFolder if !filter.is_empty() => {
                 self.rows.iter().position(|&row| row != Row::Parent)
             }
             _ => None,
@@ -812,9 +827,10 @@ impl FileDialog {
         let colors = theme::colors();
         if let Some(error) = self.listing.error {
             let text = match (error, self.purpose) {
-                (io::ErrorKind::NotFound, Purpose::Open | Purpose::AddFolder) => {
-                    "Folder not found.".to_string()
-                }
+                (
+                    io::ErrorKind::NotFound,
+                    Purpose::Open | Purpose::AddFolder | Purpose::GoToFolder,
+                ) => "Folder not found.".to_string(),
                 (io::ErrorKind::NotFound, _) => {
                     "This folder will be created with the file.".to_string()
                 }
@@ -835,9 +851,12 @@ impl FileDialog {
             Purpose::AddFolder if self.filter().is_empty() => {
                 "No subfolders. Press Enter to add this folder.".to_string()
             }
+            Purpose::GoToFolder if self.filter().is_empty() => {
+                "No subfolders. Press Enter to go to this folder.".to_string()
+            }
             _ if self.filter().is_empty() => "Empty folder.".to_string(),
             Purpose::Open => "No matching files.".to_string(),
-            Purpose::AddFolder => "No matching folders.".to_string(),
+            Purpose::AddFolder | Purpose::GoToFolder => "No matching folders.".to_string(),
             Purpose::SaveAs => format!("Press Enter to save as {}.", self.name()),
             Purpose::Create | Purpose::CreateFolder => {
                 format!("Press Enter to create {}.", self.name())
@@ -963,7 +982,7 @@ impl Listing {
                     size: meta.filter(|_| !is_dir).map(|meta| meta.len()),
                 }
             })
-            .filter(|entry| entry.is_dir || purpose != Purpose::AddFolder)
+            .filter(|entry| entry.is_dir || !purpose.picks_folder())
             .collect();
         entries.sort_by(|a, b| {
             (!a.is_dir, a.name.to_lowercase(), &a.name).cmp(&(

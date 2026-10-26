@@ -73,6 +73,8 @@ pub enum Shown {
     /// A terminal, by id.
     Terminal(u32),
     Image(PathBuf),
+    /// A file browser's folder, as gone through.
+    Browser(PathBuf),
 }
 
 /// An open file.
@@ -673,6 +675,7 @@ fn shown_value(shown: &Shown) -> Value {
         Shown::Untitled(n) => table.insert("untitled".into(), Value::Integer(*n as i64)),
         Shown::Terminal(id) => table.insert("terminal".into(), Value::Integer(*id as i64)),
         Shown::Image(path) => table.insert("image".into(), path_value(path)),
+        Shown::Browser(path) => table.insert("browser".into(), path_value(path)),
     };
     Value::Table(table)
 }
@@ -893,7 +896,10 @@ fn shown_from(table: &Table) -> Option<Shown> {
     if let Some(id) = get_u32(table, "terminal") {
         return Some(Shown::Terminal(id));
     }
-    get_path(table, "image").map(Shown::Image)
+    if let Some(path) = get_path(table, "image") {
+        return Some(Shown::Image(path));
+    }
+    get_path(table, "browser").map(Shown::Browser)
 }
 
 fn layout_from(table: &Table) -> Option<Layout> {
