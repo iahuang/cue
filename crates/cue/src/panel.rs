@@ -1130,10 +1130,8 @@ impl Panel {
                 height: 1,
             });
         }
-        Some(Rect {
-            width: self.title_width(),
-            ..self.header()
-        })
+        // The rest only drags the panel, so it isn't lit.
+        None
     }
 
     /// The header button at screen column `x`, if any.
